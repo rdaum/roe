@@ -1,0 +1,10 @@
+[package]
+name = "red"
+description = "A minimalistic editor with emacs keybindings"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+crossterm = "0.28.1"
+ropey = "1.6.1"
+slotmap = "1.0.7"
