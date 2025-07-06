@@ -597,7 +597,7 @@ impl Editor {
                         let (current_col, current_line) = buffer.to_column_line(window.cursor);
                         let target_line = current_line + content_height;
                         // Bounds check: don't go past the last line
-                        let max_line = buffer.buffer.len_lines().saturating_sub(1) as u16;
+                        let max_line = buffer.buffer_len_lines().saturating_sub(1) as u16;
                         let safe_target_line = target_line.min(max_line);
                         buffer.to_char_index(current_col, safe_target_line)
                     }
@@ -657,7 +657,7 @@ impl Editor {
         // Dispatch the key to the modes of the active-buffer in the active-window
 
         let mut chrome_actions = vec![];
-        for mode_id in buffer.modes.clone() {
+        for mode_id in buffer.modes() {
             let mode = self.modes.get_mut(mode_id).unwrap();
             let actions = mode.perform(&key_action);
             for action in actions {
@@ -1019,11 +1019,11 @@ impl Editor {
         // For now, we need to know the file path. In a real implementation,
         // this would be stored with the buffer or mode. For now, let's look
         // for a FileMode that has the file path.
-        let file_path = if let Some(mode_id) = buffer.modes.first() {
+        let file_path = if let Some(mode_id) = buffer.modes().first() {
             if let Some(_mode) = self.modes.get(*mode_id) {
                 // Try to downcast to FileMode to get the file path
                 // For now, we'll use the buffer's object name as the file path
-                buffer.object.clone()
+                buffer.object()
             } else {
                 return vec![ChromeAction::Echo("No mode found for save".to_string())];
             }
@@ -1032,7 +1032,7 @@ impl Editor {
         };
 
         // Start async save operation without blocking
-        let content = buffer.buffer.to_string();
+        let content = buffer.with_read(|b| b.buffer.to_string());
         let file_path_clone = file_path.clone();
         
         tokio::spawn(async move {
@@ -1118,12 +1118,9 @@ mod tests {
         let scratch_mode_id = modes.insert(scratch_mode);
 
         let mut buffers: SlotMap<BufferId, Buffer> = SlotMap::default();
-        let scratch_buffer = Buffer {
-            object: "test".to_string(),
-            modes: vec![scratch_mode_id],
-            buffer: ropey::Rope::from_str("Hello\nWorld\nTest"),
-            mark: None,
-        };
+        let scratch_buffer = Buffer::new(&[scratch_mode_id]);
+        scratch_buffer.set_object("test".to_string());
+        scratch_buffer.load_str("Hello\nWorld\nTest");
         let scratch_buffer_id = buffers.insert(scratch_buffer);
 
         let window = Window {
@@ -1195,7 +1192,7 @@ mod tests {
         let buffer_len = {
             let window = &editor.windows[editor.active_window];
             let buffer = &editor.buffers[window.active_buffer];
-            buffer.buffer.len_chars()
+            buffer.buffer_len_chars()
         };
 
         // Move cursor to end of buffer
@@ -2040,7 +2037,7 @@ mod tests {
 
         // Move cursor to end of buffer
         let window = &mut editor.windows[editor.active_window];
-        window.cursor = editor.buffers[window.active_buffer].buffer.len_chars();
+        window.cursor = editor.buffers[window.active_buffer].buffer_len_chars();
 
         // Yank the killed region
         let actions = editor.yank(&crate::mode::ActionPosition::cursor());

@@ -59,7 +59,7 @@ impl<W: Write> TerminalRenderer<W> {
         let region_bounds = buffer.get_region(window.cursor);
 
         // Get line content
-        if buffer_line >= buffer.buffer.len_lines() {
+        if buffer_line >= buffer.buffer_len_lines() {
             // Past end of buffer - clear the entire content line
             let content_x = window.x + 1;
             let content_width = window.width_chars.saturating_sub(2);
@@ -72,10 +72,10 @@ impl<W: Write> TerminalRenderer<W> {
             return Ok(());
         }
 
-        let line_text = buffer.buffer.line(buffer_line).to_string();
+        let line_text = buffer.buffer_line(buffer_line);
         // Remove trailing newline if present
         let line_text = line_text.trim_end_matches('\n');
-        let line_start_pos = buffer.buffer.line_to_char(buffer_line);
+        let line_start_pos = buffer.buffer_line_to_char(buffer_line);
 
         // Calculate window content area
         let content_x = window.x + 1;
@@ -284,9 +284,9 @@ impl<W: Write> Renderer for TerminalRenderer<W> {
                 let content_height = window.height_chars.saturating_sub(3);
 
                 // Mark all visible lines as dirty for our incremental renderer
-                for line_idx in 0..content_height.min(buffer.buffer.len_lines() as u16) {
+                for line_idx in 0..content_height.min(buffer.buffer_len_lines() as u16) {
                     let global_line = (window.start_line + line_idx) as usize;
-                    if global_line < buffer.buffer.len_lines() {
+                    if global_line < buffer.buffer_len_lines() {
                         // Force dirty lines to be rendered by our incremental logic
                         // We'll handle this below in the dirty lines iteration
                     }
@@ -614,11 +614,11 @@ fn draw_window_modeline(
     let mut modeline_content = String::new();
 
     // Add buffer object name
-    let object_part = format!(" {} ", buffer.object);
+    let object_part = format!(" {} ", buffer.object());
     modeline_content.push_str(&object_part);
 
     // Add mode name
-    if let Some(mode_id) = buffer.modes.first() {
+    if let Some(mode_id) = buffer.modes().first() {
         if let Some(mode) = editor.modes.get(*mode_id) {
             let mode_part = format!("({}) ", mode.name());
             modeline_content.push_str(&mode_part);
@@ -683,7 +683,7 @@ pub fn draw_window(
     let region_bounds = buffer.get_region(window.cursor);
 
     // Draw the buffer content within the content bounds
-    for (line_idx, line_text) in buffer.buffer.lines().enumerate() {
+    for (line_idx, line_text) in buffer.buffer_lines().into_iter().enumerate() {
         let screen_line = line_idx as u16;
 
         // Skip lines that are scrolled out of view
@@ -699,10 +699,10 @@ pub fn draw_window(
         }
 
         // Get the line start position in the buffer
-        let line_start_pos = buffer.buffer.line_to_char(line_idx);
+        let line_start_pos = buffer.buffer_line_to_char(line_idx);
 
         // Truncate line if it's too long for the content area
-        let line_str = line_text.to_string();
+        let line_str = line_text;
         let truncated_line = if line_str.len() > content_width as usize {
             &line_str[..content_width as usize]
         } else {

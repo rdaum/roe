@@ -55,8 +55,8 @@ async fn terminal_main<W: Write>(stdout: W) -> Result<(), std::io::Error> {
         Ok(buffer) => buffer,
         Err(_) => {
             // If README.md doesn't exist, create it with some default content
-            let mut buffer = Buffer::new(&[file_mode_id]);
-            buffer.object = "README.md".to_string();
+            let buffer = Buffer::new(&[file_mode_id]);
+            buffer.set_object("README.md".to_string());
             buffer.load_str("# README\n\nThis is a new file created by the red editor.\nTry typing some text and press Ctrl-X Ctrl-S to save!\n");
             buffer
         }
