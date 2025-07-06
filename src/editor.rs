@@ -1,4 +1,5 @@
 use crate::buffer::Buffer;
+use crate::buffer_host::{BufferHostClient, BufferResponse};
 use crate::keys::KeyAction::ChordNext;
 use crate::keys::{Bindings, CursorDirection, KeyAction, KeyState, LogicalKey};
 use crate::kill_ring::KillRing;
@@ -94,8 +95,9 @@ impl Frame {
 pub struct Editor {
     pub frame: Frame,
     pub buffers: SlotMap<BufferId, Buffer>,
+    pub buffer_hosts: SlotMap<BufferId, BufferHostClient>,
     pub windows: SlotMap<WindowId, Window>,
-    pub modes: SlotMap<ModeId, Box<dyn Mode>>,
+    pub modes: SlotMap<ModeId, Box<dyn Mode>>, // Keep for now for compatibility
     pub active_window: WindowId,
     pub key_state: KeyState,
     pub bindings: Box<dyn Bindings>,
@@ -654,55 +656,71 @@ impl Editor {
             _ => {}
         }
 
-        // Dispatch the key to the modes of the active-buffer in the active-window
+        // Dispatch the key to the BufferHost for the active buffer
 
-        let mut chrome_actions = vec![];
-        for mode_id in buffer.modes() {
-            let mode = self.modes.get_mut(mode_id).unwrap();
-            let actions = mode.perform(&key_action);
-            for action in actions {
-                match &action {
-                    ModeAction::InsertText(p, t) => {
-                        chrome_actions.extend(self.insert_text(t.clone(), p));
-                    }
-                    ModeAction::DeleteText(p, c) => {
-                        chrome_actions.extend(self.delete_text(p, *c));
-                    }
-                    ModeAction::KillText(p, c) => {
-                        chrome_actions.extend(self.kill_text(p, *c));
-                    }
-                    ModeAction::KillLine => {
-                        chrome_actions.extend(self.kill_line());
-                    }
-                    ModeAction::KillRegion => {
-                        chrome_actions.extend(self.kill_region());
-                    }
-                    ModeAction::Yank(p) => {
-                        chrome_actions.extend(self.yank(p));
-                    }
-                    ModeAction::YankIndex(p, idx) => {
-                        chrome_actions.extend(self.yank_index(p, *idx));
-                    }
-                    ModeAction::SetMark => {
-                        chrome_actions.extend(self.set_mark());
-                    }
-                    ModeAction::ClearMark => {
-                        chrome_actions.extend(self.clear_mark());
-                    }
-                    ModeAction::Save => {
-                        chrome_actions.extend(self.save_buffer());
-                    }
-                    ModeAction::CursorUp => {}
-                    ModeAction::CursorDown => {}
-                    ModeAction::CursorLeft => {}
-                    ModeAction::CursorRight => {}
-                    ModeAction::NextLine => {}
-                }
-                chrome_actions.push(ChromeAction::Echo(format!("{action:?}")));
+        let window = &mut self.windows.get_mut(self.active_window).unwrap();
+        let buffer_id = window.active_buffer;
+        
+        let chrome_actions = if let Some(buffer_host) = self.buffer_hosts.get(buffer_id) {
+            let cursor_pos = window.cursor;
+            
+            // Use async runtime to handle the async BufferHost call
+            let result = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    buffer_host.handle_key(key_action, cursor_pos).await
+                })
+            });
+            
+            match result {
+                Ok(response) => self.handle_buffer_response(response),
+                Err(err) => vec![ChromeAction::Echo(format!("Buffer error: {}", err))]
             }
-        }
+        } else {
+            vec![ChromeAction::Echo("No buffer host available".to_string())]
+        };
 
         Ok(chrome_actions)
+    }
+
+    /// Convert BufferResponse to ChromeActions
+    fn handle_buffer_response(&mut self, response: crate::buffer_host::BufferResponse) -> Vec<ChromeAction> {
+        use crate::buffer_host::BufferResponse;
+        
+        match response {
+            BufferResponse::ActionsCompleted { dirty_regions, new_cursor_pos } => {
+                let mut actions = vec![];
+                
+                // Handle dirty regions
+                for dirty_region in dirty_regions {
+                    actions.push(ChromeAction::MarkDirty(dirty_region));
+                }
+                
+                // Handle cursor movement
+                if let Some(new_pos) = new_cursor_pos {
+                    // Update the window's cursor position
+                    let window = &mut self.windows.get_mut(self.active_window).unwrap();
+                    window.cursor = new_pos;
+                    
+                    let buffer = &self.buffers[window.active_buffer];
+                    let (col, line) = buffer.to_column_line(new_pos);
+                    actions.push(ChromeAction::CursorMove(window.absolute_cursor_position(col, line)));
+                }
+                
+                actions
+            }
+            BufferResponse::Saved(file_path) => {
+                vec![ChromeAction::Echo(format!("Saved: {}", file_path))]
+            }
+            BufferResponse::Loaded(file_path) => {
+                vec![ChromeAction::Echo(format!("Loaded: {}", file_path))]
+            }
+            BufferResponse::Error(error) => {
+                vec![ChromeAction::Echo(format!("Error: {}", error))]
+            }
+            BufferResponse::NoChange => {
+                vec![]
+            }
+        }
     }
 
     /// Perform insert action, based on the position passed and taking into account the window's
@@ -1138,6 +1156,7 @@ mod tests {
         Editor {
             frame: Frame::new(80, 24),
             buffers,
+            buffer_hosts: SlotMap::default(),
             windows,
             modes,
             active_window: window_id,

@@ -73,9 +73,20 @@ impl ActionPosition {
     }
 }
 
-pub trait Mode {
+/// Result of mode processing - controls event flow through mode chain
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum ModeResult {
+    /// I consumed this event completely - no other modes should see it
+    Consumed(Vec<ModeAction>),
+    /// I annotated this event but others can still process it
+    Annotated(Vec<ModeAction>),
+    /// I didn't handle this event at all
+    Ignored,
+}
+
+pub trait Mode: Send + Sync {
     fn name(&self) -> &str;
-    fn perform(&mut self, action: &KeyAction) -> Vec<ModeAction>;
+    fn perform(&mut self, action: &KeyAction) -> ModeResult;
 }
 
 pub struct ScratchMode {}
@@ -85,66 +96,65 @@ impl Mode for ScratchMode {
         "scratch"
     }
 
-    fn perform(&mut self, action: &KeyAction) -> Vec<ModeAction> {
+    fn perform(&mut self, action: &KeyAction) -> ModeResult {
         match action {
-            KeyAction::Cursor(_) => {}
-            KeyAction::InsertModeToggle => {}
-            KeyAction::Undo => {}
-            KeyAction::Redo => {}
+            KeyAction::Cursor(_) => ModeResult::Ignored,
+            KeyAction::InsertModeToggle => ModeResult::Ignored,
+            KeyAction::Undo => ModeResult::Ignored,
+            KeyAction::Redo => ModeResult::Ignored,
             KeyAction::MarkStart => {
-                return vec![ModeAction::SetMark];
+                ModeResult::Consumed(vec![ModeAction::SetMark])
             }
-            KeyAction::MarkEnd => {}
+            KeyAction::MarkEnd => ModeResult::Ignored,
             KeyAction::KillRegion(_destructive) => {
                 // TODO: Implement region killing when mark is implemented
-                return vec![ModeAction::KillRegion];
+                ModeResult::Consumed(vec![ModeAction::KillRegion])
             }
             KeyAction::KillLine(_whole_line) => {
-                return vec![ModeAction::KillLine];
+                ModeResult::Consumed(vec![ModeAction::KillLine])
             }
             KeyAction::Yank(index) => match index {
-                Some(idx) => return vec![ModeAction::YankIndex(ActionPosition::cursor(), *idx)],
-                None => return vec![ModeAction::Yank(ActionPosition::cursor())],
+                Some(idx) => ModeResult::Consumed(vec![ModeAction::YankIndex(ActionPosition::cursor(), *idx)]),
+                None => ModeResult::Consumed(vec![ModeAction::Yank(ActionPosition::cursor())]),
             },
-            KeyAction::ForceIndent => {}
-            KeyAction::Tab => {}
-            KeyAction::Delete => return vec![ModeAction::DeleteText(ActionPosition::cursor(), 1)],
+            KeyAction::ForceIndent => ModeResult::Ignored,
+            KeyAction::Tab => ModeResult::Ignored,
+            KeyAction::Delete => ModeResult::Consumed(vec![ModeAction::DeleteText(ActionPosition::cursor(), 1)]),
             KeyAction::Backspace => {
-                return vec![ModeAction::DeleteText(ActionPosition::cursor(), -1)]
+                ModeResult::Consumed(vec![ModeAction::DeleteText(ActionPosition::cursor(), -1)])
             }
             KeyAction::Enter => {
-                return vec![ModeAction::InsertText(
+                ModeResult::Consumed(vec![ModeAction::InsertText(
                     ActionPosition::cursor(),
                     "\n".to_string(),
-                )]
+                )])
             }
-            KeyAction::Escape => {}
-            KeyAction::DeleteWord => {}
-            KeyAction::ToggleCapsLock => {}
-            KeyAction::ToggleScrollLock => {}
-            KeyAction::BackspaceWord => {}
+            KeyAction::Escape => ModeResult::Ignored,
+            KeyAction::DeleteWord => ModeResult::Ignored,
+            KeyAction::ToggleCapsLock => ModeResult::Ignored,
+            KeyAction::ToggleScrollLock => ModeResult::Ignored,
+            KeyAction::BackspaceWord => ModeResult::Ignored,
             KeyAction::AlphaNumeric(x) => {
-                return vec![ModeAction::InsertText(
+                ModeResult::Annotated(vec![ModeAction::InsertText(
                     ActionPosition::cursor(),
                     x.to_string(),
-                )]
+                )])
             }
-            KeyAction::ChordNext => {}
-            KeyAction::CommandMode => {}
-            KeyAction::Save => {}
-            KeyAction::Quit => {}
-            KeyAction::FindFile => {}
-            KeyAction::SplitHorizontal => {}
-            KeyAction::SplitVertical => {}
-            KeyAction::SwitchWindow => {}
-            KeyAction::DeleteWindow => {}
-            KeyAction::DeleteOtherWindows => {}
+            KeyAction::ChordNext => ModeResult::Ignored,
+            KeyAction::CommandMode => ModeResult::Ignored,
+            KeyAction::Save => ModeResult::Ignored,
+            KeyAction::Quit => ModeResult::Ignored,
+            KeyAction::FindFile => ModeResult::Ignored,
+            KeyAction::SplitHorizontal => ModeResult::Ignored,
+            KeyAction::SplitVertical => ModeResult::Ignored,
+            KeyAction::SwitchWindow => ModeResult::Ignored,
+            KeyAction::DeleteWindow => ModeResult::Ignored,
+            KeyAction::DeleteOtherWindows => ModeResult::Ignored,
             KeyAction::Cancel => {
-                return vec![ModeAction::ClearMark];
+                ModeResult::Consumed(vec![ModeAction::ClearMark])
             }
-            KeyAction::Unbound => {}
+            KeyAction::Unbound => ModeResult::Ignored,
         }
-        vec![]
     }
 }
 
@@ -158,66 +168,65 @@ impl Mode for FileMode {
         "file"
     }
 
-    fn perform(&mut self, action: &KeyAction) -> Vec<ModeAction> {
+    fn perform(&mut self, action: &KeyAction) -> ModeResult {
         match action {
-            KeyAction::Cursor(_) => {}
-            KeyAction::InsertModeToggle => {}
-            KeyAction::Undo => {}
-            KeyAction::Redo => {}
+            KeyAction::Cursor(_) => ModeResult::Ignored,
+            KeyAction::InsertModeToggle => ModeResult::Ignored,
+            KeyAction::Undo => ModeResult::Ignored,
+            KeyAction::Redo => ModeResult::Ignored,
             KeyAction::MarkStart => {
-                return vec![ModeAction::SetMark];
+                ModeResult::Consumed(vec![ModeAction::SetMark])
             }
-            KeyAction::MarkEnd => {}
+            KeyAction::MarkEnd => ModeResult::Ignored,
             KeyAction::KillRegion(_destructive) => {
-                return vec![ModeAction::KillRegion];
+                ModeResult::Consumed(vec![ModeAction::KillRegion])
             }
             KeyAction::KillLine(_whole_line) => {
-                return vec![ModeAction::KillLine];
+                ModeResult::Consumed(vec![ModeAction::KillLine])
             }
             KeyAction::Yank(index) => match index {
-                Some(idx) => return vec![ModeAction::YankIndex(ActionPosition::cursor(), *idx)],
-                None => return vec![ModeAction::Yank(ActionPosition::cursor())],
+                Some(idx) => ModeResult::Consumed(vec![ModeAction::YankIndex(ActionPosition::cursor(), *idx)]),
+                None => ModeResult::Consumed(vec![ModeAction::Yank(ActionPosition::cursor())]),
             },
-            KeyAction::ForceIndent => {}
-            KeyAction::Tab => {}
-            KeyAction::Delete => return vec![ModeAction::DeleteText(ActionPosition::cursor(), 1)],
+            KeyAction::ForceIndent => ModeResult::Ignored,
+            KeyAction::Tab => ModeResult::Ignored,
+            KeyAction::Delete => ModeResult::Consumed(vec![ModeAction::DeleteText(ActionPosition::cursor(), 1)]),
             KeyAction::Backspace => {
-                return vec![ModeAction::DeleteText(ActionPosition::cursor(), -1)]
+                ModeResult::Consumed(vec![ModeAction::DeleteText(ActionPosition::cursor(), -1)])
             }
             KeyAction::Enter => {
-                return vec![ModeAction::InsertText(
+                ModeResult::Consumed(vec![ModeAction::InsertText(
                     ActionPosition::cursor(),
                     "\n".to_string(),
-                )]
+                )])
             }
-            KeyAction::Escape => {}
-            KeyAction::DeleteWord => {}
-            KeyAction::ToggleCapsLock => {}
-            KeyAction::ToggleScrollLock => {}
-            KeyAction::BackspaceWord => {}
+            KeyAction::Escape => ModeResult::Ignored,
+            KeyAction::DeleteWord => ModeResult::Ignored,
+            KeyAction::ToggleCapsLock => ModeResult::Ignored,
+            KeyAction::ToggleScrollLock => ModeResult::Ignored,
+            KeyAction::BackspaceWord => ModeResult::Ignored,
             KeyAction::AlphaNumeric(x) => {
-                return vec![ModeAction::InsertText(
+                ModeResult::Annotated(vec![ModeAction::InsertText(
                     ActionPosition::cursor(),
                     x.to_string(),
-                )]
+                )])
             }
-            KeyAction::ChordNext => {}
-            KeyAction::CommandMode => {}
+            KeyAction::ChordNext => ModeResult::Ignored,
+            KeyAction::CommandMode => ModeResult::Ignored,
             KeyAction::Save => {
-                return vec![ModeAction::Save];
+                ModeResult::Consumed(vec![ModeAction::Save])
             }
-            KeyAction::Quit => {}
-            KeyAction::FindFile => {}
-            KeyAction::SplitHorizontal => {}
-            KeyAction::SplitVertical => {}
-            KeyAction::SwitchWindow => {}
-            KeyAction::DeleteWindow => {}
-            KeyAction::DeleteOtherWindows => {}
+            KeyAction::Quit => ModeResult::Ignored,
+            KeyAction::FindFile => ModeResult::Ignored,
+            KeyAction::SplitHorizontal => ModeResult::Ignored,
+            KeyAction::SplitVertical => ModeResult::Ignored,
+            KeyAction::SwitchWindow => ModeResult::Ignored,
+            KeyAction::DeleteWindow => ModeResult::Ignored,
+            KeyAction::DeleteOtherWindows => ModeResult::Ignored,
             KeyAction::Cancel => {
-                return vec![ModeAction::ClearMark];
+                ModeResult::Consumed(vec![ModeAction::ClearMark])
             }
-            KeyAction::Unbound => {}
+            KeyAction::Unbound => ModeResult::Ignored,
         }
-        vec![]
     }
 }

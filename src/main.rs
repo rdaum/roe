@@ -11,6 +11,7 @@ use terminal_renderer::TerminalRenderer;
 use terminal_renderer::ECHO_AREA_HEIGHT;
 
 mod buffer;
+mod buffer_host;
 mod editor;
 mod keys;
 mod kill_ring;
@@ -41,6 +42,7 @@ async fn terminal_main<W: Write>(stdout: W) -> Result<(), std::io::Error> {
 
     let tsize = crossterm::terminal::size()?;
 
+    // Create mode instances for the buffer
     let file_mode = Box::new(FileMode {
         file_path: "README.md".to_string(),
     });
@@ -49,19 +51,35 @@ async fn terminal_main<W: Write>(stdout: W) -> Result<(), std::io::Error> {
     let file_mode_id = modes.insert(file_mode);
 
     let mut buffers: SlotMap<BufferId, Buffer> = SlotMap::default();
+    let mut buffer_hosts: SlotMap<BufferId, buffer_host::BufferHostClient> = SlotMap::default();
 
     // Try to load README.md, fall back to scratch if it doesn't exist
-    let buffer = match Buffer::from_file("README.md", &[file_mode_id]).await {
+    let buffer = match Buffer::from_file("README.md", &[]).await {
         Ok(buffer) => buffer,
         Err(_) => {
             // If README.md doesn't exist, create it with some default content
-            let buffer = Buffer::new(&[file_mode_id]);
+            let buffer = Buffer::new(&[]);
             buffer.set_object("README.md".to_string());
             buffer.load_str("# README\n\nThis is a new file created by the red editor.\nTry typing some text and press Ctrl-X Ctrl-S to save!\n");
             buffer
         }
     };
-    let buffer_id = buffers.insert(buffer);
+    
+    let buffer_id = buffers.insert(buffer.clone());
+    
+    // Create BufferHost with modes - need to extract mode from SlotMap
+    let file_mode = modes.remove(file_mode_id).unwrap();
+    let mode_list = vec![
+        (file_mode_id, "file".to_string(), file_mode)
+    ];
+    
+    // Create BufferHost and client
+    let (buffer_client, _buffer_handle) = buffer_host::create_buffer_host(
+        buffer,
+        mode_list,
+        buffer_id,
+    );
+    buffer_hosts.insert(buffer_client);
     let initial_window = Window {
         x: 0,
         y: 0,
@@ -77,6 +95,7 @@ async fn terminal_main<W: Write>(stdout: W) -> Result<(), std::io::Error> {
     let mut editor = Editor {
         frame: Frame::new(tsize.0, tsize.1),
         buffers,
+        buffer_hosts,
         windows,
         modes,
         active_window: initial_window_id,
