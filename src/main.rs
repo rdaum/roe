@@ -746,6 +746,7 @@ fn terminal_main(stdout: &mut impl Write) -> Result<(), std::io::Error> {
         object: "** scratch **".to_string(),
         modes: vec![scratch_mode_id],
         buffer: ropey::Rope::from_str("scratch content"),
+        mark: None,
     };
     let scratch_buffer_id = buffers.insert(scratch_buffer);
     let initial_window = Window {

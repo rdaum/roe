@@ -9,6 +9,8 @@ pub struct Buffer {
     /// Like emacs major/minor mode but with N minor modes.
     pub(crate) modes: Vec<ModeId>,
     pub(crate) buffer: ropey::Rope,
+    /// Mark position for region selection (None = no mark set)
+    pub(crate) mark: Option<usize>,
 }
 
 impl Buffer {
@@ -17,6 +19,7 @@ impl Buffer {
             object: String::new(),
             modes: modes.to_vec(),
             buffer: ropey::Rope::new(),
+            mark: None,
         }
     }
 
@@ -206,6 +209,70 @@ impl Buffer {
     /// Ensure position is within buffer bounds. O(1)
     pub fn clamp_position(&self, pos: usize) -> usize {
         pos.min(self.buffer.len_chars())
+    }
+
+    // === MARK AND REGION OPERATIONS ===
+
+    /// Set the mark at the given position
+    pub fn set_mark(&mut self, pos: usize) {
+        self.mark = Some(self.clamp_position(pos));
+    }
+
+    /// Clear the mark
+    pub fn clear_mark(&mut self) {
+        self.mark = None;
+    }
+
+    /// Get the current mark position
+    pub fn get_mark(&self) -> Option<usize> {
+        self.mark
+    }
+
+    /// Check if mark is set
+    pub fn has_mark(&self) -> bool {
+        self.mark.is_some()
+    }
+
+    /// Get the region bounds (start, end) between mark and cursor
+    /// Returns None if no mark is set
+    /// start <= end always (handles mark before/after cursor)
+    pub fn get_region(&self, cursor_pos: usize) -> Option<(usize, usize)> {
+        let mark_pos = self.mark?;
+        let cursor_pos = self.clamp_position(cursor_pos);
+        let mark_pos = self.clamp_position(mark_pos);
+        
+        if mark_pos <= cursor_pos {
+            Some((mark_pos, cursor_pos))
+        } else {
+            Some((cursor_pos, mark_pos))
+        }
+    }
+
+    /// Get the text content of the current region
+    /// Returns None if no mark is set
+    pub fn get_region_text(&self, cursor_pos: usize) -> Option<String> {
+        let (start, end) = self.get_region(cursor_pos)?;
+        if start == end {
+            Some(String::new())
+        } else {
+            Some(self.buffer.slice(start..end).to_string())
+        }
+    }
+
+    /// Delete the region and return the deleted text and new cursor position
+    /// Returns None if no mark is set
+    pub fn delete_region(&mut self, cursor_pos: usize) -> Option<(String, usize)> {
+        let (start, end) = self.get_region(cursor_pos)?;
+        if start == end {
+            self.clear_mark();
+            return Some((String::new(), cursor_pos));
+        }
+
+        let deleted = self.buffer.slice(start..end).to_string();
+        self.buffer.remove(start..end);
+        self.clear_mark();
+        // Cursor should be at the start of the deleted region
+        Some((deleted, start))
     }
 }
 
@@ -439,5 +506,111 @@ mod tests {
         // Test case from failing test_relative_offset_left_to_prev_line
         // Position 7 is 'u' in "cruel", move left should go to 'r'
         assert_eq!(buffer.move_left(7), 6);
+    }
+
+    #[test]
+    fn test_mark_operations() {
+        let mut buffer = test_buffer(); // "Hello\ncruel\nworld!"
+
+        // Initially no mark
+        assert!(!buffer.has_mark());
+        assert_eq!(buffer.get_mark(), None);
+
+        // Set mark at position 5 (end of "Hello")
+        buffer.set_mark(5);
+        assert!(buffer.has_mark());
+        assert_eq!(buffer.get_mark(), Some(5));
+
+        // Clear mark
+        buffer.clear_mark();
+        assert!(!buffer.has_mark());
+        assert_eq!(buffer.get_mark(), None);
+    }
+
+    #[test]
+    fn test_region_operations() {
+        let mut buffer = test_buffer(); // "Hello\ncruel\nworld!"
+
+        // No mark set - should return None
+        assert_eq!(buffer.get_region(5), None);
+        assert_eq!(buffer.get_region_text(5), None);
+
+        // Set mark at position 2 ('l' in "Hello")
+        buffer.set_mark(2);
+
+        // Test region from mark to cursor at position 7 ('u' in "cruel")
+        let region = buffer.get_region(7);
+        assert_eq!(region, Some((2, 7))); // start <= end
+
+        // Test region text
+        let region_text = buffer.get_region_text(7);
+        assert_eq!(region_text, Some("llo\nc".to_string()));
+
+        // Test reverse region (cursor before mark)
+        let region = buffer.get_region(0);
+        assert_eq!(region, Some((0, 2))); // start <= end (swapped)
+
+        let region_text = buffer.get_region_text(0);
+        assert_eq!(region_text, Some("He".to_string()));
+    }
+
+    #[test]
+    fn test_region_delete() {
+        let mut buffer = test_buffer(); // "Hello\ncruel\nworld!"
+
+        // No mark set - should return None
+        assert_eq!(buffer.delete_region(5), None);
+
+        // Set mark at position 2 ('l' in "Hello")
+        buffer.set_mark(2);
+
+        // Delete region from mark to cursor at position 7 ('u' in "cruel")
+        let result = buffer.delete_region(7);
+        assert_eq!(result, Some(("llo\nc".to_string(), 2)));
+
+        // Check buffer content after deletion
+        assert_eq!(buffer.content(), "Heruel\nworld!");
+
+        // Mark should be cleared
+        assert!(!buffer.has_mark());
+    }
+
+    #[test]
+    fn test_empty_region() {
+        let mut buffer = test_buffer(); // "Hello\ncruel\nworld!"
+
+        // Set mark at position 5
+        buffer.set_mark(5);
+
+        // Get region at same position (empty region)
+        let region = buffer.get_region(5);
+        assert_eq!(region, Some((5, 5)));
+
+        let region_text = buffer.get_region_text(5);
+        assert_eq!(region_text, Some(String::new()));
+
+        // Delete empty region
+        let result = buffer.delete_region(5);
+        assert_eq!(result, Some((String::new(), 5)));
+
+        // Buffer should be unchanged
+        assert_eq!(buffer.content(), "Hello\ncruel\nworld!");
+
+        // Mark should be cleared
+        assert!(!buffer.has_mark());
+    }
+
+    #[test]
+    fn test_region_bounds_clamping() {
+        let mut buffer = test_buffer(); // "Hello\ncruel\nworld!"
+        let buffer_len = buffer.buffer.len_chars();
+
+        // Set mark beyond buffer end
+        buffer.set_mark(buffer_len + 10);
+        assert_eq!(buffer.get_mark(), Some(buffer_len)); // Should be clamped
+
+        // Get region with cursor beyond buffer end
+        let region = buffer.get_region(buffer_len + 5);
+        assert_eq!(region, Some((buffer_len, buffer_len))); // Both should be clamped
     }
 }

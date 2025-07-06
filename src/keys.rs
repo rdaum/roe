@@ -364,6 +364,10 @@ impl Bindings for DefaultBindings {
                 (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric('/')) => {
                     return KeyAction::Undo
                 }
+                // Ctrl-Space is set mark (C-SPC)
+                (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric(' ')) => {
+                    return KeyAction::MarkStart
+                }
                 //
                 (_, _) => {}
             }

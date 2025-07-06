@@ -28,6 +28,10 @@ pub enum ModeAction {
     Yank(ActionPosition),
     /// Yank from specific kill-ring index
     YankIndex(ActionPosition, usize),
+    /// Set mark at cursor position
+    SetMark,
+    /// Clear the mark
+    ClearMark,
 
     CursorUp,
     CursorDown,
@@ -82,7 +86,9 @@ impl Mode for ScratchMode {
             KeyAction::InsertModeToggle => {}
             KeyAction::Undo => {}
             KeyAction::Redo => {}
-            KeyAction::MarkStart => {}
+            KeyAction::MarkStart => {
+                return vec![ModeAction::SetMark];
+            }
             KeyAction::MarkEnd => {}
             KeyAction::KillRegion(_destructive) => {
                 // TODO: Implement region killing when mark is implemented

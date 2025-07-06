@@ -639,6 +639,12 @@ impl Editor {
                     ModeAction::YankIndex(p, idx) => {
                         chrome_actions.extend(self.yank_index(p, *idx));
                     }
+                    ModeAction::SetMark => {
+                        chrome_actions.extend(self.set_mark());
+                    }
+                    ModeAction::ClearMark => {
+                        chrome_actions.extend(self.clear_mark());
+                    }
                     ModeAction::CursorUp => {}
                     ModeAction::CursorDown => {}
                     ModeAction::CursorLeft => {}
@@ -837,12 +843,55 @@ impl Editor {
         }
     }
 
-    /// Kill the selected region (placeholder - requires mark implementation)
+    /// Kill the selected region
     pub fn kill_region(&mut self) -> Vec<ChromeAction> {
-        // TODO: Implement when mark/region selection is added
-        vec![ChromeAction::Echo(
-            "Kill region not yet implemented (need mark)".to_string(),
-        )]
+        let window = &mut self.windows.get_mut(self.active_window).unwrap();
+        let buffer = &mut self.buffers.get_mut(window.active_buffer).unwrap();
+
+        let Some((deleted, new_cursor_pos)) = buffer.delete_region(window.cursor) else {
+            return vec![ChromeAction::Echo("No mark set".to_string())];
+        };
+
+        if deleted.is_empty() {
+            return vec![ChromeAction::Echo("Empty region".to_string())];
+        }
+
+        // Add to kill-ring
+        self.kill_ring.kill(deleted.clone());
+
+        // Update cursor to the start of the deleted region
+        window.cursor = new_cursor_pos;
+        let new_cursor = buffer.to_column_line(window.cursor);
+        let window_cursor = window.absolute_cursor_position(new_cursor.0, new_cursor.1);
+
+        vec![
+            ChromeAction::Echo(format!("Killed region: {}", deleted.replace('\n', "\\n"))),
+            ChromeAction::Refresh(self.active_window),
+            ChromeAction::CursorMove(window_cursor),
+        ]
+    }
+
+    /// Set mark at cursor position
+    pub fn set_mark(&mut self) -> Vec<ChromeAction> {
+        let window = &self.windows[self.active_window];
+        let buffer = &mut self.buffers.get_mut(window.active_buffer).unwrap();
+        
+        buffer.set_mark(window.cursor);
+        
+        vec![ChromeAction::Echo("Mark set".to_string())]
+    }
+
+    /// Clear the mark
+    pub fn clear_mark(&mut self) -> Vec<ChromeAction> {
+        let window = &self.windows[self.active_window];
+        let buffer = &mut self.buffers.get_mut(window.active_buffer).unwrap();
+        
+        if buffer.has_mark() {
+            buffer.clear_mark();
+            vec![ChromeAction::Echo("Mark cleared".to_string())]
+        } else {
+            vec![ChromeAction::Echo("No mark to clear".to_string())]
+        }
     }
 
     /// Yank (paste) from kill-ring
@@ -892,6 +941,7 @@ mod tests {
             object: "test".to_string(),
             modes: vec![scratch_mode_id],
             buffer: ropey::Rope::from_str("Hello\nWorld\nTest"),
+            mark: None,
         };
         let scratch_buffer_id = buffers.insert(scratch_buffer);
 
@@ -1614,5 +1664,200 @@ mod tests {
         assert!(actions
             .iter()
             .any(|a| matches!(a, ChromeAction::Echo(msg) if msg.contains("empty"))));
+    }
+
+    #[test]
+    fn test_set_mark() {
+        let mut editor = test_editor();
+        let window = &mut editor.windows[editor.active_window];
+        window.cursor = 5; // End of "Hello"
+
+        // Set mark at cursor position
+        let actions = editor.set_mark();
+
+        // Should get confirmation message
+        assert!(actions.iter().any(|a| matches!(a, ChromeAction::Echo(msg) if msg.contains("Mark set"))));
+
+        // Check that mark was set in buffer
+        let window = &editor.windows[editor.active_window];
+        let buffer = &editor.buffers[window.active_buffer];
+        assert!(buffer.has_mark());
+        assert_eq!(buffer.get_mark(), Some(5));
+    }
+
+    #[test]
+    fn test_clear_mark() {
+        let mut editor = test_editor();
+        let window = &mut editor.windows[editor.active_window];
+        let buffer = &mut editor.buffers.get_mut(window.active_buffer).unwrap();
+        
+        // Set a mark first
+        buffer.set_mark(3);
+        assert!(buffer.has_mark());
+
+        // Clear mark
+        let actions = editor.clear_mark();
+
+        // Should get confirmation message
+        assert!(actions.iter().any(|a| matches!(a, ChromeAction::Echo(msg) if msg.contains("Mark cleared"))));
+
+        // Check that mark was cleared
+        let window = &editor.windows[editor.active_window];
+        let buffer = &editor.buffers[window.active_buffer];
+        assert!(!buffer.has_mark());
+    }
+
+    #[test]
+    fn test_clear_mark_when_no_mark() {
+        let mut editor = test_editor();
+
+        // Try to clear mark when none is set
+        let actions = editor.clear_mark();
+
+        // Should get error message
+        assert!(actions.iter().any(|a| matches!(a, ChromeAction::Echo(msg) if msg.contains("No mark to clear"))));
+    }
+
+    #[test]
+    fn test_kill_region_basic() {
+        let mut editor = test_editor(); // "Hello\nWorld\nTest"
+        
+        // Set mark at position 2 ('l' in "Hello")
+        let window = &mut editor.windows[editor.active_window];
+        let buffer = &mut editor.buffers.get_mut(window.active_buffer).unwrap();
+        buffer.set_mark(2);
+
+        // Move cursor to position 8 ('o' in "World")
+        let window = &mut editor.windows[editor.active_window];
+        window.cursor = 8;
+
+        // Kill region
+        let actions = editor.kill_region();
+
+        // Should have killed message and refresh
+        assert!(actions.iter().any(|a| matches!(a, ChromeAction::Echo(_))));
+        assert!(actions.iter().any(|a| matches!(a, ChromeAction::Refresh(_))));
+
+        // Check that text was killed and added to kill-ring
+        assert!(!editor.kill_ring.is_empty());
+        let killed_text = editor.kill_ring.current().unwrap();
+        assert_eq!(killed_text, "llo\nWo"); // "llo\nWo" from "He[llo\nWo]rld"
+
+        // Check buffer content after kill
+        let window = &editor.windows[editor.active_window];
+        let buffer = &editor.buffers[window.active_buffer];
+        assert_eq!(buffer.content(), "Herld\nTest");
+
+        // Check cursor position (should be at start of killed region)
+        assert_eq!(window.cursor, 2);
+
+        // Mark should be cleared
+        assert!(!buffer.has_mark());
+    }
+
+    #[test]
+    fn test_kill_region_no_mark() {
+        let mut editor = test_editor();
+
+        // Try to kill region without setting mark
+        let actions = editor.kill_region();
+
+        // Should get error message
+        assert!(actions.iter().any(|a| matches!(a, ChromeAction::Echo(msg) if msg.contains("No mark set"))));
+
+        // Buffer should be unchanged
+        let window = &editor.windows[editor.active_window];
+        let buffer = &editor.buffers[window.active_buffer];
+        assert_eq!(buffer.content(), "Hello\nWorld\nTest");
+
+        // Kill-ring should be empty
+        assert!(editor.kill_ring.is_empty());
+    }
+
+    #[test]
+    fn test_kill_region_empty() {
+        let mut editor = test_editor();
+        
+        // Set mark at cursor position (empty region)
+        let window = &mut editor.windows[editor.active_window];
+        window.cursor = 5;
+        let buffer = &mut editor.buffers.get_mut(window.active_buffer).unwrap();
+        buffer.set_mark(5);
+
+        // Kill empty region
+        let actions = editor.kill_region();
+
+        // Should get empty region message
+        assert!(actions.iter().any(|a| matches!(a, ChromeAction::Echo(msg) if msg.contains("Empty region"))));
+
+        // Buffer should be unchanged
+        let window = &editor.windows[editor.active_window];
+        let buffer = &editor.buffers[window.active_buffer];
+        assert_eq!(buffer.content(), "Hello\nWorld\nTest");
+
+        // Mark should be cleared
+        assert!(!buffer.has_mark());
+    }
+
+    #[test]
+    fn test_kill_region_reverse() {
+        let mut editor = test_editor(); // "Hello\nWorld\nTest"
+        
+        // Set mark at position 8 ('o' in "World")
+        let window = &mut editor.windows[editor.active_window];
+        let buffer = &mut editor.buffers.get_mut(window.active_buffer).unwrap();
+        buffer.set_mark(8);
+
+        // Move cursor to position 2 ('l' in "Hello") - before mark
+        let window = &mut editor.windows[editor.active_window];
+        window.cursor = 2;
+
+        // Kill region (should work in reverse)
+        let actions = editor.kill_region();
+
+        // Should have killed message
+        assert!(actions.iter().any(|a| matches!(a, ChromeAction::Echo(_))));
+
+        // Check that same text was killed
+        let killed_text = editor.kill_ring.current().unwrap();
+        assert_eq!(killed_text, "llo\nWo"); // Same region regardless of direction
+
+        // Check buffer content
+        let window = &editor.windows[editor.active_window];
+        let buffer = &editor.buffers[window.active_buffer];
+        assert_eq!(buffer.content(), "Herld\nTest");
+
+        // Cursor should be at start of region (position 2)
+        assert_eq!(window.cursor, 2);
+    }
+
+    #[test]
+    fn test_region_kill_integration_with_yank() {
+        let mut editor = test_editor(); // "Hello\nWorld\nTest"
+        
+        // Set mark and kill region
+        let window = &mut editor.windows[editor.active_window];
+        let buffer = &mut editor.buffers.get_mut(window.active_buffer).unwrap();
+        buffer.set_mark(2); // 'l' in "Hello"
+        
+        let window = &mut editor.windows[editor.active_window];
+        window.cursor = 8; // 'o' in "World"
+        
+        editor.kill_region(); // Kill "llo\nWo"
+
+        // Move cursor to end of buffer
+        let window = &mut editor.windows[editor.active_window];
+        window.cursor = editor.buffers[window.active_buffer].buffer.len_chars();
+
+        // Yank the killed region
+        let actions = editor.yank(&crate::mode::ActionPosition::cursor());
+
+        // Should have refresh action
+        assert!(actions.iter().any(|a| matches!(a, ChromeAction::Refresh(_))));
+
+        // Check buffer content - should have yanked text at end
+        let window = &editor.windows[editor.active_window];
+        let buffer = &editor.buffers[window.active_buffer];
+        assert_eq!(buffer.content(), "Herld\nTestllo\nWo");
     }
 }

@@ -13,6 +13,7 @@ Red is a minimalistic terminal-based text editor written in Rust, designed with 
    - Provides cursor movement APIs (move_left, move_right, move_up, etc.)
    - Handles text insertion/deletion at arbitrary positions
    - Converts between character positions and line/column coordinates
+   - Manages mark for region selection (per-buffer state)
 
 2. **Editor** (`editor.rs`): Central coordinator
    - Manages SlotMaps of buffers, windows, and modes
@@ -118,7 +119,7 @@ Red is a minimalistic terminal-based text editor written in Rust, designed with 
 - Configuration system
 - Multiple buffers per window
 - Plugin system
-- Region selection (mark system)
+- Region highlighting (visual feedback)
 - Yank-pop functionality (M-y)
 
 ### Known Issues
