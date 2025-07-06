@@ -105,6 +105,11 @@ impl Mode for ScratchMode {
             KeyAction::Save => {}
             KeyAction::Quit => {}
             KeyAction::FindFile => {}
+            KeyAction::SplitHorizontal => {}
+            KeyAction::SplitVertical => {}
+            KeyAction::SwitchWindow => {}
+            KeyAction::DeleteWindow => {}
+            KeyAction::DeleteOtherWindows => {}
             KeyAction::Unbound => {}
         }
         vec![]

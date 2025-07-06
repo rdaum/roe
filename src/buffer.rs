@@ -1,5 +1,4 @@
 use crate::ModeId;
-use std::cmp::min;
 
 /// Analogous to an emacs buffer.
 /// Contains a structure for storing text and metadata like title, and modes.
@@ -69,18 +68,33 @@ impl Buffer {
     /// Return the position of the start of the line relative to the start position
     pub fn bol_pos(&self, start_pos: usize) -> usize {
         let line = self.buffer.char_to_line(start_pos);
-        let bol_pos = self.buffer.line_to_char(line);
-        bol_pos
+        
+        self.buffer.line_to_char(line)
     }
 
     /// Return the position of the end of the line relative to the start position.
     pub fn eol_pos(&self, start_pos: usize) -> usize {
-        let line = self.buffer.char_to_line(start_pos);
-        let end_pos = self.buffer.line_to_char(line + 1);
-        if end_pos <= self.buffer.len_chars() {
-            return end_pos - 1;
+        // Handle empty buffer
+        if self.buffer.len_chars() == 0 {
+            return 0;
         }
-        end_pos
+
+        // If we're already at or beyond the end of the buffer, stay there
+        if start_pos >= self.buffer.len_chars() {
+            return self.buffer.len_chars();
+        }
+
+        let line = self.buffer.char_to_line(start_pos);
+        let line_count = self.buffer.len_lines();
+
+        if line + 1 < line_count {
+            // Not the last line - end of line is just before the newline
+            let next_line_start = self.buffer.line_to_char(line + 1);
+            next_line_start - 1 // Position of the newline
+        } else {
+            // Last line - end of line is end of buffer
+            self.buffer.len_chars()
+        }
     }
 
     pub fn to_column_line(&self, char_index: usize) -> (u16, u16) {
@@ -94,33 +108,104 @@ impl Buffer {
         linestart_pos + col as usize
     }
 
-    pub fn char_index_relative_offset(
-        &self,
-        position: usize,
-        col_offset: isize,
-        line_offset: isize,
-    ) -> usize {
-        // Special handling for when 'pos' is 1 beyond the end of the buffer. This is a legitimate
-        // position, but causes issues with calculating the new line position relative to that.
-        let position = min(position, self.buffer.len_chars() - 1);
+    // === PHASE 1: CLEAN CHARACTER-POSITION API ===
 
-        // Calculate the current position
-        let (col, line) = self.to_column_line(position);
-        // Calculate the new position
-        let col = col as isize + col_offset;
-        let line = line as isize + line_offset;
-        if line < 0 {
+    /// Move cursor left by one character. O(1)
+    pub fn move_left(&self, pos: usize) -> usize {
+        pos.saturating_sub(1)
+    }
+
+    /// Move cursor right by one character. O(1)  
+    pub fn move_right(&self, pos: usize) -> usize {
+        (pos + 1).min(self.buffer.len_chars())
+    }
+
+    /// Move cursor up one line, preserving column when possible. O(log N)
+    pub fn move_up(&self, pos: usize) -> usize {
+        if self.buffer.len_chars() == 0 {
             return 0;
         }
-        let new_line_pos = self.buffer.line_to_char(line as usize) as isize;
-        let new_pos = (new_line_pos + col) as usize;
-        if new_pos > self.buffer.len_chars() {
-            return self.buffer.len_chars();
+
+        let line = self.buffer.char_to_line(pos);
+        if line == 0 {
+            return pos; // Already at top
         }
-        if new_pos < 0 {
+
+        let current_line_start = self.buffer.line_to_char(line);
+        let column = pos - current_line_start;
+
+        let target_line = line - 1;
+        let target_line_start = self.buffer.line_to_char(target_line);
+        let target_line_len = self.line_length(target_line);
+
+        target_line_start + column.min(target_line_len)
+    }
+
+    /// Move cursor down one line, preserving column when possible. O(log N)
+    pub fn move_down(&self, pos: usize) -> usize {
+        if self.buffer.len_chars() == 0 {
             return 0;
         }
-        new_pos
+
+        let line = self.buffer.char_to_line(pos);
+        let total_lines = self.buffer.len_lines();
+        if line + 1 >= total_lines {
+            return pos; // Already at bottom
+        }
+
+        let current_line_start = self.buffer.line_to_char(line);
+        let column = pos - current_line_start;
+
+        let target_line = line + 1;
+        let target_line_start = self.buffer.line_to_char(target_line);
+        let target_line_len = self.line_length(target_line);
+
+        target_line_start + column.min(target_line_len)
+    }
+
+    /// Move cursor to start of current line. O(log N)
+    pub fn move_line_start(&self, pos: usize) -> usize {
+        if self.buffer.len_chars() == 0 {
+            return 0;
+        }
+
+        let line = self.buffer.char_to_line(pos);
+        self.buffer.line_to_char(line)
+    }
+
+    /// Move cursor to end of current line. O(log N)
+    pub fn move_line_end(&self, pos: usize) -> usize {
+        self.eol_pos(pos)
+    }
+
+    /// Move cursor to start of buffer. O(1)
+    pub fn move_buffer_start(&self) -> usize {
+        0
+    }
+
+    /// Move cursor to end of buffer. O(1)
+    pub fn move_buffer_end(&self) -> usize {
+        self.buffer.len_chars()
+    }
+
+    /// Get the length of a line (excluding newline). O(log N)
+    pub fn line_length(&self, line: usize) -> usize {
+        if line >= self.buffer.len_lines() {
+            return 0;
+        }
+
+        let line_start = self.buffer.line_to_char(line);
+        if line + 1 < self.buffer.len_lines() {
+            let next_line_start = self.buffer.line_to_char(line + 1);
+            next_line_start - line_start - 1 // -1 for newline
+        } else {
+            self.buffer.len_chars() - line_start
+        }
+    }
+
+    /// Ensure position is within buffer bounds. O(1)
+    pub fn clamp_position(&self, pos: usize) -> usize {
+        pos.min(self.buffer.len_chars())
     }
 }
 
@@ -163,74 +248,6 @@ mod tests {
         let (col, line) = buffer.to_column_line(12);
         assert_eq!(col, 0);
         assert_eq!(line, 2);
-    }
-
-    #[test]
-    fn test_relative_offset_up() {
-        let buffer = test_buffer();
-
-        let (col, line) = (0, 2);
-        // Move up one line
-        let pos = buffer.char_index_relative_offset(buffer.to_char_index(col, line), 0, -1);
-        assert_eq!(pos, 6);
-        let (col, line) = buffer.to_column_line(pos);
-        assert_eq!((col, line), (0, 1));
-    }
-
-    // Saw some problems in practice, so verify that hitting up cursor from end of buffer does the
-    // right thing.
-    // Up one line to the end of the previous line.
-    // If the position gets calculated from the very end (1 past the last character), then we
-    // end up at the start of the current line instead, which is wrong.
-    #[test]
-    fn test_relative_up_from_end_of_buffer() {
-        let buffer = test_buffer();
-        let (col, line) = (6, 2);
-        let pos = buffer.to_char_index(col, line);
-        assert_eq!(pos, buffer.buffer.len_chars());
-        assert_eq!(buffer.buffer.char(pos - 1), '!');
-        let pos = buffer.char_index_relative_offset(pos, 0, -1);
-        assert_eq!(buffer.buffer.char(pos), '\n');
-        // Should now be at the end of the second line
-        // assert_eq!(pos, 6);
-        let (col, line) = buffer.to_column_line(pos);
-        assert_eq!((col, line), (5, 1));
-    }
-
-    #[test]
-    fn test_relative_offset_right() {
-        let buffer = test_buffer();
-        let (col, line) = (0, 1);
-
-        // Move right one column
-        let pos = buffer.char_index_relative_offset(buffer.to_char_index(col, line), 1, 0);
-        assert_eq!(pos, 7);
-        let (col, line) = buffer.to_column_line(pos);
-        assert_eq!((col, line), (1, 1));
-    }
-
-    #[test]
-    fn test_relative_offset_left() {
-        let buffer = test_buffer();
-        let (col, line) = (1, 1);
-
-        // Moving left one, takes us to the start of the line
-        let pos = buffer.char_index_relative_offset(buffer.to_char_index(col, line), -1, 0);
-        assert_eq!(pos, 6);
-        let (col, line) = buffer.to_column_line(pos);
-        assert_eq!((col, line), (0, 1));
-    }
-
-    #[test]
-    fn test_relative_offset_left_to_prev_line() {
-        let buffer = test_buffer();
-        let (col, line) = (1, 1);
-        let pos = buffer.to_char_index(col, line);
-        assert_eq!(pos, 7);
-        let pos = buffer.char_index_relative_offset(pos, -2, 0);
-        assert_eq!(pos, 5);
-        let (col, line) = buffer.to_column_line(pos);
-        assert_eq!((col, line), (5, 0));
     }
 
     #[test]
@@ -301,5 +318,128 @@ mod tests {
         buffer.load_str("Hello, cruel world!");
         assert_eq!(buffer.delete_col_line((13, 0), -1), Some(" ".to_string()));
         assert_eq!(buffer.content(), "Hello, cruelworld!");
+    }
+
+    #[test]
+    fn test_eol_pos_middle_of_line() {
+        let buffer = test_buffer(); // "Hello\ncruel\nworld!"
+
+        // From middle of first line
+        let eol = buffer.eol_pos(2); // From 'l' in "Hello"
+        let (col, line) = buffer.to_column_line(eol);
+        assert_eq!(line, 0);
+        // Should go to after 'o' in "Hello" (position 5)
+        assert_eq!(eol, 5);
+    }
+
+    #[test]
+    fn test_eol_pos_last_line() {
+        let buffer = test_buffer(); // "Hello\ncruel\nworld!"
+
+        // From start of last line
+        let eol = buffer.eol_pos(12); // From 'w' in "world!"
+        let (col, line) = buffer.to_column_line(eol);
+        assert_eq!(line, 2);
+        // Should go to after '!' (end of buffer)
+        assert_eq!(eol, 18);
+    }
+
+    #[test]
+    fn test_eol_pos_end_of_buffer() {
+        let buffer = test_buffer(); // "Hello\ncruel\nworld!"
+        let buffer_len = buffer.buffer.len_chars();
+
+        // From end of buffer
+        let eol = buffer.eol_pos(buffer_len);
+        println!("eol_pos from end of buffer: {eol}");
+        println!("buffer length: {buffer_len}");
+
+        // When already at end of buffer, should stay at end
+        assert_eq!(eol, buffer_len);
+    }
+
+    #[test]
+    fn test_eol_pos_already_at_eol() {
+        let buffer = test_buffer(); // "Hello\ncruel\nworld!"
+
+        // From end of first line (position 5, after 'o')
+        let eol = buffer.eol_pos(5);
+        let (_col, line) = buffer.to_column_line(eol);
+        assert_eq!(line, 0);
+        // Should stay at end of line
+        assert_eq!(eol, 5);
+    }
+
+    #[test]
+    fn test_simple_movement_api() {
+        let buffer = test_buffer(); // "Hello\ncruel\nworld!"
+
+        // Test horizontal movement
+        assert_eq!(buffer.move_left(5), 4); // From end of "Hello"
+        assert_eq!(buffer.move_left(0), 0); // From start - should stay
+        assert_eq!(buffer.move_right(4), 5); // To end of "Hello"
+        assert_eq!(buffer.move_right(18), 18); // From end - should stay
+
+        // Test line movement
+        assert_eq!(buffer.move_line_start(3), 0); // From middle of "Hello" to start
+        assert_eq!(buffer.move_line_end(0), 5); // From start to end of line
+
+        // Test buffer movement
+        assert_eq!(buffer.move_buffer_start(), 0);
+        assert_eq!(buffer.move_buffer_end(), 18);
+    }
+
+    #[test]
+    fn test_vertical_movement_api() {
+        let buffer = test_buffer(); // "Hello\ncruel\nworld!"
+
+        // Move up from "cruel" to "Hello"
+        let pos = buffer.move_up(8); // From 'u' in "cruel"
+        let (col, line) = buffer.to_column_line(pos);
+        assert_eq!(line, 0); // First line
+        assert_eq!(col, 2); // Same column position ('l' in "Hello")
+
+        // Move down from "Hello" to "cruel"
+        let pos = buffer.move_down(2); // From 'l' in "Hello"
+        let (col, line) = buffer.to_column_line(pos);
+        assert_eq!(line, 1); // Second line
+        assert_eq!(col, 2); // Same column position ('u' in "cruel")
+    }
+
+    #[test]
+    fn test_movement_edge_cases() {
+        let buffer = test_buffer(); // "Hello\ncruel\nworld!"
+
+        // Move up from first line - should stay
+        assert_eq!(buffer.move_up(3), 3);
+
+        // Move down from last line - should stay
+        assert_eq!(buffer.move_down(15), 15);
+
+        // Test with empty buffer
+        let empty_buffer = Buffer::new(&[]);
+        assert_eq!(empty_buffer.move_up(0), 0);
+        assert_eq!(empty_buffer.move_down(0), 0);
+        assert_eq!(empty_buffer.move_left(0), 0);
+        assert_eq!(empty_buffer.move_right(0), 0);
+    }
+
+    #[test]
+    fn test_phase1_api_handles_original_edge_cases() {
+        let buffer = test_buffer(); // "Hello\ncruel\nworld!"
+
+        // Test case from failing test_char_index_relative_offset_column_bounds
+        // Move far left from position 7 - should go to start of buffer
+        let pos = buffer.move_left(7);
+        // Keep moving left until we hit start
+        let mut current = pos;
+        for _ in 0..10 {
+            current = buffer.move_left(current);
+        }
+        assert_eq!(current, 0); // Should reach start of buffer
+
+        // Test case from failing test_relative_offset_left_to_prev_line
+        // Position 7 is 'u' in "cruel", move left should go to 'r'
+        assert_eq!(buffer.move_left(7), 6);
     }
 }

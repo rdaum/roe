@@ -36,13 +36,13 @@ pub enum KeyAction {
     Backspace,
     /// Insert a newline or receive command etc (maybe split those two up?)
     Enter,
-    ///
+    /// Escape key
     Escape,
     /// Delete the "word" under the cursor
     DeleteWord,
-    ///
+    /// Toggle caps lock
     ToggleCapsLock,
-    ///
+    /// Toggle scroll lock
     ToggleScrollLock,
     /// Backspace-delete the "word" before the cursor
     BackspaceWord,
@@ -59,7 +59,17 @@ pub enum KeyAction {
     Quit,
     /// Find file
     FindFile,
-    ///
+    /// Split window horizontally
+    SplitHorizontal,
+    /// Split window vertically
+    SplitVertical,
+    /// Switch to next window
+    SwitchWindow,
+    /// Delete current window
+    DeleteWindow,
+    /// Delete all other windows (keep only current)
+    DeleteOtherWindows,
+    /// Unbound key
     Unbound,
 }
 
@@ -111,7 +121,7 @@ pub enum LogicalKey {
 }
 
 impl LogicalKey {
-    pub fn to_display(&self) -> String {
+    pub fn as_display_string(&self) -> String {
         // emacs-like short form.  i.e. x, m,. C-, S- M- etc.
         let s = match self {
             LogicalKey::Left => "←",
@@ -120,8 +130,8 @@ impl LogicalKey {
             LogicalKey::Down => "↓",
             LogicalKey::PageUp => "PgUp",
             LogicalKey::PageDown => "PgDn",
-            LogicalKey::Function(f) => &format!("F{}", f),
-            LogicalKey::AlphaNumeric(a) => &format!("{}", a),
+            LogicalKey::Function(f) => &format!("F{f}"),
+            LogicalKey::AlphaNumeric(a) => &format!("{a}"),
             LogicalKey::Backspace => "⌫",
             LogicalKey::Enter => "⏎",
             LogicalKey::Home => "Home",
@@ -168,6 +178,12 @@ pub struct KeyState {
     // Active keys
     // TODO: this could be a bitset, with some fandangling for modifiers
     keys: Vec<KeyPress>,
+}
+
+impl Default for KeyState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl KeyState {
@@ -289,13 +305,11 @@ impl Bindings for DefaultBindings {
                 }
                 // C-c C-x continue a chord
                 (
-                    LogicalKey::Modifier(KeyModifier::Control(_) | KeyModifier::Shift(_)),
+                    LogicalKey::Modifier(KeyModifier::Control(_)),
                     LogicalKey::AlphaNumeric(a),
                 ) if a == 'c' || a == 'x' => return KeyAction::ChordNext,
                 // M-x command mode
-                (LogicalKey::Modifier(KeyModifier::Meta(_)), LogicalKey::AlphaNumeric(a))
-                    if a == 'x' =>
-                {
+                (LogicalKey::Modifier(KeyModifier::Meta(_)), LogicalKey::AlphaNumeric('x')) => {
                     return KeyAction::CommandMode
                 }
                 // Ctrl-End is buffer-end
@@ -307,69 +321,47 @@ impl Bindings for DefaultBindings {
                     return KeyAction::Cursor(CursorDirection::BufferStart)
                 }
                 // Ctrl-P
-                (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric(a))
-                    if a == 'p' =>
-                {
+                (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric('p')) => {
                     return KeyAction::Cursor(CursorDirection::Up)
                 }
                 // Ctrl-N
-                (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric(a))
-                    if a == 'n' =>
-                {
+                (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric('n')) => {
                     return KeyAction::Cursor(CursorDirection::Down)
                 }
                 // Ctrl-F
-                (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric(a))
-                    if a == 'f' =>
-                {
+                (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric('f')) => {
                     return KeyAction::Cursor(CursorDirection::Right)
                 }
                 // Ctrl-B
-                (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric(a))
-                    if a == 'b' =>
-                {
+                (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric('b')) => {
                     return KeyAction::Cursor(CursorDirection::Left)
                 }
                 // Ctrl-V is page-down
-                (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric(a))
-                    if a == 'v' =>
-                {
+                (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric('v')) => {
                     return KeyAction::Cursor(CursorDirection::PageDown)
                 }
                 // Ctrl-A is start of line
-                (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric(a))
-                    if a == 'a' =>
-                {
+                (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric('a')) => {
                     return KeyAction::Cursor(CursorDirection::LineStart)
                 }
                 // Ctrl-E is end of line
-                (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric(a))
-                    if a == 'e' =>
-                {
+                (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric('e')) => {
                     return KeyAction::Cursor(CursorDirection::LineEnd)
                 }
                 // Ctrl-K is kill-line
-                (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric(a))
-                    if a == 'k' =>
-                {
+                (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric('k')) => {
                     return KeyAction::KillLine(false)
                 }
                 // Ctrl-Y is yank
-                (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric(a))
-                    if a == 'y' =>
-                {
+                (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric('y')) => {
                     return KeyAction::Yank(None)
                 }
                 // Ctrl-W is kill-region
-                (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric(a))
-                    if a == 'w' =>
-                {
+                (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric('w')) => {
                     return KeyAction::KillRegion(true)
                 }
                 // Ctrl-/ is undo
-                (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric(a))
-                    if a == '/' =>
-                {
+                (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric('/')) => {
                     return KeyAction::Undo
                 }
                 //
@@ -399,6 +391,36 @@ impl Bindings for DefaultBindings {
                     LogicalKey::AlphaNumeric(a),
                     LogicalKey::AlphaNumeric(b),
                 ) if *a == 'x' && *b == 'f' => return KeyAction::FindFile,
+                // C-x 2 split horizontally
+                (
+                    LogicalKey::Modifier(KeyModifier::Control(_)),
+                    LogicalKey::AlphaNumeric(a),
+                    LogicalKey::AlphaNumeric(b),
+                ) if *a == 'x' && *b == '2' => return KeyAction::SplitHorizontal,
+                // C-x 3 split vertically
+                (
+                    LogicalKey::Modifier(KeyModifier::Control(_)),
+                    LogicalKey::AlphaNumeric(a),
+                    LogicalKey::AlphaNumeric(b),
+                ) if *a == 'x' && *b == '3' => return KeyAction::SplitVertical,
+                // C-x o switch window
+                (
+                    LogicalKey::Modifier(KeyModifier::Control(_)),
+                    LogicalKey::AlphaNumeric(a),
+                    LogicalKey::AlphaNumeric(b),
+                ) if *a == 'x' && *b == 'o' => return KeyAction::SwitchWindow,
+                // C-x 0 delete window
+                (
+                    LogicalKey::Modifier(KeyModifier::Control(_)),
+                    LogicalKey::AlphaNumeric(a),
+                    LogicalKey::AlphaNumeric(b),
+                ) if *a == 'x' && *b == '0' => return KeyAction::DeleteWindow,
+                // C-x 1 delete other windows
+                (
+                    LogicalKey::Modifier(KeyModifier::Control(_)),
+                    LogicalKey::AlphaNumeric(a),
+                    LogicalKey::AlphaNumeric(b),
+                ) if *a == 'x' && *b == '1' => return KeyAction::DeleteOtherWindows,
                 // Ctrl-Shift-W is kill-region non-destructive
                 (
                     LogicalKey::Modifier(KeyModifier::Control(_)),
@@ -421,6 +443,6 @@ impl Bindings for DefaultBindings {
                 (_, _, _) => {}
             }
         }
-        return KeyAction::Unbound;
+        KeyAction::Unbound
     }
 }
