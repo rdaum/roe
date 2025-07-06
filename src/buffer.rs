@@ -68,7 +68,7 @@ impl Buffer {
     /// Return the position of the start of the line relative to the start position
     pub fn bol_pos(&self, start_pos: usize) -> usize {
         let line = self.buffer.char_to_line(start_pos);
-        
+
         self.buffer.line_to_char(line)
     }
 
@@ -232,7 +232,7 @@ mod tests {
     #[test]
     fn test_position_conversions() {
         let buffer = test_buffer();
-        let (col, line) = buffer.to_column_line(7);
+        let (_col, line) = buffer.to_column_line(7);
         let pos = buffer.to_char_index(5, line - 1);
         // Go up to the end of previous line (the \n)
         assert_eq!(pos, 5);
@@ -326,7 +326,7 @@ mod tests {
 
         // From middle of first line
         let eol = buffer.eol_pos(2); // From 'l' in "Hello"
-        let (col, line) = buffer.to_column_line(eol);
+        let (_col, line) = buffer.to_column_line(eol);
         assert_eq!(line, 0);
         // Should go to after 'o' in "Hello" (position 5)
         assert_eq!(eol, 5);
@@ -338,7 +338,7 @@ mod tests {
 
         // From start of last line
         let eol = buffer.eol_pos(12); // From 'w' in "world!"
-        let (col, line) = buffer.to_column_line(eol);
+        let (_col, line) = buffer.to_column_line(eol);
         assert_eq!(line, 2);
         // Should go to after '!' (end of buffer)
         assert_eq!(eol, 18);
@@ -351,8 +351,6 @@ mod tests {
 
         // From end of buffer
         let eol = buffer.eol_pos(buffer_len);
-        println!("eol_pos from end of buffer: {eol}");
-        println!("buffer length: {buffer_len}");
 
         // When already at end of buffer, should stay at end
         assert_eq!(eol, buffer_len);
