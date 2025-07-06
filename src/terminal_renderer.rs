@@ -2,10 +2,11 @@ use crate::editor::{ChromeAction, Frame, Window};
 use crate::keys::{KeyModifier, LogicalKey, Side};
 use crate::renderer::{DirtyRegion, DirtyTracker, ModelineComponent, Renderer};
 use crate::{Editor, WindowId};
-use crossterm::event::{Event, KeyCode, KeyModifiers, ModifierKeyCode};
+use crossterm::event::{Event, EventStream, KeyCode, KeyModifiers, ModifierKeyCode};
 use crossterm::style::{Color, Print, Stylize};
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::{cursor, queue};
+use futures::{future::FutureExt, select, StreamExt};
 use std::io::Write;
 
 pub const ECHO_AREA_HEIGHT: u16 = 1;
@@ -847,13 +848,24 @@ pub fn echo(
     Ok(())
 }
 
-pub fn event_loop_with_renderer<W: Write>(
+pub async fn event_loop_with_renderer<W: Write>(
     renderer: &mut TerminalRenderer<W>,
     editor: &mut Editor,
 ) -> Result<(), std::io::Error> {
+    let mut event_stream = EventStream::new();
+
     loop {
-        // Get the next event
-        let event = crossterm::event::read()?;
+        // Get the next event asynchronously
+        let mut maybe_event = event_stream.next().fuse();
+        let event = select! {
+            event = maybe_event => {
+                match event {
+                    Some(Ok(event)) => event,
+                    Some(Err(e)) => return Err(e),
+                    None => continue, // Stream ended, shouldn't happen but handle gracefully
+                }
+            }
+        };
         let keys = match event {
             Event::Key(keystroke) => {
                 let key = crossterm_key_translate(&keystroke.code);
@@ -883,9 +895,6 @@ pub fn event_loop_with_renderer<W: Write>(
 
         // Display the keys pressed in echo with - between, using as_display_string, but only if there's
         // modifiers in play
-        // TODO: Implement proper echo area rendering in the incremental renderer
-        // For now, skip echo display to avoid interfering with terminal output
-
         let actions = editor.key_event(keys)?;
 
         for action in actions {

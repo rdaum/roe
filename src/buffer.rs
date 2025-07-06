@@ -28,10 +28,8 @@ impl Buffer {
     }
 
     /// Create a new buffer and load content from a file
-    pub fn from_file(file_path: &str, modes: &[ModeId]) -> Result<Self, std::io::Error> {
-        use std::fs;
-
-        let content = fs::read_to_string(file_path)?;
+    pub async fn from_file(file_path: &str, modes: &[ModeId]) -> Result<Self, std::io::Error> {
+        let content = tokio::fs::read_to_string(file_path).await?;
         let buffer = Self {
             object: file_path.to_string(),
             modes: modes.to_vec(),
@@ -42,13 +40,9 @@ impl Buffer {
     }
 
     /// Save buffer content to file
-    pub fn save_to_file(&self, file_path: &str) -> Result<(), std::io::Error> {
-        use std::fs;
-        use std::io::Write;
-
-        let mut file = fs::File::create(file_path)?;
-        file.write_all(self.buffer.to_string().as_bytes())?;
-        file.sync_all()?;
+    pub async fn save_to_file(&self, file_path: &str) -> Result<(), std::io::Error> {
+        let content = self.buffer.to_string();
+        tokio::fs::write(file_path, content.as_bytes()).await?;
         Ok(())
     }
 

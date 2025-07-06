@@ -1023,7 +1023,7 @@ impl Editor {
             if let Some(_mode) = self.modes.get(*mode_id) {
                 // Try to downcast to FileMode to get the file path
                 // For now, we'll use the buffer's object name as the file path
-                &buffer.object
+                buffer.object.clone()
             } else {
                 return vec![ChromeAction::Echo("No mode found for save".to_string())];
             }
@@ -1031,18 +1031,24 @@ impl Editor {
             return vec![ChromeAction::Echo("No mode found for save".to_string())];
         };
 
-        // Attempt to save the file
-        match buffer.save_to_file(file_path) {
-            Ok(()) => {
-                vec![ChromeAction::Echo(format!("Saved {}", file_path))]
+        // Start async save operation without blocking
+        let content = buffer.buffer.to_string();
+        let file_path_clone = file_path.clone();
+        
+        tokio::spawn(async move {
+            match tokio::fs::write(&file_path_clone, content.as_bytes()).await {
+                Ok(()) => {
+                    // TODO: Send success message back to editor
+                    eprintln!("Saved {}", file_path_clone);
+                }
+                Err(err) => {
+                    // TODO: Send error message back to editor  
+                    eprintln!("Error saving {}: {}", file_path_clone, err);
+                }
             }
-            Err(err) => {
-                vec![ChromeAction::Echo(format!(
-                    "Error saving {}: {}",
-                    file_path, err
-                ))]
-            }
-        }
+        });
+
+        vec![ChromeAction::Echo(format!("Saving {}...", file_path))]
     }
 
     /// Ensure the cursor is visible in the window, scrolling if necessary.

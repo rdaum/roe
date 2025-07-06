@@ -32,7 +32,7 @@ new_key_type! {
 }
 
 // Everything to run in raw_mode
-fn terminal_main<W: Write>(stdout: W) -> Result<(), std::io::Error> {
+async fn terminal_main<W: Write>(stdout: W) -> Result<(), std::io::Error> {
     assert!(crossterm::terminal::is_raw_mode_enabled()?);
     let _ws = crossterm::terminal::window_size()?;
 
@@ -51,7 +51,7 @@ fn terminal_main<W: Write>(stdout: W) -> Result<(), std::io::Error> {
     let mut buffers: SlotMap<BufferId, Buffer> = SlotMap::default();
 
     // Try to load README.md, fall back to scratch if it doesn't exist
-    let buffer = match Buffer::from_file("README.md", &[file_mode_id]) {
+    let buffer = match Buffer::from_file("README.md", &[file_mode_id]).await {
         Ok(buffer) => buffer,
         Err(_) => {
             // If README.md doesn't exist, create it with some default content
@@ -93,7 +93,7 @@ fn terminal_main<W: Write>(stdout: W) -> Result<(), std::io::Error> {
     renderer.render_full(&editor)?;
 
     // Event loop with renderer
-    terminal_renderer::event_loop_with_renderer(&mut renderer, &mut editor)?;
+    terminal_renderer::event_loop_with_renderer(&mut renderer, &mut editor).await?;
 
     Ok(())
 }
@@ -108,7 +108,8 @@ fn exit_state(device: &mut impl Write) -> Result<(), std::io::Error> {
     Ok(())
 }
 
-fn main() -> Result<(), std::io::Error> {
+#[tokio::main]
+async fn main() -> Result<(), std::io::Error> {
     let mut stdout = std::io::stdout();
 
     crossterm::terminal::enable_raw_mode()?;
@@ -118,7 +119,7 @@ fn main() -> Result<(), std::io::Error> {
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     )?;
     execute!(stdout, crossterm::cursor::EnableBlinking)?;
-    if let Err(e) = terminal_main(&mut stdout) {
+    if let Err(e) = terminal_main(&mut stdout).await {
         exit_state(&mut stdout)?;
         eprintln!("Error: {e}");
         return Err(e);
