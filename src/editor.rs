@@ -587,12 +587,19 @@ impl Editor {
                     CursorDirection::BufferStart => buffer.move_buffer_start(),
                     CursorDirection::BufferEnd => buffer.move_buffer_end(),
                     CursorDirection::PageUp => {
-                        // TODO: implement page movement
-                        window.cursor
+                        let content_height = window.height_chars.saturating_sub(3); // Account for border + modeline
+                        let (current_col, current_line) = buffer.to_column_line(window.cursor);
+                        let target_line = current_line.saturating_sub(content_height);
+                        buffer.to_char_index(current_col, target_line)
                     }
                     CursorDirection::PageDown => {
-                        // TODO: implement page movement
-                        window.cursor
+                        let content_height = window.height_chars.saturating_sub(3); // Account for border + modeline
+                        let (current_col, current_line) = buffer.to_column_line(window.cursor);
+                        let target_line = current_line + content_height;
+                        // Bounds check: don't go past the last line
+                        let max_line = buffer.buffer.len_lines().saturating_sub(1) as u16;
+                        let safe_target_line = target_line.min(max_line);
+                        buffer.to_char_index(current_col, safe_target_line)
                     }
                 };
 
@@ -601,9 +608,20 @@ impl Editor {
                 // Now compute the physical position of the cursor in the window.
                 let (col, line) = buffer.to_column_line(new_pos);
 
+                // Auto-scroll to keep cursor visible
+                let content_height = window.height_chars.saturating_sub(3); // Account for border + modeline
+                let needs_redraw = Self::ensure_cursor_visible_static(window, line, content_height);
+
                 let mut actions = vec![ChromeAction::CursorMove(
                     window.absolute_cursor_position(col, line),
                 )];
+
+                // If we scrolled, mark the entire buffer dirty to redraw everything
+                if needs_redraw {
+                    actions.push(ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                        buffer_id: window.active_buffer,
+                    }));
+                }
 
                 // If there's a mark set, cursor movement changes the region highlighting
                 // so we need to mark the buffer dirty to trigger a redraw
@@ -670,6 +688,9 @@ impl Editor {
                     }
                     ModeAction::ClearMark => {
                         chrome_actions.extend(self.clear_mark());
+                    }
+                    ModeAction::Save => {
+                        chrome_actions.extend(self.save_buffer());
                     }
                     ModeAction::CursorUp => {}
                     ModeAction::CursorDown => {}
@@ -988,6 +1009,64 @@ impl Editor {
         } else {
             vec![ChromeAction::Echo("No mark to clear".to_string())]
         }
+    }
+
+    /// Save the current buffer to file
+    pub fn save_buffer(&mut self) -> Vec<ChromeAction> {
+        let window = &self.windows[self.active_window];
+        let buffer = &self.buffers[window.active_buffer];
+
+        // For now, we need to know the file path. In a real implementation,
+        // this would be stored with the buffer or mode. For now, let's look
+        // for a FileMode that has the file path.
+        let file_path = if let Some(mode_id) = buffer.modes.first() {
+            if let Some(_mode) = self.modes.get(*mode_id) {
+                // Try to downcast to FileMode to get the file path
+                // For now, we'll use the buffer's object name as the file path
+                &buffer.object
+            } else {
+                return vec![ChromeAction::Echo("No mode found for save".to_string())];
+            }
+        } else {
+            return vec![ChromeAction::Echo("No mode found for save".to_string())];
+        };
+
+        // Attempt to save the file
+        match buffer.save_to_file(file_path) {
+            Ok(()) => {
+                vec![ChromeAction::Echo(format!("Saved {}", file_path))]
+            }
+            Err(err) => {
+                vec![ChromeAction::Echo(format!(
+                    "Error saving {}: {}",
+                    file_path, err
+                ))]
+            }
+        }
+    }
+
+    /// Ensure the cursor is visible in the window, scrolling if necessary.
+    /// Returns true if scrolling occurred (requiring a redraw).
+    fn ensure_cursor_visible_static(
+        window: &mut Window,
+        cursor_line: u16,
+        content_height: u16,
+    ) -> bool {
+        let old_start_line = window.start_line;
+
+        // Check if cursor is below the visible area
+        if cursor_line >= window.start_line + content_height {
+            // Cursor is below visible area - scroll down
+            window.start_line = cursor_line.saturating_sub(content_height.saturating_sub(1));
+        }
+        // Check if cursor is above the visible area
+        else if cursor_line < window.start_line {
+            // Cursor is above visible area - scroll up
+            window.start_line = cursor_line;
+        }
+
+        // Return true if we scrolled (start_line changed)
+        old_start_line != window.start_line
     }
 
     /// Yank (paste) from kill-ring

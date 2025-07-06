@@ -33,6 +33,8 @@ pub enum ModeAction {
     SetMark,
     /// Clear the mark
     ClearMark,
+    /// Save the buffer to file
+    Save,
 
     CursorUp,
     CursorDown,
@@ -130,6 +132,80 @@ impl Mode for ScratchMode {
             KeyAction::ChordNext => {}
             KeyAction::CommandMode => {}
             KeyAction::Save => {}
+            KeyAction::Quit => {}
+            KeyAction::FindFile => {}
+            KeyAction::SplitHorizontal => {}
+            KeyAction::SplitVertical => {}
+            KeyAction::SwitchWindow => {}
+            KeyAction::DeleteWindow => {}
+            KeyAction::DeleteOtherWindows => {}
+            KeyAction::Cancel => {
+                return vec![ModeAction::ClearMark];
+            }
+            KeyAction::Unbound => {}
+        }
+        vec![]
+    }
+}
+
+/// A mode for editing text files with load/save capability
+pub struct FileMode {
+    pub file_path: String,
+}
+
+impl Mode for FileMode {
+    fn name(&self) -> &str {
+        "file"
+    }
+
+    fn perform(&mut self, action: &KeyAction) -> Vec<ModeAction> {
+        match action {
+            KeyAction::Cursor(_) => {}
+            KeyAction::InsertModeToggle => {}
+            KeyAction::Undo => {}
+            KeyAction::Redo => {}
+            KeyAction::MarkStart => {
+                return vec![ModeAction::SetMark];
+            }
+            KeyAction::MarkEnd => {}
+            KeyAction::KillRegion(_destructive) => {
+                return vec![ModeAction::KillRegion];
+            }
+            KeyAction::KillLine(_whole_line) => {
+                return vec![ModeAction::KillLine];
+            }
+            KeyAction::Yank(index) => match index {
+                Some(idx) => return vec![ModeAction::YankIndex(ActionPosition::cursor(), *idx)],
+                None => return vec![ModeAction::Yank(ActionPosition::cursor())],
+            },
+            KeyAction::ForceIndent => {}
+            KeyAction::Tab => {}
+            KeyAction::Delete => return vec![ModeAction::DeleteText(ActionPosition::cursor(), 1)],
+            KeyAction::Backspace => {
+                return vec![ModeAction::DeleteText(ActionPosition::cursor(), -1)]
+            }
+            KeyAction::Enter => {
+                return vec![ModeAction::InsertText(
+                    ActionPosition::cursor(),
+                    "\n".to_string(),
+                )]
+            }
+            KeyAction::Escape => {}
+            KeyAction::DeleteWord => {}
+            KeyAction::ToggleCapsLock => {}
+            KeyAction::ToggleScrollLock => {}
+            KeyAction::BackspaceWord => {}
+            KeyAction::AlphaNumeric(x) => {
+                return vec![ModeAction::InsertText(
+                    ActionPosition::cursor(),
+                    x.to_string(),
+                )]
+            }
+            KeyAction::ChordNext => {}
+            KeyAction::CommandMode => {}
+            KeyAction::Save => {
+                return vec![ModeAction::Save];
+            }
             KeyAction::Quit => {}
             KeyAction::FindFile => {}
             KeyAction::SplitHorizontal => {}

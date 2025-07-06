@@ -1,5 +1,5 @@
 /// Emacs-style kill-ring implementation
-/// 
+///
 /// The kill-ring is a circular buffer that stores killed (cut/copied) text.
 /// It maintains a history of killed text that can be yanked (pasted) back.
 /// Multiple consecutive kills are appended together, following Emacs conventions.
@@ -53,7 +53,7 @@ impl KillRing {
         } else {
             // Add as new entry
             self.entries.push(text);
-            
+
             // Maintain ring size limit
             if self.entries.len() > self.max_size {
                 self.entries.remove(0);
@@ -61,7 +61,11 @@ impl KillRing {
         }
 
         // Reset current index to point to the most recent entry
-        self.current_index = if self.entries.is_empty() { 0 } else { self.entries.len() - 1 };
+        self.current_index = if self.entries.is_empty() {
+            0
+        } else {
+            self.entries.len() - 1
+        };
         self.last_was_kill = true;
     }
 
@@ -80,7 +84,7 @@ impl KillRing {
         } else {
             // Add as new entry
             self.entries.push(text);
-            
+
             // Maintain ring size limit
             if self.entries.len() > self.max_size {
                 self.entries.remove(0);
@@ -88,7 +92,11 @@ impl KillRing {
         }
 
         // Reset current index to point to the most recent entry
-        self.current_index = if self.entries.is_empty() { 0 } else { self.entries.len() - 1 };
+        self.current_index = if self.entries.is_empty() {
+            0
+        } else {
+            self.entries.len() - 1
+        };
         self.last_was_kill = true;
     }
 
@@ -98,7 +106,7 @@ impl KillRing {
         if self.entries.is_empty() {
             return None;
         }
-        
+
         // Reset to most recent entry
         self.current_index = self.entries.len() - 1;
         Some(&self.entries[self.current_index])
@@ -110,7 +118,7 @@ impl KillRing {
         if self.entries.is_empty() || index >= self.entries.len() {
             return None;
         }
-        
+
         // Index 0 is most recent, so convert to actual array index
         self.current_index = self.entries.len() - 1 - index;
         Some(&self.entries[self.current_index])
@@ -177,7 +185,7 @@ mod tests {
     #[test]
     fn test_basic_kill_and_yank() {
         let mut ring = KillRing::new();
-        
+
         ring.kill("hello".to_string());
         assert_eq!(ring.yank(), Some("hello"));
     }
@@ -185,10 +193,10 @@ mod tests {
     #[test]
     fn test_consecutive_kills_append() {
         let mut ring = KillRing::new();
-        
+
         ring.kill("hello".to_string());
         ring.kill(" world".to_string());
-        
+
         assert_eq!(ring.yank(), Some("hello world"));
         assert_eq!(ring.len(), 1); // Should be one combined entry
     }
@@ -196,11 +204,11 @@ mod tests {
     #[test]
     fn test_non_consecutive_kills() {
         let mut ring = KillRing::new();
-        
+
         ring.kill("first".to_string());
         ring.break_kill_sequence(); // Simulate non-kill operation
         ring.kill("second".to_string());
-        
+
         assert_eq!(ring.len(), 2);
         assert_eq!(ring.yank(), Some("second")); // Most recent
     }
@@ -208,42 +216,42 @@ mod tests {
     #[test]
     fn test_kill_prepend() {
         let mut ring = KillRing::new();
-        
+
         ring.kill("world".to_string());
         ring.kill_prepend("hello ".to_string());
-        
+
         assert_eq!(ring.yank(), Some("hello world"));
     }
 
     #[test]
     fn test_yank_index() {
         let mut ring = KillRing::new();
-        
+
         ring.kill("first".to_string());
         ring.break_kill_sequence();
         ring.kill("second".to_string());
         ring.break_kill_sequence();
         ring.kill("third".to_string());
-        
-        assert_eq!(ring.yank_index(0), Some("third"));  // Most recent
+
+        assert_eq!(ring.yank_index(0), Some("third")); // Most recent
         assert_eq!(ring.yank_index(1), Some("second")); // Second most recent
-        assert_eq!(ring.yank_index(2), Some("first"));  // Oldest
-        assert_eq!(ring.yank_index(3), None);           // Out of bounds
+        assert_eq!(ring.yank_index(2), Some("first")); // Oldest
+        assert_eq!(ring.yank_index(3), None); // Out of bounds
     }
 
     #[test]
     fn test_yank_pop() {
         let mut ring = KillRing::new();
-        
+
         ring.kill("first".to_string());
         ring.break_kill_sequence();
         ring.kill("second".to_string());
         ring.break_kill_sequence();
         ring.kill("third".to_string());
-        
+
         // Start with most recent
         assert_eq!(ring.yank(), Some("third"));
-        
+
         // Pop to previous entries
         assert_eq!(ring.yank_pop(), Some("second"));
         assert_eq!(ring.yank_pop(), Some("first"));
@@ -253,13 +261,13 @@ mod tests {
     #[test]
     fn test_max_capacity() {
         let mut ring = KillRing::with_capacity(2);
-        
+
         ring.kill("first".to_string());
         ring.break_kill_sequence();
         ring.kill("second".to_string());
         ring.break_kill_sequence();
         ring.kill("third".to_string()); // Should evict "first"
-        
+
         assert_eq!(ring.len(), 2);
         assert_eq!(ring.yank_index(0), Some("third"));
         assert_eq!(ring.yank_index(1), Some("second"));
@@ -269,10 +277,10 @@ mod tests {
     #[test]
     fn test_empty_kill_ignored() {
         let mut ring = KillRing::new();
-        
+
         ring.kill("".to_string());
         assert!(ring.is_empty());
-        
+
         ring.kill("hello".to_string());
         ring.kill("".to_string()); // Should not affect existing entry
         assert_eq!(ring.yank(), Some("hello"));
@@ -281,10 +289,10 @@ mod tests {
     #[test]
     fn test_current() {
         let mut ring = KillRing::new();
-        
+
         ring.kill("test".to_string());
         assert_eq!(ring.current(), Some("test"));
-        
+
         // current() should not change state
         assert_eq!(ring.current(), Some("test"));
         assert_eq!(ring.yank(), Some("test"));

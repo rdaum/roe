@@ -99,7 +99,7 @@ impl<W: Write> TerminalRenderer<W> {
         // Render with region highlighting
         if let Some((region_start, region_end)) = region_bounds {
             let line_end_pos = line_start_pos + line_text.len();
-            
+
             // Check if this entire line is within the region
             if line_start_pos >= region_start && line_end_pos <= region_end {
                 // Entire line is highlighted - render text + fill rest of line with highlighted spaces
@@ -108,7 +108,7 @@ impl<W: Write> TerminalRenderer<W> {
                     &mut self.device,
                     Print(text_to_render.on(Color::Yellow).with(Color::Black))
                 )?;
-                
+
                 // Fill the remaining width with highlighted spaces for full-line highlighting
                 let remaining_width = content_width as usize - chars_to_render.len();
                 if remaining_width > 0 {
@@ -138,7 +138,7 @@ impl<W: Write> TerminalRenderer<W> {
                         )?;
                     }
                 }
-                
+
                 // For partial highlighting, if the region extends past the line content,
                 // fill remaining space with highlighted background
                 if region_start < line_end_pos && region_end > line_end_pos {
@@ -202,7 +202,20 @@ impl<W: Write> TerminalRenderer<W> {
                     // Calculate where the position should be (right-aligned)
                     let position_start = modeline_width.saturating_sub(position_text.len());
 
-                    // Move to position and update
+                    // Clear the entire right area where position could be (assume max 10 chars for position)
+                    let max_position_width = 10; // Should be enough for "9999:9999 "
+                    let clear_start = modeline_width.saturating_sub(max_position_width);
+                    let clear_width = modeline_width - clear_start;
+                    let clear_spaces = " ".repeat(clear_width);
+
+                    // First clear the area
+                    queue!(
+                        &mut self.device,
+                        cursor::MoveTo(modeline_x + clear_start as u16, modeline_y),
+                        Print(clear_spaces.on(MODE_LINE_BG_COLOR).with(FG_COLOR))
+                    )?;
+
+                    // Then write the new position
                     queue!(
                         &mut self.device,
                         cursor::MoveTo(modeline_x + position_start as u16, modeline_y),
@@ -701,7 +714,7 @@ pub fn draw_window(
         // Draw the line with region highlighting
         if let Some((region_start, region_end)) = region_bounds {
             let line_end_pos = line_start_pos + line_str.len();
-            
+
             // Check if this entire line is within the region
             if line_start_pos >= region_start && line_end_pos <= region_end {
                 // Entire line is highlighted - render text + fill rest of line with highlighted spaces
@@ -709,7 +722,7 @@ pub fn draw_window(
                     device,
                     Print(truncated_line.on(Color::Yellow).with(Color::Black))
                 )?;
-                
+
                 // Fill the remaining width with highlighted spaces for full-line highlighting
                 let remaining_width = content_width as usize - truncated_line.len();
                 if remaining_width > 0 {
@@ -736,7 +749,7 @@ pub fn draw_window(
                         queue!(device, Print(ch.to_string().with(FG_COLOR).on(BG_COLOR)))?;
                     }
                 }
-                
+
                 // For partial highlighting, if the region extends past the line content,
                 // fill remaining space with highlighted background
                 if region_start < line_end_pos && region_end > line_end_pos {

@@ -27,6 +27,31 @@ impl Buffer {
         self.buffer = ropey::Rope::from_str(text);
     }
 
+    /// Create a new buffer and load content from a file
+    pub fn from_file(file_path: &str, modes: &[ModeId]) -> Result<Self, std::io::Error> {
+        use std::fs;
+
+        let content = fs::read_to_string(file_path)?;
+        let buffer = Self {
+            object: file_path.to_string(),
+            modes: modes.to_vec(),
+            buffer: ropey::Rope::from_str(&content),
+            mark: None,
+        };
+        Ok(buffer)
+    }
+
+    /// Save buffer content to file
+    pub fn save_to_file(&self, file_path: &str) -> Result<(), std::io::Error> {
+        use std::fs;
+        use std::io::Write;
+
+        let mut file = fs::File::create(file_path)?;
+        file.write_all(self.buffer.to_string().as_bytes())?;
+        file.sync_all()?;
+        Ok(())
+    }
+
     pub fn content(&self) -> String {
         self.buffer.to_string()
     }
@@ -240,7 +265,7 @@ impl Buffer {
         let mark_pos = self.mark?;
         let cursor_pos = self.clamp_position(cursor_pos);
         let mark_pos = self.clamp_position(mark_pos);
-        
+
         if mark_pos <= cursor_pos {
             Some((mark_pos, cursor_pos))
         } else {

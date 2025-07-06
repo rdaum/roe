@@ -3,7 +3,7 @@ use crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
 use crossterm::execute;
 use editor::{Editor, Frame, Window};
 use keys::KeyState;
-use mode::{Mode, ScratchMode};
+use mode::{FileMode, Mode};
 use renderer::Renderer;
 use slotmap::{new_key_type, SlotMap};
 use std::io::Write;
@@ -41,27 +41,35 @@ fn terminal_main<W: Write>(stdout: W) -> Result<(), std::io::Error> {
 
     let tsize = crossterm::terminal::size()?;
 
-    let scratch_mode = Box::new(ScratchMode {});
+    let file_mode = Box::new(FileMode {
+        file_path: "README.md".to_string(),
+    });
 
     let mut modes: SlotMap<ModeId, Box<dyn Mode>> = SlotMap::default();
-    let scratch_mode_id = modes.insert(scratch_mode);
+    let file_mode_id = modes.insert(file_mode);
 
     let mut buffers: SlotMap<BufferId, Buffer> = SlotMap::default();
-    let scratch_buffer = Buffer {
-        object: "** scratch **".to_string(),
-        modes: vec![scratch_mode_id],
-        buffer: ropey::Rope::from_str("scratch content"),
-        mark: None,
+
+    // Try to load README.md, fall back to scratch if it doesn't exist
+    let buffer = match Buffer::from_file("README.md", &[file_mode_id]) {
+        Ok(buffer) => buffer,
+        Err(_) => {
+            // If README.md doesn't exist, create it with some default content
+            let mut buffer = Buffer::new(&[file_mode_id]);
+            buffer.object = "README.md".to_string();
+            buffer.load_str("# README\n\nThis is a new file created by the red editor.\nTry typing some text and press Ctrl-X Ctrl-S to save!\n");
+            buffer
+        }
     };
-    let scratch_buffer_id = buffers.insert(scratch_buffer);
+    let buffer_id = buffers.insert(buffer);
     let initial_window = Window {
         x: 0,
         y: 0,
         width_chars: tsize.0,
         height_chars: tsize.1 - ECHO_AREA_HEIGHT,
-        active_buffer: scratch_buffer_id,
+        active_buffer: buffer_id,
         start_line: 0,
-        cursor: buffers[scratch_buffer_id].buffer.len_chars(),
+        cursor: 0, // Start at beginning of file
     };
     let mut windows: SlotMap<WindowId, Window> = SlotMap::default();
     let initial_window_id = windows.insert(initial_window);
