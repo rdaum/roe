@@ -1,11 +1,10 @@
 use crate::buffer::Buffer;
-#[cfg(not(test))]
-use crate::echo;
 use crate::keys::KeyAction::ChordNext;
 use crate::keys::{Bindings, CursorDirection, KeyAction, KeyState, LogicalKey};
 use crate::kill_ring::KillRing;
 use crate::mode::{ActionPosition, Mode, ModeAction};
-use crate::{BufferId, ModeId, WindowId, ECHO_AREA_HEIGHT};
+use crate::renderer::{DirtyRegion, ModelineComponent};
+use crate::{BufferId, ModeId, WindowId};
 use slotmap::SlotMap;
 
 /// A "window" in the emacs sense, not the OS sense.
@@ -73,7 +72,9 @@ impl WindowNode {
 /// A "frame" in the emacs sense, not the OS sense.
 /// Represents the entire screen or window, including the modeline and echo area.
 pub struct Frame {
+    #[allow(dead_code)]
     pub columns: u16,
+    #[allow(dead_code)]
     pub rows: u16,
     pub available_columns: u16,
     pub available_lines: u16,
@@ -85,7 +86,7 @@ impl Frame {
             columns,
             rows,
             available_columns: columns,
-            available_lines: rows - ECHO_AREA_HEIGHT, /* no global modeline */
+            available_lines: rows,
         }
     }
 }
@@ -115,7 +116,7 @@ pub enum ChromeAction {
     CursorMove((u16, u16)),
     Huh,
     Echo(String),
-    Refresh(WindowId),
+    MarkDirty(DirtyRegion),
     Quit,
     SplitHorizontal,
     SplitVertical,
@@ -541,8 +542,6 @@ impl Editor {
         let _ = self.key_state.take();
 
         // Skip echo in tests to avoid terminal issues
-        #[cfg(not(test))]
-        echo(&mut std::io::stdout(), self, &format!("{key_action:?}"))?;
         let window = &mut self.windows.get_mut(self.active_window).unwrap();
         let buffer = &self.buffers.get_mut(window.active_buffer).unwrap();
 
@@ -602,9 +601,36 @@ impl Editor {
                 // Now compute the physical position of the cursor in the window.
                 let (col, line) = buffer.to_column_line(new_pos);
 
-                return Ok(vec![ChromeAction::CursorMove(
+                let mut actions = vec![ChromeAction::CursorMove(
                     window.absolute_cursor_position(col, line),
-                )]);
+                )];
+
+                // If there's a mark set, cursor movement changes the region highlighting
+                // so we need to mark the buffer dirty to trigger a redraw
+                if buffer.has_mark() {
+                    actions.push(ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                        buffer_id: window.active_buffer,
+                    }));
+                }
+
+                // Cursor movement always updates the position in the modeline
+                actions.push(ChromeAction::MarkDirty(DirtyRegion::Modeline {
+                    window_id: self.active_window,
+                    component: ModelineComponent::CursorPosition,
+                }));
+
+                return Ok(actions);
+            }
+            KeyAction::Cancel => {
+                // Cancel current operation - for now, just clear mark if set
+                let window = &self.windows[self.active_window];
+                let buffer = &self.buffers[window.active_buffer];
+
+                if buffer.has_mark() {
+                    return Ok(self.clear_mark());
+                } else {
+                    return Ok(vec![ChromeAction::Echo("Quit".to_string())]);
+                }
             }
             KeyAction::Unbound => return Ok(vec![ChromeAction::Huh]),
             _ => {}
@@ -655,9 +681,6 @@ impl Editor {
             }
         }
 
-        // Skip echo in tests to avoid terminal issues
-        #[cfg(not(test))]
-        crate::echo(&mut std::io::stdout(), self, &format!("{chrome_actions:?}"))?;
         Ok(chrome_actions)
     }
 
@@ -672,6 +695,7 @@ impl Editor {
         match position {
             ActionPosition::Cursor => {
                 let length = text.len();
+                let has_newline = text.contains('\n');
                 buffer.insert_pos(text, window.cursor);
 
                 // Advance the cursor
@@ -680,22 +704,49 @@ impl Editor {
                 let new_cursor = buffer.to_column_line(window.cursor);
                 let window_cursor = window.absolute_cursor_position(new_cursor.0, new_cursor.1);
 
-                // Refresh the window
-                // TODO: actually just print the portion rather than the whole thing
+                // Mark dirty regions based on what was inserted
+                let cursor_line = buffer.to_column_line(window.cursor).1 as usize;
+                let dirty_action = if has_newline {
+                    // Newlines affect multiple lines, mark entire buffer dirty
+                    ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                        buffer_id: window.active_buffer,
+                    })
+                } else {
+                    // Simple text insertion, only current line affected
+                    ChromeAction::MarkDirty(DirtyRegion::Line {
+                        buffer_id: window.active_buffer,
+                        line: cursor_line,
+                    })
+                };
+
                 vec![
                     ChromeAction::Echo("Inserted text".to_string()),
-                    ChromeAction::Refresh(self.active_window),
+                    dirty_action,
                     ChromeAction::CursorMove(window_cursor),
                 ]
             }
             ActionPosition::Absolute(l, c) => {
-                buffer.insert_col_line(text, (*l, *c));
+                buffer.insert_col_line(text.clone(), (*l, *c));
 
                 let new_cursor = buffer.to_column_line(window.cursor);
                 let window_cursor = window.absolute_cursor_position(new_cursor.0, new_cursor.1);
+
+                let dirty_action = if text.contains('\n') {
+                    // Newlines affect multiple lines, mark entire buffer dirty
+                    ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                        buffer_id: window.active_buffer,
+                    })
+                } else {
+                    // Simple text insertion, only current line affected
+                    ChromeAction::MarkDirty(DirtyRegion::Line {
+                        buffer_id: window.active_buffer,
+                        line: *l as usize,
+                    })
+                };
+
                 vec![
                     ChromeAction::Echo("Inserted text".to_string()),
-                    ChromeAction::Refresh(self.active_window),
+                    dirty_action,
                     ChromeAction::CursorMove(window_cursor),
                 ]
             }
@@ -728,19 +779,51 @@ impl Editor {
                 }
                 let new_cursor = buffer.to_column_line(window.cursor);
                 let window_cursor = window.absolute_cursor_position(new_cursor.0, new_cursor.1);
+                let cursor_line = new_cursor.1 as usize;
+
+                // If we deleted a newline, mark entire buffer dirty to handle line merging
+                let dirty_action = if deleted.contains('\n') {
+                    ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                        buffer_id: window.active_buffer,
+                    })
+                } else {
+                    ChromeAction::MarkDirty(DirtyRegion::Line {
+                        buffer_id: window.active_buffer,
+                        line: cursor_line,
+                    })
+                };
+
                 vec![
                     ChromeAction::Echo("Deleted text".to_string()),
-                    ChromeAction::Refresh(self.active_window),
+                    dirty_action,
                     ChromeAction::CursorMove(window_cursor),
                 ]
             }
             ActionPosition::Absolute(l, c) => {
-                buffer.delete_col_line((*l, *c), count);
+                let Some(deleted) = buffer.delete_col_line((*l, *c), count) else {
+                    return vec![];
+                };
+                if deleted.is_empty() {
+                    return vec![];
+                }
                 let new_cursor = buffer.to_column_line(window.cursor);
                 let window_cursor = window.absolute_cursor_position(new_cursor.0, new_cursor.1);
+
+                // If we deleted a newline, mark entire buffer dirty to handle line merging
+                let dirty_action = if deleted.contains('\n') {
+                    ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                        buffer_id: window.active_buffer,
+                    })
+                } else {
+                    ChromeAction::MarkDirty(DirtyRegion::Line {
+                        buffer_id: window.active_buffer,
+                        line: *l as usize,
+                    })
+                };
+
                 vec![
                     ChromeAction::Echo("Deleted text".to_string()),
-                    ChromeAction::Refresh(self.active_window),
+                    dirty_action,
                     ChromeAction::CursorMove(window_cursor),
                 ]
             }
@@ -778,7 +861,9 @@ impl Editor {
                 let window_cursor = window.absolute_cursor_position(new_cursor.0, new_cursor.1);
                 vec![
                     ChromeAction::Echo(format!("Killed: {deleted}")),
-                    ChromeAction::Refresh(self.active_window),
+                    ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                        buffer_id: window.active_buffer,
+                    }),
                     ChromeAction::CursorMove(window_cursor),
                 ]
             }
@@ -801,7 +886,9 @@ impl Editor {
                 let window_cursor = window.absolute_cursor_position(new_cursor.0, new_cursor.1);
                 vec![
                     ChromeAction::Echo(format!("Killed: {deleted}")),
-                    ChromeAction::Refresh(self.active_window),
+                    ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                        buffer_id: window.active_buffer,
+                    }),
                     ChromeAction::CursorMove(window_cursor),
                 ]
             }
@@ -833,7 +920,9 @@ impl Editor {
                 let window_cursor = window.absolute_cursor_position(new_cursor.0, new_cursor.1);
                 vec![
                     ChromeAction::Echo(format!("Killed line: {}", killed.replace('\n', "\\n"))),
-                    ChromeAction::Refresh(self.active_window),
+                    ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                        buffer_id: window.active_buffer,
+                    }),
                     ChromeAction::CursorMove(window_cursor),
                 ]
             }
@@ -866,7 +955,9 @@ impl Editor {
 
         vec![
             ChromeAction::Echo(format!("Killed region: {}", deleted.replace('\n', "\\n"))),
-            ChromeAction::Refresh(self.active_window),
+            ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                buffer_id: window.active_buffer,
+            }),
             ChromeAction::CursorMove(window_cursor),
         ]
     }
@@ -875,9 +966,9 @@ impl Editor {
     pub fn set_mark(&mut self) -> Vec<ChromeAction> {
         let window = &self.windows[self.active_window];
         let buffer = &mut self.buffers.get_mut(window.active_buffer).unwrap();
-        
+
         buffer.set_mark(window.cursor);
-        
+
         vec![ChromeAction::Echo("Mark set".to_string())]
     }
 
@@ -885,10 +976,15 @@ impl Editor {
     pub fn clear_mark(&mut self) -> Vec<ChromeAction> {
         let window = &self.windows[self.active_window];
         let buffer = &mut self.buffers.get_mut(window.active_buffer).unwrap();
-        
+
         if buffer.has_mark() {
             buffer.clear_mark();
-            vec![ChromeAction::Echo("Mark cleared".to_string())]
+            vec![
+                ChromeAction::Echo("Mark cleared".to_string()),
+                ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                    buffer_id: window.active_buffer,
+                }),
+            ]
         } else {
             vec![ChromeAction::Echo("No mark to clear".to_string())]
         }
@@ -1529,7 +1625,7 @@ mod tests {
         assert!(actions.iter().any(|a| matches!(a, ChromeAction::Echo(_))));
         assert!(actions
             .iter()
-            .any(|a| matches!(a, ChromeAction::Refresh(_))));
+            .any(|a| matches!(a, ChromeAction::MarkDirty(_))));
 
         // Check that text was killed and kill-ring has content
         assert!(!editor.kill_ring.is_empty());
@@ -1578,7 +1674,7 @@ mod tests {
         // Should have inserted text
         assert!(actions
             .iter()
-            .any(|a| matches!(a, ChromeAction::Refresh(_))));
+            .any(|a| matches!(a, ChromeAction::MarkDirty(_))));
 
         // Check buffer content
         let window = &editor.windows[editor.active_window];
@@ -1676,7 +1772,9 @@ mod tests {
         let actions = editor.set_mark();
 
         // Should get confirmation message
-        assert!(actions.iter().any(|a| matches!(a, ChromeAction::Echo(msg) if msg.contains("Mark set"))));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, ChromeAction::Echo(msg) if msg.contains("Mark set"))));
 
         // Check that mark was set in buffer
         let window = &editor.windows[editor.active_window];
@@ -1690,7 +1788,7 @@ mod tests {
         let mut editor = test_editor();
         let window = &mut editor.windows[editor.active_window];
         let buffer = &mut editor.buffers.get_mut(window.active_buffer).unwrap();
-        
+
         // Set a mark first
         buffer.set_mark(3);
         assert!(buffer.has_mark());
@@ -1699,7 +1797,9 @@ mod tests {
         let actions = editor.clear_mark();
 
         // Should get confirmation message
-        assert!(actions.iter().any(|a| matches!(a, ChromeAction::Echo(msg) if msg.contains("Mark cleared"))));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, ChromeAction::Echo(msg) if msg.contains("Mark cleared"))));
 
         // Check that mark was cleared
         let window = &editor.windows[editor.active_window];
@@ -1715,13 +1815,15 @@ mod tests {
         let actions = editor.clear_mark();
 
         // Should get error message
-        assert!(actions.iter().any(|a| matches!(a, ChromeAction::Echo(msg) if msg.contains("No mark to clear"))));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, ChromeAction::Echo(msg) if msg.contains("No mark to clear"))));
     }
 
     #[test]
     fn test_kill_region_basic() {
         let mut editor = test_editor(); // "Hello\nWorld\nTest"
-        
+
         // Set mark at position 2 ('l' in "Hello")
         let window = &mut editor.windows[editor.active_window];
         let buffer = &mut editor.buffers.get_mut(window.active_buffer).unwrap();
@@ -1736,7 +1838,9 @@ mod tests {
 
         // Should have killed message and refresh
         assert!(actions.iter().any(|a| matches!(a, ChromeAction::Echo(_))));
-        assert!(actions.iter().any(|a| matches!(a, ChromeAction::Refresh(_))));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, ChromeAction::MarkDirty(_))));
 
         // Check that text was killed and added to kill-ring
         assert!(!editor.kill_ring.is_empty());
@@ -1763,7 +1867,9 @@ mod tests {
         let actions = editor.kill_region();
 
         // Should get error message
-        assert!(actions.iter().any(|a| matches!(a, ChromeAction::Echo(msg) if msg.contains("No mark set"))));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, ChromeAction::Echo(msg) if msg.contains("No mark set"))));
 
         // Buffer should be unchanged
         let window = &editor.windows[editor.active_window];
@@ -1777,7 +1883,7 @@ mod tests {
     #[test]
     fn test_kill_region_empty() {
         let mut editor = test_editor();
-        
+
         // Set mark at cursor position (empty region)
         let window = &mut editor.windows[editor.active_window];
         window.cursor = 5;
@@ -1788,7 +1894,9 @@ mod tests {
         let actions = editor.kill_region();
 
         // Should get empty region message
-        assert!(actions.iter().any(|a| matches!(a, ChromeAction::Echo(msg) if msg.contains("Empty region"))));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, ChromeAction::Echo(msg) if msg.contains("Empty region"))));
 
         // Buffer should be unchanged
         let window = &editor.windows[editor.active_window];
@@ -1802,7 +1910,7 @@ mod tests {
     #[test]
     fn test_kill_region_reverse() {
         let mut editor = test_editor(); // "Hello\nWorld\nTest"
-        
+
         // Set mark at position 8 ('o' in "World")
         let window = &mut editor.windows[editor.active_window];
         let buffer = &mut editor.buffers.get_mut(window.active_buffer).unwrap();
@@ -1834,15 +1942,15 @@ mod tests {
     #[test]
     fn test_region_kill_integration_with_yank() {
         let mut editor = test_editor(); // "Hello\nWorld\nTest"
-        
+
         // Set mark and kill region
         let window = &mut editor.windows[editor.active_window];
         let buffer = &mut editor.buffers.get_mut(window.active_buffer).unwrap();
         buffer.set_mark(2); // 'l' in "Hello"
-        
+
         let window = &mut editor.windows[editor.active_window];
         window.cursor = 8; // 'o' in "World"
-        
+
         editor.kill_region(); // Kill "llo\nWo"
 
         // Move cursor to end of buffer
@@ -1853,7 +1961,9 @@ mod tests {
         let actions = editor.yank(&crate::mode::ActionPosition::cursor());
 
         // Should have refresh action
-        assert!(actions.iter().any(|a| matches!(a, ChromeAction::Refresh(_))));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, ChromeAction::MarkDirty(_))));
 
         // Check buffer content - should have yanked text at end
         let window = &editor.windows[editor.active_window];

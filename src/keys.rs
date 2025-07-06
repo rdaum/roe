@@ -19,6 +19,7 @@ pub enum KeyAction {
     /// Begin a selection
     MarkStart,
     /// End a selection
+    #[allow(dead_code)]
     MarkEnd,
     /// Add to kill-ring. If true, the selection is deleted, otherwise left present.
     KillRegion(bool),
@@ -27,6 +28,7 @@ pub enum KeyAction {
     /// Yank from kill-ring. If Some, yank that index, otherwise yank the last kill.
     Yank(Option<usize>),
     /// Force the current line to obey the indent rules
+    #[allow(dead_code)]
     ForceIndent,
     /// Move cursor over one tab-stop
     Tab,
@@ -39,12 +41,14 @@ pub enum KeyAction {
     /// Escape key
     Escape,
     /// Delete the "word" under the cursor
+    #[allow(dead_code)]
     DeleteWord,
     /// Toggle caps lock
     ToggleCapsLock,
     /// Toggle scroll lock
     ToggleScrollLock,
     /// Backspace-delete the "word" before the cursor
+    #[allow(dead_code)]
     BackspaceWord,
     AlphaNumeric(char),
     /// Wait for the next key, to form a chord
@@ -69,6 +73,8 @@ pub enum KeyAction {
     DeleteWindow,
     /// Delete all other windows (keep only current)
     DeleteOtherWindows,
+    /// Cancel current operation (Ctrl-G)
+    Cancel,
     /// Unbound key
     Unbound,
 }
@@ -304,10 +310,11 @@ impl Bindings for DefaultBindings {
                     return KeyAction::AlphaNumeric(a.to_ascii_uppercase());
                 }
                 // C-c C-x continue a chord
-                (
-                    LogicalKey::Modifier(KeyModifier::Control(_)),
-                    LogicalKey::AlphaNumeric(a),
-                ) if a == 'c' || a == 'x' => return KeyAction::ChordNext,
+                (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric(a))
+                    if a == 'c' || a == 'x' =>
+                {
+                    return KeyAction::ChordNext
+                }
                 // M-x command mode
                 (LogicalKey::Modifier(KeyModifier::Meta(_)), LogicalKey::AlphaNumeric('x')) => {
                     return KeyAction::CommandMode
@@ -367,6 +374,10 @@ impl Bindings for DefaultBindings {
                 // Ctrl-Space is set mark (C-SPC)
                 (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric(' ')) => {
                     return KeyAction::MarkStart
+                }
+                // Ctrl-G is cancel
+                (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric('g')) => {
+                    return KeyAction::Cancel
                 }
                 //
                 (_, _) => {}

@@ -19,6 +19,7 @@ pub enum ModeAction {
     /// Delete a piece of text from the buffer
     DeleteText(ActionPosition, isize),
     /// Kill (cut) text and add it to kill-ring
+    #[allow(dead_code)]
     KillText(ActionPosition, isize),
     /// Kill from cursor to end of line
     KillLine,
@@ -45,8 +46,10 @@ pub enum ActionPosition {
     /// Action should occur relative to the cursor's position in the buffer
     Cursor,
     /// Action should occur at an absolute position in the buffer, row/column
+    #[allow(dead_code)]
     Absolute(u16, u16),
     /// Action should happen at the very end of the buffer, appending or removing etc.
+    #[allow(dead_code)]
     End,
 }
 
@@ -97,12 +100,10 @@ impl Mode for ScratchMode {
             KeyAction::KillLine(_whole_line) => {
                 return vec![ModeAction::KillLine];
             }
-            KeyAction::Yank(index) => {
-                match index {
-                    Some(idx) => return vec![ModeAction::YankIndex(ActionPosition::cursor(), *idx)],
-                    None => return vec![ModeAction::Yank(ActionPosition::cursor())],
-                }
-            }
+            KeyAction::Yank(index) => match index {
+                Some(idx) => return vec![ModeAction::YankIndex(ActionPosition::cursor(), *idx)],
+                None => return vec![ModeAction::Yank(ActionPosition::cursor())],
+            },
             KeyAction::ForceIndent => {}
             KeyAction::Tab => {}
             KeyAction::Delete => return vec![ModeAction::DeleteText(ActionPosition::cursor(), 1)],
@@ -136,6 +137,9 @@ impl Mode for ScratchMode {
             KeyAction::SwitchWindow => {}
             KeyAction::DeleteWindow => {}
             KeyAction::DeleteOtherWindows => {}
+            KeyAction::Cancel => {
+                return vec![ModeAction::ClearMark];
+            }
             KeyAction::Unbound => {}
         }
         vec![]

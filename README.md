@@ -47,6 +47,7 @@ A minimalistic text editor with Emacs-like keybindings and buffer management, bu
 - `C-S-y`: Yank from kill-ring index 0
 
 ### Other
+- `C-g`: Cancel current operation (e.g., clear region selection)
 - `C-x C-c`: Quit
 - `M-x`: Command mode (not yet implemented)
 - `<Esc>`: Escape
@@ -90,7 +91,8 @@ This is a work-in-progress editor. Currently implemented:
 - Emacs-style keybindings
 - Terminal rendering with borders and modelines
 - Kill-ring (cut/copy/paste system)
-- Region selection (mark system)
+- Region selection (mark system) with visual highlighting
+- Incremental rendering system for performance
 
 Not yet implemented:
 - File I/O
@@ -98,7 +100,6 @@ Not yet implemented:
 - Search and replace
 - Undo/redo
 - Configuration system
-- Region highlighting (visual feedback)
 
 ## Contributing
 
