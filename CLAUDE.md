@@ -19,6 +19,7 @@ Red is a minimalistic terminal-based text editor written in Rust, designed with 
    - Handles window layout using a tree-based system (WindowNode)
    - Processes key events and dispatches to appropriate handlers
    - Manages window splitting, deletion, and switching
+   - Contains global kill-ring for cut/copy/paste operations
 
 3. **Window** (`window.rs`): View into a buffer
    - Tracks position, size, cursor position, and scroll offset
@@ -36,7 +37,13 @@ Red is a minimalistic terminal-based text editor written in Rust, designed with 
    - Modes respond to KeyActions and return ModeActions
    - Designed for extensibility (syntax highlighting, language-specific features)
 
-6. **Main** (`main.rs`): Terminal interface and rendering
+6. **Kill-ring** (`kill_ring.rs`): Emacs-style cut/copy/paste system
+   - Circular buffer storing killed (cut/copied) text
+   - Supports consecutive kill appending
+   - Provides yank (paste) and yank-pop functionality
+   - Configurable capacity (default 60 entries)
+
+7. **Main** (`main.rs`): Terminal interface and rendering
    - Event loop processing keyboard input
    - Screen rendering with Unicode box drawing characters
    - Window borders and per-window modelines
@@ -106,12 +113,13 @@ Red is a minimalistic terminal-based text editor written in Rust, designed with 
 ### Not Yet Implemented
 - File I/O (loading/saving files)
 - Syntax highlighting system
-- Kill ring (copy/paste buffer)
 - Undo/redo functionality
 - Search and replace
 - Configuration system
 - Multiple buffers per window
 - Plugin system
+- Region selection (mark system)
+- Yank-pop functionality (M-y)
 
 ### Known Issues
 - Page up/down movement not implemented

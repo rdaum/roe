@@ -1,6 +1,7 @@
 use crate::buffer::Buffer;
 use crate::keys::KeyAction::ChordNext;
 use crate::keys::{Bindings, CursorDirection, KeyAction, KeyState, LogicalKey};
+use crate::kill_ring::KillRing;
 use crate::mode::{ActionPosition, Mode, ModeAction};
 use crate::{echo, BufferId, ModeId, WindowId, ECHO_AREA_HEIGHT};
 use slotmap::SlotMap;
@@ -94,6 +95,8 @@ pub struct Editor {
     pub bindings: Box<dyn Bindings>,
     /// Tree structure representing window layout
     pub window_tree: WindowNode,
+    /// Global kill-ring for cut/copy/paste operations
+    pub kill_ring: KillRing,
 }
 
 /// The main event loop, which receives keystrokes and dispatches them to the mode in the buffer
@@ -539,6 +542,21 @@ impl Editor {
                     ModeAction::DeleteText(p, c) => {
                         chrome_actions.extend(self.delete_text(p, *c));
                     }
+                    ModeAction::KillText(p, c) => {
+                        chrome_actions.extend(self.kill_text(p, *c));
+                    }
+                    ModeAction::KillLine => {
+                        chrome_actions.extend(self.kill_line());
+                    }
+                    ModeAction::KillRegion => {
+                        chrome_actions.extend(self.kill_region());
+                    }
+                    ModeAction::Yank(p) => {
+                        chrome_actions.extend(self.yank(p));
+                    }
+                    ModeAction::YankIndex(p, idx) => {
+                        chrome_actions.extend(self.yank_index(p, *idx));
+                    }
                     ModeAction::CursorUp => {}
                     ModeAction::CursorDown => {}
                     ModeAction::CursorLeft => {}
@@ -562,6 +580,9 @@ impl Editor {
     /// Perform insert action, based on the position passed and taking into account the window's
     /// cursor position.
     pub fn insert_text(&mut self, text: String, position: &ActionPosition) -> Vec<ChromeAction> {
+        // Break kill sequence since we're doing a non-kill operation
+        self.kill_ring.break_kill_sequence();
+        
         let window = &mut self.windows.get_mut(self.active_window).unwrap();
         let buffer = &mut self.buffers.get_mut(window.active_buffer).unwrap();
         match position {
@@ -601,6 +622,9 @@ impl Editor {
     }
 
     pub fn delete_text(&mut self, position: &ActionPosition, count: isize) -> Vec<ChromeAction> {
+        // Break kill sequence since we're doing a non-kill operation
+        self.kill_ring.break_kill_sequence();
+        
         let window = &mut self.windows.get_mut(self.active_window).unwrap();
         let buffer = &mut self.buffers.get_mut(window.active_buffer).unwrap();
 
@@ -640,6 +664,133 @@ impl Editor {
                 vec![ChromeAction::Echo("End delete not implemented".to_string())]
             }
         }
+    }
+
+    /// Kill (cut) text and add it to the kill-ring
+    pub fn kill_text(&mut self, position: &ActionPosition, count: isize) -> Vec<ChromeAction> {
+        let window = &mut self.windows.get_mut(self.active_window).unwrap();
+        let buffer = &mut self.buffers.get_mut(window.active_buffer).unwrap();
+
+        match position {
+            ActionPosition::Cursor => {
+                let Some(deleted) = buffer.delete_pos(window.cursor, count) else {
+                    return vec![];
+                };
+                if deleted.is_empty() {
+                    return vec![];
+                }
+
+                // Add to kill-ring
+                if count < 0 {
+                    self.kill_ring.kill_prepend(deleted.clone());
+                    // Adjust cursor for backward kill
+                    let length = deleted.len();
+                    window.cursor -= length;
+                } else {
+                    self.kill_ring.kill(deleted.clone());
+                }
+
+                let new_cursor = buffer.to_column_line(window.cursor);
+                let window_cursor = window.absolute_cursor_position(new_cursor.0, new_cursor.1);
+                vec![
+                    ChromeAction::Echo(format!("Killed: {}", deleted)),
+                    ChromeAction::Refresh(self.active_window),
+                    ChromeAction::CursorMove(window_cursor),
+                ]
+            }
+            ActionPosition::Absolute(l, c) => {
+                let Some(deleted) = buffer.delete_col_line((*l, *c), count) else {
+                    return vec![];
+                };
+                if deleted.is_empty() {
+                    return vec![];
+                }
+
+                // Add to kill-ring
+                if count < 0 {
+                    self.kill_ring.kill_prepend(deleted.clone());
+                } else {
+                    self.kill_ring.kill(deleted.clone());
+                }
+
+                let new_cursor = buffer.to_column_line(window.cursor);
+                let window_cursor = window.absolute_cursor_position(new_cursor.0, new_cursor.1);
+                vec![
+                    ChromeAction::Echo(format!("Killed: {}", deleted)),
+                    ChromeAction::Refresh(self.active_window),
+                    ChromeAction::CursorMove(window_cursor),
+                ]
+            }
+            ActionPosition::End => {
+                vec![ChromeAction::Echo("End kill not implemented".to_string())]
+            }
+        }
+    }
+
+    /// Kill from cursor to end of line
+    pub fn kill_line(&mut self) -> Vec<ChromeAction> {
+        let window = &mut self.windows.get_mut(self.active_window).unwrap();
+        let buffer = &mut self.buffers.get_mut(window.active_buffer).unwrap();
+
+        let eol_pos = buffer.eol_pos(window.cursor);
+        let text_to_kill = if eol_pos > window.cursor {
+            // Kill to end of line
+            let count = eol_pos - window.cursor;
+            buffer.delete_pos(window.cursor, count as isize)
+        } else {
+            // At end of line, kill the newline character if it exists
+            buffer.delete_pos(window.cursor, 1)
+        };
+
+        match text_to_kill {
+            Some(killed) if !killed.is_empty() => {
+                self.kill_ring.kill(killed.clone());
+                let new_cursor = buffer.to_column_line(window.cursor);
+                let window_cursor = window.absolute_cursor_position(new_cursor.0, new_cursor.1);
+                vec![
+                    ChromeAction::Echo(format!("Killed line: {}", killed.replace('\n', "\\n"))),
+                    ChromeAction::Refresh(self.active_window),
+                    ChromeAction::CursorMove(window_cursor),
+                ]
+            }
+            _ => {
+                vec![ChromeAction::Echo("Nothing to kill".to_string())]
+            }
+        }
+    }
+
+    /// Kill the selected region (placeholder - requires mark implementation)
+    pub fn kill_region(&mut self) -> Vec<ChromeAction> {
+        // TODO: Implement when mark/region selection is added
+        vec![ChromeAction::Echo("Kill region not yet implemented (need mark)".to_string())]
+    }
+
+    /// Yank (paste) from kill-ring
+    pub fn yank(&mut self, position: &ActionPosition) -> Vec<ChromeAction> {
+        let text = match self.kill_ring.yank() {
+            Some(text) => text.to_string(),
+            None => return vec![ChromeAction::Echo("Kill ring is empty".to_string())],
+        };
+
+        // Break the kill sequence since we're doing a yank
+        self.kill_ring.break_kill_sequence();
+
+        // Insert the yanked text
+        self.insert_text(text, position)
+    }
+
+    /// Yank from specific kill-ring index
+    pub fn yank_index(&mut self, position: &ActionPosition, index: usize) -> Vec<ChromeAction> {
+        let text = match self.kill_ring.yank_index(index) {
+            Some(text) => text.to_string(),
+            None => return vec![ChromeAction::Echo(format!("No kill at index {}", index))],
+        };
+
+        // Break the kill sequence since we're doing a yank
+        self.kill_ring.break_kill_sequence();
+
+        // Insert the yanked text
+        self.insert_text(text, position)
     }
 }
 
@@ -685,6 +836,7 @@ mod tests {
             key_state: KeyState::new(),
             bindings: Box::new(DefaultBindings {}),
             window_tree: WindowNode::new_leaf(window_id),
+            kill_ring: KillRing::new(),
         }
     }
 
@@ -1216,5 +1368,148 @@ mod tests {
         
         // Should still have one window
         assert_eq!(editor.windows.len(), 1);
+    }
+
+    #[test]
+    fn test_kill_line() {
+        let mut editor = test_editor();
+        let window = &mut editor.windows[editor.active_window];
+        window.cursor = 2; // Position at 'l' in "Hello"
+        
+        // Kill from cursor to end of line
+        let actions = editor.kill_line();
+        
+        // Should have a killed message and refresh
+        assert!(actions.iter().any(|a| matches!(a, ChromeAction::Echo(_))));
+        assert!(actions.iter().any(|a| matches!(a, ChromeAction::Refresh(_))));
+        
+        // Check that text was killed and kill-ring has content
+        assert!(!editor.kill_ring.is_empty());
+        let killed_text = editor.kill_ring.current().unwrap();
+        assert_eq!(killed_text, "llo"); // "llo" from "He[l]lo"
+        
+        // Check buffer content
+        let window = &editor.windows[editor.active_window];
+        let buffer = &editor.buffers[window.active_buffer];
+        assert_eq!(buffer.content(), "He\nWorld\nTest");
+    }
+
+    #[test]
+    fn test_kill_line_consecutive() {
+        let mut editor = test_editor();
+        let window = &mut editor.windows[editor.active_window];
+        window.cursor = 5; // At end of "Hello"
+        
+        // Kill the newline
+        editor.kill_line();
+        
+        // Kill from beginning of next line
+        let window = &mut editor.windows[editor.active_window];
+        window.cursor = 5; // Still at position 5, but now it's at "World"
+        editor.kill_line();
+        
+        // Should have appended kills
+        let killed_text = editor.kill_ring.current().unwrap();
+        assert_eq!(killed_text, "\nWorld"); // Newline + "World"
+    }
+
+    #[test]
+    fn test_yank_basic() {
+        let mut editor = test_editor();
+        
+        // First kill some text
+        let window = &mut editor.windows[editor.active_window];
+        window.cursor = 0; // Start of buffer
+        editor.kill_line(); // Kill "Hello"
+        
+        // Move cursor and yank
+        let window = &mut editor.windows[editor.active_window];
+        window.cursor = 0; // Start of buffer (now at "\ncruel...")
+        let actions = editor.yank(&crate::mode::ActionPosition::cursor());
+        
+        // Should have inserted text
+        assert!(actions.iter().any(|a| matches!(a, ChromeAction::Refresh(_))));
+        
+        // Check buffer content
+        let window = &editor.windows[editor.active_window];
+        let buffer = &editor.buffers[window.active_buffer];
+        let content = buffer.content();
+        assert!(content.starts_with("Hello")); // Yanked text should be at start
+    }
+
+    #[test]
+    fn test_yank_index() {
+        let mut editor = test_editor();
+        
+        // Kill multiple pieces of text
+        let window = &mut editor.windows[editor.active_window];
+        window.cursor = 0;
+        editor.kill_line(); // Kill "Hello"
+        
+        // Break sequence and kill something else
+        editor.kill_ring.break_kill_sequence();
+        let window = &mut editor.windows[editor.active_window];
+        window.cursor = 0;
+        editor.kill_line(); // Kill "cruel"
+        
+        // Yank the first kill (index 1, "Hello")
+        let window = &mut editor.windows[editor.active_window];
+        window.cursor = 0;
+        editor.yank_index(&crate::mode::ActionPosition::cursor(), 1);
+        
+        // Check that we got the older kill
+        let window = &editor.windows[editor.active_window];
+        let buffer = &editor.buffers[window.active_buffer];
+        let content = buffer.content();
+        assert!(content.starts_with("Hello"));
+    }
+
+    #[test]
+    fn test_kill_ring_max_capacity() {
+        let mut editor = test_editor();
+        
+        // Fill up the kill ring beyond capacity
+        for i in 0..65 { // More than default capacity of 60
+            editor.kill_ring.break_kill_sequence();
+            editor.kill_ring.kill(format!("kill-{}", i));
+        }
+        
+        // Should be at max capacity
+        assert_eq!(editor.kill_ring.len(), 60);
+        
+        // Most recent should be kill-64
+        let recent = editor.kill_ring.yank().unwrap();
+        assert_eq!(recent, "kill-64");
+    }
+
+    #[test]
+    fn test_kill_sequence_break() {
+        let mut editor = test_editor();
+        
+        // Kill some text
+        editor.kill_ring.kill("first".to_string());
+        
+        // Do a non-kill operation (insert text)
+        let window = &mut editor.windows[editor.active_window];
+        window.cursor = 0;
+        editor.insert_text("test".to_string(), &crate::mode::ActionPosition::cursor());
+        
+        // Kill again - should be separate entry
+        editor.kill_ring.kill("second".to_string());
+        
+        // Should have two separate entries
+        assert_eq!(editor.kill_ring.len(), 2);
+        assert_eq!(editor.kill_ring.yank().unwrap(), "second");
+    }
+
+    #[test]
+    fn test_empty_kill_ring_yank() {
+        let mut editor = test_editor();
+        
+        // Try to yank from empty kill ring
+        let actions = editor.yank(&crate::mode::ActionPosition::cursor());
+        
+        // Should get an error message
+        assert!(actions.iter().any(|a| matches!(a, ChromeAction::Echo(msg) if msg.contains("empty"))));
     }
 }

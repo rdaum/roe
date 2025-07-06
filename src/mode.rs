@@ -18,6 +18,16 @@ pub enum ModeAction {
     InsertText(ActionPosition, String),
     /// Delete a piece of text from the buffer
     DeleteText(ActionPosition, isize),
+    /// Kill (cut) text and add it to kill-ring
+    KillText(ActionPosition, isize),
+    /// Kill from cursor to end of line
+    KillLine,
+    /// Kill the selected region (requires mark to be set)
+    KillRegion,
+    /// Yank (paste) from kill-ring
+    Yank(ActionPosition),
+    /// Yank from specific kill-ring index
+    YankIndex(ActionPosition, usize),
 
     CursorUp,
     CursorDown,
@@ -74,9 +84,19 @@ impl Mode for ScratchMode {
             KeyAction::Redo => {}
             KeyAction::MarkStart => {}
             KeyAction::MarkEnd => {}
-            KeyAction::KillRegion(_) => {}
-            KeyAction::KillLine(_) => {}
-            KeyAction::Yank(_) => {}
+            KeyAction::KillRegion(_destructive) => {
+                // TODO: Implement region killing when mark is implemented
+                return vec![ModeAction::KillRegion];
+            }
+            KeyAction::KillLine(_whole_line) => {
+                return vec![ModeAction::KillLine];
+            }
+            KeyAction::Yank(index) => {
+                match index {
+                    Some(idx) => return vec![ModeAction::YankIndex(ActionPosition::cursor(), *idx)],
+                    None => return vec![ModeAction::Yank(ActionPosition::cursor())],
+                }
+            }
             KeyAction::ForceIndent => {}
             KeyAction::Tab => {}
             KeyAction::Delete => return vec![ModeAction::DeleteText(ActionPosition::cursor(), 1)],

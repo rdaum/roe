@@ -15,6 +15,7 @@ use std::io::Write;
 mod buffer;
 mod editor;
 mod keys;
+mod kill_ring;
 mod mode;
 mod window;
 
@@ -768,6 +769,7 @@ fn terminal_main(stdout: &mut impl Write) -> Result<(), std::io::Error> {
         key_state: KeyState::new(),
         bindings: Box::new(keys::DefaultBindings {}),
         window_tree: editor::WindowNode::new_leaf(initial_window_id),
+        kill_ring: kill_ring::KillRing::new(),
     };
 
     draw_screen(stdout, &editor)?;

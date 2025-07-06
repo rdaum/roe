@@ -38,6 +38,10 @@ A minimalistic text editor with Emacs-like keybindings and buffer management, bu
 - `<Backspace>`: Delete character before cursor
 - `<Delete>`: Delete character at cursor
 - `<Enter>`: Insert newline
+- `C-k`: Kill (cut) from cursor to end of line
+- `C-w`: Kill region (when region is selected)
+- `C-y`: Yank (paste) most recent kill
+- `C-S-y`: Yank from kill-ring index 0
 
 ### Other
 - `C-x C-c`: Quit
@@ -82,14 +86,15 @@ This is a work-in-progress editor. Currently implemented:
 - Window splitting and management  
 - Emacs-style keybindings
 - Terminal rendering with borders and modelines
+- Kill-ring (cut/copy/paste system)
 
 Not yet implemented:
 - File I/O
 - Syntax highlighting
 - Search and replace
-- Kill ring / clipboard
 - Undo/redo
 - Configuration system
+- Region selection (mark system)
 
 ## Contributing
 
