@@ -144,7 +144,7 @@ impl CommandMode {
     pub fn handle_key(
         &mut self,
         action: KeyAction,
-        registry: &CommandRegistry,
+        _registry: &CommandRegistry,
     ) -> CommandModeResult {
         match action {
             KeyAction::AlphaNumeric(c) => {

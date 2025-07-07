@@ -11,11 +11,14 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
-use crate::editor::{ChromeAction, Frame, Window};
+use crate::editor::{BorderInfo, ChromeAction, DragType, Frame, MouseDragState, Window};
 use crate::keys::{KeyModifier, LogicalKey, Side};
 use crate::renderer::{DirtyRegion, DirtyTracker, ModelineComponent, Renderer};
 use crate::{Editor, WindowId};
-use crossterm::event::{Event, EventStream, KeyCode, KeyModifiers, ModifierKeyCode};
+use crossterm::event::{
+    Event, EventStream, KeyCode, KeyModifiers, ModifierKeyCode, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use crossterm::style::{Color, Print, Stylize};
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::{cursor, queue};
@@ -962,12 +965,23 @@ pub async fn event_loop_with_renderer<W: Write>(
                 // No keys to process for resize event
                 vec![]
             }
+            Event::Mouse(mouse_event) => {
+                // Handle mouse events for window resizing
+                handle_mouse_event(editor, renderer, mouse_event);
+                // No keys to process for mouse events
+                vec![]
+            }
             _ => vec![],
         };
 
         // Display the keys pressed in echo with - between, using as_display_string, but only if there's
         // modifiers in play
-        let actions = editor.key_event(keys)?;
+        let actions = if keys.is_empty() {
+            // No keys to process (e.g., mouse events, resize events)
+            vec![]
+        } else {
+            editor.key_event(keys)?
+        };
 
         for action in actions {
             match action {
@@ -1037,6 +1051,229 @@ fn draw_command_window(
     draw_window(device, editor, window)?;
 
     Ok(())
+}
+
+/// Handle mouse events for window resizing
+fn handle_mouse_event<W: Write>(
+    editor: &mut Editor,
+    renderer: &mut TerminalRenderer<W>,
+    mouse_event: MouseEvent,
+) {
+    match mouse_event.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            // Check if the mouse is on a window border
+            if let Some((border_info, target_window)) =
+                detect_border_click(editor, mouse_event.column, mouse_event.row)
+            {
+                // Start dragging the border
+                editor.mouse_drag_state = Some(MouseDragState {
+                    drag_type: DragType::WindowBorder,
+                    start_pos: (mouse_event.column, mouse_event.row),
+                    last_pos: (mouse_event.column, mouse_event.row),
+                    current_pos: (mouse_event.column, mouse_event.row),
+                    target_window: Some(target_window),
+                    border_info: Some(border_info),
+                });
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            // Continue dragging if we're in a drag state
+            if let Some(drag_state) = editor.mouse_drag_state.clone() {
+                let new_pos = (mouse_event.column, mouse_event.row);
+
+                // Calculate incremental change from last position
+                let dx = new_pos.0 as i32 - drag_state.last_pos.0 as i32;
+                let dy = new_pos.1 as i32 - drag_state.last_pos.1 as i32;
+
+                // Only process if there's actual movement
+                if dx != 0 || dy != 0 {
+                    // Update positions in drag state
+                    if let Some(ref mut drag_state_mut) = editor.mouse_drag_state {
+                        drag_state_mut.current_pos = new_pos;
+                        drag_state_mut.last_pos = new_pos;
+                    }
+
+                    // Process the resize with cloned data
+                    if let Some(border_info) = drag_state.border_info {
+                        let target_window = drag_state.target_window;
+
+                        // Update window layout with incremental change
+                        update_window_resize_incremental(
+                            editor,
+                            target_window,
+                            &border_info,
+                            dx,
+                            dy,
+                        );
+                        renderer.mark_dirty(DirtyRegion::FullScreen);
+                    }
+                }
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            // End dragging
+            if editor.mouse_drag_state.is_some() {
+                editor.mouse_drag_state = None;
+                renderer.mark_dirty(DirtyRegion::FullScreen);
+            }
+        }
+        _ => {
+            // Ignore other mouse events for now
+        }
+    }
+}
+
+/// Detect if a mouse click is on a window border
+fn detect_border_click(editor: &Editor, x: u16, y: u16) -> Option<(BorderInfo, WindowId)> {
+    // Check all windows to see if the click is on a border
+    for (window_id, window) in &editor.windows {
+        // Check if click is on window borders
+        let left_border = window.x;
+        let right_border = window.x + window.width_chars - 1;
+        let top_border = window.y;
+        let bottom_border = window.y + window.height_chars - 1;
+
+        // Check vertical borders (left and right sides)
+        if (x == left_border || x == right_border) && y >= top_border && y <= bottom_border {
+            // This is a vertical border
+            if let Some(split_info) = find_split_for_border(editor, window_id, true) {
+                return Some((
+                    BorderInfo {
+                        is_vertical: true,
+                        split_node_path: split_info.0,
+                        original_ratio: split_info.1,
+                    },
+                    window_id,
+                ));
+            }
+        }
+
+        // Check horizontal borders (top and bottom sides)
+        if (y == top_border || y == bottom_border) && x >= left_border && x <= right_border {
+            // This is a horizontal border
+            if let Some(split_info) = find_split_for_border(editor, window_id, false) {
+                return Some((
+                    BorderInfo {
+                        is_vertical: false,
+                        split_node_path: split_info.0,
+                        original_ratio: split_info.1,
+                    },
+                    window_id,
+                ));
+            }
+        }
+    }
+
+    None
+}
+
+/// Find the split node that controls the given border
+fn find_split_for_border(
+    editor: &Editor,
+    window_id: WindowId,
+    is_vertical_border: bool,
+) -> Option<(Vec<usize>, f32)> {
+    // This is a simplified implementation
+    // In a real implementation, we would traverse the window tree to find the exact split node
+    // For now, we'll return a placeholder that works with simple two-window splits
+
+    // Find if this window has a sibling that shares the border
+    for (other_window_id, other_window) in &editor.windows {
+        if other_window_id == window_id {
+            continue;
+        }
+
+        let window = &editor.windows[window_id];
+
+        if is_vertical_border {
+            // Check if windows are horizontally adjacent
+            if (window.x + window.width_chars == other_window.x
+                || other_window.x + other_window.width_chars == window.x)
+                && window.y < other_window.y + other_window.height_chars
+                && other_window.y < window.y + window.height_chars
+            {
+                return Some((vec![0], 0.5)); // Simplified path and ratio
+            }
+        } else {
+            // Check if windows are vertically adjacent
+            if (window.y + window.height_chars == other_window.y
+                || other_window.y + other_window.height_chars == window.y)
+                && window.x < other_window.x + other_window.width_chars
+                && other_window.x < window.x + window.width_chars
+            {
+                return Some((vec![0], 0.5)); // Simplified path and ratio
+            }
+        }
+    }
+
+    None
+}
+
+/// Update window layout based on incremental mouse drag
+fn update_window_resize_incremental(
+    editor: &mut Editor,
+    target_window_id: Option<WindowId>,
+    border_info: &BorderInfo,
+    dx: i32,
+    dy: i32,
+) {
+    // Use incremental changes with much finer granularity
+    if let Some(_target_window_id) = target_window_id {
+        // Use a sensitivity factor to make resizing smoother
+        // Each pixel of mouse movement = 0.5% ratio change (adjustable)
+        const SENSITIVITY: f32 = 0.005;
+
+        // Calculate the incremental ratio change
+        if border_info.is_vertical && dx != 0 {
+            // For vertical borders, adjust the split ratio based on horizontal movement
+            let ratio_change = dx as f32 * SENSITIVITY;
+            adjust_window_tree_ratio_incremental(&mut editor.window_tree, ratio_change, true);
+        } else if !border_info.is_vertical && dy != 0 {
+            // For horizontal borders, adjust the split ratio based on vertical movement
+            let ratio_change = dy as f32 * SENSITIVITY;
+            adjust_window_tree_ratio_incremental(&mut editor.window_tree, ratio_change, false);
+        }
+
+        // Recalculate layout to apply the new ratios
+        editor.calculate_window_layout();
+    }
+}
+
+/// Recursively adjust window tree ratios for incremental resizing
+fn adjust_window_tree_ratio_incremental(
+    node: &mut crate::editor::WindowNode,
+    ratio_change: f32,
+    is_vertical: bool,
+) {
+    use crate::editor::{SplitDirection, WindowNode};
+
+    match node {
+        WindowNode::Leaf { .. } => {
+            // Nothing to adjust for leaf nodes
+        }
+        WindowNode::Split {
+            direction,
+            ratio,
+            first,
+            second,
+        } => {
+            // Only adjust if the split direction matches the resize direction
+            let should_adjust = match direction {
+                SplitDirection::Vertical => is_vertical,
+                SplitDirection::Horizontal => !is_vertical,
+            };
+
+            if should_adjust {
+                // Adjust the ratio incrementally, keeping it within bounds
+                // Use tighter bounds to prevent extreme layouts
+                *ratio = (*ratio + ratio_change).clamp(0.15, 0.85);
+            } else {
+                // Recurse into child nodes
+                adjust_window_tree_ratio_incremental(first, ratio_change, is_vertical);
+                adjust_window_tree_ratio_incremental(second, ratio_change, is_vertical);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

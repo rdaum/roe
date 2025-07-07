@@ -137,6 +137,43 @@ pub struct Frame {
     pub available_lines: u16,
 }
 
+/// Mouse drag state for window resizing
+#[derive(Debug, Clone)]
+pub struct MouseDragState {
+    /// The type of drag operation
+    pub drag_type: DragType,
+    /// Starting mouse position
+    pub start_pos: (u16, u16),
+    /// Last processed mouse position (to calculate incremental changes)
+    pub last_pos: (u16, u16),
+    /// Current mouse position
+    pub current_pos: (u16, u16),
+    /// Window being resized (if applicable)
+    pub target_window: Option<WindowId>,
+    /// Border being dragged (if applicable)
+    pub border_info: Option<BorderInfo>,
+}
+
+/// Type of drag operation
+#[derive(Debug, Clone, Copy)]
+pub enum DragType {
+    /// Dragging a window border to resize
+    WindowBorder,
+    /// Other drag operations (reserved for future use)
+    Other,
+}
+
+/// Information about the border being dragged
+#[derive(Debug, Clone)]
+pub struct BorderInfo {
+    /// Whether this is a vertical or horizontal border
+    pub is_vertical: bool,
+    /// The window node being resized (path to the split node in the window tree)
+    pub split_node_path: Vec<usize>,
+    /// Original ratio of the split
+    pub original_ratio: f32,
+}
+
 impl Frame {
     pub fn new(columns: u16, rows: u16) -> Self {
         Frame {
@@ -173,6 +210,8 @@ pub struct Editor {
     pub echo_message_time: Option<Instant>,
     /// Current key chord being typed (for echo area display)
     pub current_key_chord: Vec<LogicalKey>,
+    /// Mouse drag state for window resizing
+    pub mouse_drag_state: Option<MouseDragState>,
 }
 
 /// The main event loop, which receives keystrokes and dispatches them to the mode in the buffer

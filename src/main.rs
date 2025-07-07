@@ -12,7 +12,9 @@
 //
 
 use buffer::Buffer;
-use crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use editor::{Editor, Frame, Window};
 use keys::KeyState;
@@ -194,6 +196,7 @@ async fn terminal_main<W: Write>(stdout: W, file_paths: Vec<String>) -> Result<(
         echo_message: String::new(),
         echo_message_time: None,
         current_key_chord: Vec::new(),
+        mouse_drag_state: None,
     };
 
     // Initialize buffer history with the current buffer
@@ -218,6 +221,7 @@ fn exit_state(device: &mut impl Write) -> Result<(), std::io::Error> {
         crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
     )?;
     execute!(device, crossterm::cursor::Show)?;
+    execute!(device, DisableMouseCapture)?;
     crossterm::terminal::disable_raw_mode()?;
     Ok(())
 }
@@ -236,6 +240,7 @@ async fn main() -> Result<(), std::io::Error> {
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     )?;
     execute!(stdout, crossterm::cursor::EnableBlinking)?;
+    execute!(stdout, EnableMouseCapture)?;
     if let Err(e) = terminal_main(&mut stdout, file_paths).await {
         exit_state(&mut stdout)?;
         eprintln!("Error: {e}");
