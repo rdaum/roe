@@ -265,6 +265,21 @@ pub fn create_default_registry() -> CommandRegistry {
         }),
     ));
 
+    // Buffer commands
+    registry.register_command(Command::new(
+        "messages",
+        "Switch to Messages buffer",
+        CommandCategory::Global,
+        Box::new(|_context| Ok(vec![ChromeAction::ShowMessages])),
+    ));
+
+    registry.register_command(Command::new(
+        "show-messages",
+        "Switch to Messages buffer (alias)",
+        CommandCategory::Global,
+        Box::new(|_context| Ok(vec![ChromeAction::ShowMessages])),
+    ));
+
     // Utility commands
     registry.register_command(Command::new(
         "keyboard-quit",

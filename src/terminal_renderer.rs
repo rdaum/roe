@@ -1029,6 +1029,15 @@ pub async fn event_loop_with_renderer<W: Write>(
                         renderer.mark_dirty(DirtyRegion::FullScreen);
                     }
                 }
+                ChromeAction::ShowMessages => {
+                    // Switch to the Messages buffer
+                    let messages_buffer_id = editor.get_messages_buffer();
+                    if let Some(current_window) = editor.windows.get_mut(editor.active_window) {
+                        current_window.active_buffer = messages_buffer_id;
+                        current_window.cursor = 0; // Start at beginning of messages
+                    }
+                    renderer.mark_dirty(DirtyRegion::FullScreen);
+                }
             }
         }
 

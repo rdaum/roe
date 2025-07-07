@@ -197,6 +197,7 @@ async fn terminal_main<W: Write>(stdout: W, file_paths: Vec<String>) -> Result<(
         echo_message_time: None,
         current_key_chord: Vec::new(),
         mouse_drag_state: None,
+        messages_buffer_id: None,
     };
 
     // Initialize buffer history with the current buffer

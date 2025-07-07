@@ -296,3 +296,58 @@ impl Mode for FileMode {
         ]
     }
 }
+
+/// A read-only mode for displaying messages (echo events, logs, etc.)
+pub struct MessagesMode {}
+
+impl Mode for MessagesMode {
+    fn name(&self) -> &str {
+        "messages"
+    }
+
+    fn perform(&mut self, action: &KeyAction) -> ModeResult {
+        match action {
+            // Allow cursor movement for navigation
+            KeyAction::Cursor(_) => ModeResult::Ignored,
+            // Allow marks for copying messages
+            KeyAction::MarkStart => ModeResult::Consumed(vec![ModeAction::SetMark]),
+            KeyAction::KillRegion(destructive) => {
+                if *destructive {
+                    // C-w - don't allow destructive operations in messages buffer
+                    ModeResult::Ignored
+                } else {
+                    // M-w - copy region to kill-ring without deleting
+                    ModeResult::Consumed(vec![ModeAction::CopyRegion])
+                }
+            }
+            KeyAction::Yank(index) => match index {
+                Some(idx) => ModeResult::Consumed(vec![ModeAction::YankIndex(
+                    ActionPosition::cursor(),
+                    *idx,
+                )]),
+                None => ModeResult::Consumed(vec![ModeAction::Yank(ActionPosition::cursor())]),
+            },
+            KeyAction::Cancel => ModeResult::Consumed(vec![ModeAction::ClearMark]),
+            // Block all editing operations - messages buffer is read-only
+            KeyAction::AlphaNumeric(_) => ModeResult::Ignored,
+            KeyAction::Enter => ModeResult::Ignored,
+            KeyAction::Backspace => ModeResult::Ignored,
+            KeyAction::Delete => ModeResult::Ignored,
+            KeyAction::Tab => ModeResult::Ignored,
+            KeyAction::KillLine(_) => ModeResult::Ignored,
+            // All other operations are ignored
+            _ => ModeResult::Ignored,
+        }
+    }
+
+    fn available_commands(&self) -> Vec<Command> {
+        use crate::editor::ChromeAction;
+
+        vec![Command::new(
+            "clear-messages",
+            "Clear all messages from the messages buffer",
+            CommandCategory::Mode("messages".to_string()),
+            Box::new(|_context| Ok(vec![ChromeAction::Echo("Messages cleared".to_string())])),
+        )]
+    }
+}

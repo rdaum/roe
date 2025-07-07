@@ -20,7 +20,7 @@ use crate::file_selector_mode::FileSelectorMode;
 use crate::keys::KeyAction::ChordNext;
 use crate::keys::{Bindings, CursorDirection, KeyAction, KeyState, LogicalKey};
 use crate::kill_ring::KillRing;
-use crate::mode::{ActionPosition, Mode};
+use crate::mode::{ActionPosition, MessagesMode, Mode};
 use crate::renderer::{DirtyRegion, ModelineComponent};
 use crate::{BufferId, ModeId, WindowId};
 use slotmap::SlotMap;
@@ -212,6 +212,8 @@ pub struct Editor {
     pub current_key_chord: Vec<LogicalKey>,
     /// Mouse drag state for window resizing
     pub mouse_drag_state: Option<MouseDragState>,
+    /// Messages buffer for collecting echo messages and logs
+    pub messages_buffer_id: Option<BufferId>,
 }
 
 /// The main event loop, which receives keystrokes and dispatches them to the mode in the buffer
@@ -232,6 +234,7 @@ pub enum ChromeAction {
     SwitchWindow,
     DeleteWindow,
     DeleteOtherWindows,
+    ShowMessages,
 }
 
 impl Editor {
@@ -486,12 +489,69 @@ impl Editor {
         })
     }
 
+    /// Get or create the Messages buffer
+    pub fn get_messages_buffer(&mut self) -> BufferId {
+        if let Some(buffer_id) = self.messages_buffer_id {
+            // Messages buffer already exists, return it
+            buffer_id
+        } else {
+            // Create new Messages buffer
+            let messages_mode = Box::new(MessagesMode {});
+            let messages_mode_id = self.modes.insert(messages_mode);
+
+            let messages_buffer = Buffer::new(&[messages_mode_id]);
+            messages_buffer.set_object("*Messages*".to_string());
+            messages_buffer
+                .load_str("Messages buffer - echo messages and logs will appear here.\n\n");
+
+            let messages_buffer_id = self.buffers.insert(messages_buffer.clone());
+
+            // Create BufferHost for the messages buffer
+            let mode_list = vec![(
+                messages_mode_id,
+                "messages".to_string(),
+                self.modes.remove(messages_mode_id).unwrap(),
+            )];
+            let (buffer_client, _buffer_handle) = crate::buffer_host::create_buffer_host(
+                messages_buffer,
+                mode_list,
+                messages_buffer_id,
+            );
+            self.buffer_hosts.insert(messages_buffer_id, buffer_client);
+
+            // Store the Messages buffer ID for future use
+            self.messages_buffer_id = Some(messages_buffer_id);
+
+            messages_buffer_id
+        }
+    }
+
+    /// Add a message to the Messages buffer
+    pub fn add_message_to_buffer(&mut self, message: String) {
+        let messages_buffer_id = self.get_messages_buffer();
+        if let Some(buffer) = self.buffers.get(messages_buffer_id) {
+            // Add timestamp and message to the buffer
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let formatted_message = format!("[{}] {}\n", now, message);
+
+            // Append message to end of buffer
+            let buffer_len = buffer.buffer_len_chars();
+            buffer.insert_pos(formatted_message, buffer_len);
+        }
+    }
+
     /// Set the echo area message (this will override any chord display)
     pub fn set_echo_message(&mut self, message: String) {
-        self.echo_message = message;
+        self.echo_message = message.clone();
         self.echo_message_time = Some(Instant::now());
         // Clear chord since we're showing a different message
         self.current_key_chord.clear();
+
+        // Also add the message to the Messages buffer
+        self.add_message_to_buffer(message);
     }
 
     /// Clear the echo area message
