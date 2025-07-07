@@ -11,6 +11,7 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
+use crate::editor::OpenType;
 use crate::keys::KeyAction;
 use crate::mode::{ActionPosition, Mode, ModeAction, ModeResult};
 use crate::BufferId;
@@ -40,11 +41,13 @@ pub struct FileSelectorMode {
     all_items: Vec<String>,
     /// All paths in current directory (unfiltered)
     all_paths: Vec<PathBuf>,
+    /// How to open the selected file
+    open_type: OpenType,
 }
 
 impl FileSelectorMode {
     /// Create a new FileSelectorMode with initial state
-    pub fn new() -> Self {
+    pub fn new(open_type: OpenType) -> Self {
         Self {
             input: String::new(),
             matches: Vec::new(),
@@ -56,6 +59,7 @@ impl FileSelectorMode {
             current_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             all_items: Vec::new(),
             all_paths: Vec::new(),
+            open_type,
         }
     }
 
@@ -247,7 +251,7 @@ impl FileSelectorMode {
 
 impl Default for FileSelectorMode {
     fn default() -> Self {
-        Self::new()
+        Self::new(OpenType::New)
     }
 }
 
@@ -336,7 +340,10 @@ impl Mode for FileSelectorMode {
                         ])
                     } else {
                         // Open the selected file
-                        ModeResult::Consumed(vec![ModeAction::OpenFile(selected_path)])
+                        ModeResult::Consumed(vec![ModeAction::OpenFile {
+                            path: selected_path,
+                            open_type: self.open_type,
+                        }])
                     }
                 } else {
                     ModeResult::Ignored

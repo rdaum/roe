@@ -162,8 +162,11 @@ pub enum EditorAction {
     SwitchToBuffer(crate::BufferId),
     /// Kill a specific buffer
     KillBuffer(crate::BufferId),
-    /// Open a file at a path
-    OpenFile(std::path::PathBuf),
+    /// Open a file at a path with specified open type
+    OpenFile {
+        path: std::path::PathBuf,
+        open_type: crate::editor::OpenType,
+    },
     /// Kill line (to kill-ring)
     KillLine,
     /// Kill region (to kill-ring)
@@ -612,9 +615,9 @@ impl BufferHost {
                     // Store buffer kill for execution at Editor level
                     editor_action = Some(EditorAction::KillBuffer(buffer_id));
                 }
-                ModeAction::OpenFile(path) => {
+                ModeAction::OpenFile { path, open_type } => {
                     // Store file open for execution at Editor level
-                    editor_action = Some(EditorAction::OpenFile(path));
+                    editor_action = Some(EditorAction::OpenFile { path, open_type });
                 }
                 ModeAction::KillLine => {
                     // Kill from cursor to end of line (store in kill-ring - will be handled at Editor level)

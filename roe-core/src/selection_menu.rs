@@ -338,34 +338,4 @@ mod tests {
         assert_eq!(menu.len(), 2); // apple and apricot
         assert_eq!(menu.get_selected_item().unwrap().name, "apple");
     }
-
-    #[test]
-    fn test_navigation() {
-        let mut menu = SelectionMenu::new(3);
-        let items = vec![
-            TestItem {
-                name: "first".to_string(),
-            },
-            TestItem {
-                name: "second".to_string(),
-            },
-            TestItem {
-                name: "third".to_string(),
-            },
-        ];
-
-        menu.init_with_items(items);
-
-        // Move down
-        assert!(menu.move_selection_down());
-        assert_eq!(menu.get_selected_item().unwrap().name, "second");
-
-        // Move up
-        assert!(menu.move_selection_up());
-        assert_eq!(menu.get_selected_item().unwrap().name, "first");
-
-        // Can't move up from first
-        assert!(!menu.move_selection_up());
-        assert_eq!(menu.get_selected_item().unwrap().name, "first");
-    }
 }

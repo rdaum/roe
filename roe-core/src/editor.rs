@@ -42,6 +42,15 @@ pub enum WindowType {
     },
 }
 
+/// How to open a file
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenType {
+    /// Open in new buffer (find-file behavior)
+    New,
+    /// Replace current buffer (visit-file behavior)
+    Visit,
+}
+
 /// Type of command being executed in a command window
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandType {
@@ -52,7 +61,7 @@ pub enum CommandType {
     /// C-x k buffer killing
     KillBuffer,
     /// File opening
-    FindFile,
+    OpenFile(OpenType),
 }
 
 /// Command window position
@@ -222,8 +231,8 @@ impl Editor {}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum ChromeAction {
-    /// Open the find-file dialog
-    FindFile,
+    /// Open file dialog with specified open type
+    OpenFile(OpenType),
     /// Open the command palette (M-x)
     CommandMode,
     /// Open buffer switch dialog
@@ -272,7 +281,8 @@ impl Editor {
                 CommandType::Execute => "Execute",
                 CommandType::BufferSwitch => "Switch Buffer",
                 CommandType::KillBuffer => "Kill Buffer",
-                CommandType::FindFile => "Find File",
+                CommandType::OpenFile(OpenType::New) => "Find File",
+                CommandType::OpenFile(OpenType::Visit) => "Visit File",
             }
         ));
 
@@ -377,9 +387,9 @@ impl Editor {
                     content,
                 )
             }
-            CommandType::FindFile => {
-                // Create FileSelectorMode for C-x C-f
-                let mut file_selector_mode = FileSelectorMode::new();
+            CommandType::OpenFile(open_type) => {
+                // Create FileSelectorMode for C-x C-f and C-x C-v
+                let mut file_selector_mode = FileSelectorMode::new(open_type);
                 file_selector_mode.init_with_buffer(command_buffer_id);
 
                 let content = file_selector_mode.generate_buffer_content();
@@ -1557,7 +1567,7 @@ impl Editor {
                                 ));
                             }
                         }
-                        EditorAction::OpenFile(file_path) => {
+                        EditorAction::OpenFile { path, open_type } => {
                             // Close the file selector window after selection
                             if let Some(command_window_id) = self.find_command_window() {
                                 self.close_command_window(command_window_id);
@@ -1576,8 +1586,19 @@ impl Editor {
                                     self.active_window
                                 };
 
+                            // For visit-file, kill the current buffer first
+                            if open_type == OpenType::Visit {
+                                let current_buffer_id = self.windows[window_to_open].active_buffer;
+                                // Don't kill command buffers
+                                if !self.is_command_buffer(current_buffer_id) {
+                                    // Remove the buffer host and buffer
+                                    self.buffer_hosts.remove(&current_buffer_id);
+                                    self.buffers.remove(current_buffer_id);
+                                }
+                            }
+
                             // Open the file in the determined window
-                            match self.open_file_in_window(file_path, window_to_open).await {
+                            match self.open_file_in_window(path, window_to_open).await {
                                 Ok(message) => {
                                     actions.push(ChromeAction::Echo(message));
                                     actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
@@ -2208,7 +2229,7 @@ impl Editor {
                     result_actions.push(ChromeAction::Echo("Kill buffer selection".to_string()));
                     result_actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
                 }
-                ChromeAction::FindFile => {
+                ChromeAction::OpenFile(open_type) => {
                     // If file selector window is already open, close it first
                     if let Some(existing_command_window_id) = self.find_command_window() {
                         self.close_command_window(existing_command_window_id);
@@ -2217,14 +2238,16 @@ impl Editor {
                     // Create file selector window at bottom with enough height for file list
                     let window_height = 10; // Dynamic sizing based on available space
                     let _file_selector_window_id = self.create_command_window(
-                        CommandType::FindFile,
+                        CommandType::OpenFile(open_type),
                         CommandWindowPosition::Bottom,
                         window_height,
                     );
 
-                    result_actions.push(ChromeAction::Echo(
-                        "Find file: opening file selector".to_string(),
-                    ));
+                    let message = match open_type {
+                        OpenType::New => "Find file: opening file selector".to_string(),
+                        OpenType::Visit => "Visit file: opening file selector".to_string(),
+                    };
+                    result_actions.push(ChromeAction::Echo(message));
                     result_actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
                 }
                 ChromeAction::Save => {

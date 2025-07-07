@@ -986,7 +986,7 @@ pub async fn event_loop_with_renderer<W: Write>(
                     echo(&mut renderer.device, editor, &message)?;
                 }
 
-                ChromeAction::FindFile => {}
+                ChromeAction::OpenFile(_) => {}
                 ChromeAction::CommandMode => {}
                 ChromeAction::SwitchBuffer => {}
                 ChromeAction::KillBuffer => {}

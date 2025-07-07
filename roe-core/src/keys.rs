@@ -470,6 +470,14 @@ impl Bindings for DefaultBindings {
                 ) if *a == 'x' && *b == 'f' => {
                     return KeyAction::Command(CMD_FIND_FILE.to_string())
                 }
+                // C-x C-v visit-file
+                (
+                    LogicalKey::Modifier(KeyModifier::Control(_)),
+                    LogicalKey::AlphaNumeric(a),
+                    LogicalKey::AlphaNumeric(b),
+                ) if *a == 'x' && *b == 'v' => {
+                    return KeyAction::Command(CMD_VISIT_FILE.to_string())
+                }
                 // C-x 2 split horizontally
                 (
                     LogicalKey::Modifier(KeyModifier::Control(_)),

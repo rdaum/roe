@@ -81,8 +81,11 @@ pub enum ModeAction {
     SwitchToBuffer(crate::BufferId),
     /// Kill a specific buffer
     KillBuffer(crate::BufferId),
-    /// Open a file by path
-    OpenFile(std::path::PathBuf),
+    /// Open a file by path with specified open type
+    OpenFile {
+        path: std::path::PathBuf,
+        open_type: crate::editor::OpenType,
+    },
     /// Move cursor to specific position (row, column)
     MoveCursor(u16, u16),
 

@@ -11,7 +11,7 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
-use crate::editor::ChromeAction;
+use crate::editor::{ChromeAction, OpenType};
 use crate::{BufferId, WindowId};
 
 // Command name constants
@@ -31,6 +31,7 @@ pub const CMD_DESCRIBE_BUFFER: &str = "describe-buffer";
 pub const CMD_DESCRIBE_MODE: &str = "describe-mode";
 pub const CMD_SWITCH_BUFFER: &str = "switch-to-buffer";
 pub const CMD_KILL_BUFFER: &str = "kill-buffer";
+pub const CMD_VISIT_FILE: &str = "visit-file";
 pub const CMD_MESSAGES: &str = "messages";
 pub const CMD_SHOW_MESSAGES: &str = "show-messages";
 pub const CMD_KEYBOARD_QUIT: &str = "keyboard-quit";
@@ -178,7 +179,7 @@ pub fn create_default_registry() -> CommandRegistry {
         CMD_FIND_FILE,
         "Open a file",
         CommandCategory::Global,
-        Box::new(|_context| Ok(vec![ChromeAction::FindFile])),
+        Box::new(|_context| Ok(vec![ChromeAction::OpenFile(OpenType::New)])),
     ));
 
     registry.register_command(Command::new(
@@ -186,6 +187,13 @@ pub fn create_default_registry() -> CommandRegistry {
         "Save current buffer to file",
         CommandCategory::Global,
         Box::new(|_context| Ok(vec![ChromeAction::Save])),
+    ));
+
+    registry.register_command(Command::new(
+        CMD_VISIT_FILE,
+        "Visit file, replacing current buffer",
+        CommandCategory::Global,
+        Box::new(|_context| Ok(vec![ChromeAction::OpenFile(OpenType::Visit)])),
     ));
 
     // Editor lifecycle
@@ -383,5 +391,34 @@ mod tests {
         let q_matches = registry.find_commands("q");
         assert_eq!(q_matches.len(), 1);
         assert_eq!(q_matches[0].name, "quit");
+    }
+
+    #[test]
+    fn test_visit_file_command_registered() {
+        let registry = create_default_registry();
+
+        // Test that visit-file command is registered
+        let visit_file_cmd = registry.get_command(CMD_VISIT_FILE);
+        assert!(visit_file_cmd.is_some());
+        assert_eq!(visit_file_cmd.unwrap().name, "visit-file");
+        assert_eq!(
+            visit_file_cmd.unwrap().description,
+            "Visit file, replacing current buffer"
+        );
+
+        // Test that find-file command still works
+        let find_file_cmd = registry.get_command(CMD_FIND_FILE);
+        assert!(find_file_cmd.is_some());
+        assert_eq!(find_file_cmd.unwrap().name, "find-file");
+        assert_eq!(find_file_cmd.unwrap().description, "Open a file");
+
+        // Test prefix matching
+        let find_commands = registry.find_commands("find");
+        assert_eq!(find_commands.len(), 1);
+        assert_eq!(find_commands[0].name, "find-file");
+
+        let visit_commands = registry.find_commands("visit");
+        assert_eq!(visit_commands.len(), 1);
+        assert_eq!(visit_commands[0].name, "visit-file");
     }
 }
