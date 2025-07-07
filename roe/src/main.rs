@@ -26,6 +26,39 @@ use slotmap::SlotMap;
 use std::collections::HashMap;
 use std::io::Write;
 
+/// Generate welcome screen content with ASCII art logo and getting started text
+fn create_welcome_screen_content() -> String {
+    // Include the ASCII art from rune.txt at compile time
+    const RUNE_ART: &str = include_str!("../../rune.txt");
+    
+    let mut content = String::new();
+    
+    // Add the ASCII art
+    content.push_str(RUNE_ART);
+    
+    // Add some spacing
+    content.push_str("\n\n");
+    
+    // Add centered title - we'll center it manually for now
+    let title = "ROE - Ryan's Own Emacs";
+    let title_padding = " ".repeat(20); // Rough centering
+    content.push_str(&format!("{}{}\n\n", title_padding, title));
+    
+    // Add getting started information
+    content.push_str("                        Getting Started:\n\n");
+    content.push_str("                     C-x C-f  -  Find and open a file\n");
+    content.push_str("                     C-x C-s  -  Save current buffer\n");
+    content.push_str("                     C-x C-c  -  Exit Roe\n");
+    content.push_str("                     M-x      -  Execute command\n");
+    content.push_str("                     C-x b    -  Switch buffer\n");
+    content.push_str("                     C-x 2    -  Split window horizontally\n");
+    content.push_str("                     C-x 3    -  Split window vertically\n");
+    content.push_str("                     C-x o    -  Switch to other window\n\n");
+    content.push_str("                     Press C-x C-f to open your first file!\n");
+    
+    content
+}
+
 // Everything to run in raw_mode
 async fn terminal_main<W: Write>(stdout: W, file_paths: Vec<String>) -> Result<(), std::io::Error> {
     assert!(crossterm::terminal::is_raw_mode_enabled()?);
@@ -40,56 +73,67 @@ async fn terminal_main<W: Write>(stdout: W, file_paths: Vec<String>) -> Result<(
     let mut buffer_hosts: HashMap<BufferId, buffer_host::BufferHostClient> = HashMap::new();
     let mut modes: SlotMap<ModeId, Box<dyn Mode>> = SlotMap::default();
 
-    // Determine which files to open
-    let files_to_open = if file_paths.is_empty() {
-        // No files specified, try README.md as fallback
-        vec!["README.md".to_string()]
-    } else {
-        file_paths
-    };
-
     let mut first_buffer_id = None;
 
-    // Create buffers for all specified files
-    for file_path in files_to_open {
-        // Create FileMode for this file
-        let file_mode = Box::new(mode::FileMode {
-            file_path: file_path.clone(),
-        });
-        let file_mode_id = modes.insert(file_mode);
+    if file_paths.is_empty() {
+        // No files specified, create welcome screen buffer
+        let welcome_mode = Box::new(mode::MessagesMode {});
+        let welcome_mode_id = modes.insert(welcome_mode);
 
-        // Try to load the file, create empty buffer if it doesn't exist
-        let buffer = match Buffer::from_file(&file_path, &[file_mode_id]).await {
-            Ok(buffer) => buffer,
-            Err(_) => {
-                // File doesn't exist, create empty buffer with FileMode
-                let buffer = Buffer::new(&[file_mode_id]);
-                buffer.set_object(file_path.clone());
-                if file_path == "README.md" {
-                    // Special case for README.md - add default content
-                    buffer.load_str("# README\n\nThis is a new file created by the red editor.\nTry typing some text and press Ctrl-X Ctrl-S to save!\n");
-                }
-                buffer
-            }
-        };
+        let buffer = Buffer::new(&[welcome_mode_id]);
+        buffer.set_object("*Welcome*".to_string());
+        buffer.load_str(&create_welcome_screen_content());
 
         let buffer_id = buffers.insert(buffer.clone());
+        first_buffer_id = Some(buffer_id);
 
-        // Remember the first buffer for the initial window
-        if first_buffer_id.is_none() {
-            first_buffer_id = Some(buffer_id);
-        }
+        // Create BufferHost with MessagesMode for the welcome buffer
+        let welcome_mode = modes
+            .remove(welcome_mode_id)
+            .expect("MessagesMode should exist in modes SlotMap");
+        let mode_list = vec![(welcome_mode_id, "welcome".to_string(), welcome_mode)];
 
-        // Create BufferHost with mode for this buffer
-        let file_mode = modes
-            .remove(file_mode_id)
-            .expect("FileMode should exist in modes SlotMap");
-        let mode_list = vec![(file_mode_id, "file".to_string(), file_mode)];
-
-        // Create BufferHost and client
         let (buffer_client, _buffer_handle) =
             buffer_host::create_buffer_host(buffer, mode_list, buffer_id);
         buffer_hosts.insert(buffer_id, buffer_client);
+    } else {
+        // Create buffers for all specified files
+        for file_path in file_paths {
+            // Create FileMode for this file
+            let file_mode = Box::new(mode::FileMode {
+                file_path: file_path.clone(),
+            });
+            let file_mode_id = modes.insert(file_mode);
+
+            // Try to load the file, create empty buffer if it doesn't exist
+            let buffer = match Buffer::from_file(&file_path, &[file_mode_id]).await {
+                Ok(buffer) => buffer,
+                Err(_) => {
+                    // File doesn't exist, create empty buffer with FileMode
+                    let buffer = Buffer::new(&[file_mode_id]);
+                    buffer.set_object(file_path.clone());
+                    buffer
+                }
+            };
+
+            let buffer_id = buffers.insert(buffer.clone());
+
+            // Remember the first buffer for the initial window
+            if first_buffer_id.is_none() {
+                first_buffer_id = Some(buffer_id);
+            }
+
+            // Create BufferHost with mode for this buffer
+            let file_mode = modes
+                .remove(file_mode_id)
+                .expect("FileMode should exist in modes SlotMap");
+            let mode_list = vec![(file_mode_id, "file".to_string(), file_mode)];
+
+            // Create BufferHost and client
+            let (buffer_client, _buffer_handle) =
+                buffer_host::create_buffer_host(buffer, mode_list, buffer_id);
+            buffer_hosts.insert(buffer_id, buffer_client);
+        }
     }
 
     // Create windows - split horizontally if we have 2+ files, single window otherwise
