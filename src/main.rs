@@ -178,6 +178,8 @@ async fn terminal_main<W: Write>(stdout: W, file_paths: Vec<String>) -> Result<(
         kill_ring: kill_ring::KillRing::new(),
         command_registry: command_registry::create_default_registry(),
         buffer_history: Vec::new(),
+        echo_message: String::new(),
+        current_key_chord: Vec::new(),
     };
     
     // Initialize buffer history with the current buffer

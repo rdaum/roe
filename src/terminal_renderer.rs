@@ -383,6 +383,23 @@ impl<W: Write> Renderer for TerminalRenderer<W> {
             }
         }
 
+        // Draw echo area
+        if !editor.echo_message.is_empty() {
+            let (x, y) = echo_area_position(&editor.frame);
+            let available_width = editor.frame.available_columns.saturating_sub(x);
+            let truncated_message = if editor.echo_message.len() > available_width as usize {
+                &editor.echo_message[..available_width.saturating_sub(3) as usize]
+            } else {
+                &editor.echo_message
+            };
+            queue!(&mut self.device, cursor::MoveTo(x, y), Clear(ClearType::CurrentLine))?;
+            queue!(
+                &mut self.device,
+                cursor::MoveTo(x, y),
+                Print(truncated_message.with(FG_COLOR).on(BG_COLOR))
+            )?;
+        }
+
         // Position cursor and show it
         let active_window = &editor.windows[editor.active_window];
         let (col, line) =
@@ -843,11 +860,17 @@ pub fn echo(
     // Stash the cursor position
     let cursor_pos = crossterm::cursor::position()?;
 
+    let available_width = editor.frame.available_columns.saturating_sub(x);
+    let truncated_message = if message.len() > available_width as usize {
+        &message[..available_width.saturating_sub(3) as usize]
+    } else {
+        message
+    };
     queue!(device, cursor::MoveTo(x, y), Clear(ClearType::CurrentLine))?;
     queue!(
         device,
         cursor::MoveTo(x, y),
-        Print(message.with(FG_COLOR).on(BG_COLOR))
+        Print(truncated_message.with(FG_COLOR).on(BG_COLOR))
     )?;
     // Restore the cursor position
     queue!(device, cursor::MoveTo(cursor_pos.0, cursor_pos.1))?;
@@ -907,9 +930,10 @@ pub async fn event_loop_with_renderer<W: Write>(
 
         for action in actions {
             match action {
-                ChromeAction::Echo(_message) => {
-                    // TODO: Implement echo area rendering in the incremental renderer
-                    // For now, just ignore echo messages to avoid terminal interference
+                ChromeAction::Echo(message) => {
+                    // Set the echo message in the editor and render it
+                    editor.set_echo_message(message.clone());
+                    echo(&mut renderer.device, editor, &message)?;
                 }
 
                 ChromeAction::FileOpen => {

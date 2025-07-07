@@ -1,7 +1,7 @@
 use crate::keys::KeyAction;
 use crate::mode::{Mode, ModeResult, ModeAction, ActionPosition};
 use crate::{BufferId};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::fs;
 
 /// Interactive file selector mode for C-x C-f (find-file)
@@ -82,7 +82,7 @@ impl FileSelectorMode {
                     let path = entry.path();
                     
                     if metadata.is_dir() {
-                        dirs.push((format!("{}/", name), path));
+                        dirs.push((format!("{name}/"), path));
                     } else {
                         files.push((name, path));
                     }
@@ -153,9 +153,9 @@ impl FileSelectorMode {
             let is_selected = self.visible_selection_index() == Some(idx);
             if is_selected {
                 // Mark selected item with arrow or highlighting
-                content.push_str(&format!("> {}\n", item_name));
+                content.push_str(&format!("> {item_name}\n"));
             } else {
-                content.push_str(&format!("  {}\n", item_name));
+                content.push_str(&format!("  {item_name}\n"));
             }
         }
         

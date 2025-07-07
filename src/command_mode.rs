@@ -1,8 +1,8 @@
-use crate::command_registry::{Command, CommandRegistry, CommandContext};
+use crate::command_registry::{CommandRegistry, CommandContext};
 use crate::editor::ChromeAction;
 use crate::keys::KeyAction;
 use crate::mode::{Mode, ModeResult, ModeAction, ActionPosition};
-use crate::{BufferId, WindowId};
+use crate::BufferId;
 
 /// Interactive command completion and execution mode
 /// This mode manages a command window buffer that displays completions
@@ -116,9 +116,9 @@ impl CommandMode {
             let is_selected = self.visible_selection_index() == Some(idx);
             if is_selected {
                 // Mark selected item with arrow or highlighting
-                content.push_str(&format!("> {}\n", completion));
+                content.push_str(&format!("> {completion}\n"));
             } else {
-                content.push_str(&format!("  {}\n", completion));
+                content.push_str(&format!("  {completion}\n"));
             }
         }
         
@@ -269,7 +269,7 @@ impl CommandMode {
         if let Some(command) = registry.get_command(command_name) {
             command.execute(context)
         } else {
-            Err(format!("Command not found: {}", command_name))
+            Err(format!("Command not found: {command_name}"))
         }
     }
 }
@@ -386,7 +386,7 @@ mod tests {
         
         // Update with empty input should show all commands
         cmd_mode.update_matches(&registry);
-        assert!(cmd_mode.matches.len() > 0);
+        assert!(!cmd_mode.matches.is_empty());
         
         // Type 'q' should filter to quit commands
         cmd_mode.input = "q".to_string();

@@ -107,6 +107,16 @@ pub enum EditorAction {
     KillBuffer(crate::BufferId),
     /// Open a file at a path
     OpenFile(std::path::PathBuf),
+    /// Kill line (to kill-ring)
+    KillLine,
+    /// Kill region (to kill-ring)
+    KillRegion,
+    /// Copy region to kill-ring without deleting
+    CopyRegion,
+    /// Yank from kill-ring
+    Yank { position: crate::mode::ActionPosition },
+    /// Yank from specific kill-ring index
+    YankIndex { position: crate::mode::ActionPosition, index: usize },
 }
 
 /// Response from BufferHost
@@ -392,7 +402,7 @@ impl BufferHost {
                                 
                                 // Update cursor if we deleted backwards
                                 if count < 0 {
-                                    cursor_pos = cursor_pos.saturating_sub(count.abs() as usize);
+                                    cursor_pos = cursor_pos.saturating_sub(count.unsigned_abs());
                                     new_cursor_pos = Some(cursor_pos);
                                 }
                             }
@@ -465,6 +475,29 @@ impl BufferHost {
                     // Store file open for execution at Editor level
                     editor_action = Some(EditorAction::OpenFile(path));
                 }
+                ModeAction::KillLine => {
+                    // Kill from cursor to end of line (store in kill-ring - will be handled at Editor level)
+                    editor_action = Some(EditorAction::KillLine);
+                }
+                ModeAction::KillRegion => {
+                    // Kill the region between mark and cursor (store in kill-ring - will be handled at Editor level)
+                    editor_action = Some(EditorAction::KillRegion);
+                }
+                ModeAction::CopyRegion => {
+                    // Copy the region to kill-ring without deleting (will be handled at Editor level)
+                    editor_action = Some(EditorAction::CopyRegion);
+                    // Clear the mark after copying to stop region highlighting
+                    self.buffer.clear_mark();
+                    dirty_regions.push(DirtyRegion::Buffer { buffer_id: self.buffer_id });
+                }
+                ModeAction::Yank(position) => {
+                    // Yank from kill-ring (will be handled at Editor level)
+                    editor_action = Some(EditorAction::Yank { position: position.clone() });
+                }
+                ModeAction::YankIndex(position, index) => {
+                    // Yank from specific kill-ring index (will be handled at Editor level)
+                    editor_action = Some(EditorAction::YankIndex { position: position.clone(), index });
+                }
                 // TODO: Implement other actions
                 _ => {}
             }
@@ -494,7 +527,7 @@ impl BufferHost {
         
         match tokio::fs::write(&file_path, content.as_bytes()).await {
             Ok(()) => BufferResponse::Saved(file_path),
-            Err(e) => BufferResponse::Error(format!("Save failed: {}", e)),
+            Err(e) => BufferResponse::Error(format!("Save failed: {e}")),
         }
     }
     
@@ -513,7 +546,7 @@ impl BufferHost {
                 });
                 BufferResponse::Loaded(file_path)
             }
-            Err(e) => BufferResponse::Error(format!("Load failed: {}", e)),
+            Err(e) => BufferResponse::Error(format!("Load failed: {e}")),
         }
     }
 }

@@ -323,6 +323,10 @@ impl Bindings for DefaultBindings {
                 (LogicalKey::Modifier(KeyModifier::Meta(_)), LogicalKey::AlphaNumeric('x')) => {
                     return KeyAction::CommandMode
                 }
+                // M-w copy region (like C-w but without deleting)
+                (LogicalKey::Modifier(KeyModifier::Meta(_)), LogicalKey::AlphaNumeric('w')) => {
+                    return KeyAction::KillRegion(false)
+                }
                 // Ctrl-End is buffer-end
                 (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::End) => {
                     return KeyAction::Cursor(CursorDirection::BufferEnd)

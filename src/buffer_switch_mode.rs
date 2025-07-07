@@ -144,9 +144,9 @@ impl BufferSwitchMode {
             let is_selected = self.visible_selection_index() == Some(idx);
             if is_selected {
                 // Mark selected item with arrow or highlighting
-                content.push_str(&format!("> {}\n", buffer_name));
+                content.push_str(&format!("> {buffer_name}\n"));
             } else {
-                content.push_str(&format!("  {}\n", buffer_name));
+                content.push_str(&format!("  {buffer_name}\n"));
             }
         }
         

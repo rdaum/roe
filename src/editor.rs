@@ -1,13 +1,13 @@
 use crate::buffer::Buffer;
-use crate::buffer_host::{self, BufferHostClient, BufferResponse};
+use crate::buffer_host::{self, BufferHostClient};
 use crate::buffer_switch_mode::{BufferSwitchMode, BufferSwitchPurpose};
-use crate::command_mode::{CommandMode, CommandModeResult};
-use crate::command_registry::{create_default_registry, CommandContext, CommandRegistry};
+use crate::command_mode::CommandMode;
+use crate::command_registry::CommandRegistry;
 use crate::file_selector_mode::FileSelectorMode;
 use crate::keys::KeyAction::ChordNext;
 use crate::keys::{Bindings, CursorDirection, KeyAction, KeyState, LogicalKey};
 use crate::kill_ring::KillRing;
-use crate::mode::{ActionPosition, Mode, ModeAction};
+use crate::mode::{ActionPosition, Mode};
 use crate::renderer::{DirtyRegion, ModelineComponent};
 use crate::{BufferId, ModeId, WindowId};
 use slotmap::SlotMap;
@@ -150,6 +150,10 @@ pub struct Editor {
     pub previous_active_window: Option<WindowId>,
     /// Buffer history (most recently used first) for smart buffer switching
     pub buffer_history: Vec<BufferId>,
+    /// Current echo area message
+    pub echo_message: String,
+    /// Current key chord being typed (for echo area display)
+    pub current_key_chord: Vec<LogicalKey>,
 }
 
 /// The main event loop, which receives keystrokes and dispatches them to the mode in the buffer
@@ -422,6 +426,72 @@ impl Editor {
             window.active_buffer == buffer_id
                 && matches!(window.window_type, WindowType::Command { .. })
         })
+    }
+
+    /// Set the echo area message (this will override any chord display)
+    pub fn set_echo_message(&mut self, message: String) {
+        self.echo_message = message;
+        // Clear chord since we're showing a different message
+        self.current_key_chord.clear();
+    }
+
+    /// Clear the echo area message
+    pub fn clear_echo_message(&mut self) {
+        self.echo_message.clear();
+    }
+
+    /// Clear the current key chord sequence
+    pub fn clear_key_chord(&mut self) {
+        self.current_key_chord.clear();
+        self.clear_echo_message();
+    }
+
+    /// Update echo area with current key chord
+    pub fn update_echo_with_chord(&mut self) {
+        if !self.current_key_chord.is_empty() {
+            self.echo_message = self.format_key_chord(&self.current_key_chord);
+        }
+    }
+
+    /// Format a key chord in Emacs style (e.g., "C-x", "M-x", "C-x C-c")
+    fn format_key_chord(&self, keys: &[LogicalKey]) -> String {
+        let mut result = Vec::new();
+        let mut i = 0;
+
+        while i < keys.len() {
+            match &keys[i] {
+                LogicalKey::Modifier(_modifier) => {
+                    // Check if there's a following non-modifier key
+                    if i + 1 < keys.len() {
+                        match &keys[i + 1] {
+                            LogicalKey::Modifier(_) => {
+                                // Two modifiers in a row, treat separately
+                                result.push(keys[i].as_display_string());
+                                i += 1;
+                            }
+                            _ => {
+                                // Modifier followed by regular key, combine with dash
+                                let modifier_str = keys[i].as_display_string();
+                                let key_str = keys[i + 1].as_display_string();
+                                result.push(format!("{modifier_str}-{key_str}"));
+                                i += 2;
+                            }
+                        }
+                    } else {
+                        // Modifier at end, display as-is
+                        result.push(keys[i].as_display_string());
+                        i += 1;
+                    }
+                }
+                _ => {
+                    // Non-modifier key
+                    result.push(keys[i].as_display_string());
+                    i += 1;
+                }
+            }
+        }
+
+        result.join(" ")
     }
 
     /// Update buffer history when switching to a buffer
@@ -886,11 +956,19 @@ impl Editor {
         let key_action = self
             .bindings
             .keystroke(pressed.iter().map(|k| k.key).collect());
+
         if key_action == ChordNext {
-            return Ok(vec![]);
+            // Update chord display with current pressed keys
+            self.current_key_chord = pressed.iter().map(|k| k.key).collect();
+            self.update_echo_with_chord();
+            // Return an Echo action to trigger redraw of echo area
+            return Ok(vec![ChromeAction::Echo(self.echo_message.clone())]);
         }
 
         let _ = self.key_state.take();
+
+        // Clear the key chord after processing (action completed)
+        self.clear_key_chord();
 
         // Skip echo in tests to avoid terminal issues
         let active_buffer_id = {
@@ -1131,7 +1209,7 @@ impl Editor {
                     tokio::runtime::Handle::current()
                         .block_on(async { self.handle_buffer_response(response).await })
                 }),
-                Err(err) => vec![ChromeAction::Echo(format!("Buffer error: {}", err))],
+                Err(err) => vec![ChromeAction::Echo(format!("Buffer error: {err}"))],
             }
         } else {
             vec![ChromeAction::Echo("No buffer host available".to_string())]
@@ -1185,8 +1263,7 @@ impl Editor {
                             }
                             // TODO: Implement command execution
                             actions.push(ChromeAction::Echo(format!(
-                                "Execute command: {}",
-                                command_name
+                                "Execute command: {command_name}"
                             )));
                         }
                         EditorAction::SwitchToBuffer(target_buffer_id) => {
@@ -1220,8 +1297,7 @@ impl Editor {
                                 let buffer = &self.buffers[target_buffer_id];
                                 let buffer_name = buffer.object();
                                 actions.push(ChromeAction::Echo(format!(
-                                    "Switched to buffer: {}",
-                                    buffer_name
+                                    "Switched to buffer: {buffer_name}"
                                 )));
                                 actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
                             } else {
@@ -1308,8 +1384,7 @@ impl Editor {
                                 self.buffers.remove(buffer_id);
 
                                 actions.push(ChromeAction::Echo(format!(
-                                    "Killed buffer: {}",
-                                    buffer_name
+                                    "Killed buffer: {buffer_name}"
                                 )));
                                 actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
                             } else {
@@ -1345,11 +1420,35 @@ impl Editor {
                                 }
                                 Err(error) => {
                                     actions.push(ChromeAction::Echo(format!(
-                                        "Error opening file: {}",
-                                        error
+                                        "Error opening file: {error}"
                                     )));
                                 }
                             }
+                        }
+                        EditorAction::KillLine => {
+                            // Delegate to kill_line method which handles kill-ring
+                            let kill_actions = self.kill_line();
+                            actions.extend(kill_actions);
+                        }
+                        EditorAction::KillRegion => {
+                            // Delegate to kill_region method which handles kill-ring
+                            let kill_actions = self.kill_region();
+                            actions.extend(kill_actions);
+                        }
+                        EditorAction::CopyRegion => {
+                            // Delegate to copy_region method which handles kill-ring
+                            let copy_actions = self.copy_region();
+                            actions.extend(copy_actions);
+                        }
+                        EditorAction::Yank { position } => {
+                            // Delegate to yank method
+                            let yank_actions = self.yank(&position);
+                            actions.extend(yank_actions);
+                        }
+                        EditorAction::YankIndex { position, index } => {
+                            // Delegate to yank_index method
+                            let yank_actions = self.yank_index(&position, index);
+                            actions.extend(yank_actions);
                         }
                     }
                 }
@@ -1357,13 +1456,13 @@ impl Editor {
                 actions
             }
             BufferResponse::Saved(file_path) => {
-                vec![ChromeAction::Echo(format!("Saved: {}", file_path))]
+                vec![ChromeAction::Echo(format!("Saved: {file_path}"))]
             }
             BufferResponse::Loaded(file_path) => {
-                vec![ChromeAction::Echo(format!("Loaded: {}", file_path))]
+                vec![ChromeAction::Echo(format!("Loaded: {file_path}"))]
             }
             BufferResponse::Error(error) => {
-                vec![ChromeAction::Echo(format!("Error: {}", error))]
+                vec![ChromeAction::Echo(format!("Error: {error}"))]
             }
             BufferResponse::NoChange => {
                 vec![]
@@ -1649,6 +1748,27 @@ impl Editor {
         ]
     }
 
+    /// Copy region to kill-ring without deleting
+    pub fn copy_region(&mut self) -> Vec<ChromeAction> {
+        let window = &self.windows[self.active_window];
+        let buffer = &self.buffers[window.active_buffer];
+
+        let Some(region_text) = buffer.get_region_text(window.cursor) else {
+            return vec![ChromeAction::Echo("No mark set".to_string())];
+        };
+
+        if region_text.is_empty() {
+            return vec![ChromeAction::Echo("Empty region".to_string())];
+        }
+
+        // Add to kill-ring without deleting
+        self.kill_ring.kill(region_text.clone());
+
+        vec![
+            ChromeAction::Echo(format!("Copied region: {}", region_text.replace('\n', "\\n"))),
+        ]
+    }
+
     /// Set mark at cursor position
     pub fn set_mark(&mut self) -> Vec<ChromeAction> {
         let window = &self.windows[self.active_window];
@@ -1705,16 +1825,16 @@ impl Editor {
             match tokio::fs::write(&file_path_clone, content.as_bytes()).await {
                 Ok(()) => {
                     // TODO: Send success message back to editor
-                    eprintln!("Saved {}", file_path_clone);
+                    eprintln!("Saved {file_path_clone}");
                 }
                 Err(err) => {
                     // TODO: Send error message back to editor
-                    eprintln!("Error saving {}: {}", file_path_clone, err);
+                    eprintln!("Error saving {file_path_clone}: {err}");
                 }
             }
         });
 
-        vec![ChromeAction::Echo(format!("Saving {}...", file_path))]
+        vec![ChromeAction::Echo(format!("Saving {file_path}..."))]
     }
 
     /// Ensure the cursor is visible in the window, scrolling if necessary.
@@ -1863,6 +1983,8 @@ mod tests {
             kill_ring: KillRing::new(),
             command_registry: Default::default(),
             buffer_history: vec![],
+            echo_message: "".to_string(),
+            current_key_chord: vec![],
         }
     }
 

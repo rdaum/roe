@@ -296,6 +296,192 @@ impl BufferInner {
     }
 }
 
+/// Public Buffer interface that handles synchronization internally
+/// This is what the rest of the codebase should use
+pub struct Buffer {
+    inner: Arc<RwLock<BufferInner>>,
+}
+
+impl Buffer {
+    /// Create a new buffer
+    pub fn new(modes: &[ModeId]) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(BufferInner::new(modes))),
+        }
+    }
+
+    /// Create a new buffer and load content from a file
+    pub async fn from_file(file_path: &str, modes: &[ModeId]) -> Result<Self, std::io::Error> {
+        let buffer_inner = BufferInner::from_file(file_path, modes).await?;
+        Ok(Self {
+            inner: Arc::new(RwLock::new(buffer_inner)),
+        })
+    }
+
+    /// Execute a closure with read access to the buffer
+    pub fn with_read<R>(&self, f: impl FnOnce(&BufferInner) -> R) -> R {
+        f(&self.inner.read().unwrap())
+    }
+
+    /// Execute a closure with write access to the buffer
+    pub fn with_write<R>(&self, f: impl FnOnce(&mut BufferInner) -> R) -> R {
+        f(&mut self.inner.write().unwrap())
+    }
+
+    /// Get the underlying Arc<RwLock<BufferInner>> for cases where direct access is needed
+    pub fn inner(&self) -> &Arc<RwLock<BufferInner>> {
+        &self.inner
+    }
+
+    /// Clone the underlying Arc<RwLock<BufferInner>>
+    pub fn inner_clone(&self) -> Arc<RwLock<BufferInner>> {
+        self.inner.clone()
+    }
+
+    // Convenience methods for common operations that don't need multiple calls
+    
+    pub fn to_column_line(&self, char_index: usize) -> (u16, u16) {
+        self.with_read(|b| b.to_column_line(char_index))
+    }
+
+    pub fn to_char_index(&self, col: u16, line: u16) -> usize {
+        self.with_read(|b| b.to_char_index(col, line))
+    }
+
+    pub fn has_mark(&self) -> bool {
+        self.with_read(|b| b.has_mark())
+    }
+
+    pub fn get_region(&self, cursor_pos: usize) -> Option<(usize, usize)> {
+        self.with_read(|b| b.get_region(cursor_pos))
+    }
+
+    // Movement operations
+    pub fn move_left(&self, pos: usize) -> usize {
+        self.with_read(|b| b.move_left(pos))
+    }
+
+    pub fn move_right(&self, pos: usize) -> usize {
+        self.with_read(|b| b.move_right(pos))
+    }
+
+    pub fn move_up(&self, pos: usize) -> usize {
+        self.with_read(|b| b.move_up(pos))
+    }
+
+    pub fn move_down(&self, pos: usize) -> usize {
+        self.with_read(|b| b.move_down(pos))
+    }
+
+    pub fn move_line_start(&self, pos: usize) -> usize {
+        self.with_read(|b| b.move_line_start(pos))
+    }
+
+    pub fn move_line_end(&self, pos: usize) -> usize {
+        self.with_read(|b| b.move_line_end(pos))
+    }
+
+    pub fn move_buffer_start(&self) -> usize {
+        self.with_read(|b| b.move_buffer_start())
+    }
+
+    pub fn move_buffer_end(&self) -> usize {
+        self.with_read(|b| b.move_buffer_end())
+    }
+
+    pub fn eol_pos(&self, start_pos: usize) -> usize {
+        self.with_read(|b| b.eol_pos(start_pos))
+    }
+
+    // Write operations that need mutable access
+    pub fn insert_pos(&self, fragment: String, position: usize) {
+        self.with_write(|b| b.insert_pos(fragment, position))
+    }
+
+    pub fn insert_col_line(&self, fragment: String, position: (u16, u16)) {
+        self.with_write(|b| b.insert_col_line(fragment, position))
+    }
+
+    pub fn delete_pos(&self, position: usize, count: isize) -> Option<String> {
+        self.with_write(|b| b.delete_pos(position, count))
+    }
+
+    pub fn delete_col_line(&self, position: (u16, u16), count: isize) -> Option<String> {
+        self.with_write(|b| b.delete_col_line(position, count))
+    }
+
+    pub fn set_mark(&self, pos: usize) {
+        self.with_write(|b| b.set_mark(pos))
+    }
+
+    pub fn clear_mark(&self) {
+        self.with_write(|b| b.clear_mark())
+    }
+
+    pub fn delete_region(&self, cursor_pos: usize) -> Option<(String, usize)> {
+        self.with_write(|b| b.delete_region(cursor_pos))
+    }
+
+    // Properties that need read access
+    pub fn object(&self) -> String {
+        self.with_read(|b| b.object.clone())
+    }
+
+    pub fn modes(&self) -> Vec<ModeId> {
+        self.with_read(|b| b.modes.clone())
+    }
+
+    pub fn load_str(&self, text: &str) {
+        self.with_write(|b| b.load_str(text))
+    }
+
+    // Additional methods needed by the renderer
+    pub fn buffer_len_lines(&self) -> usize {
+        self.with_read(|b| b.buffer.len_lines())
+    }
+
+    pub fn buffer_line(&self, line_idx: usize) -> String {
+        self.with_read(|b| b.buffer.line(line_idx).to_string())
+    }
+
+    pub fn buffer_line_to_char(&self, line_idx: usize) -> usize {
+        self.with_read(|b| b.buffer.line_to_char(line_idx))
+    }
+
+    pub fn buffer_lines(&self) -> Vec<String> {
+        self.with_read(|b| b.buffer.lines().map(|line| line.to_string()).collect())
+    }
+
+    // Add mutable field access for main.rs compatibility
+    pub fn set_object(&self, object: String) {
+        self.with_write(|b| b.object = object)
+    }
+
+    pub fn content(&self) -> String {
+        self.with_read(|b| b.content())
+    }
+
+    pub fn get_mark(&self) -> Option<usize> {
+        self.with_read(|b| b.get_mark())
+    }
+
+    pub fn get_region_text(&self, cursor_pos: usize) -> Option<String> {
+        self.with_read(|b| b.get_region_text(cursor_pos))
+    }
+
+    pub fn buffer_len_chars(&self) -> usize {
+        self.with_read(|b| b.buffer.len_chars())
+    }
+}
+
+impl Clone for Buffer {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,187 +818,5 @@ mod tests {
         // Get region with cursor beyond buffer end
         let region = buffer.get_region(buffer_len + 5);
         assert_eq!(region, Some((buffer_len, buffer_len))); // Both should be clamped
-    }
-}
-
-/// Public Buffer interface that handles synchronization internally
-/// This is what the rest of the codebase should use
-pub struct Buffer {
-    inner: Arc<RwLock<BufferInner>>,
-}
-
-impl Buffer {
-    /// Create a new buffer
-    pub fn new(modes: &[ModeId]) -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(BufferInner::new(modes))),
-        }
-    }
-
-    /// Create a new buffer and load content from a file
-    pub async fn from_file(file_path: &str, modes: &[ModeId]) -> Result<Self, std::io::Error> {
-        let buffer_inner = BufferInner::from_file(file_path, modes).await?;
-        Ok(Self {
-            inner: Arc::new(RwLock::new(buffer_inner)),
-        })
-    }
-
-    /// Execute a closure with read access to the buffer
-    pub fn with_read<R>(&self, f: impl FnOnce(&BufferInner) -> R) -> R {
-        f(&self.inner.read().unwrap())
-    }
-
-    /// Execute a closure with write access to the buffer
-    pub fn with_write<R>(&self, f: impl FnOnce(&mut BufferInner) -> R) -> R {
-        f(&mut self.inner.write().unwrap())
-    }
-
-    /// Get the underlying Arc<RwLock<BufferInner>> for cases where direct access is needed
-    pub fn inner(&self) -> &Arc<RwLock<BufferInner>> {
-        &self.inner
-    }
-
-    /// Clone the underlying Arc<RwLock<BufferInner>>
-    pub fn inner_clone(&self) -> Arc<RwLock<BufferInner>> {
-        self.inner.clone()
-    }
-
-    // Convenience methods for common operations that don't need multiple calls
-    
-    pub fn to_column_line(&self, char_index: usize) -> (u16, u16) {
-        self.with_read(|b| b.to_column_line(char_index))
-    }
-
-    pub fn to_char_index(&self, col: u16, line: u16) -> usize {
-        self.with_read(|b| b.to_char_index(col, line))
-    }
-
-    pub fn has_mark(&self) -> bool {
-        self.with_read(|b| b.has_mark())
-    }
-
-    pub fn get_region(&self, cursor_pos: usize) -> Option<(usize, usize)> {
-        self.with_read(|b| b.get_region(cursor_pos))
-    }
-
-    // Movement operations
-    pub fn move_left(&self, pos: usize) -> usize {
-        self.with_read(|b| b.move_left(pos))
-    }
-
-    pub fn move_right(&self, pos: usize) -> usize {
-        self.with_read(|b| b.move_right(pos))
-    }
-
-    pub fn move_up(&self, pos: usize) -> usize {
-        self.with_read(|b| b.move_up(pos))
-    }
-
-    pub fn move_down(&self, pos: usize) -> usize {
-        self.with_read(|b| b.move_down(pos))
-    }
-
-    pub fn move_line_start(&self, pos: usize) -> usize {
-        self.with_read(|b| b.move_line_start(pos))
-    }
-
-    pub fn move_line_end(&self, pos: usize) -> usize {
-        self.with_read(|b| b.move_line_end(pos))
-    }
-
-    pub fn move_buffer_start(&self) -> usize {
-        self.with_read(|b| b.move_buffer_start())
-    }
-
-    pub fn move_buffer_end(&self) -> usize {
-        self.with_read(|b| b.move_buffer_end())
-    }
-
-    pub fn eol_pos(&self, start_pos: usize) -> usize {
-        self.with_read(|b| b.eol_pos(start_pos))
-    }
-
-    // Write operations that need mutable access
-    pub fn insert_pos(&self, fragment: String, position: usize) {
-        self.with_write(|b| b.insert_pos(fragment, position))
-    }
-
-    pub fn insert_col_line(&self, fragment: String, position: (u16, u16)) {
-        self.with_write(|b| b.insert_col_line(fragment, position))
-    }
-
-    pub fn delete_pos(&self, position: usize, count: isize) -> Option<String> {
-        self.with_write(|b| b.delete_pos(position, count))
-    }
-
-    pub fn delete_col_line(&self, position: (u16, u16), count: isize) -> Option<String> {
-        self.with_write(|b| b.delete_col_line(position, count))
-    }
-
-    pub fn set_mark(&self, pos: usize) {
-        self.with_write(|b| b.set_mark(pos))
-    }
-
-    pub fn clear_mark(&self) {
-        self.with_write(|b| b.clear_mark())
-    }
-
-    pub fn delete_region(&self, cursor_pos: usize) -> Option<(String, usize)> {
-        self.with_write(|b| b.delete_region(cursor_pos))
-    }
-
-    // Properties that need read access
-    pub fn object(&self) -> String {
-        self.with_read(|b| b.object.clone())
-    }
-
-    pub fn modes(&self) -> Vec<ModeId> {
-        self.with_read(|b| b.modes.clone())
-    }
-
-    pub fn load_str(&self, text: &str) {
-        self.with_write(|b| b.load_str(text))
-    }
-
-    // Additional methods needed by the renderer
-    pub fn buffer_len_lines(&self) -> usize {
-        self.with_read(|b| b.buffer.len_lines())
-    }
-
-    pub fn buffer_line(&self, line_idx: usize) -> String {
-        self.with_read(|b| b.buffer.line(line_idx).to_string())
-    }
-
-    pub fn buffer_line_to_char(&self, line_idx: usize) -> usize {
-        self.with_read(|b| b.buffer.line_to_char(line_idx))
-    }
-
-    pub fn buffer_lines(&self) -> Vec<String> {
-        self.with_read(|b| b.buffer.lines().map(|line| line.to_string()).collect())
-    }
-
-    // Add mutable field access for main.rs compatibility
-    pub fn set_object(&self, object: String) {
-        self.with_write(|b| b.object = object)
-    }
-
-    pub fn content(&self) -> String {
-        self.with_read(|b| b.content())
-    }
-
-    pub fn get_mark(&self) -> Option<usize> {
-        self.with_read(|b| b.get_mark())
-    }
-
-    pub fn buffer_len_chars(&self) -> usize {
-        self.with_read(|b| b.buffer.len_chars())
-    }
-}
-
-impl Clone for Buffer {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-        }
     }
 }

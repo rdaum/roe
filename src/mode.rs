@@ -26,6 +26,8 @@ pub enum ModeAction {
     KillLine,
     /// Kill the selected region (requires mark to be set)
     KillRegion,
+    /// Copy the selected region to kill-ring without deleting (requires mark to be set)
+    CopyRegion,
     /// Yank (paste) from kill-ring
     Yank(ActionPosition),
     /// Yank from specific kill-ring index
@@ -123,9 +125,14 @@ impl Mode for ScratchMode {
                 ModeResult::Consumed(vec![ModeAction::SetMark])
             }
             KeyAction::MarkEnd => ModeResult::Ignored,
-            KeyAction::KillRegion(_destructive) => {
-                // TODO: Implement region killing when mark is implemented
-                ModeResult::Consumed(vec![ModeAction::KillRegion])
+            KeyAction::KillRegion(destructive) => {
+                if *destructive {
+                    // C-w - kill region (delete and copy to kill-ring)
+                    ModeResult::Consumed(vec![ModeAction::KillRegion])
+                } else {
+                    // M-w - copy region to kill-ring without deleting
+                    ModeResult::Consumed(vec![ModeAction::CopyRegion])
+                }
             }
             KeyAction::KillLine(_whole_line) => {
                 ModeResult::Consumed(vec![ModeAction::KillLine])
@@ -197,8 +204,14 @@ impl Mode for FileMode {
                 ModeResult::Consumed(vec![ModeAction::SetMark])
             }
             KeyAction::MarkEnd => ModeResult::Ignored,
-            KeyAction::KillRegion(_destructive) => {
-                ModeResult::Consumed(vec![ModeAction::KillRegion])
+            KeyAction::KillRegion(destructive) => {
+                if *destructive {
+                    // C-w - kill region (delete and copy to kill-ring)
+                    ModeResult::Consumed(vec![ModeAction::KillRegion])
+                } else {
+                    // M-w - copy region to kill-ring without deleting
+                    ModeResult::Consumed(vec![ModeAction::CopyRegion])
+                }
             }
             KeyAction::KillLine(_whole_line) => {
                 ModeResult::Consumed(vec![ModeAction::KillLine])
