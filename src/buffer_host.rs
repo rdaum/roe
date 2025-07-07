@@ -127,7 +127,6 @@ impl ModeClient {
             .await
             .map_err(|_| format!("Mode {} reply failed", self.name))
     }
-
 }
 
 /// Request sent to BufferHost
@@ -240,8 +239,6 @@ impl BufferHostClient {
             .await
             .map_err(|_| "BufferHost reply failed".to_string())
     }
-
-
 
     /// Send a mouse event to the buffer and wait for response
     pub async fn handle_mouse(

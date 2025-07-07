@@ -13,9 +13,11 @@
 
 use buffer::Buffer;
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
+use crossterm::terminal::disable_raw_mode;
 use editor::{Editor, Frame, Window};
 use keys::KeyState;
 use mode::{FileMode, Mode};
@@ -217,13 +219,23 @@ async fn terminal_main<W: Write>(stdout: W, file_paths: Vec<String>) -> Result<(
 }
 
 fn exit_state(device: &mut impl Write) -> Result<(), std::io::Error> {
+    // Restore terminal to original state
+    execute!(device, DisableMouseCapture)?;
+    execute!(device, crossterm::cursor::Show)?;
+    execute!(device, crossterm::cursor::SetCursorStyle::DefaultUserShape)?;
+    execute!(device, PopKeyboardEnhancementFlags)?;
+    device.flush()?;
+
+    disable_raw_mode()?;
+
     execute!(
         device,
         crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
     )?;
-    execute!(device, crossterm::cursor::Show)?;
-    execute!(device, DisableMouseCapture)?;
-    crossterm::terminal::disable_raw_mode()?;
+    let (_, height) = crossterm::terminal::size().unwrap_or((80, 24));
+    execute!(device, crossterm::cursor::MoveTo(0, height))?;
+    device.flush()?;
+
     Ok(())
 }
 
@@ -234,21 +246,28 @@ async fn main() -> Result<(), std::io::Error> {
     // Collect command line arguments (skip the program name)
     let file_paths: Vec<String> = std::env::args().skip(1).collect();
 
+    // Set up terminal state
     crossterm::terminal::enable_raw_mode()?;
-    // Disambiguate keyboard modifier codes
     execute!(
         stdout,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     )?;
     execute!(stdout, crossterm::cursor::EnableBlinking)?;
     execute!(stdout, EnableMouseCapture)?;
-    if let Err(e) = terminal_main(&mut stdout, file_paths).await {
-        exit_state(&mut stdout)?;
+
+    // Run the application
+    let result = terminal_main(&mut stdout, file_paths).await;
+
+    // Always clean up terminal state, regardless of success or failure
+    if let Err(cleanup_err) = exit_state(&mut stdout) {
+        eprintln!("Warning: Failed to clean up terminal state: {cleanup_err}");
+    }
+
+    // Handle the main result
+    if let Err(e) = result {
         eprintln!("Error: {e}");
         return Err(e);
     }
-
-    exit_state(&mut stdout)?;
 
     Ok(())
 }

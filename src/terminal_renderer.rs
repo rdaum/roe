@@ -1073,7 +1073,9 @@ async fn handle_mouse_event<W: Write>(
                 return;
             }
 
-            let Some(window_id) = find_window_at_position(editor, mouse_event.column, mouse_event.row) else {
+            let Some(window_id) =
+                find_window_at_position(editor, mouse_event.column, mouse_event.row)
+            else {
                 return;
             };
 
@@ -1094,7 +1096,8 @@ async fn handle_mouse_event<W: Write>(
                 event_type: crate::mode::MouseEventType::LeftClick,
             };
 
-            let Some(actions) = handle_mode_mouse_event(editor, window_id, &mode_mouse_event).await else {
+            let Some(actions) = handle_mode_mouse_event(editor, window_id, &mode_mouse_event).await
+            else {
                 return;
             };
 

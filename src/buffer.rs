@@ -53,7 +53,6 @@ impl BufferInner {
         Ok(buffer_inner)
     }
 
-
     /// Insert a fragment of text into the buffer at the given line/col position.
     pub fn insert_col_line(&mut self, fragment: String, position: (u16, u16)) {
         let buffer_location = self.buffer.line_to_char(position.1 as usize) + position.0 as usize;
@@ -415,7 +414,6 @@ impl BufferInner {
         self.mark = None;
     }
 
-
     /// Get the current mark position
     pub fn get_mark(&self) -> Option<usize> {
         self.mark
@@ -641,8 +639,6 @@ impl Buffer {
     pub fn set_object(&self, object: String) {
         self.with_write(|b| b.object = object)
     }
-
-
 
     pub fn content(&self) -> String {
         self.with_read(|b| b.content())
