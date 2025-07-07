@@ -24,6 +24,7 @@ pub mod keys;
 pub mod kill_ring;
 pub mod mode;
 pub mod renderer;
+pub mod selection_menu;
 pub mod window;
 
 new_key_type! {
