@@ -225,7 +225,10 @@ impl Mode for ScratchMode {
         match event.event_type {
             MouseEventType::LeftClick => {
                 // Move cursor to clicked position (row, col)
-                ModeResult::Consumed(vec![ModeAction::MoveCursor(event.position.1, event.position.0)])
+                ModeResult::Consumed(vec![ModeAction::MoveCursor(
+                    event.position.1,
+                    event.position.0,
+                )])
             }
             // Ignore other mouse events for now
             _ => ModeResult::Ignored,
@@ -341,7 +344,10 @@ impl Mode for FileMode {
         match event.event_type {
             MouseEventType::LeftClick => {
                 // Move cursor to clicked position (row, col)
-                ModeResult::Consumed(vec![ModeAction::MoveCursor(event.position.1, event.position.0)])
+                ModeResult::Consumed(vec![ModeAction::MoveCursor(
+                    event.position.1,
+                    event.position.0,
+                )])
             }
             // Ignore other mouse events for now
             _ => ModeResult::Ignored,
@@ -407,7 +413,10 @@ impl Mode for MessagesMode {
         match event.event_type {
             MouseEventType::LeftClick => {
                 // Move cursor to clicked position (read-only mode, so just navigation)
-                ModeResult::Consumed(vec![ModeAction::MoveCursor(event.position.1, event.position.0)])
+                ModeResult::Consumed(vec![ModeAction::MoveCursor(
+                    event.position.1,
+                    event.position.0,
+                )])
             }
             // Ignore other mouse events for now
             _ => ModeResult::Ignored,

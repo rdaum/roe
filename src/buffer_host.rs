@@ -291,26 +291,24 @@ impl BufferHostClient {
     /// Send a mouse event to the buffer (fire and forget)
     pub fn handle_mouse_async(&self, event: crate::mode::MouseEvent, cursor_pos: usize) {
         let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
-        
+
         let message = BufferMessage {
-            request: BufferRequest::HandleMouse {
-                event,
-                cursor_pos,
-            },
+            request: BufferRequest::HandleMouse { event, cursor_pos },
             reply: reply_tx,
         };
         let _ = self.sender.try_send(message);
     }
 
     /// Send a mouse event to the buffer and wait for response
-    pub async fn handle_mouse(&self, event: crate::mode::MouseEvent, cursor_pos: usize) -> Result<BufferResponse, String> {
+    pub async fn handle_mouse(
+        &self,
+        event: crate::mode::MouseEvent,
+        cursor_pos: usize,
+    ) -> Result<BufferResponse, String> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        
+
         let message = BufferMessage {
-            request: BufferRequest::HandleMouse {
-                event,
-                cursor_pos,
-            },
+            request: BufferRequest::HandleMouse { event, cursor_pos },
             reply: reply_tx,
         };
 
@@ -705,23 +703,24 @@ impl BufferHost {
                     // Convert window coordinates to buffer position
                     let line = row as usize;
                     let column = col as usize;
-                    
+
                     // Make sure we don't go past the end of the buffer
                     let buffer_lines = self.buffer.buffer_len_lines();
                     let target_line = line.min(buffer_lines.saturating_sub(1));
-                    
+
                     // Get line start and make sure column is within line bounds
                     let line_start = self.buffer.buffer_line_to_char(target_line);
                     let line_len = if target_line < buffer_lines {
-                        self.buffer.buffer_line(target_line).len().saturating_sub(1) // -1 for newline
+                        self.buffer.buffer_line(target_line).len().saturating_sub(1)
+                    // -1 for newline
                     } else {
                         0
                     };
                     let target_column = column.min(line_len);
-                    
+
                     let new_pos = line_start + target_column;
                     new_cursor_pos = Some(new_pos);
-                    
+
                     dirty_regions.push(DirtyRegion::Buffer {
                         buffer_id: self.buffer_id,
                     });

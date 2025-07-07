@@ -73,7 +73,12 @@ impl<W: Write> TerminalRenderer<W> {
         let buffer = &editor.buffers[window.active_buffer];
 
         // Check if there's a region selected for highlighting
-        let region_bounds = buffer.get_region(window.cursor);
+        // Only show region highlighting in the active window
+        let region_bounds = if window_id == editor.active_window {
+            buffer.get_region(window.cursor)
+        } else {
+            None
+        };
 
         // Get line content
         if buffer_line >= buffer.buffer_len_lines() {
@@ -1085,31 +1090,35 @@ async fn handle_mouse_event<W: Write>(
                 });
             } else {
                 // Check if the mouse is within a window content area
-                if let Some(window_id) = find_window_at_position(editor, mouse_event.column, mouse_event.row) {
+                if let Some(window_id) =
+                    find_window_at_position(editor, mouse_event.column, mouse_event.row)
+                {
                     // Switch to the clicked window if it's not already active
                     if editor.active_window != window_id {
                         editor.previous_active_window = Some(editor.active_window);
                         editor.active_window = window_id;
                         renderer.mark_dirty(DirtyRegion::FullScreen);
                     }
-                    
+
                     // Convert screen coordinates to buffer-absolute coordinates
                     let window = &editor.windows[window_id];
                     let relative_x = mouse_event.column.saturating_sub(window.x + 1); // +1 for border
                     let relative_y = mouse_event.row.saturating_sub(window.y + 1); // +1 for top border
-                    
+
                     // Convert window-relative coordinates to buffer-absolute coordinates
                     let buffer_row = relative_y + window.start_line;
                     let buffer_col = relative_x;
-                    
+
                     // Create mouse event for the mode
                     let mode_mouse_event = crate::mode::MouseEvent {
                         position: (buffer_col, buffer_row),
                         event_type: crate::mode::MouseEventType::LeftClick,
                     };
-                    
+
                     // Send the mouse event to the buffer's mode and process response
-                    if let Some(actions) = handle_mode_mouse_event(editor, window_id, &mode_mouse_event).await {
+                    if let Some(actions) =
+                        handle_mode_mouse_event(editor, window_id, &mode_mouse_event).await
+                    {
                         for action in actions {
                             match action {
                                 ChromeAction::MarkDirty(dirty_region) => {
@@ -1179,7 +1188,7 @@ fn find_window_at_position(editor: &Editor, x: u16, y: u16) -> Option<WindowId> 
         let content_right = window.x + window.width_chars - 1; // -1 for right border
         let content_top = window.y;
         let content_bottom = window.y + window.height_chars - 1;
-        
+
         if x >= content_left && x < content_right && y >= content_top && y <= content_bottom {
             return Some(window_id);
         }
@@ -1188,14 +1197,21 @@ fn find_window_at_position(editor: &Editor, x: u16, y: u16) -> Option<WindowId> 
 }
 
 /// Handle mouse events for modes
-async fn handle_mode_mouse_event(editor: &mut Editor, window_id: WindowId, mouse_event: &crate::mode::MouseEvent) -> Option<Vec<crate::editor::ChromeAction>> {
+async fn handle_mode_mouse_event(
+    editor: &mut Editor,
+    window_id: WindowId,
+    mouse_event: &crate::mode::MouseEvent,
+) -> Option<Vec<crate::editor::ChromeAction>> {
     let window = &editor.windows[window_id];
     let buffer_id = window.active_buffer;
     let cursor_pos = window.cursor;
-    
+
     if let Some(buffer_host) = editor.buffer_hosts.get(&buffer_id) {
         // Send mouse event to buffer host and wait for response
-        if let Ok(response) = buffer_host.handle_mouse(mouse_event.clone(), cursor_pos).await {
+        if let Ok(response) = buffer_host
+            .handle_mouse(mouse_event.clone(), cursor_pos)
+            .await
+        {
             // Process the response like key events do
             return Some(editor.handle_buffer_response(response).await);
         }
