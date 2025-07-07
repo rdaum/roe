@@ -12,10 +12,10 @@
 //
 
 use crate::keys::KeyAction;
-use crate::mode::{Mode, ModeResult, ModeAction, ActionPosition};
-use crate::{BufferId};
-use std::path::PathBuf;
+use crate::mode::{ActionPosition, Mode, ModeAction, ModeResult};
+use crate::BufferId;
 use std::fs;
+use std::path::PathBuf;
 
 /// Interactive file selector mode for C-x C-f (find-file)
 /// This mode manages a command window buffer that displays files and directories
@@ -58,7 +58,7 @@ impl FileSelectorMode {
             all_paths: Vec::new(),
         }
     }
-    
+
     /// Initialize with buffer and load current directory
     pub fn init_with_buffer(&mut self, buffer_id: BufferId) {
         // Reset all state to ensure clean initialization
@@ -66,34 +66,35 @@ impl FileSelectorMode {
         self.buffer_id = Some(buffer_id);
         self.selected_index = 0;
         self.item_scroll_offset = 0;
-        
+
         // Load current directory contents
         self.load_directory();
         self.update_matches_internal();
         self.update_scroll_to_center();
     }
-    
+
     /// Load the contents of the current directory
     fn load_directory(&mut self) {
         self.all_items.clear();
         self.all_paths.clear();
-        
+
         // Always add ".." to go up a directory (unless we're at root)
         if self.current_dir.parent().is_some() {
             self.all_items.push("../".to_string());
-            self.all_paths.push(self.current_dir.parent().unwrap().to_path_buf());
+            self.all_paths
+                .push(self.current_dir.parent().unwrap().to_path_buf());
         }
-        
+
         // Read directory contents
         if let Ok(entries) = fs::read_dir(&self.current_dir) {
             let mut dirs = Vec::new();
             let mut files = Vec::new();
-            
+
             for entry in entries.flatten() {
                 if let Ok(metadata) = entry.metadata() {
                     let name = entry.file_name().to_string_lossy().to_string();
                     let path = entry.path();
-                    
+
                     if metadata.is_dir() {
                         dirs.push((format!("{name}/"), path));
                     } else {
@@ -101,11 +102,11 @@ impl FileSelectorMode {
                     }
                 }
             }
-            
+
             // Sort directories and files separately
             dirs.sort_by(|a, b| a.0.cmp(&b.0));
             files.sort_by(|a, b| a.0.cmp(&b.0));
-            
+
             // Add directories first, then files
             for (name, path) in dirs {
                 self.all_items.push(name);
@@ -117,7 +118,7 @@ impl FileSelectorMode {
             }
         }
     }
-    
+
     /// Update matches based on current input using stored file list
     fn update_matches_internal(&mut self) {
         if self.input.is_empty() {
@@ -128,38 +129,38 @@ impl FileSelectorMode {
             // Filter by prefix/contains
             let mut filtered_names = Vec::new();
             let mut filtered_paths = Vec::new();
-            
+
             for (i, name) in self.all_items.iter().enumerate() {
                 if name.to_lowercase().contains(&self.input.to_lowercase()) {
                     filtered_names.push(name.clone());
                     filtered_paths.push(self.all_paths[i].clone());
                 }
             }
-            
+
             self.matches = filtered_names;
             self.paths = filtered_paths;
         }
-        
+
         // Reset selection to first match
         self.selected_index = 0;
         self.item_scroll_offset = 0;
-        
+
         // Ensure we keep the selection centered
         self.update_scroll_to_center();
     }
-    
+
     /// Generate buffer content string
     pub fn generate_buffer_content(&self) -> String {
         let mut content = String::new();
-        
+
         // Show current directory path
         content.push_str(&format!("Directory: {}\n", self.current_dir.display()));
-        
+
         // Show user input on next line if any
         if !self.input.is_empty() {
             content.push_str(&format!("Filter: {}\n", self.input));
         }
-        
+
         // File/directory lines with highlighting
         let visible_items = self.visible_items();
         for (idx, item_name) in visible_items.iter().enumerate() {
@@ -171,15 +172,15 @@ impl FileSelectorMode {
                 content.push_str(&format!("  {item_name}\n"));
             }
         }
-        
+
         content
     }
-    
+
     /// Get the currently selected file path
     pub fn get_selected_path(&self) -> Option<PathBuf> {
         self.paths.get(self.selected_index).cloned()
     }
-    
+
     /// Navigate to a directory
     pub fn navigate_to_directory(&mut self, path: PathBuf) -> bool {
         if path.is_dir() {
@@ -193,7 +194,7 @@ impl FileSelectorMode {
             false
         }
     }
-    
+
     /// Update scroll offset to keep selection centered
     fn update_scroll_to_center(&mut self) {
         if self.matches.len() <= self.max_visible_items {
@@ -201,9 +202,9 @@ impl FileSelectorMode {
             self.item_scroll_offset = 0;
             return;
         }
-        
+
         let half_window = self.max_visible_items / 2;
-        
+
         // Try to center the selection
         if self.selected_index < half_window {
             // Near the beginning, show from start
@@ -216,22 +217,23 @@ impl FileSelectorMode {
             self.item_scroll_offset = self.selected_index - half_window;
         }
     }
-    
+
     /// Get the visible items for rendering
     pub fn visible_items(&self) -> &[String] {
         let start = self.item_scroll_offset;
         let end = (start + self.max_visible_items).min(self.matches.len());
         &self.matches[start..end]
     }
-    
+
     /// Get the relative index of the selection within the visible items
     pub fn visible_selection_index(&self) -> Option<usize> {
         if self.matches.is_empty() {
             return None;
         }
-        
-        if self.selected_index >= self.item_scroll_offset 
-            && self.selected_index < self.item_scroll_offset + self.max_visible_items {
+
+        if self.selected_index >= self.item_scroll_offset
+            && self.selected_index < self.item_scroll_offset + self.max_visible_items
+        {
             Some(self.selected_index - self.item_scroll_offset)
         } else {
             None
@@ -250,7 +252,7 @@ impl Mode for FileSelectorMode {
     fn name(&self) -> &str {
         "file-selector"
     }
-    
+
     fn perform(&mut self, action: &KeyAction) -> ModeResult {
         // Handle file selector mode specific actions
         match action {
@@ -260,7 +262,7 @@ impl Mode for FileSelectorMode {
                 // Clear buffer and replace with new content
                 ModeResult::Consumed(vec![
                     ModeAction::ClearText,
-                    ModeAction::InsertText(ActionPosition::start(), self.generate_buffer_content())
+                    ModeAction::InsertText(ActionPosition::start(), self.generate_buffer_content()),
                 ])
             }
             KeyAction::Backspace => {
@@ -269,7 +271,10 @@ impl Mode for FileSelectorMode {
                     self.update_matches_internal();
                     ModeResult::Consumed(vec![
                         ModeAction::ClearText,
-                        ModeAction::InsertText(ActionPosition::start(), self.generate_buffer_content())
+                        ModeAction::InsertText(
+                            ActionPosition::start(),
+                            self.generate_buffer_content(),
+                        ),
                     ])
                 } else {
                     ModeResult::Ignored
@@ -283,7 +288,7 @@ impl Mode for FileSelectorMode {
                 // Always consume arrow keys in file selector mode, even if we can't move
                 ModeResult::Consumed(vec![
                     ModeAction::ClearText,
-                    ModeAction::InsertText(ActionPosition::start(), self.generate_buffer_content())
+                    ModeAction::InsertText(ActionPosition::start(), self.generate_buffer_content()),
                 ])
             }
             KeyAction::Cursor(crate::keys::CursorDirection::Down) => {
@@ -294,7 +299,7 @@ impl Mode for FileSelectorMode {
                 // Always consume arrow keys in file selector mode, even if we can't move
                 ModeResult::Consumed(vec![
                     ModeAction::ClearText,
-                    ModeAction::InsertText(ActionPosition::start(), self.generate_buffer_content())
+                    ModeAction::InsertText(ActionPosition::start(), self.generate_buffer_content()),
                 ])
             }
             KeyAction::Tab => {
@@ -304,7 +309,10 @@ impl Mode for FileSelectorMode {
                     self.update_scroll_to_center();
                     ModeResult::Consumed(vec![
                         ModeAction::ClearText,
-                        ModeAction::InsertText(ActionPosition::start(), self.generate_buffer_content())
+                        ModeAction::InsertText(
+                            ActionPosition::start(),
+                            self.generate_buffer_content(),
+                        ),
                     ])
                 } else {
                     ModeResult::Ignored
@@ -317,13 +325,14 @@ impl Mode for FileSelectorMode {
                         self.navigate_to_directory(selected_path);
                         ModeResult::Consumed(vec![
                             ModeAction::ClearText,
-                            ModeAction::InsertText(ActionPosition::start(), self.generate_buffer_content())
+                            ModeAction::InsertText(
+                                ActionPosition::start(),
+                                self.generate_buffer_content(),
+                            ),
                         ])
                     } else {
                         // Open the selected file
-                        ModeResult::Consumed(vec![
-                            ModeAction::OpenFile(selected_path)
-                        ])
+                        ModeResult::Consumed(vec![ModeAction::OpenFile(selected_path)])
                     }
                 } else {
                     ModeResult::Ignored

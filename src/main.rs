@@ -195,7 +195,7 @@ async fn terminal_main<W: Write>(stdout: W, file_paths: Vec<String>) -> Result<(
         echo_message_time: None,
         current_key_chord: Vec::new(),
     };
-    
+
     // Initialize buffer history with the current buffer
     let initial_buffer_id = editor.windows[active_window_id].active_buffer;
     editor.record_buffer_access(initial_buffer_id);

@@ -113,7 +113,7 @@ pub enum ModeResult {
 pub trait Mode: Send + Sync {
     fn name(&self) -> &str;
     fn perform(&mut self, action: &KeyAction) -> ModeResult;
-    
+
     /// Return commands that this mode provides
     /// Default implementation returns no commands
     fn available_commands(&self) -> Vec<Command> {
@@ -134,9 +134,7 @@ impl Mode for ScratchMode {
             KeyAction::InsertModeToggle => ModeResult::Ignored,
             KeyAction::Undo => ModeResult::Ignored,
             KeyAction::Redo => ModeResult::Ignored,
-            KeyAction::MarkStart => {
-                ModeResult::Consumed(vec![ModeAction::SetMark])
-            }
+            KeyAction::MarkStart => ModeResult::Consumed(vec![ModeAction::SetMark]),
             KeyAction::MarkEnd => ModeResult::Ignored,
             KeyAction::KillRegion(destructive) => {
                 if *destructive {
@@ -147,36 +145,35 @@ impl Mode for ScratchMode {
                     ModeResult::Consumed(vec![ModeAction::CopyRegion])
                 }
             }
-            KeyAction::KillLine(_whole_line) => {
-                ModeResult::Consumed(vec![ModeAction::KillLine])
-            }
+            KeyAction::KillLine(_whole_line) => ModeResult::Consumed(vec![ModeAction::KillLine]),
             KeyAction::Yank(index) => match index {
-                Some(idx) => ModeResult::Consumed(vec![ModeAction::YankIndex(ActionPosition::cursor(), *idx)]),
+                Some(idx) => ModeResult::Consumed(vec![ModeAction::YankIndex(
+                    ActionPosition::cursor(),
+                    *idx,
+                )]),
                 None => ModeResult::Consumed(vec![ModeAction::Yank(ActionPosition::cursor())]),
             },
             KeyAction::ForceIndent => ModeResult::Ignored,
             KeyAction::Tab => ModeResult::Ignored,
-            KeyAction::Delete => ModeResult::Consumed(vec![ModeAction::DeleteText(ActionPosition::cursor(), 1)]),
+            KeyAction::Delete => {
+                ModeResult::Consumed(vec![ModeAction::DeleteText(ActionPosition::cursor(), 1)])
+            }
             KeyAction::Backspace => {
                 ModeResult::Consumed(vec![ModeAction::DeleteText(ActionPosition::cursor(), -1)])
             }
-            KeyAction::Enter => {
-                ModeResult::Consumed(vec![ModeAction::InsertText(
-                    ActionPosition::cursor(),
-                    "\n".to_string(),
-                )])
-            }
+            KeyAction::Enter => ModeResult::Consumed(vec![ModeAction::InsertText(
+                ActionPosition::cursor(),
+                "\n".to_string(),
+            )]),
             KeyAction::Escape => ModeResult::Ignored,
             KeyAction::DeleteWord => ModeResult::Ignored,
             KeyAction::ToggleCapsLock => ModeResult::Ignored,
             KeyAction::ToggleScrollLock => ModeResult::Ignored,
             KeyAction::BackspaceWord => ModeResult::Ignored,
-            KeyAction::AlphaNumeric(x) => {
-                ModeResult::Annotated(vec![ModeAction::InsertText(
-                    ActionPosition::cursor(),
-                    x.to_string(),
-                )])
-            }
+            KeyAction::AlphaNumeric(x) => ModeResult::Annotated(vec![ModeAction::InsertText(
+                ActionPosition::cursor(),
+                x.to_string(),
+            )]),
             KeyAction::ChordNext => ModeResult::Ignored,
             KeyAction::CommandMode => ModeResult::Ignored,
             KeyAction::Save => ModeResult::Ignored,
@@ -187,9 +184,7 @@ impl Mode for ScratchMode {
             KeyAction::SwitchWindow => ModeResult::Ignored,
             KeyAction::DeleteWindow => ModeResult::Ignored,
             KeyAction::DeleteOtherWindows => ModeResult::Ignored,
-            KeyAction::Cancel => {
-                ModeResult::Consumed(vec![ModeAction::ClearMark])
-            }
+            KeyAction::Cancel => ModeResult::Consumed(vec![ModeAction::ClearMark]),
             KeyAction::SwitchBuffer => ModeResult::Ignored,
             KeyAction::KillBuffer => ModeResult::Ignored,
             KeyAction::Unbound => ModeResult::Ignored,
@@ -213,9 +208,7 @@ impl Mode for FileMode {
             KeyAction::InsertModeToggle => ModeResult::Ignored,
             KeyAction::Undo => ModeResult::Ignored,
             KeyAction::Redo => ModeResult::Ignored,
-            KeyAction::MarkStart => {
-                ModeResult::Consumed(vec![ModeAction::SetMark])
-            }
+            KeyAction::MarkStart => ModeResult::Consumed(vec![ModeAction::SetMark]),
             KeyAction::MarkEnd => ModeResult::Ignored,
             KeyAction::KillRegion(destructive) => {
                 if *destructive {
@@ -226,41 +219,38 @@ impl Mode for FileMode {
                     ModeResult::Consumed(vec![ModeAction::CopyRegion])
                 }
             }
-            KeyAction::KillLine(_whole_line) => {
-                ModeResult::Consumed(vec![ModeAction::KillLine])
-            }
+            KeyAction::KillLine(_whole_line) => ModeResult::Consumed(vec![ModeAction::KillLine]),
             KeyAction::Yank(index) => match index {
-                Some(idx) => ModeResult::Consumed(vec![ModeAction::YankIndex(ActionPosition::cursor(), *idx)]),
+                Some(idx) => ModeResult::Consumed(vec![ModeAction::YankIndex(
+                    ActionPosition::cursor(),
+                    *idx,
+                )]),
                 None => ModeResult::Consumed(vec![ModeAction::Yank(ActionPosition::cursor())]),
             },
             KeyAction::ForceIndent => ModeResult::Ignored,
             KeyAction::Tab => ModeResult::Ignored,
-            KeyAction::Delete => ModeResult::Consumed(vec![ModeAction::DeleteText(ActionPosition::cursor(), 1)]),
+            KeyAction::Delete => {
+                ModeResult::Consumed(vec![ModeAction::DeleteText(ActionPosition::cursor(), 1)])
+            }
             KeyAction::Backspace => {
                 ModeResult::Consumed(vec![ModeAction::DeleteText(ActionPosition::cursor(), -1)])
             }
-            KeyAction::Enter => {
-                ModeResult::Consumed(vec![ModeAction::InsertText(
-                    ActionPosition::cursor(),
-                    "\n".to_string(),
-                )])
-            }
+            KeyAction::Enter => ModeResult::Consumed(vec![ModeAction::InsertText(
+                ActionPosition::cursor(),
+                "\n".to_string(),
+            )]),
             KeyAction::Escape => ModeResult::Ignored,
             KeyAction::DeleteWord => ModeResult::Ignored,
             KeyAction::ToggleCapsLock => ModeResult::Ignored,
             KeyAction::ToggleScrollLock => ModeResult::Ignored,
             KeyAction::BackspaceWord => ModeResult::Ignored,
-            KeyAction::AlphaNumeric(x) => {
-                ModeResult::Annotated(vec![ModeAction::InsertText(
-                    ActionPosition::cursor(),
-                    x.to_string(),
-                )])
-            }
+            KeyAction::AlphaNumeric(x) => ModeResult::Annotated(vec![ModeAction::InsertText(
+                ActionPosition::cursor(),
+                x.to_string(),
+            )]),
             KeyAction::ChordNext => ModeResult::Ignored,
             KeyAction::CommandMode => ModeResult::Ignored,
-            KeyAction::Save => {
-                ModeResult::Consumed(vec![ModeAction::Save])
-            }
+            KeyAction::Save => ModeResult::Consumed(vec![ModeAction::Save]),
             KeyAction::Quit => ModeResult::Ignored,
             KeyAction::FindFile => ModeResult::Ignored,
             KeyAction::SplitHorizontal => ModeResult::Ignored,
@@ -268,26 +258,22 @@ impl Mode for FileMode {
             KeyAction::SwitchWindow => ModeResult::Ignored,
             KeyAction::DeleteWindow => ModeResult::Ignored,
             KeyAction::DeleteOtherWindows => ModeResult::Ignored,
-            KeyAction::Cancel => {
-                ModeResult::Consumed(vec![ModeAction::ClearMark])
-            }
+            KeyAction::Cancel => ModeResult::Consumed(vec![ModeAction::ClearMark]),
             KeyAction::SwitchBuffer => ModeResult::Ignored,
             KeyAction::KillBuffer => ModeResult::Ignored,
             KeyAction::Unbound => ModeResult::Ignored,
         }
     }
-    
+
     fn available_commands(&self) -> Vec<Command> {
         use crate::editor::ChromeAction;
-        
+
         vec![
             Command::new(
                 "save-buffer",
                 "Save current buffer to file",
                 CommandCategory::Mode("file".to_string()),
-                Box::new(|_context| {
-                    Ok(vec![ChromeAction::Echo("Saving file...".to_string())])
-                }),
+                Box::new(|_context| Ok(vec![ChromeAction::Echo("Saving file...".to_string())])),
             ),
             Command::new(
                 "revert-buffer",
@@ -302,7 +288,9 @@ impl Mode for FileMode {
                 "Write buffer to a new file",
                 CommandCategory::Mode("file".to_string()),
                 Box::new(|_context| {
-                    Ok(vec![ChromeAction::Echo("Write file not implemented yet".to_string())])
+                    Ok(vec![ChromeAction::Echo(
+                        "Write file not implemented yet".to_string(),
+                    )])
                 }),
             ),
         ]

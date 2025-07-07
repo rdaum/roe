@@ -249,14 +249,14 @@ impl BufferInner {
         if self.buffer.len_chars() == 0 {
             return 0;
         }
-        
+
         let mut current_pos = self.clamp_position(pos);
         let buffer_len = self.buffer.len_chars();
-        
+
         if current_pos >= buffer_len {
             return buffer_len;
         }
-        
+
         // Skip any whitespace we're currently in
         while current_pos < buffer_len {
             let ch = self.buffer.char(current_pos);
@@ -265,7 +265,7 @@ impl BufferInner {
             }
             current_pos += 1;
         }
-        
+
         // Skip the current word (non-whitespace chars)
         while current_pos < buffer_len {
             let ch = self.buffer.char(current_pos);
@@ -274,7 +274,7 @@ impl BufferInner {
             }
             current_pos += 1;
         }
-        
+
         // Skip trailing whitespace to get to start of next word
         while current_pos < buffer_len {
             let ch = self.buffer.char(current_pos);
@@ -283,7 +283,7 @@ impl BufferInner {
             }
             current_pos += 1;
         }
-        
+
         current_pos
     }
 
@@ -292,16 +292,16 @@ impl BufferInner {
         if self.buffer.len_chars() == 0 {
             return 0;
         }
-        
+
         let mut current_pos = self.clamp_position(pos);
-        
+
         if current_pos == 0 {
             return 0;
         }
-        
+
         // Move back one position to start
         current_pos = current_pos.saturating_sub(1);
-        
+
         // Skip any whitespace we're currently in (moving backwards)
         while current_pos > 0 {
             let ch = self.buffer.char(current_pos);
@@ -310,7 +310,7 @@ impl BufferInner {
             }
             current_pos = current_pos.saturating_sub(1);
         }
-        
+
         // Skip the current word (moving backwards through non-whitespace)
         while current_pos > 0 {
             let ch = self.buffer.char(current_pos.saturating_sub(1));
@@ -319,7 +319,7 @@ impl BufferInner {
             }
             current_pos = current_pos.saturating_sub(1);
         }
-        
+
         current_pos
     }
 
@@ -337,28 +337,28 @@ impl BufferInner {
         if self.buffer.len_chars() == 0 {
             return 0;
         }
-        
+
         let current_pos = self.clamp_position(pos);
         let current_line = self.buffer.char_to_line(current_pos);
         let total_lines = self.buffer.len_lines();
-        
+
         let mut target_line = current_line;
-        
+
         // Skip current paragraph (non-blank lines)
         while target_line < total_lines && !self.is_line_blank(target_line) {
             target_line += 1;
         }
-        
+
         // Skip blank lines
         while target_line < total_lines && self.is_line_blank(target_line) {
             target_line += 1;
         }
-        
+
         // If we reached end of buffer, return end
         if target_line >= total_lines {
             return self.buffer.len_chars();
         }
-        
+
         // Return start of the target line
         self.buffer.line_to_char(target_line)
     }
@@ -368,35 +368,36 @@ impl BufferInner {
         if self.buffer.len_chars() == 0 {
             return 0;
         }
-        
+
         let current_pos = self.clamp_position(pos);
         let current_line = self.buffer.char_to_line(current_pos);
-        
+
         if current_line == 0 {
             return 0; // Already at start
         }
-        
+
         // First, find the start of the current paragraph
         let mut line_idx = current_line;
-        
+
         // If we're already at the start of a non-blank line, we're at paragraph start
         let line_start_pos = self.buffer.line_to_char(current_line);
-        let already_at_paragraph_start = current_pos == line_start_pos && !self.is_line_blank(current_line);
-        
+        let already_at_paragraph_start =
+            current_pos == line_start_pos && !self.is_line_blank(current_line);
+
         if already_at_paragraph_start {
             // We're at the start of a paragraph, move to previous paragraph
             line_idx = line_idx.saturating_sub(1);
-            
+
             // Skip blank lines backwards
             while line_idx > 0 && self.is_line_blank(line_idx) {
                 line_idx = line_idx.saturating_sub(1);
             }
-            
+
             // Skip current paragraph backwards (non-blank lines)
             while line_idx > 0 && !self.is_line_blank(line_idx) {
                 line_idx = line_idx.saturating_sub(1);
             }
-            
+
             // If we stopped on a blank line, skip forward to start of paragraph
             if self.is_line_blank(line_idx) && line_idx + 1 < self.buffer.len_lines() {
                 line_idx += 1;
@@ -412,7 +413,7 @@ impl BufferInner {
                 line_idx = prev_line;
             }
         }
-        
+
         // Return start of the target line
         self.buffer.line_to_char(line_idx)
     }
@@ -525,7 +526,7 @@ impl Buffer {
     }
 
     // Convenience methods for common operations that don't need multiple calls
-    
+
     pub fn to_column_line(&self, char_index: usize) -> (u16, u16) {
         self.with_read(|b| b.to_column_line(char_index))
     }
@@ -1028,40 +1029,40 @@ mod tests {
         // Load some test text with various word patterns
         let mut buffer = buffer;
         buffer.load_str("hello world  test\n  another line");
-        
+
         // Test forward word movement
         // From start (position 0), should move to 'w' in "world"
         assert_eq!(buffer.move_word_forward(0), 6); // "hello " -> "world"
-        
+
         // From 'w' in "world", should move to 't' in "test"
         assert_eq!(buffer.move_word_forward(6), 13); // "world  " -> "test"
-        
+
         // From 't' in "test", should move to 'a' in "another" (skipping newline and spaces)
         assert_eq!(buffer.move_word_forward(13), 20); // "test\n  " -> "another"
-        
+
         // From 'a' in "another", should move to 'l' in "line"
         assert_eq!(buffer.move_word_forward(20), 28); // "another " -> "line"
-        
+
         // From end of buffer, should stay at end
         let end_pos = buffer.buffer.len_chars();
         assert_eq!(buffer.move_word_forward(end_pos), end_pos);
-        
+
         // Test backward word movement
         // From end, should move to start of "line"
         assert_eq!(buffer.move_word_backward(end_pos), 28);
-        
+
         // From 'l' in "line", should move to start of "another"
         assert_eq!(buffer.move_word_backward(28), 20);
-        
+
         // From 'a' in "another", should move to start of "test"
         assert_eq!(buffer.move_word_backward(20), 13);
-        
+
         // From 't' in "test", should move to start of "world"
         assert_eq!(buffer.move_word_backward(13), 6);
-        
+
         // From 'w' in "world", should move to start of "hello"
         assert_eq!(buffer.move_word_backward(6), 0);
-        
+
         // From start, should stay at start
         assert_eq!(buffer.move_word_backward(0), 0);
     }
@@ -1071,10 +1072,10 @@ mod tests {
         let mut buffer = BufferInner::new(&[]);
         // Load text with multiple paragraphs separated by blank lines
         buffer.load_str("First paragraph\nstill first paragraph\n\nSecond paragraph\nstill second\n\n\nThird paragraph\nstill third");
-        
+
         // Text layout:
         // Line 0: "First paragraph"                    (chars 0-15)
-        // Line 1: "still first paragraph"             (chars 16-37) 
+        // Line 1: "still first paragraph"             (chars 16-37)
         // Line 2: ""                                  (chars 38-38, blank line)
         // Line 3: "Second paragraph"                  (chars 39-55)
         // Line 4: "still second"                      (chars 56-68)
@@ -1082,40 +1083,40 @@ mod tests {
         // Line 6: ""                                  (chars 70-70, blank line)
         // Line 7: "Third paragraph"                   (chars 71-86)
         // Line 8: "still third"                       (chars 87-98)
-        
+
         // Test forward paragraph movement
         // From start of first paragraph (pos 0), should move to start of second paragraph
         assert_eq!(buffer.move_paragraph_forward(0), 39); // Start of "Second paragraph"
-        
+
         // From middle of first paragraph, should still move to start of second paragraph
         assert_eq!(buffer.move_paragraph_forward(10), 39); // Start of "Second paragraph"
-        
+
         // From start of second paragraph, should move to start of third paragraph
         assert_eq!(buffer.move_paragraph_forward(39), 71); // Start of "Third paragraph"
-        
+
         // From middle of second paragraph, should move to start of third paragraph
         assert_eq!(buffer.move_paragraph_forward(60), 71); // Start of "Third paragraph"
-        
+
         // From start of third paragraph, should move to end of buffer
         let end_pos = buffer.buffer.len_chars();
         assert_eq!(buffer.move_paragraph_forward(71), end_pos); // End of buffer
-        
+
         // Test backward paragraph movement
         // From end of buffer, should move to start of third paragraph
         assert_eq!(buffer.move_paragraph_backward(end_pos), 71);
-        
+
         // From middle of third paragraph, should move to start of third paragraph
         assert_eq!(buffer.move_paragraph_backward(90), 71);
-        
+
         // From start of third paragraph, should move to start of second paragraph
         assert_eq!(buffer.move_paragraph_backward(71), 39);
-        
+
         // From middle of second paragraph, should move to start of second paragraph
         assert_eq!(buffer.move_paragraph_backward(50), 39);
-        
+
         // From start of second paragraph, should move to start of first paragraph
         assert_eq!(buffer.move_paragraph_backward(39), 0);
-        
+
         // From start of first paragraph, should stay at start
         assert_eq!(buffer.move_paragraph_backward(0), 0);
     }

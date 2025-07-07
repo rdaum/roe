@@ -47,7 +47,8 @@ pub enum CommandCategory {
 }
 
 /// Handler function type for commands
-pub type CommandHandler = Box<dyn Fn(CommandContext) -> Result<Vec<ChromeAction>, String> + Send + Sync>;
+pub type CommandHandler =
+    Box<dyn Fn(CommandContext) -> Result<Vec<ChromeAction>, String> + Send + Sync>;
 
 /// A single command that can be executed
 pub struct Command {
@@ -76,7 +77,7 @@ impl Command {
             handler,
         }
     }
-    
+
     /// Execute this command with the given context
     pub fn execute(&self, context: CommandContext) -> Result<Vec<ChromeAction>, String> {
         (self.handler)(context)
@@ -95,32 +96,33 @@ impl CommandRegistry {
             commands: Vec::new(),
         }
     }
-    
+
     /// Register a new command
     pub fn register_command(&mut self, command: Command) {
         // Remove any existing command with the same name
         self.commands.retain(|c| c.name != command.name);
         self.commands.push(command);
     }
-    
+
     /// Find all commands matching the given prefix
     pub fn find_commands(&self, prefix: &str) -> Vec<&Command> {
         let prefix_lower = prefix.to_lowercase();
-        let mut matches: Vec<&Command> = self.commands
+        let mut matches: Vec<&Command> = self
+            .commands
             .iter()
             .filter(|cmd| cmd.name.to_lowercase().starts_with(&prefix_lower))
             .collect();
-        
+
         // Sort by name for consistent ordering
         matches.sort_by(|a, b| a.name.cmp(&b.name));
         matches
     }
-    
+
     /// Get a specific command by exact name
     pub fn get_command(&self, name: &str) -> Option<&Command> {
         self.commands.iter().find(|cmd| cmd.name == name)
     }
-    
+
     /// Get all commands in a specific category
     pub fn get_commands_by_category(&self, category: &CommandCategory) -> Vec<&Command> {
         self.commands
@@ -128,12 +130,12 @@ impl CommandRegistry {
             .filter(|cmd| &cmd.category == category)
             .collect()
     }
-    
+
     /// Get all registered commands
     pub fn all_commands(&self) -> &[Command] {
         &self.commands
     }
-    
+
     /// Remove all commands from a specific category (useful for mode cleanup)
     pub fn remove_commands_by_category(&mut self, category: &CommandCategory) {
         self.commands.retain(|cmd| &cmd.category != category);
@@ -149,160 +151,135 @@ impl Default for CommandRegistry {
 /// Initialize the command registry with comprehensive global commands
 pub fn create_default_registry() -> CommandRegistry {
     let mut registry = CommandRegistry::new();
-    
+
     // File operations
     registry.register_command(Command::new(
         "find-file",
         "Open a file",
         CommandCategory::Global,
-        Box::new(|_context| {
-            Ok(vec![ChromeAction::FileOpen])
-        }),
+        Box::new(|_context| Ok(vec![ChromeAction::FileOpen])),
     ));
-    
+
     registry.register_command(Command::new(
         "save-buffer",
         "Save current buffer to file",
         CommandCategory::Global,
         Box::new(|context| {
-            Ok(vec![
-                ChromeAction::Echo(format!("Saving {}...", context.buffer_name))
-            ])
+            Ok(vec![ChromeAction::Echo(format!(
+                "Saving {}...",
+                context.buffer_name
+            ))])
         }),
     ));
-    
+
     // Editor lifecycle
     registry.register_command(Command::new(
         "quit",
         "Quit the editor",
         CommandCategory::Global,
-        Box::new(|_context| {
-            Ok(vec![ChromeAction::Quit])
-        }),
+        Box::new(|_context| Ok(vec![ChromeAction::Quit])),
     ));
-    
+
     registry.register_command(Command::new(
         "exit",
         "Exit the editor (alias for quit)",
         CommandCategory::Global,
-        Box::new(|_context| {
-            Ok(vec![ChromeAction::Quit])
-        }),
+        Box::new(|_context| Ok(vec![ChromeAction::Quit])),
     ));
-    
+
     // Window management
     registry.register_command(Command::new(
         "split-window-horizontally",
         "Split current window horizontally",
         CommandCategory::Global,
-        Box::new(|_context| {
-            Ok(vec![ChromeAction::SplitHorizontal])
-        }),
+        Box::new(|_context| Ok(vec![ChromeAction::SplitHorizontal])),
     ));
-    
+
     registry.register_command(Command::new(
-        "split-window-vertically", 
+        "split-window-vertically",
         "Split current window vertically",
         CommandCategory::Global,
-        Box::new(|_context| {
-            Ok(vec![ChromeAction::SplitVertical])
-        }),
+        Box::new(|_context| Ok(vec![ChromeAction::SplitVertical])),
     ));
-    
+
     registry.register_command(Command::new(
         "delete-window",
         "Delete current window",
         CommandCategory::Global,
-        Box::new(|_context| {
-            Ok(vec![ChromeAction::DeleteWindow])
-        }),
+        Box::new(|_context| Ok(vec![ChromeAction::DeleteWindow])),
     ));
-    
+
     registry.register_command(Command::new(
         "delete-other-windows",
         "Delete all windows except current",
         CommandCategory::Global,
-        Box::new(|_context| {
-            Ok(vec![ChromeAction::DeleteOtherWindows])
-        }),
+        Box::new(|_context| Ok(vec![ChromeAction::DeleteOtherWindows])),
     ));
-    
+
     registry.register_command(Command::new(
         "other-window",
         "Switch to next window",
         CommandCategory::Global,
-        Box::new(|_context| {
-            Ok(vec![ChromeAction::SwitchWindow])
-        }),
+        Box::new(|_context| Ok(vec![ChromeAction::SwitchWindow])),
     ));
-    
+
     // Alternative command names (common aliases)
     registry.register_command(Command::new(
         "split-window-below",
         "Split current window horizontally (alias)",
         CommandCategory::Global,
-        Box::new(|_context| {
-            Ok(vec![ChromeAction::SplitHorizontal])
-        }),
+        Box::new(|_context| Ok(vec![ChromeAction::SplitHorizontal])),
     ));
-    
+
     registry.register_command(Command::new(
         "split-window-right",
         "Split current window vertically (alias)",
         CommandCategory::Global,
-        Box::new(|_context| {
-            Ok(vec![ChromeAction::SplitVertical])
-        }),
+        Box::new(|_context| Ok(vec![ChromeAction::SplitVertical])),
     ));
-    
+
     // Information commands
     registry.register_command(Command::new(
         "describe-buffer",
         "Show information about current buffer",
         CommandCategory::Global,
         Box::new(|context| {
-            Ok(vec![
-                ChromeAction::Echo(format!(
-                    "Buffer: {} ({}:{}) {} chars", 
-                    context.buffer_name,
-                    context.current_line,
-                    context.current_column,
-                    context.buffer_content.len()
-                ))
-            ])
+            Ok(vec![ChromeAction::Echo(format!(
+                "Buffer: {} ({}:{}) {} chars",
+                context.buffer_name,
+                context.current_line,
+                context.current_column,
+                context.buffer_content.len()
+            ))])
         }),
     ));
-    
+
     registry.register_command(Command::new(
         "describe-mode",
         "Show information about current major mode",
         CommandCategory::Global,
         Box::new(|_context| {
-            Ok(vec![
-                ChromeAction::Echo("Current mode: file-mode".to_string())
-            ])
+            Ok(vec![ChromeAction::Echo(
+                "Current mode: file-mode".to_string(),
+            )])
         }),
     ));
-    
+
     // Utility commands
     registry.register_command(Command::new(
         "keyboard-quit",
         "Cancel current operation",
         CommandCategory::Global,
-        Box::new(|_context| {
-            Ok(vec![
-                ChromeAction::Echo("Quit".to_string())
-            ])
-        }),
+        Box::new(|_context| Ok(vec![ChromeAction::Echo("Quit".to_string())])),
     ));
-    
+
     registry
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     fn dummy_context() -> CommandContext {
         CommandContext {
             buffer_content: "test".to_string(),
@@ -315,55 +292,55 @@ mod tests {
             current_column: 1,
         }
     }
-    
+
     #[test]
     fn test_command_registry_basic() {
         let mut registry = CommandRegistry::new();
-        
+
         registry.register_command(Command::new(
             "test-command",
             "A test command",
             CommandCategory::Global,
             Box::new(|_| Ok(vec![])),
         ));
-        
+
         assert_eq!(registry.all_commands().len(), 1);
         assert!(registry.get_command("test-command").is_some());
         assert!(registry.get_command("nonexistent").is_none());
     }
-    
+
     #[test]
     fn test_prefix_matching() {
         let mut registry = CommandRegistry::new();
-        
+
         registry.register_command(Command::new(
             "save-buffer",
             "Save buffer",
             CommandCategory::Global,
             Box::new(|_| Ok(vec![])),
         ));
-        
+
         registry.register_command(Command::new(
             "save-all",
             "Save all",
             CommandCategory::Global,
             Box::new(|_| Ok(vec![])),
         ));
-        
+
         registry.register_command(Command::new(
             "quit",
             "Quit",
             CommandCategory::Global,
             Box::new(|_| Ok(vec![])),
         ));
-        
+
         let save_matches = registry.find_commands("save");
         assert_eq!(save_matches.len(), 2);
-        
+
         let save_buffer_matches = registry.find_commands("save-b");
         assert_eq!(save_buffer_matches.len(), 1);
         assert_eq!(save_buffer_matches[0].name, "save-buffer");
-        
+
         let q_matches = registry.find_commands("q");
         assert_eq!(q_matches.len(), 1);
         assert_eq!(q_matches[0].name, "quit");

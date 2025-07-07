@@ -20,8 +20,8 @@ use crossterm::style::{Color, Print, Stylize};
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::{cursor, queue};
 use futures::{future::FutureExt, select, StreamExt};
-use tokio::time::{interval, Duration};
 use std::io::Write;
+use tokio::time::{interval, Duration};
 
 pub const ECHO_AREA_HEIGHT: u16 = 1;
 pub const BG_COLOR: Color = Color::Black;
@@ -392,7 +392,10 @@ impl<W: Write> Renderer for TerminalRenderer<W> {
         // Draw command windows
         for window_id in editor.windows.keys() {
             let window = &editor.windows[window_id];
-            if matches!(window.window_type, crate::editor::WindowType::Command { .. }) {
+            if matches!(
+                window.window_type,
+                crate::editor::WindowType::Command { .. }
+            ) {
                 draw_command_window(&mut self.device, editor, window_id)?;
             }
         }
@@ -406,7 +409,11 @@ impl<W: Write> Renderer for TerminalRenderer<W> {
             } else {
                 &editor.echo_message
             };
-            queue!(&mut self.device, cursor::MoveTo(x, y), Clear(ClearType::CurrentLine))?;
+            queue!(
+                &mut self.device,
+                cursor::MoveTo(x, y),
+                Clear(ClearType::CurrentLine)
+            )?;
             queue!(
                 &mut self.device,
                 cursor::MoveTo(x, y),
@@ -912,7 +919,7 @@ pub async fn event_loop_with_renderer<W: Write>(
             }
             _ = echo_timer.tick().fuse() => None, // Timer tick, check for expired echo
         };
-        
+
         // Handle timer tick (check for expired echo messages)
         if event.is_none() {
             if editor.check_and_clear_expired_echo() {
@@ -921,7 +928,7 @@ pub async fn event_loop_with_renderer<W: Write>(
             }
             continue;
         }
-        
+
         let event = event.unwrap();
         let keys = match event {
             Event::Key(keystroke) => {
@@ -946,6 +953,14 @@ pub async fn event_loop_with_renderer<W: Write>(
                 // Then key.
                 keys.push(key);
                 keys
+            }
+            Event::Resize(width, height) => {
+                // Handle terminal resize event
+                editor.handle_resize(width, height);
+                // Trigger full screen redraw
+                renderer.mark_dirty(DirtyRegion::FullScreen);
+                // No keys to process for resize event
+                vec![]
             }
             _ => vec![],
         };
@@ -1016,11 +1031,11 @@ fn draw_command_window(
     window_id: crate::WindowId,
 ) -> Result<(), std::io::Error> {
     let window = &editor.windows[window_id];
-    
+
     // Just draw the command window like a normal window with dark blue background
     // The buffer content will handle showing the completions and highlighting
     draw_window(device, editor, window)?;
-    
+
     Ok(())
 }
 

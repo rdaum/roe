@@ -12,8 +12,8 @@
 //
 
 use crate::keys::KeyAction;
-use crate::mode::{Mode, ModeResult, ModeAction, ActionPosition};
-use crate::{BufferId};
+use crate::mode::{ActionPosition, Mode, ModeAction, ModeResult};
+use crate::BufferId;
 
 /// Purpose of the buffer selection mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,7 +24,7 @@ pub enum BufferSwitchPurpose {
     Kill,
 }
 
-/// Interactive buffer switching mode 
+/// Interactive buffer switching mode
 /// This mode manages a command window buffer that displays available buffers
 pub struct BufferSwitchMode {
     /// Current user input (what they've typed to filter buffers)
@@ -65,7 +65,7 @@ impl BufferSwitchMode {
             purpose: BufferSwitchPurpose::Switch, // Default to switch
         }
     }
-    
+
     /// Create a new BufferSwitchMode with specific purpose
     pub fn new_with_purpose(purpose: BufferSwitchPurpose) -> Self {
         Self {
@@ -81,17 +81,17 @@ impl BufferSwitchMode {
             purpose,
         }
     }
-    
+
     /// Initialize with buffer and buffer list
     pub fn init_with_buffer(&mut self, buffer_id: BufferId, buffer_list: Vec<(BufferId, String)>) {
         // Reset all state to ensure clean initialization
         self.input.clear();
         self.buffer_id = Some(buffer_id);
-        
+
         // Split buffer list into separate vectors
         self.all_buffer_ids = buffer_list.iter().map(|(id, _)| *id).collect();
         self.all_buffer_names = buffer_list.iter().map(|(_, name)| name.clone()).collect();
-        
+
         // Start with all buffers visible
         self.matches = self.all_buffer_names.clone();
         self.buffer_ids = self.all_buffer_ids.clone();
@@ -99,19 +99,28 @@ impl BufferSwitchMode {
         self.buffer_scroll_offset = 0;
         self.update_scroll_to_center();
     }
-    
+
     /// Initialize with buffer list and pre-select a specific buffer
-    pub fn init_with_buffer_and_preselect(&mut self, buffer_id: BufferId, buffer_list: Vec<(BufferId, String)>, current_buffer_id: BufferId) {
+    pub fn init_with_buffer_and_preselect(
+        &mut self,
+        buffer_id: BufferId,
+        buffer_list: Vec<(BufferId, String)>,
+        current_buffer_id: BufferId,
+    ) {
         // First do normal initialization
         self.init_with_buffer(buffer_id, buffer_list);
-        
+
         // Then find and select the current buffer (for kill mode)
-        if let Some(index) = self.all_buffer_ids.iter().position(|&id| id == current_buffer_id) {
+        if let Some(index) = self
+            .all_buffer_ids
+            .iter()
+            .position(|&id| id == current_buffer_id)
+        {
             self.selected_index = index;
             self.update_scroll_to_center();
         }
     }
-    
+
     /// Update matches based on current input using stored buffer list
     fn update_matches_internal(&mut self) {
         if self.input.is_empty() {
@@ -122,35 +131,35 @@ impl BufferSwitchMode {
             // Filter by prefix
             let mut filtered_names = Vec::new();
             let mut filtered_ids = Vec::new();
-            
+
             for (i, name) in self.all_buffer_names.iter().enumerate() {
                 if name.to_lowercase().contains(&self.input.to_lowercase()) {
                     filtered_names.push(name.clone());
                     filtered_ids.push(self.all_buffer_ids[i]);
                 }
             }
-            
+
             self.matches = filtered_names;
             self.buffer_ids = filtered_ids;
         }
-        
+
         // Reset selection to first match
         self.selected_index = 0;
         self.buffer_scroll_offset = 0;
-        
+
         // Ensure we keep the selection centered
         self.update_scroll_to_center();
     }
-    
+
     /// Generate buffer content string
     pub fn generate_buffer_content(&self) -> String {
         let mut content = String::new();
-        
+
         // Show user input on first line if any
         if !self.input.is_empty() {
             content.push_str(&format!("{}\n", self.input));
         }
-        
+
         // Buffer lines with highlighting
         let visible_buffers = self.visible_buffers();
         for (idx, buffer_name) in visible_buffers.iter().enumerate() {
@@ -162,15 +171,15 @@ impl BufferSwitchMode {
                 content.push_str(&format!("  {buffer_name}\n"));
             }
         }
-        
+
         content
     }
-    
+
     /// Get the currently selected buffer ID
     pub fn get_selected_buffer(&self) -> Option<BufferId> {
         self.buffer_ids.get(self.selected_index).copied()
     }
-    
+
     /// Update scroll offset to keep selection centered
     fn update_scroll_to_center(&mut self) {
         if self.matches.len() <= self.max_visible_buffers {
@@ -178,9 +187,9 @@ impl BufferSwitchMode {
             self.buffer_scroll_offset = 0;
             return;
         }
-        
+
         let half_window = self.max_visible_buffers / 2;
-        
+
         // Try to center the selection
         if self.selected_index < half_window {
             // Near the beginning, show from start
@@ -193,22 +202,23 @@ impl BufferSwitchMode {
             self.buffer_scroll_offset = self.selected_index - half_window;
         }
     }
-    
+
     /// Get the visible buffers for rendering
     pub fn visible_buffers(&self) -> &[String] {
         let start = self.buffer_scroll_offset;
         let end = (start + self.max_visible_buffers).min(self.matches.len());
         &self.matches[start..end]
     }
-    
+
     /// Get the relative index of the selection within the visible buffers
     pub fn visible_selection_index(&self) -> Option<usize> {
         if self.matches.is_empty() {
             return None;
         }
-        
-        if self.selected_index >= self.buffer_scroll_offset 
-            && self.selected_index < self.buffer_scroll_offset + self.max_visible_buffers {
+
+        if self.selected_index >= self.buffer_scroll_offset
+            && self.selected_index < self.buffer_scroll_offset + self.max_visible_buffers
+        {
             Some(self.selected_index - self.buffer_scroll_offset)
         } else {
             None
@@ -227,7 +237,7 @@ impl Mode for BufferSwitchMode {
     fn name(&self) -> &str {
         "buffer-switch"
     }
-    
+
     fn perform(&mut self, action: &KeyAction) -> ModeResult {
         // Handle buffer switch mode specific actions
         match action {
@@ -237,7 +247,7 @@ impl Mode for BufferSwitchMode {
                 // Clear buffer and replace with new content
                 ModeResult::Consumed(vec![
                     ModeAction::ClearText,
-                    ModeAction::InsertText(ActionPosition::start(), self.generate_buffer_content())
+                    ModeAction::InsertText(ActionPosition::start(), self.generate_buffer_content()),
                 ])
             }
             KeyAction::Backspace => {
@@ -246,7 +256,10 @@ impl Mode for BufferSwitchMode {
                     self.update_matches_internal();
                     ModeResult::Consumed(vec![
                         ModeAction::ClearText,
-                        ModeAction::InsertText(ActionPosition::start(), self.generate_buffer_content())
+                        ModeAction::InsertText(
+                            ActionPosition::start(),
+                            self.generate_buffer_content(),
+                        ),
                     ])
                 } else {
                     ModeResult::Ignored
@@ -260,7 +273,7 @@ impl Mode for BufferSwitchMode {
                 // Always consume arrow keys in buffer switch mode, even if we can't move
                 ModeResult::Consumed(vec![
                     ModeAction::ClearText,
-                    ModeAction::InsertText(ActionPosition::start(), self.generate_buffer_content())
+                    ModeAction::InsertText(ActionPosition::start(), self.generate_buffer_content()),
                 ])
             }
             KeyAction::Cursor(crate::keys::CursorDirection::Down) => {
@@ -271,7 +284,7 @@ impl Mode for BufferSwitchMode {
                 // Always consume arrow keys in buffer switch mode, even if we can't move
                 ModeResult::Consumed(vec![
                     ModeAction::ClearText,
-                    ModeAction::InsertText(ActionPosition::start(), self.generate_buffer_content())
+                    ModeAction::InsertText(ActionPosition::start(), self.generate_buffer_content()),
                 ])
             }
             KeyAction::Tab => {
@@ -281,7 +294,10 @@ impl Mode for BufferSwitchMode {
                     self.update_scroll_to_center();
                     ModeResult::Consumed(vec![
                         ModeAction::ClearText,
-                        ModeAction::InsertText(ActionPosition::start(), self.generate_buffer_content())
+                        ModeAction::InsertText(
+                            ActionPosition::start(),
+                            self.generate_buffer_content(),
+                        ),
                     ])
                 } else {
                     ModeResult::Ignored

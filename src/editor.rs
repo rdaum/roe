@@ -589,6 +589,18 @@ impl Editor {
         );
     }
 
+    /// Handle terminal resize event
+    pub fn handle_resize(&mut self, width: u16, height: u16) {
+        // Update the frame dimensions
+        self.frame.columns = width;
+        self.frame.rows = height;
+        self.frame.available_columns = width;
+        self.frame.available_lines = height;
+
+        // Recalculate window layout with new dimensions
+        self.calculate_window_layout();
+    }
+
     /// Debug function to print window tree structure
     #[allow(dead_code)]
     fn debug_window_tree(&self, node: &WindowNode, depth: usize) -> String {
@@ -979,7 +991,7 @@ impl Editor {
     ) -> Result<Vec<ChromeAction>, std::io::Error> {
         // Check if echo message has expired and clear it
         let echo_cleared = self.check_and_clear_expired_echo();
-        
+
         for key in keys {
             self.key_state.press(key);
         }
@@ -1171,8 +1183,12 @@ impl Editor {
                         }
                         CursorDirection::WordForward => buffer.move_word_forward(window.cursor),
                         CursorDirection::WordBackward => buffer.move_word_backward(window.cursor),
-                        CursorDirection::ParagraphForward => buffer.move_paragraph_forward(window.cursor),
-                        CursorDirection::ParagraphBackward => buffer.move_paragraph_backward(window.cursor),
+                        CursorDirection::ParagraphForward => {
+                            buffer.move_paragraph_forward(window.cursor)
+                        }
+                        CursorDirection::ParagraphBackward => {
+                            buffer.move_paragraph_backward(window.cursor)
+                        }
                     };
 
                     window.cursor = new_pos;
@@ -1235,7 +1251,10 @@ impl Editor {
             KeyAction::Unbound => {
                 // Include the key sequence in the undefined message, like Emacs
                 let unbound_message = if !unbound_key_sequence.is_empty() {
-                    format!("{} is undefined", self.format_key_chord(&unbound_key_sequence))
+                    format!(
+                        "{} is undefined",
+                        self.format_key_chord(&unbound_key_sequence)
+                    )
                 } else {
                     "Key is undefined".to_string()
                 };
@@ -1275,7 +1294,7 @@ impl Editor {
         if echo_cleared {
             final_actions.push(ChromeAction::Echo(self.echo_message.clone()));
         }
-        
+
         Ok(final_actions)
     }
 
@@ -1831,8 +1850,13 @@ impl Editor {
         buffer.clear_mark();
 
         vec![
-            ChromeAction::Echo(format!("Copied region: {}", region_text.replace('\n', "\\n"))),
-            ChromeAction::MarkDirty(DirtyRegion::Buffer { buffer_id: window.active_buffer }),
+            ChromeAction::Echo(format!(
+                "Copied region: {}",
+                region_text.replace('\n', "\\n")
+            )),
+            ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                buffer_id: window.active_buffer,
+            }),
         ]
     }
 

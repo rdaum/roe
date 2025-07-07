@@ -11,10 +11,10 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
-use crate::command_registry::{CommandRegistry, CommandContext};
+use crate::command_registry::{CommandContext, CommandRegistry};
 use crate::editor::ChromeAction;
 use crate::keys::KeyAction;
-use crate::mode::{Mode, ModeResult, ModeAction, ActionPosition};
+use crate::mode::{ActionPosition, Mode, ModeAction, ModeResult};
 use crate::BufferId;
 
 /// Interactive command completion and execution mode
@@ -49,7 +49,7 @@ impl CommandMode {
             all_commands: Vec::new(),
         }
     }
-    
+
     /// Initialize with buffer and command list
     pub fn init_with_buffer(&mut self, buffer_id: BufferId, commands: Vec<String>) {
         // Reset all state to ensure clean initialization
@@ -61,7 +61,7 @@ impl CommandMode {
         self.completion_scroll_offset = 0;
         self.update_scroll_to_center();
     }
-    
+
     /// Update matches based on current input using stored command list
     fn update_matches_internal(&mut self) {
         self.matches = if self.input.is_empty() {
@@ -75,54 +75,56 @@ impl CommandMode {
                 .cloned()
                 .collect()
         };
-        
+
         // Reset selection to first match
         self.selected_index = 0;
         self.completion_scroll_offset = 0;
-        
+
         // Ensure we keep the selection centered
         self.update_scroll_to_center();
     }
-    
+
     /// Update matches based on current input
     pub fn update_matches(&mut self, registry: &CommandRegistry) {
         self.matches = if self.input.is_empty() {
             // Show all commands if no input
-            registry.all_commands()
+            registry
+                .all_commands()
                 .iter()
                 .map(|cmd| cmd.name.clone())
                 .collect()
         } else {
             // Filter by prefix
-            registry.find_commands(&self.input)
+            registry
+                .find_commands(&self.input)
                 .iter()
                 .map(|cmd| cmd.name.clone())
                 .collect()
         };
-        
+
         // Reset selection to first match
         self.selected_index = 0;
         self.completion_scroll_offset = 0;
-        
+
         // Ensure we keep the selection centered
         self.update_scroll_to_center();
     }
-    
+
     /// Update the buffer content with current prompt and completions
     fn update_buffer_content(&self) {
         // This method will be called from within Mode implementation
         // where we have access to the buffer through the Editor
     }
-    
+
     /// Generate buffer content string
     pub fn generate_buffer_content(&self) -> String {
         let mut content = String::new();
-        
+
         // Show user input on first line if any
         if !self.input.is_empty() {
             content.push_str(&format!("{}\n", self.input));
         }
-        
+
         // Completion lines with highlighting
         let visible_completions = self.visible_completions();
         for (idx, completion) in visible_completions.iter().enumerate() {
@@ -134,12 +136,16 @@ impl CommandMode {
                 content.push_str(&format!("  {completion}\n"));
             }
         }
-        
+
         content
     }
-    
+
     /// Handle a key action in command mode
-    pub fn handle_key(&mut self, action: KeyAction, registry: &CommandRegistry) -> CommandModeResult {
+    pub fn handle_key(
+        &mut self,
+        action: KeyAction,
+        registry: &CommandRegistry,
+    ) -> CommandModeResult {
         match action {
             KeyAction::AlphaNumeric(c) => {
                 // Add character to input
@@ -185,18 +191,16 @@ impl CommandMode {
                     CommandModeResult::Continue
                 }
             }
-            KeyAction::Escape => {
-                CommandModeResult::Cancel
-            }
+            KeyAction::Escape => CommandModeResult::Cancel,
             _ => CommandModeResult::Continue,
         }
     }
-    
+
     /// Get the currently selected command name
     pub fn get_selected_command(&self) -> Option<String> {
         self.matches.get(self.selected_index).cloned()
     }
-    
+
     /// Update scroll offset to keep selection centered
     fn update_scroll_to_center(&mut self) {
         if self.matches.len() <= self.max_visible_completions {
@@ -204,9 +208,9 @@ impl CommandMode {
             self.completion_scroll_offset = 0;
             return;
         }
-        
+
         let half_window = self.max_visible_completions / 2;
-        
+
         // Try to center the selection
         if self.selected_index < half_window {
             // Near the beginning, show from start
@@ -219,38 +223,39 @@ impl CommandMode {
             self.completion_scroll_offset = self.selected_index - half_window;
         }
     }
-    
+
     /// Get the visible completions for rendering
     pub fn visible_completions(&self) -> &[String] {
         let start = self.completion_scroll_offset;
         let end = (start + self.max_visible_completions).min(self.matches.len());
         &self.matches[start..end]
     }
-    
+
     /// Get the relative index of the selection within the visible completions
     pub fn visible_selection_index(&self) -> Option<usize> {
         if self.matches.is_empty() {
             return None;
         }
-        
-        if self.selected_index >= self.completion_scroll_offset 
-            && self.selected_index < self.completion_scroll_offset + self.max_visible_completions {
+
+        if self.selected_index >= self.completion_scroll_offset
+            && self.selected_index < self.completion_scroll_offset + self.max_visible_completions
+        {
             Some(self.selected_index - self.completion_scroll_offset)
         } else {
             None
         }
     }
-    
+
     /// Complete input to the longest common prefix of all matches
     fn complete_to_common_prefix(&mut self) {
         if self.matches.len() <= 1 {
             return;
         }
-        
+
         // Find longest common prefix
         let first = &self.matches[0];
         let mut common_len = first.len();
-        
+
         for other in &self.matches[1..] {
             let mut len = 0;
             for (a, b) in first.chars().zip(other.chars()) {
@@ -262,22 +267,22 @@ impl CommandMode {
             }
             common_len = common_len.min(len);
         }
-        
+
         if common_len > self.input.len() {
             self.input = first[..common_len].to_string();
         }
     }
-    
+
     /// Get the current prompt line (what should be displayed in the input area)
     pub fn get_prompt_line(&self) -> String {
         self.input.clone()
     }
-    
+
     /// Execute the given command with context
     pub fn execute_command(
-        command_name: &str, 
-        registry: &CommandRegistry, 
-        context: CommandContext
+        command_name: &str,
+        registry: &CommandRegistry,
+        context: CommandContext,
     ) -> Result<Vec<ChromeAction>, String> {
         if let Some(command) = registry.get_command(command_name) {
             command.execute(context)
@@ -309,7 +314,7 @@ impl Mode for CommandMode {
     fn name(&self) -> &str {
         "command"
     }
-    
+
     fn perform(&mut self, action: &KeyAction) -> ModeResult {
         // Handle command mode specific actions
         match action {
@@ -319,7 +324,7 @@ impl Mode for CommandMode {
                 // Clear buffer and replace with new content
                 ModeResult::Consumed(vec![
                     ModeAction::ClearText,
-                    ModeAction::InsertText(ActionPosition::start(), self.generate_buffer_content())
+                    ModeAction::InsertText(ActionPosition::start(), self.generate_buffer_content()),
                 ])
             }
             KeyAction::Backspace => {
@@ -328,7 +333,10 @@ impl Mode for CommandMode {
                     self.update_matches_internal();
                     ModeResult::Consumed(vec![
                         ModeAction::ClearText,
-                        ModeAction::InsertText(ActionPosition::start(), self.generate_buffer_content())
+                        ModeAction::InsertText(
+                            ActionPosition::start(),
+                            self.generate_buffer_content(),
+                        ),
                     ])
                 } else {
                     ModeResult::Ignored
@@ -342,7 +350,7 @@ impl Mode for CommandMode {
                 // Always consume arrow keys in command mode, even if we can't move
                 ModeResult::Consumed(vec![
                     ModeAction::ClearText,
-                    ModeAction::InsertText(ActionPosition::start(), self.generate_buffer_content())
+                    ModeAction::InsertText(ActionPosition::start(), self.generate_buffer_content()),
                 ])
             }
             KeyAction::Cursor(crate::keys::CursorDirection::Down) => {
@@ -353,7 +361,7 @@ impl Mode for CommandMode {
                 // Always consume arrow keys in command mode, even if we can't move
                 ModeResult::Consumed(vec![
                     ModeAction::ClearText,
-                    ModeAction::InsertText(ActionPosition::start(), self.generate_buffer_content())
+                    ModeAction::InsertText(ActionPosition::start(), self.generate_buffer_content()),
                 ])
             }
             KeyAction::Tab => {
@@ -361,16 +369,14 @@ impl Mode for CommandMode {
                 self.update_matches_internal();
                 ModeResult::Consumed(vec![
                     ModeAction::ClearText,
-                    ModeAction::InsertText(ActionPosition::start(), self.generate_buffer_content())
+                    ModeAction::InsertText(ActionPosition::start(), self.generate_buffer_content()),
                 ])
             }
             KeyAction::Enter => {
                 // Execute the selected command by returning a special action
                 if let Some(command_name) = self.get_selected_command() {
                     // Return a special action that the Editor can recognize as command execution
-                    ModeResult::Consumed(vec![
-                        ModeAction::ExecuteCommand(command_name)
-                    ])
+                    ModeResult::Consumed(vec![ModeAction::ExecuteCommand(command_name)])
                 } else {
                     ModeResult::Ignored
                 }
@@ -388,57 +394,57 @@ impl Mode for CommandMode {
 mod tests {
     use super::*;
     use crate::command_registry::create_default_registry;
-    
+
     #[test]
     fn test_command_mode_basic() {
         let registry = create_default_registry();
         let mut cmd_mode = CommandMode::new();
-        
+
         // Initially no matches
         assert_eq!(cmd_mode.matches.len(), 0);
-        
+
         // Update with empty input should show all commands
         cmd_mode.update_matches(&registry);
         assert!(!cmd_mode.matches.is_empty());
-        
+
         // Type 'q' should filter to quit commands
         cmd_mode.input = "q".to_string();
         cmd_mode.update_matches(&registry);
         assert!(cmd_mode.matches.iter().any(|m| m.contains("quit")));
     }
-    
+
     #[test]
     fn test_navigation() {
         let registry = create_default_registry();
         let mut cmd_mode = CommandMode::new();
         cmd_mode.update_matches(&registry);
-        
+
         let initial_selection = cmd_mode.selected_index;
-        
+
         // Move down
         let result = cmd_mode.handle_key(
-            KeyAction::Cursor(crate::keys::CursorDirection::Down), 
-            &registry
+            KeyAction::Cursor(crate::keys::CursorDirection::Down),
+            &registry,
         );
         assert_eq!(result, CommandModeResult::Continue);
         assert_eq!(cmd_mode.selected_index, initial_selection + 1);
-        
+
         // Move up
         let result = cmd_mode.handle_key(
-            KeyAction::Cursor(crate::keys::CursorDirection::Up), 
-            &registry
+            KeyAction::Cursor(crate::keys::CursorDirection::Up),
+            &registry,
         );
         assert_eq!(result, CommandModeResult::Continue);
         assert_eq!(cmd_mode.selected_index, initial_selection);
     }
-    
+
     #[test]
     fn test_execution() {
         let registry = create_default_registry();
         let mut cmd_mode = CommandMode::new();
         cmd_mode.input = "quit".to_string();
         cmd_mode.update_matches(&registry);
-        
+
         let result = cmd_mode.handle_key(KeyAction::Enter, &registry);
         if let CommandModeResult::Execute(command_name) = result {
             assert_eq!(command_name, "quit");
