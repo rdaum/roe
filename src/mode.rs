@@ -1,3 +1,4 @@
+use crate::command_registry::{Command, CommandCategory};
 use crate::keys::KeyAction;
 
 /// Mode dispatch functions all return actions in response to events.
@@ -35,6 +36,12 @@ pub enum ModeAction {
     ClearMark,
     /// Save the buffer to file
     Save,
+    /// Clear all text from the buffer
+    ClearText,
+    /// Execute a command by name
+    ExecuteCommand(String),
+    /// Switch to a specific buffer
+    SwitchToBuffer(crate::BufferId),
 
     CursorUp,
     CursorDown,
@@ -87,6 +94,12 @@ pub enum ModeResult {
 pub trait Mode: Send + Sync {
     fn name(&self) -> &str;
     fn perform(&mut self, action: &KeyAction) -> ModeResult;
+    
+    /// Return commands that this mode provides
+    /// Default implementation returns no commands
+    fn available_commands(&self) -> Vec<Command> {
+        vec![]
+    }
 }
 
 pub struct ScratchMode {}
@@ -153,6 +166,7 @@ impl Mode for ScratchMode {
             KeyAction::Cancel => {
                 ModeResult::Consumed(vec![ModeAction::ClearMark])
             }
+            KeyAction::SwitchBuffer => ModeResult::Ignored,
             KeyAction::Unbound => ModeResult::Ignored,
         }
     }
@@ -226,7 +240,39 @@ impl Mode for FileMode {
             KeyAction::Cancel => {
                 ModeResult::Consumed(vec![ModeAction::ClearMark])
             }
+            KeyAction::SwitchBuffer => ModeResult::Ignored,
             KeyAction::Unbound => ModeResult::Ignored,
         }
+    }
+    
+    fn available_commands(&self) -> Vec<Command> {
+        use crate::editor::ChromeAction;
+        
+        vec![
+            Command::new(
+                "save-buffer",
+                "Save current buffer to file",
+                CommandCategory::Mode("file".to_string()),
+                Box::new(|_context| {
+                    Ok(vec![ChromeAction::Echo("Saving file...".to_string())])
+                }),
+            ),
+            Command::new(
+                "revert-buffer",
+                "Reload buffer from file, discarding changes",
+                CommandCategory::Mode("file".to_string()),
+                Box::new(|_context| {
+                    Ok(vec![ChromeAction::Echo("Reverting buffer...".to_string())])
+                }),
+            ),
+            Command::new(
+                "write-file",
+                "Write buffer to a new file",
+                CommandCategory::Mode("file".to_string()),
+                Box::new(|_context| {
+                    Ok(vec![ChromeAction::Echo("Write file not implemented yet".to_string())])
+                }),
+            ),
+        ]
     }
 }

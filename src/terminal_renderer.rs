@@ -375,6 +375,14 @@ impl<W: Write> Renderer for TerminalRenderer<W> {
         // Draw all borders and modelines
         draw_all_window_borders(&mut self.device, editor)?;
 
+        // Draw command windows
+        for window_id in editor.windows.keys() {
+            let window = &editor.windows[window_id];
+            if matches!(window.window_type, crate::editor::WindowType::Command { .. }) {
+                draw_command_window(&mut self.device, editor, window_id)?;
+            }
+        }
+
         // Position cursor and show it
         let active_window = &editor.windows[editor.active_window];
         let (col, line) =
@@ -877,7 +885,7 @@ pub async fn event_loop_with_renderer<W: Write>(
                     keys.push(LogicalKey::Modifier(KeyModifier::Control(Side::Left)));
                 }
                 if keystroke.modifiers.contains(KeyModifiers::ALT) {
-                    keys.push(LogicalKey::Modifier(KeyModifier::Alt(Side::Left)));
+                    keys.push(LogicalKey::Modifier(KeyModifier::Meta(Side::Left)));
                 }
                 if keystroke.modifiers.contains(KeyModifiers::SHIFT) {
                     keys.push(LogicalKey::Modifier(KeyModifier::Shift(Side::Left)));
@@ -949,6 +957,21 @@ pub async fn event_loop_with_renderer<W: Write>(
         renderer.render_incremental(editor)?;
         renderer.clear_dirty();
     }
+}
+
+/// Draw the command window overlay
+fn draw_command_window(
+    device: &mut impl Write,
+    editor: &Editor,
+    window_id: crate::WindowId,
+) -> Result<(), std::io::Error> {
+    let window = &editor.windows[window_id];
+    
+    // Just draw the command window like a normal window with dark blue background
+    // The buffer content will handle showing the completions and highlighting
+    draw_window(device, editor, window)?;
+    
+    Ok(())
 }
 
 #[cfg(test)]

@@ -103,6 +103,8 @@ pub enum BufferResponse {
     ActionsCompleted {
         dirty_regions: Vec<DirtyRegion>,
         new_cursor_pos: Option<usize>, // None means cursor didn't move
+        command_to_execute: Option<String>, // Command to execute at Editor level
+        buffer_to_switch: Option<crate::BufferId>, // Buffer to switch to at Editor level
     },
     /// File operation completed
     Saved(String),
@@ -302,52 +304,129 @@ impl BufferHost {
     async fn execute_actions(&mut self, actions: Vec<ModeAction>, mut cursor_pos: usize) -> BufferResponse {
         let mut dirty_regions = vec![];
         let mut new_cursor_pos = None;
+        let mut command_to_execute = None;
+        let mut buffer_to_switch = None;
         
         for action in actions {
             match action {
                 ModeAction::InsertText(pos, text) => {
-                    if let ActionPosition::Cursor = pos {
-                        let has_newline = text.contains('\n');
-                        self.buffer.insert_pos(text.clone(), cursor_pos);
-                        
-                        // Advance the cursor
-                        cursor_pos += text.len();
-                        new_cursor_pos = Some(cursor_pos);
-                        
-                        // Mark appropriate dirty regions
-                        if has_newline {
-                            dirty_regions.push(DirtyRegion::Buffer { buffer_id: self.buffer_id });
-                        } else {
-                            let line = self.buffer.to_column_line(cursor_pos).1 as usize;
-                            dirty_regions.push(DirtyRegion::Line { buffer_id: self.buffer_id, line });
+                    match pos {
+                        ActionPosition::Cursor => {
+                            let has_newline = text.contains('\n');
+                            self.buffer.insert_pos(text.clone(), cursor_pos);
+                            
+                            // Advance the cursor
+                            cursor_pos += text.len();
+                            new_cursor_pos = Some(cursor_pos);
+                            
+                            // Mark appropriate dirty regions
+                            if has_newline {
+                                dirty_regions.push(DirtyRegion::Buffer { buffer_id: self.buffer_id });
+                            } else {
+                                let line = self.buffer.to_column_line(cursor_pos).1 as usize;
+                                dirty_regions.push(DirtyRegion::Line { buffer_id: self.buffer_id, line });
+                            }
+                        }
+                        ActionPosition::Absolute(col, row) => {
+                            let has_newline = text.contains('\n');
+                            self.buffer.insert_col_line(text.clone(), (col, row));
+                            
+                            // For command mode, position cursor at end of user input line
+                            if let Some(newline_pos) = text.find('\n') {
+                                let first_line = &text[..newline_pos];
+                                // Position cursor at the end of the first line (user input)
+                                new_cursor_pos = Some(first_line.len());
+                            } else {
+                                // Single line case - position at the end
+                                new_cursor_pos = Some(text.len());
+                            }
+                            
+                            // Mark appropriate dirty regions
+                            if has_newline {
+                                dirty_regions.push(DirtyRegion::Buffer { buffer_id: self.buffer_id });
+                            } else {
+                                dirty_regions.push(DirtyRegion::Line { buffer_id: self.buffer_id, line: row as usize });
+                            }
+                        }
+                        ActionPosition::End => {
+                            // Insert at end of buffer
+                            let buffer_len = self.buffer.buffer_len_chars();
+                            let has_newline = text.contains('\n');
+                            self.buffer.insert_pos(text.clone(), buffer_len);
+                            
+                            if has_newline {
+                                dirty_regions.push(DirtyRegion::Buffer { buffer_id: self.buffer_id });
+                            } else {
+                                let line = self.buffer.to_column_line(buffer_len).1 as usize;
+                                dirty_regions.push(DirtyRegion::Line { buffer_id: self.buffer_id, line });
+                            }
                         }
                     }
                 }
                 ModeAction::DeleteText(pos, count) => {
-                    if let ActionPosition::Cursor = pos {
-                        if let Some(deleted) = self.buffer.delete_pos(cursor_pos, count) {
-                            // Check if deleted text contains newlines
-                            let has_newline = deleted.contains('\n');
-                            
-                            if has_newline {
-                                // Newlines affect multiple lines, mark entire buffer dirty
-                                dirty_regions.push(DirtyRegion::Buffer { buffer_id: self.buffer_id });
-                            } else {
-                                // Simple text deletion, only current line affected
-                                let line = self.buffer.to_column_line(cursor_pos).1 as usize;
-                                dirty_regions.push(DirtyRegion::Line { buffer_id: self.buffer_id, line });
+                    match pos {
+                        ActionPosition::Cursor => {
+                            if let Some(deleted) = self.buffer.delete_pos(cursor_pos, count) {
+                                // Check if deleted text contains newlines
+                                let has_newline = deleted.contains('\n');
+                                
+                                if has_newline {
+                                    // Newlines affect multiple lines, mark entire buffer dirty
+                                    dirty_regions.push(DirtyRegion::Buffer { buffer_id: self.buffer_id });
+                                } else {
+                                    // Simple text deletion, only current line affected
+                                    let line = self.buffer.to_column_line(cursor_pos).1 as usize;
+                                    dirty_regions.push(DirtyRegion::Line { buffer_id: self.buffer_id, line });
+                                }
+                                
+                                // Update cursor if we deleted backwards
+                                if count < 0 {
+                                    cursor_pos = cursor_pos.saturating_sub(count.abs() as usize);
+                                    new_cursor_pos = Some(cursor_pos);
+                                }
                             }
-                            
-                            // Update cursor if we deleted backwards
-                            if count < 0 {
-                                cursor_pos = cursor_pos.saturating_sub(count.abs() as usize);
-                                new_cursor_pos = Some(cursor_pos);
+                        }
+                        ActionPosition::Absolute(col, row) => {
+                            if let Some(deleted) = self.buffer.delete_col_line((col, row), count) {
+                                // Check if deleted text contains newlines
+                                let has_newline = deleted.contains('\n');
+                                
+                                if has_newline {
+                                    // Newlines affect multiple lines, mark entire buffer dirty
+                                    dirty_regions.push(DirtyRegion::Buffer { buffer_id: self.buffer_id });
+                                } else {
+                                    // Simple text deletion, only current line affected
+                                    dirty_regions.push(DirtyRegion::Line { buffer_id: self.buffer_id, line: row as usize });
+                                }
+                            }
+                        }
+                        ActionPosition::End => {
+                            // Delete from end of buffer backwards
+                            let buffer_len = self.buffer.buffer_len_chars();
+                            if let Some(deleted) = self.buffer.delete_pos(buffer_len, count) {
+                                let has_newline = deleted.contains('\n');
+                                
+                                if has_newline {
+                                    dirty_regions.push(DirtyRegion::Buffer { buffer_id: self.buffer_id });
+                                } else {
+                                    let line = self.buffer.to_column_line(buffer_len).1 as usize;
+                                    dirty_regions.push(DirtyRegion::Line { buffer_id: self.buffer_id, line });
+                                }
                             }
                         }
                     }
                 }
                 ModeAction::Save => {
                     return self.save_buffer().await;
+                }
+                ModeAction::ClearText => {
+                    // Clear all text from the buffer
+                    let buffer_len = self.buffer.buffer_len_chars();
+                    if buffer_len > 0 {
+                        self.buffer.delete_pos(0, buffer_len as isize);
+                        dirty_regions.push(DirtyRegion::Buffer { buffer_id: self.buffer_id });
+                        new_cursor_pos = Some(0); // Move cursor to start
+                    }
                 }
                 ModeAction::SetMark => {
                     self.buffer.set_mark(cursor_pos);
@@ -359,15 +438,25 @@ impl BufferHost {
                     // Mark highlighting might change
                     dirty_regions.push(DirtyRegion::Buffer { buffer_id: self.buffer_id });
                 }
+                ModeAction::ExecuteCommand(command_name) => {
+                    // Store command for execution at Editor level
+                    command_to_execute = Some(command_name);
+                }
+                ModeAction::SwitchToBuffer(buffer_id) => {
+                    // Store buffer switch for execution at Editor level
+                    buffer_to_switch = Some(buffer_id);
+                }
                 // TODO: Implement other actions
                 _ => {}
             }
         }
         
-        if !dirty_regions.is_empty() || new_cursor_pos.is_some() {
+        if !dirty_regions.is_empty() || new_cursor_pos.is_some() || command_to_execute.is_some() || buffer_to_switch.is_some() {
             BufferResponse::ActionsCompleted {
                 dirty_regions,
                 new_cursor_pos,
+                command_to_execute,
+                buffer_to_switch,
             }
         } else {
             BufferResponse::NoChange

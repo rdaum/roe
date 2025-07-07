@@ -6,12 +6,16 @@ use keys::KeyState;
 use mode::{FileMode, Mode};
 use renderer::Renderer;
 use slotmap::{new_key_type, SlotMap};
+use std::collections::HashMap;
 use std::io::Write;
 use terminal_renderer::TerminalRenderer;
 use terminal_renderer::ECHO_AREA_HEIGHT;
 
 mod buffer;
 mod buffer_host;
+mod buffer_switch_mode;
+mod command_mode;
+mod command_registry;
 mod editor;
 mod keys;
 mod kill_ring;
@@ -38,12 +42,12 @@ async fn terminal_main<W: Write>(stdout: W, file_paths: Vec<String>) -> Result<(
     let _ws = crossterm::terminal::window_size()?;
 
     // Set the size of the screen
-    assert!(crossterm::terminal::size()? != (0, 0));
+    assert_ne!(crossterm::terminal::size()?, (0, 0));
 
     let tsize = crossterm::terminal::size()?;
 
     let mut buffers: SlotMap<BufferId, Buffer> = SlotMap::default();
-    let mut buffer_hosts: SlotMap<BufferId, buffer_host::BufferHostClient> = SlotMap::default();
+    let mut buffer_hosts: HashMap<BufferId, buffer_host::BufferHostClient> = HashMap::new();
     let mut modes: SlotMap<ModeId, Box<dyn Mode>> = SlotMap::default();
 
     // Determine which files to open
@@ -55,7 +59,7 @@ async fn terminal_main<W: Write>(stdout: W, file_paths: Vec<String>) -> Result<(
     };
 
     let mut first_buffer_id = None;
-    
+
     // Create buffers for all specified files
     for file_path in files_to_open {
         // Create FileMode for this file
@@ -63,7 +67,7 @@ async fn terminal_main<W: Write>(stdout: W, file_paths: Vec<String>) -> Result<(
             file_path: file_path.clone(),
         });
         let file_mode_id = modes.insert(file_mode);
-        
+
         // Try to load the file, create empty buffer if it doesn't exist
         let buffer = match Buffer::from_file(&file_path, &[]).await {
             Ok(buffer) => buffer,
@@ -78,40 +82,35 @@ async fn terminal_main<W: Write>(stdout: W, file_paths: Vec<String>) -> Result<(
                 buffer
             }
         };
-        
+
         let buffer_id = buffers.insert(buffer.clone());
-        
+
         // Remember the first buffer for the initial window
         if first_buffer_id.is_none() {
             first_buffer_id = Some(buffer_id);
         }
-        
+
         // Create BufferHost with mode for this buffer
         let file_mode = modes.remove(file_mode_id).unwrap();
-        let mode_list = vec![
-            (file_mode_id, "file".to_string(), file_mode)
-        ];
-        
+        let mode_list = vec![(file_mode_id, "file".to_string(), file_mode)];
+
         // Create BufferHost and client
-        let (buffer_client, _buffer_handle) = buffer_host::create_buffer_host(
-            buffer,
-            mode_list,
-            buffer_id,
-        );
-        buffer_hosts.insert(buffer_client);
+        let (buffer_client, _buffer_handle) =
+            buffer_host::create_buffer_host(buffer, mode_list, buffer_id);
+        buffer_hosts.insert(buffer_id, buffer_client);
     }
 
     // Create windows - split horizontally if we have 2+ files, single window otherwise
     let mut windows: SlotMap<WindowId, Window> = SlotMap::default();
     let window_tree;
     let active_window_id;
-    
+
     let buffer_ids: Vec<BufferId> = buffers.keys().collect();
-    
+
     if buffer_ids.len() >= 2 {
         // Two-window horizontal split
         let window_height = (tsize.1 - ECHO_AREA_HEIGHT) / 2;
-        
+
         // Top window (first file)
         let top_window = Window {
             x: 0,
@@ -121,9 +120,10 @@ async fn terminal_main<W: Write>(stdout: W, file_paths: Vec<String>) -> Result<(
             active_buffer: buffer_ids[0],
             start_line: 0,
             cursor: 0,
+            window_type: editor::WindowType::Normal,
         };
         let top_window_id = windows.insert(top_window);
-        
+
         // Bottom window (second file)
         let bottom_window = Window {
             x: 0,
@@ -133,9 +133,10 @@ async fn terminal_main<W: Write>(stdout: W, file_paths: Vec<String>) -> Result<(
             active_buffer: buffer_ids[1],
             start_line: 0,
             cursor: 0,
+            window_type: editor::WindowType::Normal,
         };
         let bottom_window_id = windows.insert(bottom_window);
-        
+
         // Create horizontal split tree
         window_tree = editor::WindowNode::new_split(
             editor::SplitDirection::Horizontal,
@@ -143,7 +144,7 @@ async fn terminal_main<W: Write>(stdout: W, file_paths: Vec<String>) -> Result<(
             editor::WindowNode::new_leaf(top_window_id),
             editor::WindowNode::new_leaf(bottom_window_id),
         );
-        
+
         active_window_id = top_window_id; // Start with top window active
     } else {
         // Single window (full screen)
@@ -156,6 +157,7 @@ async fn terminal_main<W: Write>(stdout: W, file_paths: Vec<String>) -> Result<(
             active_buffer,
             start_line: 0,
             cursor: 0,
+            window_type: editor::WindowType::Normal,
         };
         active_window_id = windows.insert(window);
         window_tree = editor::WindowNode::new_leaf(active_window_id);
@@ -168,10 +170,12 @@ async fn terminal_main<W: Write>(stdout: W, file_paths: Vec<String>) -> Result<(
         windows,
         modes,
         active_window: active_window_id,
+        previous_active_window: None,
         key_state: KeyState::new(),
         bindings: Box::new(keys::DefaultBindings {}),
         window_tree,
         kill_ring: kill_ring::KillRing::new(),
+        command_registry: command_registry::create_default_registry(),
     };
 
     // Create terminal renderer

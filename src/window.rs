@@ -23,6 +23,7 @@ impl Window {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::editor::WindowType;
     use crate::BufferId;
 
     fn test_window() -> Window {
@@ -34,6 +35,7 @@ mod tests {
             active_buffer: BufferId::default(),
             start_line: 0,
             cursor: 0,
+            window_type: WindowType::Normal,
         }
     }
 

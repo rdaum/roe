@@ -73,6 +73,8 @@ pub enum KeyAction {
     DeleteWindow,
     /// Delete all other windows (keep only current)
     DeleteOtherWindows,
+    /// Switch to another buffer (C-x b)
+    SwitchBuffer,
     /// Cancel current operation (Ctrl-G)
     Cancel,
     /// Unbound key
@@ -436,6 +438,12 @@ impl Bindings for DefaultBindings {
                     LogicalKey::AlphaNumeric(a),
                     LogicalKey::AlphaNumeric(b),
                 ) if *a == 'x' && *b == '1' => return KeyAction::DeleteOtherWindows,
+                // C-x b switch buffer
+                (
+                    LogicalKey::Modifier(KeyModifier::Control(_)),
+                    LogicalKey::AlphaNumeric(a),
+                    LogicalKey::AlphaNumeric(b),
+                ) if *a == 'x' && *b == 'b' => return KeyAction::SwitchBuffer,
                 // Ctrl-Shift-W is kill-region non-destructive
                 (
                     LogicalKey::Modifier(KeyModifier::Control(_)),
