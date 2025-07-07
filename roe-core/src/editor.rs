@@ -377,7 +377,13 @@ impl Editor {
         let mode_id = self.modes.insert(mode_box);
 
         // Create BufferHost with the appropriate mode
-        let mode_list = vec![(mode_id, mode_name, self.modes.remove(mode_id).unwrap())];
+        let mode_list = vec![(
+            mode_id,
+            mode_name,
+            self.modes
+                .remove(mode_id)
+                .expect("Mode should exist in SlotMap"),
+        )];
 
         let (buffer_client, _buffer_handle) =
             crate::buffer_host::create_buffer_host(command_buffer, mode_list, command_buffer_id);
@@ -510,7 +516,9 @@ impl Editor {
             let mode_list = vec![(
                 messages_mode_id,
                 "messages".to_string(),
-                self.modes.remove(messages_mode_id).unwrap(),
+                self.modes
+                    .remove(messages_mode_id)
+                    .expect("Messages mode should exist in SlotMap"),
             )];
             let (buffer_client, _buffer_handle) = crate::buffer_host::create_buffer_host(
                 messages_buffer,
@@ -533,7 +541,7 @@ impl Editor {
             // Add timestamp and message to the buffer
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .expect("Buffer host should be created successfully")
                 .as_secs();
             let formatted_message = format!("[{now}] {message}\n");
 
@@ -1252,7 +1260,10 @@ impl Editor {
                 } else {
                     // Handle normal cursor movement in regular windows
                     // Get fresh references for cursor movement
-                    let window = &mut self.windows.get_mut(self.active_window).unwrap();
+                    let window = &mut self
+                        .windows
+                        .get_mut(self.active_window)
+                        .expect("Active window should exist");
                     let buffer = &self.buffers[window.active_buffer];
 
                     // Use clean character-position API
@@ -1420,7 +1431,10 @@ impl Editor {
                 // Handle cursor movement
                 if let Some(new_pos) = new_cursor_pos {
                     // Update the window's cursor position
-                    let window = &mut self.windows.get_mut(self.active_window).unwrap();
+                    let window = &mut self
+                        .windows
+                        .get_mut(self.active_window)
+                        .expect("Active window should exist");
                     window.cursor = new_pos;
 
                     let buffer = &self.buffers[window.active_buffer];
@@ -1466,7 +1480,10 @@ impl Editor {
 
                             // Switch the determined window to the selected buffer
                             if self.buffers.contains_key(target_buffer_id) {
-                                let window = &mut self.windows.get_mut(window_to_switch).unwrap();
+                                let window = &mut self
+                                    .windows
+                                    .get_mut(window_to_switch)
+                                    .expect("Window to switch should exist");
                                 window.active_buffer = target_buffer_id;
                                 window.cursor = 0;
 
@@ -1537,7 +1554,9 @@ impl Editor {
                                     let mode_list = vec![(
                                         scratch_mode_id,
                                         "scratch".to_string(),
-                                        self.modes.remove(scratch_mode_id).unwrap(),
+                                        self.modes
+                                            .remove(scratch_mode_id)
+                                            .expect("Scratch mode should exist"),
                                     )];
                                     let (buffer_client, _buffer_handle) =
                                         buffer_host::create_buffer_host(
@@ -1655,8 +1674,14 @@ impl Editor {
         // Break kill sequence since we're doing a non-kill operation
         self.kill_ring.break_kill_sequence();
 
-        let window = &mut self.windows.get_mut(self.active_window).unwrap();
-        let buffer = &mut self.buffers.get_mut(window.active_buffer).unwrap();
+        let window = &mut self
+            .windows
+            .get_mut(self.active_window)
+            .expect("Active window should exist");
+        let buffer = &mut self
+            .buffers
+            .get_mut(window.active_buffer)
+            .expect("Active buffer should exist");
         match position {
             ActionPosition::Cursor => {
                 let length = text.len();
@@ -1725,8 +1750,14 @@ impl Editor {
         // Break kill sequence since we're doing a non-kill operation
         self.kill_ring.break_kill_sequence();
 
-        let window = &mut self.windows.get_mut(self.active_window).unwrap();
-        let buffer = &mut self.buffers.get_mut(window.active_buffer).unwrap();
+        let window = &mut self
+            .windows
+            .get_mut(self.active_window)
+            .expect("Active window should exist");
+        let buffer = &mut self
+            .buffers
+            .get_mut(window.active_buffer)
+            .expect("Active buffer should exist");
 
         match position {
             ActionPosition::Cursor => {
@@ -1800,8 +1831,14 @@ impl Editor {
 
     /// Kill (cut) text and add it to the kill-ring
     pub fn kill_text(&mut self, position: &ActionPosition, count: isize) -> Vec<ChromeAction> {
-        let window = &mut self.windows.get_mut(self.active_window).unwrap();
-        let buffer = &mut self.buffers.get_mut(window.active_buffer).unwrap();
+        let window = &mut self
+            .windows
+            .get_mut(self.active_window)
+            .expect("Active window should exist");
+        let buffer = &mut self
+            .buffers
+            .get_mut(window.active_buffer)
+            .expect("Active buffer should exist");
 
         match position {
             ActionPosition::Cursor => {
@@ -1865,8 +1902,14 @@ impl Editor {
 
     /// Kill from cursor to end of line
     pub fn kill_line(&mut self) -> Vec<ChromeAction> {
-        let window = &mut self.windows.get_mut(self.active_window).unwrap();
-        let buffer = &mut self.buffers.get_mut(window.active_buffer).unwrap();
+        let window = &mut self
+            .windows
+            .get_mut(self.active_window)
+            .expect("Active window should exist");
+        let buffer = &mut self
+            .buffers
+            .get_mut(window.active_buffer)
+            .expect("Active buffer should exist");
 
         let eol_pos = buffer.eol_pos(window.cursor);
         let text_to_kill = if eol_pos > window.cursor {
@@ -1899,8 +1942,14 @@ impl Editor {
 
     /// Kill the selected region
     pub fn kill_region(&mut self) -> Vec<ChromeAction> {
-        let window = &mut self.windows.get_mut(self.active_window).unwrap();
-        let buffer = &mut self.buffers.get_mut(window.active_buffer).unwrap();
+        let window = &mut self
+            .windows
+            .get_mut(self.active_window)
+            .expect("Active window should exist");
+        let buffer = &mut self
+            .buffers
+            .get_mut(window.active_buffer)
+            .expect("Active buffer should exist");
 
         let Some((deleted, new_cursor_pos)) = buffer.delete_region(window.cursor) else {
             return vec![ChromeAction::Echo("No mark set".to_string())];
@@ -1962,7 +2011,10 @@ impl Editor {
     /// Set mark at cursor position
     pub fn set_mark(&mut self) -> Vec<ChromeAction> {
         let window = &self.windows[self.active_window];
-        let buffer = &mut self.buffers.get_mut(window.active_buffer).unwrap();
+        let buffer = &mut self
+            .buffers
+            .get_mut(window.active_buffer)
+            .expect("Active buffer should exist");
 
         buffer.set_mark(window.cursor);
 
@@ -1972,7 +2024,10 @@ impl Editor {
     /// Clear the mark
     pub fn clear_mark(&mut self) -> Vec<ChromeAction> {
         let window = &self.windows[self.active_window];
-        let buffer = &mut self.buffers.get_mut(window.active_buffer).unwrap();
+        let buffer = &mut self
+            .buffers
+            .get_mut(window.active_buffer)
+            .expect("Active buffer should exist");
 
         if buffer.has_mark() {
             buffer.clear_mark();
@@ -2107,7 +2162,10 @@ impl Editor {
         let file_mode_id = self.modes.insert(file_mode);
 
         // Create BufferHost with FileMode for this buffer
-        let file_mode = self.modes.remove(file_mode_id).unwrap();
+        let file_mode = self
+            .modes
+            .remove(file_mode_id)
+            .expect("File mode should exist in SlotMap");
         let mode_list = vec![(file_mode_id, "file".to_string(), file_mode)];
 
         // Create BufferHost and client

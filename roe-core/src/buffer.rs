@@ -493,12 +493,18 @@ impl Buffer {
 
     /// Execute a closure with read access to the buffer
     pub fn with_read<R>(&self, f: impl FnOnce(&BufferInner) -> R) -> R {
-        f(&self.inner.read().unwrap())
+        f(&self
+            .inner
+            .read()
+            .expect("Buffer lock should not be poisoned"))
     }
 
     /// Execute a closure with write access to the buffer
     pub fn with_write<R>(&self, f: impl FnOnce(&mut BufferInner) -> R) -> R {
-        f(&mut self.inner.write().unwrap())
+        f(&mut self
+            .inner
+            .write()
+            .expect("Buffer lock should not be poisoned"))
     }
 
     // Convenience methods for common operations that don't need multiple calls

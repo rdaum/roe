@@ -81,8 +81,12 @@ impl FileSelectorMode {
         // Always add ".." to go up a directory (unless we're at root)
         if self.current_dir.parent().is_some() {
             self.all_items.push("../".to_string());
-            self.all_paths
-                .push(self.current_dir.parent().unwrap().to_path_buf());
+            self.all_paths.push(
+                self.current_dir
+                    .parent()
+                    .expect("Directory should have a parent")
+                    .to_path_buf(),
+            );
         }
 
         // Read directory contents

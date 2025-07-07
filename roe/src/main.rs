@@ -81,7 +81,9 @@ async fn terminal_main<W: Write>(stdout: W, file_paths: Vec<String>) -> Result<(
         }
 
         // Create BufferHost with mode for this buffer
-        let file_mode = modes.remove(file_mode_id).unwrap();
+        let file_mode = modes
+            .remove(file_mode_id)
+            .expect("FileMode should exist in modes SlotMap");
         let mode_list = vec![(file_mode_id, "file".to_string(), file_mode)];
 
         // Create BufferHost and client

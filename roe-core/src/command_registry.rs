@@ -294,7 +294,7 @@ pub fn create_default_registry() -> CommandRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_command_registry_basic() {
         let mut registry = CommandRegistry::new();

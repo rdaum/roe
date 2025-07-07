@@ -927,7 +927,7 @@ pub async fn event_loop_with_renderer<W: Write>(
             continue;
         }
 
-        let event = event.unwrap();
+        let event = event.expect("Event stream should provide valid events");
         let keys = match event {
             Event::Key(keystroke) => {
                 let key = crossterm_key_translate(&keystroke.code);
