@@ -53,16 +53,6 @@ impl BufferInner {
         Ok(buffer_inner)
     }
 
-    /// Save buffer content to file
-    pub async fn save_to_file(&self, file_path: &str) -> Result<(), std::io::Error> {
-        let content = self.buffer.to_string();
-        tokio::fs::write(file_path, content.as_bytes()).await?;
-        Ok(())
-    }
-
-    pub fn content(&self) -> String {
-        self.buffer.to_string()
-    }
 
     /// Insert a fragment of text into the buffer at the given line/col position.
     pub fn insert_col_line(&mut self, fragment: String, position: (u16, u16)) {
@@ -102,11 +92,6 @@ impl BufferInner {
     }
 
     /// Return the position of the start of the line relative to the start position
-    pub fn bol_pos(&self, start_pos: usize) -> usize {
-        let line = self.buffer.char_to_line(start_pos);
-
-        self.buffer.line_to_char(line)
-    }
 
     /// Return the position of the end of the line relative to the start position.
     pub fn eol_pos(&self, start_pos: usize) -> usize {
@@ -430,6 +415,7 @@ impl BufferInner {
         self.mark = None;
     }
 
+
     /// Get the current mark position
     pub fn get_mark(&self) -> Option<usize> {
         self.mark
@@ -438,6 +424,10 @@ impl BufferInner {
     /// Check if mark is set
     pub fn has_mark(&self) -> bool {
         self.mark.is_some()
+    }
+
+    pub fn content(&self) -> String {
+        self.buffer.to_string()
     }
 
     /// Get the region bounds (start, end) between mark and cursor
@@ -516,14 +506,6 @@ impl Buffer {
     }
 
     /// Get the underlying Arc<RwLock<BufferInner>> for cases where direct access is needed
-    pub fn inner(&self) -> &Arc<RwLock<BufferInner>> {
-        &self.inner
-    }
-
-    /// Clone the underlying Arc<RwLock<BufferInner>>
-    pub fn inner_clone(&self) -> Arc<RwLock<BufferInner>> {
-        self.inner.clone()
-    }
 
     // Convenience methods for common operations that don't need multiple calls
 
@@ -659,6 +641,8 @@ impl Buffer {
     pub fn set_object(&self, object: String) {
         self.with_write(|b| b.object = object)
     }
+
+
 
     pub fn content(&self) -> String {
         self.with_read(|b| b.content())

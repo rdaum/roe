@@ -128,13 +128,6 @@ impl ModeClient {
             .map_err(|_| format!("Mode {} reply failed", self.name))
     }
 
-    pub fn mode_id(&self) -> ModeId {
-        self.mode_id
-    }
-
-    pub fn name(&self) -> &str {
-        &self.name
-    }
 }
 
 /// Request sent to BufferHost
@@ -248,56 +241,7 @@ impl BufferHostClient {
             .map_err(|_| "BufferHost reply failed".to_string())
     }
 
-    /// Get current buffer state
-    pub async fn get_state(&self) -> Result<BufferResponse, String> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let message = BufferMessage {
-            request: BufferRequest::GetState,
-            reply: reply_tx,
-        };
 
-        self.sender
-            .send(message)
-            .await
-            .map_err(|_| "BufferHost disconnected".to_string())?;
-
-        reply_rx
-            .await
-            .map_err(|_| "BufferHost reply failed".to_string())
-    }
-
-    /// Save buffer to file
-    pub async fn save(&self) -> Result<BufferResponse, String> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let message = BufferMessage {
-            request: BufferRequest::Save,
-            reply: reply_tx,
-        };
-
-        self.sender
-            .send(message)
-            .await
-            .map_err(|_| "BufferHost disconnected".to_string())?;
-
-        reply_rx
-            .await
-            .map_err(|_| "BufferHost reply failed".to_string())
-    }
-
-    pub fn buffer_id(&self) -> BufferId {
-        self.buffer_id
-    }
-
-    /// Send a mouse event to the buffer (fire and forget)
-    pub fn handle_mouse_async(&self, event: crate::mode::MouseEvent, cursor_pos: usize) {
-        let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
-
-        let message = BufferMessage {
-            request: BufferRequest::HandleMouse { event, cursor_pos },
-            reply: reply_tx,
-        };
-        let _ = self.sender.try_send(message);
-    }
 
     /// Send a mouse event to the buffer and wait for response
     pub async fn handle_mouse(
@@ -725,7 +669,6 @@ impl BufferHost {
                         buffer_id: self.buffer_id,
                     });
                 }
-                // TODO: Implement other actions
                 _ => {}
             }
         }

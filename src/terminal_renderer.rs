@@ -72,7 +72,6 @@ impl<W: Write> TerminalRenderer<W> {
         let window = &editor.windows[window_id];
         let buffer = &editor.buffers[window.active_buffer];
 
-        // Check if there's a region selected for highlighting
         // Only show region highlighting in the active window
         let region_bounds = if window_id == editor.active_window {
             buffer.get_region(window.cursor)
@@ -80,7 +79,6 @@ impl<W: Write> TerminalRenderer<W> {
             None
         };
 
-        // Get line content
         if buffer_line >= buffer.buffer_len_lines() {
             // Past end of buffer - clear the entire content line
             let content_x = window.x + 1;
@@ -99,27 +97,19 @@ impl<W: Write> TerminalRenderer<W> {
         let line_text = line_text.trim_end_matches('\n');
         let line_start_pos = buffer.buffer_line_to_char(buffer_line);
 
-        // Calculate window content area
         let content_x = window.x + 1;
         let content_width = window.width_chars.saturating_sub(2);
 
-        // Position cursor at start of the content area for this line
         queue!(&mut self.device, cursor::MoveTo(content_x, screen_row))?;
-
-        // Clear the entire content line first to avoid artifacts
         let clear_spaces = " ".repeat(content_width as usize);
         queue!(
             &mut self.device,
             Print(clear_spaces.with(FG_COLOR).on(BG_COLOR))
         )?;
 
-        // Position cursor back to start of content area
         queue!(&mut self.device, cursor::MoveTo(content_x, screen_row))?;
 
-        // Extract the characters we need to render (entire line since we cleared it)
         let chars_to_render: Vec<char> = line_text.chars().take(content_width as usize).collect();
-
-        // Render with region highlighting
         if let Some((region_start, region_end)) = region_bounds {
             let line_end_pos = line_start_pos + line_text.len();
 
@@ -996,19 +986,13 @@ pub async fn event_loop_with_renderer<W: Write>(
                     echo(&mut renderer.device, editor, &message)?;
                 }
 
-                ChromeAction::FileOpen => {
-                    // TODO: Implement file open dialog
-                }
-                ChromeAction::CommandMode => {
-                    // TODO: Implement command mode
-                }
+                ChromeAction::FileOpen => {}
+                ChromeAction::CommandMode => {}
                 ChromeAction::Huh => {}
                 ChromeAction::Quit => {
                     return Ok(());
                 }
-                ChromeAction::CursorMove((_col, _line)) => {
-                    // TODO: Handle cursor movement if needed
-                }
+                ChromeAction::CursorMove((_col, _line)) => {}
                 ChromeAction::MarkDirty(dirty_region) => {
                     renderer.mark_dirty(dirty_region);
                 }
@@ -1075,11 +1059,9 @@ async fn handle_mouse_event<W: Write>(
 ) {
     match mouse_event.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            // Check if the mouse is on a window border
             if let Some((border_info, target_window)) =
                 detect_border_click(editor, mouse_event.column, mouse_event.row)
             {
-                // Start dragging the border
                 editor.mouse_drag_state = Some(MouseDragState {
                     drag_type: DragType::WindowBorder,
                     start_pos: (mouse_event.column, mouse_event.row),
@@ -1088,84 +1070,70 @@ async fn handle_mouse_event<W: Write>(
                     target_window: Some(target_window),
                     border_info: Some(border_info),
                 });
-            } else {
-                // Check if the mouse is within a window content area
-                if let Some(window_id) =
-                    find_window_at_position(editor, mouse_event.column, mouse_event.row)
-                {
-                    // Switch to the clicked window if it's not already active
-                    if editor.active_window != window_id {
-                        editor.previous_active_window = Some(editor.active_window);
-                        editor.active_window = window_id;
-                        renderer.mark_dirty(DirtyRegion::FullScreen);
-                    }
+                return;
+            }
 
-                    // Convert screen coordinates to buffer-absolute coordinates
-                    let window = &editor.windows[window_id];
-                    let relative_x = mouse_event.column.saturating_sub(window.x + 1); // +1 for border
-                    let relative_y = mouse_event.row.saturating_sub(window.y + 1); // +1 for top border
+            let Some(window_id) = find_window_at_position(editor, mouse_event.column, mouse_event.row) else {
+                return;
+            };
 
-                    // Convert window-relative coordinates to buffer-absolute coordinates
-                    let buffer_row = relative_y + window.start_line;
-                    let buffer_col = relative_x;
+            if editor.active_window != window_id {
+                editor.previous_active_window = Some(editor.active_window);
+                editor.active_window = window_id;
+                renderer.mark_dirty(DirtyRegion::FullScreen);
+            }
 
-                    // Create mouse event for the mode
-                    let mode_mouse_event = crate::mode::MouseEvent {
-                        position: (buffer_col, buffer_row),
-                        event_type: crate::mode::MouseEventType::LeftClick,
-                    };
+            let window = &editor.windows[window_id];
+            let relative_x = mouse_event.column.saturating_sub(window.x + 1);
+            let relative_y = mouse_event.row.saturating_sub(window.y + 1);
+            let buffer_row = relative_y + window.start_line;
+            let buffer_col = relative_x;
 
-                    // Send the mouse event to the buffer's mode and process response
-                    if let Some(actions) =
-                        handle_mode_mouse_event(editor, window_id, &mode_mouse_event).await
-                    {
-                        for action in actions {
-                            match action {
-                                ChromeAction::MarkDirty(dirty_region) => {
-                                    renderer.mark_dirty(dirty_region);
-                                }
-                                _ => {
-                                    // Handle other actions if needed
-                                }
-                            }
-                        }
-                    }
+            let mode_mouse_event = crate::mode::MouseEvent {
+                position: (buffer_col, buffer_row),
+                event_type: crate::mode::MouseEventType::LeftClick,
+            };
+
+            let Some(actions) = handle_mode_mouse_event(editor, window_id, &mode_mouse_event).await else {
+                return;
+            };
+
+            for action in actions {
+                if let ChromeAction::MarkDirty(dirty_region) = action {
+                    renderer.mark_dirty(dirty_region);
                 }
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            // Continue dragging if we're in a drag state
-            if let Some(drag_state) = editor.mouse_drag_state.clone() {
-                let new_pos = (mouse_event.column, mouse_event.row);
+            let Some(drag_state) = editor.mouse_drag_state.clone() else {
+                return;
+            };
 
-                // Calculate incremental change from last position
-                let dx = new_pos.0 as i32 - drag_state.last_pos.0 as i32;
-                let dy = new_pos.1 as i32 - drag_state.last_pos.1 as i32;
+            let new_pos = (mouse_event.column, mouse_event.row);
+            let dx = new_pos.0 as i32 - drag_state.last_pos.0 as i32;
+            let dy = new_pos.1 as i32 - drag_state.last_pos.1 as i32;
 
-                // Only process if there's actual movement
-                if dx != 0 || dy != 0 {
-                    // Update positions in drag state
-                    if let Some(ref mut drag_state_mut) = editor.mouse_drag_state {
-                        drag_state_mut.current_pos = new_pos;
-                        drag_state_mut.last_pos = new_pos;
-                    }
-
-                    // Process the resize with cloned data
-                    if let Some(border_info) = drag_state.border_info {
-                        let target_window = drag_state.target_window;
-
-                        // Update window layout with incremental change
-                        update_window_resize_incremental(
-                            editor,
-                            target_window,
-                            &border_info,
-                            dx,
-                            dy,
-                        );
-                        renderer.mark_dirty(DirtyRegion::FullScreen);
-                    }
-                }
+            if dx == 0 && dy == 0 {
+                return;
             }
+
+            if let Some(ref mut drag_state_mut) = editor.mouse_drag_state {
+                drag_state_mut.current_pos = new_pos;
+                drag_state_mut.last_pos = new_pos;
+            }
+
+            let Some(border_info) = drag_state.border_info else {
+                return;
+            };
+
+            update_window_resize_incremental(
+                editor,
+                drag_state.target_window,
+                &border_info,
+                dx,
+                dy,
+            );
+            renderer.mark_dirty(DirtyRegion::FullScreen);
         }
         MouseEventKind::Up(MouseButton::Left) => {
             // End dragging
