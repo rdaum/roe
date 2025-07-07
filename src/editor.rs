@@ -535,7 +535,7 @@ impl Editor {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs();
-            let formatted_message = format!("[{}] {}\n", now, message);
+            let formatted_message = format!("[{now}] {message}\n");
 
             // Append message to end of buffer
             let buffer_len = buffer.buffer_len_chars();
