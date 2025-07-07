@@ -1,8 +1,8 @@
 [package]
-name = "red"
+name = "roe"
 version = "0.1.0"
 edition = "2021"
-description = "A minimalistic editor with emacs keybindings"
+description = "Ryan's Own Emacs - A minimalistic editor with emacs keybindings"
 
 [dependencies]
 crossterm = { version = "0.28.1", features = ["event-stream"] }

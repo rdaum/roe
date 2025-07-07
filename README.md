@@ -1,8 +1,6 @@
-# Rymacs
+# Roe (Ryan's Own Emacs)
 
 A minimalistic console text editor in the spirit of the Emacs family of editors, built in Rust.
-
-_Note: The name "Rymacs" is provisional and will change._
 
 This editor follows the Emacs tradition in three key ways: (a) it's buffer-oriented rather than
 file-oriented, (b) it uses the default GNU Emacs keybinding set, and (c) it's being architected with
@@ -16,7 +14,7 @@ interpreter written in Rust.
 
 ## Screenshot
 
-![Screenshot of Rymacs editor](screenshot.png)
+![Screenshot of Roe editor](screenshot.png)
 
 ## Features
 
@@ -124,7 +122,7 @@ cargo run
 
 ## Architecture
 
-Red is built with a clean separation of concerns:
+Roe is built with a clean separation of concerns:
 
 - **Buffer**: Text storage using `ropey` for efficient editing
 - **Window**: View into a buffer with cursor and scroll position
