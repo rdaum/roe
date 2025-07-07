@@ -14,6 +14,10 @@ Lisp. However, the architecture has been designed from the ground up to delegate
 logic to an embedded scripting system. The likely outcome will be to embed "Steel" Scheme, a Scheme
 interpreter written in Rust.
 
+## Screenshot
+
+![Screenshot of Rymacs editor](screenshot.png)
+
 ## Features
 
 - **Emacs-style keybindings**: Familiar keyboard shortcuts for Emacs users
