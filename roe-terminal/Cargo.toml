@@ -1,0 +1,12 @@
+[package]
+name = "roe-terminal"
+version = "0.1.0"
+edition = "2021"
+description = "Terminal rendering for Roe (Ryan's Own Emacs)"
+
+[dependencies]
+crossterm = { workspace = true }
+futures = { workspace = true }
+roe-core = { path = "../roe-core" }
+slotmap = { workspace = true }
+tokio = { workspace = true }

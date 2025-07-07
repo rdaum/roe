@@ -11,48 +11,20 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
-use buffer::Buffer;
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::disable_raw_mode;
-use editor::{Editor, Frame, Window};
-use keys::KeyState;
-use mode::{FileMode, Mode};
-use renderer::Renderer;
-use slotmap::{new_key_type, SlotMap};
+use roe_core::{
+    buffer_host, command_registry, editor, keys, kill_ring, mode, Buffer, BufferId, Editor, Frame,
+    KeyState, Mode, ModeId, Renderer, Window, WindowId,
+};
+use roe_terminal::{TerminalRenderer, ECHO_AREA_HEIGHT};
+use slotmap::SlotMap;
 use std::collections::HashMap;
 use std::io::Write;
-use terminal_renderer::TerminalRenderer;
-use terminal_renderer::ECHO_AREA_HEIGHT;
-
-mod buffer;
-mod buffer_host;
-mod buffer_switch_mode;
-mod command_mode;
-mod command_registry;
-mod editor;
-mod file_selector_mode;
-mod keys;
-mod kill_ring;
-mod mode;
-mod renderer;
-mod terminal_renderer;
-mod window;
-
-new_key_type! {
-    pub struct WindowId;
-}
-
-new_key_type! {
-    pub struct BufferId;
-}
-
-new_key_type! {
-    pub struct ModeId;
-}
 
 // Everything to run in raw_mode
 async fn terminal_main<W: Write>(stdout: W, file_paths: Vec<String>) -> Result<(), std::io::Error> {
@@ -81,7 +53,7 @@ async fn terminal_main<W: Write>(stdout: W, file_paths: Vec<String>) -> Result<(
     // Create buffers for all specified files
     for file_path in files_to_open {
         // Create FileMode for this file
-        let file_mode = Box::new(FileMode {
+        let file_mode = Box::new(mode::FileMode {
             file_path: file_path.clone(),
         });
         let file_mode_id = modes.insert(file_mode);
@@ -213,7 +185,7 @@ async fn terminal_main<W: Write>(stdout: W, file_paths: Vec<String>) -> Result<(
     renderer.render_full(&editor)?;
 
     // Event loop with renderer
-    terminal_renderer::event_loop_with_renderer(&mut renderer, &mut editor).await?;
+    roe_terminal::terminal_renderer::event_loop_with_renderer(&mut renderer, &mut editor).await?;
 
     Ok(())
 }
@@ -248,7 +220,7 @@ async fn main() -> Result<(), std::io::Error> {
         eprintln!("   https://github.com/rdaum/roe/issues");
         eprintln!();
         eprintln!("Include the following crash details in your report:");
-        eprintln!("{}", panic_info);
+        eprintln!("{panic_info}");
     }));
 
     let mut stdout = std::io::stdout();

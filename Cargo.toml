@@ -1,10 +1,12 @@
-[package]
-name = "roe"
-version = "0.1.0"
-edition = "2021"
-description = "Ryan's Own Emacs - A minimalistic editor with emacs keybindings"
+[workspace]
+members = [
+    "roe",
+    "roe-core",
+    "roe-terminal",
+]
+resolver = "2"
 
-[dependencies]
+[workspace.dependencies]
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures = "0.3"
 ropey = "1.6"

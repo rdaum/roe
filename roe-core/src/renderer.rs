@@ -111,6 +111,12 @@ pub struct DirtyTracker {
     full_screen_dirty: bool,
 }
 
+impl Default for DirtyTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DirtyTracker {
     pub fn new() -> Self {
         Self {

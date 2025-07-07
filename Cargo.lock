@@ -329,8 +329,29 @@ name = "roe"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "roe-core",
+ "roe-terminal",
+ "slotmap",
+ "tokio",
+]
+
+[[package]]
+name = "roe-core"
+version = "0.1.0"
+dependencies = [
  "futures",
  "ropey",
+ "slotmap",
+ "tokio",
+]
+
+[[package]]
+name = "roe-terminal"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "futures",
+ "roe-core",
  "slotmap",
  "tokio",
 ]

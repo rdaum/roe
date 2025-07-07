@@ -11,10 +11,6 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
-use crate::editor::{BorderInfo, ChromeAction, DragType, Frame, MouseDragState, Window};
-use crate::keys::{KeyModifier, LogicalKey, Side};
-use crate::renderer::{DirtyRegion, DirtyTracker, ModelineComponent, Renderer};
-use crate::{Editor, WindowId};
 use crossterm::event::{
     Event, EventStream, KeyCode, KeyModifiers, ModifierKeyCode, MouseButton, MouseEvent,
     MouseEventKind,
@@ -23,6 +19,10 @@ use crossterm::style::{Color, Print, Stylize};
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::{cursor, queue};
 use futures::{future::FutureExt, select, StreamExt};
+use roe_core::editor::{BorderInfo, ChromeAction, DragType, Frame, MouseDragState, Window};
+use roe_core::keys::{KeyModifier, LogicalKey, Side};
+use roe_core::renderer::{DirtyRegion, DirtyTracker, ModelineComponent, Renderer};
+use roe_core::{Editor, WindowId};
 use std::io::Write;
 use tokio::time::{interval, Duration};
 
@@ -260,7 +260,7 @@ impl<W: Write> Renderer for TerminalRenderer<W> {
         self.dirty_tracker.mark_dirty(region);
     }
 
-    fn render_incremental(&mut self, editor: &Editor) -> Result<(), Self::Error> {
+    fn render_incremental(&mut self, editor: &Editor) -> Result<(), std::io::Error> {
         // If full screen is dirty, fall back to full render
         if self.dirty_tracker.is_full_screen_dirty() {
             return self.render_full(editor);
@@ -371,7 +371,7 @@ impl<W: Write> Renderer for TerminalRenderer<W> {
         Ok(())
     }
 
-    fn render_full(&mut self, editor: &Editor) -> Result<(), Self::Error> {
+    fn render_full(&mut self, editor: &Editor) -> Result<(), std::io::Error> {
         // Hide cursor during redraw
         queue!(&mut self.device, cursor::Hide)?;
 
@@ -392,7 +392,7 @@ impl<W: Write> Renderer for TerminalRenderer<W> {
             let window = &editor.windows[window_id];
             if matches!(
                 window.window_type,
-                crate::editor::WindowType::Command { .. }
+                roe_core::editor::WindowType::Command { .. }
             ) {
                 draw_command_window(&mut self.device, editor, window_id)?;
             }
@@ -1040,7 +1040,7 @@ pub async fn event_loop_with_renderer<W: Write>(
 fn draw_command_window(
     device: &mut impl Write,
     editor: &Editor,
-    window_id: crate::WindowId,
+    window_id: WindowId,
 ) -> Result<(), std::io::Error> {
     let window = &editor.windows[window_id];
 
@@ -1091,9 +1091,9 @@ async fn handle_mouse_event<W: Write>(
             let buffer_row = relative_y + window.start_line;
             let buffer_col = relative_x;
 
-            let mode_mouse_event = crate::mode::MouseEvent {
+            let mode_mouse_event = roe_core::mode::MouseEvent {
                 position: (buffer_col, buffer_row),
-                event_type: crate::mode::MouseEventType::LeftClick,
+                event_type: roe_core::mode::MouseEventType::LeftClick,
             };
 
             let Some(actions) = handle_mode_mouse_event(editor, window_id, &mode_mouse_event).await
@@ -1171,8 +1171,8 @@ fn find_window_at_position(editor: &Editor, x: u16, y: u16) -> Option<WindowId> 
 async fn handle_mode_mouse_event(
     editor: &mut Editor,
     window_id: WindowId,
-    mouse_event: &crate::mode::MouseEvent,
-) -> Option<Vec<crate::editor::ChromeAction>> {
+    mouse_event: &roe_core::mode::MouseEvent,
+) -> Option<Vec<roe_core::editor::ChromeAction>> {
     let window = &editor.windows[window_id];
     let buffer_id = window.active_buffer;
     let cursor_pos = window.cursor;
@@ -1308,11 +1308,11 @@ fn update_window_resize_incremental(
 
 /// Recursively adjust window tree ratios for incremental resizing
 fn adjust_window_tree_ratio_incremental(
-    node: &mut crate::editor::WindowNode,
+    node: &mut roe_core::editor::WindowNode,
     ratio_change: f32,
     is_vertical: bool,
 ) {
-    use crate::editor::{SplitDirection, WindowNode};
+    use roe_core::editor::{SplitDirection, WindowNode};
 
     match node {
         WindowNode::Leaf { .. } => {
