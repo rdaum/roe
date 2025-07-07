@@ -23,6 +23,8 @@ interpreter written in Rust.
   editors. Just like GNU emacs.
   - Even the command entry window is a buffer.
 - **Window management**: Split windows horizontally/vertically, switch between them, same as emacs.
+- **Mouse support**: Click to position cursor, drag window borders to resize, click to switch
+  windows
 - **Modular architecture**: Extensible mode system for different editing behaviors
 - **Terminal-based**: Lightweight, runs in your terminal
 - **Fast rendering**: Uses crossterm for efficient terminal manipulation
@@ -76,6 +78,13 @@ customizable keybindings and macro recording/playback in the future._
 
 - `C-x b`: Switch to another buffer
 - `C-x k`: Kill (close) a buffer
+
+### Mouse Operations
+
+- **Click**: Position cursor at click location
+- **Click in window**: Switch to clicked window
+- **Drag window borders**: Resize windows by dragging their borders
+- **Mouse events in modes**: Mouse events are forwarded to modes for future extensibility
 
 ### File Operations
 
@@ -142,6 +151,7 @@ This is a work-in-progress editor. Currently implemented:
 - **Kill ring**: Cut, copy, paste with kill ring history
 - **Command mode**: Interactive command execution (M-x) with completion
 - **File operations**: Open and save files
+- **Mouse integration**: Click-to-position cursor, window switching, border dragging for resizing
 - **Terminal UI**: Efficient rendering with borders, modelines, and echo area
 - **Auto-clearing messages**: Timed echo message clearing for better UX
 
