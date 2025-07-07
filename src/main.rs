@@ -241,6 +241,16 @@ fn exit_state(device: &mut impl Write) -> Result<(), std::io::Error> {
 
 #[tokio::main]
 async fn main() -> Result<(), std::io::Error> {
+    // Set panic handler to clean up terminal state while preserving panic info
+    std::panic::set_hook(Box::new(|panic_info| {
+        let _ = exit_state(&mut std::io::stdout());
+        eprintln!("💥 Roe has crashed! This shouldn't happen - please file a bug report at:");
+        eprintln!("   https://github.com/rdaum/roe/issues");
+        eprintln!();
+        eprintln!("Include the following crash details in your report:");
+        eprintln!("{}", panic_info);
+    }));
+
     let mut stdout = std::io::stdout();
 
     // Collect command line arguments (skip the program name)
