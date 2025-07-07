@@ -967,7 +967,7 @@ pub async fn event_loop_with_renderer<W: Write>(
             }
             Event::Mouse(mouse_event) => {
                 // Handle mouse events for window resizing
-                handle_mouse_event(editor, renderer, mouse_event);
+                handle_mouse_event(editor, renderer, mouse_event).await;
                 // No keys to process for mouse events
                 vec![]
             }
@@ -1063,7 +1063,7 @@ fn draw_command_window(
 }
 
 /// Handle mouse events for window resizing
-fn handle_mouse_event<W: Write>(
+async fn handle_mouse_event<W: Write>(
     editor: &mut Editor,
     renderer: &mut TerminalRenderer<W>,
     mouse_event: MouseEvent,
@@ -1083,6 +1083,45 @@ fn handle_mouse_event<W: Write>(
                     target_window: Some(target_window),
                     border_info: Some(border_info),
                 });
+            } else {
+                // Check if the mouse is within a window content area
+                if let Some(window_id) = find_window_at_position(editor, mouse_event.column, mouse_event.row) {
+                    // Switch to the clicked window if it's not already active
+                    if editor.active_window != window_id {
+                        editor.previous_active_window = Some(editor.active_window);
+                        editor.active_window = window_id;
+                        renderer.mark_dirty(DirtyRegion::FullScreen);
+                    }
+                    
+                    // Convert screen coordinates to buffer-absolute coordinates
+                    let window = &editor.windows[window_id];
+                    let relative_x = mouse_event.column.saturating_sub(window.x + 1); // +1 for border
+                    let relative_y = mouse_event.row.saturating_sub(window.y + 1); // +1 for top border
+                    
+                    // Convert window-relative coordinates to buffer-absolute coordinates
+                    let buffer_row = relative_y + window.start_line;
+                    let buffer_col = relative_x;
+                    
+                    // Create mouse event for the mode
+                    let mode_mouse_event = crate::mode::MouseEvent {
+                        position: (buffer_col, buffer_row),
+                        event_type: crate::mode::MouseEventType::LeftClick,
+                    };
+                    
+                    // Send the mouse event to the buffer's mode and process response
+                    if let Some(actions) = handle_mode_mouse_event(editor, window_id, &mode_mouse_event).await {
+                        for action in actions {
+                            match action {
+                                ChromeAction::MarkDirty(dirty_region) => {
+                                    renderer.mark_dirty(dirty_region);
+                                }
+                                _ => {
+                                    // Handle other actions if needed
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
@@ -1130,6 +1169,38 @@ fn handle_mouse_event<W: Write>(
             // Ignore other mouse events for now
         }
     }
+}
+
+/// Find which window contains the given screen position
+fn find_window_at_position(editor: &Editor, x: u16, y: u16) -> Option<WindowId> {
+    for (window_id, window) in &editor.windows {
+        // Check if position is within window content area (not on borders)
+        let content_left = window.x + 1; // +1 for left border
+        let content_right = window.x + window.width_chars - 1; // -1 for right border
+        let content_top = window.y;
+        let content_bottom = window.y + window.height_chars - 1;
+        
+        if x >= content_left && x < content_right && y >= content_top && y <= content_bottom {
+            return Some(window_id);
+        }
+    }
+    None
+}
+
+/// Handle mouse events for modes
+async fn handle_mode_mouse_event(editor: &mut Editor, window_id: WindowId, mouse_event: &crate::mode::MouseEvent) -> Option<Vec<crate::editor::ChromeAction>> {
+    let window = &editor.windows[window_id];
+    let buffer_id = window.active_buffer;
+    let cursor_pos = window.cursor;
+    
+    if let Some(buffer_host) = editor.buffer_hosts.get(&buffer_id) {
+        // Send mouse event to buffer host and wait for response
+        if let Ok(response) = buffer_host.handle_mouse(mouse_event.clone(), cursor_pos).await {
+            // Process the response like key events do
+            return Some(editor.handle_buffer_response(response).await);
+        }
+    }
+    None
 }
 
 /// Detect if a mouse click is on a window border

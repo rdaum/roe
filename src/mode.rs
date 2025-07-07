@@ -14,6 +14,28 @@
 use crate::command_registry::{Command, CommandCategory};
 use crate::keys::KeyAction;
 
+/// Mouse event information for modes
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MouseEvent {
+    /// Mouse position within the window (column, row)
+    pub position: (u16, u16),
+    /// Type of mouse event
+    pub event_type: MouseEventType,
+}
+
+/// Types of mouse events that modes can handle
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MouseEventType {
+    /// Left mouse button click
+    LeftClick,
+    /// Right mouse button click
+    RightClick,
+    /// Mouse moved (with no buttons pressed)
+    Move,
+    /// Left button drag
+    LeftDrag,
+}
+
 /// Mode dispatch functions all return actions in response to events.
 /// Actions are things like "insert text", "delete text", "move cursor", etc.
 /// Example events are things like "keystroke" or "mouse click" (with logical key, not physical)
@@ -61,6 +83,8 @@ pub enum ModeAction {
     KillBuffer(crate::BufferId),
     /// Open a file by path
     OpenFile(std::path::PathBuf),
+    /// Move cursor to specific position (row, column)
+    MoveCursor(u16, u16),
 
     CursorUp,
     CursorDown,
@@ -113,6 +137,12 @@ pub enum ModeResult {
 pub trait Mode: Send + Sync {
     fn name(&self) -> &str;
     fn perform(&mut self, action: &KeyAction) -> ModeResult;
+
+    /// Handle mouse events within the mode's window
+    /// Default implementation ignores all mouse events
+    fn handle_mouse(&mut self, _event: &MouseEvent) -> ModeResult {
+        ModeResult::Ignored
+    }
 
     /// Return commands that this mode provides
     /// Default implementation returns no commands
@@ -188,6 +218,17 @@ impl Mode for ScratchMode {
             KeyAction::SwitchBuffer => ModeResult::Ignored,
             KeyAction::KillBuffer => ModeResult::Ignored,
             KeyAction::Unbound => ModeResult::Ignored,
+        }
+    }
+
+    fn handle_mouse(&mut self, event: &MouseEvent) -> ModeResult {
+        match event.event_type {
+            MouseEventType::LeftClick => {
+                // Move cursor to clicked position (row, col)
+                ModeResult::Consumed(vec![ModeAction::MoveCursor(event.position.1, event.position.0)])
+            }
+            // Ignore other mouse events for now
+            _ => ModeResult::Ignored,
         }
     }
 }
@@ -295,6 +336,17 @@ impl Mode for FileMode {
             ),
         ]
     }
+
+    fn handle_mouse(&mut self, event: &MouseEvent) -> ModeResult {
+        match event.event_type {
+            MouseEventType::LeftClick => {
+                // Move cursor to clicked position (row, col)
+                ModeResult::Consumed(vec![ModeAction::MoveCursor(event.position.1, event.position.0)])
+            }
+            // Ignore other mouse events for now
+            _ => ModeResult::Ignored,
+        }
+    }
 }
 
 /// A read-only mode for displaying messages (echo events, logs, etc.)
@@ -349,5 +401,16 @@ impl Mode for MessagesMode {
             CommandCategory::Mode("messages".to_string()),
             Box::new(|_context| Ok(vec![ChromeAction::Echo("Messages cleared".to_string())])),
         )]
+    }
+
+    fn handle_mouse(&mut self, event: &MouseEvent) -> ModeResult {
+        match event.event_type {
+            MouseEventType::LeftClick => {
+                // Move cursor to clicked position (read-only mode, so just navigation)
+                ModeResult::Consumed(vec![ModeAction::MoveCursor(event.position.1, event.position.0)])
+            }
+            // Ignore other mouse events for now
+            _ => ModeResult::Ignored,
+        }
     }
 }

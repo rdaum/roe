@@ -1398,7 +1398,7 @@ impl Editor {
     }
 
     /// Convert BufferResponse to ChromeActions
-    async fn handle_buffer_response(
+    pub async fn handle_buffer_response(
         &mut self,
         response: crate::buffer_host::BufferResponse,
     ) -> Vec<ChromeAction> {
@@ -2176,6 +2176,8 @@ mod tests {
             echo_message: "".to_string(),
             echo_message_time: None,
             current_key_chord: vec![],
+            mouse_drag_state: None,
+            messages_buffer_id: None,
         }
     }
 

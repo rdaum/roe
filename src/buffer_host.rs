@@ -19,9 +19,17 @@ use crate::{BufferId, ModeId};
 use tokio::sync::{mpsc, oneshot};
 
 /// Message sent to a mode actor
-pub struct ModeMessage {
-    pub action: KeyAction,
-    pub reply: oneshot::Sender<ModeResult>,
+pub enum ModeMessage {
+    /// Key action to process
+    KeyAction {
+        action: KeyAction,
+        reply: oneshot::Sender<ModeResult>,
+    },
+    /// Mouse event to process
+    MouseEvent {
+        event: crate::mode::MouseEvent,
+        reply: oneshot::Sender<ModeResult>,
+    },
 }
 
 /// Persistent mode actor that runs in its own task
@@ -51,10 +59,18 @@ impl ModeActor {
     pub fn spawn(mut self) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             while let Some(message) = self.receiver.recv().await {
-                let result = self.mode_impl.perform(&message.action);
-
-                // Send reply (ignore if receiver dropped)
-                let _ = message.reply.send(result);
+                match message {
+                    ModeMessage::KeyAction { action, reply } => {
+                        let result = self.mode_impl.perform(&action);
+                        let _ = reply.send(result);
+                        continue;
+                    }
+                    ModeMessage::MouseEvent { event, reply } => {
+                        let result = self.mode_impl.handle_mouse(&event);
+                        let _ = reply.send(result);
+                        continue;
+                    }
+                };
             }
         })
     }
@@ -79,8 +95,26 @@ impl ModeClient {
     /// Send a key action to the mode and wait for response
     pub async fn handle_key(&self, action: KeyAction) -> Result<ModeResult, String> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        let message = ModeMessage {
+        let message = ModeMessage::KeyAction {
             action,
+            reply: reply_tx,
+        };
+
+        self.sender
+            .send(message)
+            .await
+            .map_err(|_| format!("Mode {} disconnected", self.name))?;
+
+        reply_rx
+            .await
+            .map_err(|_| format!("Mode {} reply failed", self.name))
+    }
+
+    /// Send a mouse event to the mode and wait for response
+    pub async fn handle_mouse(&self, event: crate::mode::MouseEvent) -> Result<ModeResult, String> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let message = ModeMessage::MouseEvent {
+            event,
             reply: reply_tx,
         };
 
@@ -109,6 +143,11 @@ pub enum BufferRequest {
     /// Process a keystroke through the mode chain
     HandleKey {
         action: KeyAction,
+        cursor_pos: usize,
+    },
+    /// Process a mouse event through the mode chain
+    HandleMouse {
+        event: crate::mode::MouseEvent,
         cursor_pos: usize,
     },
     /// Get current buffer state
@@ -248,6 +287,42 @@ impl BufferHostClient {
     pub fn buffer_id(&self) -> BufferId {
         self.buffer_id
     }
+
+    /// Send a mouse event to the buffer (fire and forget)
+    pub fn handle_mouse_async(&self, event: crate::mode::MouseEvent, cursor_pos: usize) {
+        let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+        
+        let message = BufferMessage {
+            request: BufferRequest::HandleMouse {
+                event,
+                cursor_pos,
+            },
+            reply: reply_tx,
+        };
+        let _ = self.sender.try_send(message);
+    }
+
+    /// Send a mouse event to the buffer and wait for response
+    pub async fn handle_mouse(&self, event: crate::mode::MouseEvent, cursor_pos: usize) -> Result<BufferResponse, String> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        
+        let message = BufferMessage {
+            request: BufferRequest::HandleMouse {
+                event,
+                cursor_pos,
+            },
+            reply: reply_tx,
+        };
+
+        self.sender
+            .send(message)
+            .await
+            .map_err(|_| "BufferHost disconnected".to_string())?;
+
+        reply_rx
+            .await
+            .map_err(|_| "BufferHost reply failed".to_string())
+    }
 }
 
 /// The BufferHost that processes requests and coordinates with mode actors
@@ -319,6 +394,9 @@ impl BufferHost {
             BufferRequest::HandleKey { action, cursor_pos } => {
                 self.handle_key_action(action, cursor_pos).await
             }
+            BufferRequest::HandleMouse { event, cursor_pos } => {
+                self.handle_mouse_action(event, cursor_pos).await
+            }
             BufferRequest::GetState => self.get_state(),
             BufferRequest::Save => self.save_buffer().await,
             BufferRequest::Load(file_path) => self.load_buffer(file_path).await,
@@ -347,6 +425,44 @@ impl BufferHost {
                             // This mode handled the event but allows others to see it too
                             actions_to_execute.extend(actions);
                             // Continue to next mode
+                        }
+                        ModeResult::Ignored => {
+                            // This mode ignored the event - continue to next mode
+                        }
+                    }
+                }
+                Err(_) => {
+                    // Mode communication failed, continue to next mode
+                    continue;
+                }
+            }
+        }
+
+        // Execute collected actions on the shared buffer
+        self.execute_actions(actions_to_execute, cursor_pos).await
+    }
+
+    /// Process mouse event through mode chain sequentially
+    async fn handle_mouse_action(
+        &mut self,
+        mouse_event: crate::mode::MouseEvent,
+        cursor_pos: usize,
+    ) -> BufferResponse {
+        let mut actions_to_execute = vec![];
+
+        // Process through mode chain in order
+        for mode_client in &self.mode_clients {
+            match mode_client.handle_mouse(mouse_event.clone()).await {
+                Ok(result) => {
+                    match result {
+                        ModeResult::Consumed(actions) => {
+                            // This mode consumed the event - add its actions and stop
+                            actions_to_execute.extend(actions);
+                            break;
+                        }
+                        ModeResult::Annotated(actions) => {
+                            // This mode annotated the event - add its actions and continue
+                            actions_to_execute.extend(actions);
                         }
                         ModeResult::Ignored => {
                             // This mode ignored the event - continue to next mode
@@ -583,6 +699,31 @@ impl BufferHost {
                     editor_action = Some(EditorAction::YankIndex {
                         position: position.clone(),
                         index,
+                    });
+                }
+                ModeAction::MoveCursor(row, col) => {
+                    // Convert window coordinates to buffer position
+                    let line = row as usize;
+                    let column = col as usize;
+                    
+                    // Make sure we don't go past the end of the buffer
+                    let buffer_lines = self.buffer.buffer_len_lines();
+                    let target_line = line.min(buffer_lines.saturating_sub(1));
+                    
+                    // Get line start and make sure column is within line bounds
+                    let line_start = self.buffer.buffer_line_to_char(target_line);
+                    let line_len = if target_line < buffer_lines {
+                        self.buffer.buffer_line(target_line).len().saturating_sub(1) // -1 for newline
+                    } else {
+                        0
+                    };
+                    let target_column = column.min(line_len);
+                    
+                    let new_pos = line_start + target_column;
+                    new_cursor_pos = Some(new_pos);
+                    
+                    dirty_regions.push(DirtyRegion::Buffer {
+                        buffer_id: self.buffer_id,
                     });
                 }
                 // TODO: Implement other actions
