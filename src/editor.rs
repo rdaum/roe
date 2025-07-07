@@ -1,8 +1,9 @@
 use crate::buffer::Buffer;
-use crate::buffer_host::{BufferHostClient, BufferResponse};
-use crate::buffer_switch_mode::BufferSwitchMode;
+use crate::buffer_host::{self, BufferHostClient, BufferResponse};
+use crate::buffer_switch_mode::{BufferSwitchMode, BufferSwitchPurpose};
 use crate::command_mode::{CommandMode, CommandModeResult};
 use crate::command_registry::{create_default_registry, CommandContext, CommandRegistry};
+use crate::file_selector_mode::FileSelectorMode;
 use crate::keys::KeyAction::ChordNext;
 use crate::keys::{Bindings, CursorDirection, KeyAction, KeyState, LogicalKey};
 use crate::kill_ring::KillRing;
@@ -10,7 +11,7 @@ use crate::mode::{ActionPosition, Mode, ModeAction};
 use crate::renderer::{DirtyRegion, ModelineComponent};
 use crate::{BufferId, ModeId, WindowId};
 use slotmap::SlotMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Type of window - normal editing window or special command window
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +32,8 @@ pub enum CommandType {
     Execute,
     /// C-x b buffer switching
     BufferSwitch,
+    /// C-x k buffer killing
+    KillBuffer,
     /// File opening
     FindFile,
 }
@@ -145,6 +148,8 @@ pub struct Editor {
     pub command_registry: CommandRegistry,
     /// Window that was active before opening command/buffer switch window
     pub previous_active_window: Option<WindowId>,
+    /// Buffer history (most recently used first) for smart buffer switching
+    pub buffer_history: Vec<BufferId>,
 }
 
 /// The main event loop, which receives keystrokes and dispatches them to the mode in the buffer
@@ -181,7 +186,8 @@ impl Editor {
             "*Command:{}*",
             match command_type {
                 CommandType::Execute => "Execute",
-                CommandType::BufferSwitch => "Switch Buffer", 
+                CommandType::BufferSwitch => "Switch Buffer",
+                CommandType::KillBuffer => "Kill Buffer",
                 CommandType::FindFile => "Find File",
             }
         ));
@@ -200,37 +206,102 @@ impl Editor {
                     .collect();
                 let mut command_mode = CommandMode::new();
                 command_mode.init_with_buffer(command_buffer_id, command_names);
-                
+
                 let content = command_mode.generate_buffer_content();
-                (Box::new(command_mode) as Box<dyn Mode>, "command".to_string(), content)
+                (
+                    Box::new(command_mode) as Box<dyn Mode>,
+                    "command".to_string(),
+                    content,
+                )
             }
             CommandType::BufferSwitch => {
                 // Create BufferSwitchMode for C-x b
+                // Show all buffers except command window buffers (including the current one being created)
+                let mut command_buffer_ids: HashSet<BufferId> = self
+                    .windows
+                    .iter()
+                    .filter(|(_, window)| matches!(window.window_type, WindowType::Command { .. }))
+                    .map(|(_, window)| window.active_buffer)
+                    .collect();
+
+                // Also exclude the command buffer we're about to create
+                command_buffer_ids.insert(command_buffer_id);
+
                 let buffer_list: Vec<(BufferId, String)> = self
                     .buffers
                     .iter()
+                    .filter(|(id, _)| !command_buffer_ids.contains(id))
                     .map(|(id, buffer)| (id, buffer.object()))
                     .collect();
-                let mut buffer_switch_mode = BufferSwitchMode::new();
-                buffer_switch_mode.init_with_buffer(command_buffer_id, buffer_list);
-                
+                let mut buffer_switch_mode =
+                    BufferSwitchMode::new_with_purpose(BufferSwitchPurpose::Switch);
+
+                // For switch mode, pre-select the previous buffer (most recently used other than current)
+                let current_buffer_id = self.windows[self.active_window].active_buffer;
+                if let Some(previous_buffer_id) = self.get_previous_buffer(current_buffer_id) {
+                    buffer_switch_mode.init_with_buffer_and_preselect(
+                        command_buffer_id,
+                        buffer_list,
+                        previous_buffer_id,
+                    );
+                } else {
+                    buffer_switch_mode.init_with_buffer(command_buffer_id, buffer_list);
+                }
+
                 let content = buffer_switch_mode.generate_buffer_content();
-                (Box::new(buffer_switch_mode) as Box<dyn Mode>, "buffer-switch".to_string(), content)
+                (
+                    Box::new(buffer_switch_mode) as Box<dyn Mode>,
+                    "buffer-switch".to_string(),
+                    content,
+                )
+            }
+            CommandType::KillBuffer => {
+                // Create BufferSwitchMode for C-x k (reuse buffer switch UI)
+                // Show all buffers except command window buffers (including the current one being created)
+                let mut command_buffer_ids: HashSet<BufferId> = self
+                    .windows
+                    .iter()
+                    .filter(|(_, window)| matches!(window.window_type, WindowType::Command { .. }))
+                    .map(|(_, window)| window.active_buffer)
+                    .collect();
+
+                // Also exclude the command buffer we're about to create
+                command_buffer_ids.insert(command_buffer_id);
+
+                let buffer_list: Vec<(BufferId, String)> = self
+                    .buffers
+                    .iter()
+                    .filter(|(id, _)| !command_buffer_ids.contains(id))
+                    .map(|(id, buffer)| (id, buffer.object()))
+                    .collect();
+                let mut buffer_switch_mode =
+                    BufferSwitchMode::new_with_purpose(BufferSwitchPurpose::Kill);
+                // For kill mode, pre-select the current buffer
+                let current_buffer_id = self.windows[self.active_window].active_buffer;
+                buffer_switch_mode.init_with_buffer_and_preselect(
+                    command_buffer_id,
+                    buffer_list,
+                    current_buffer_id,
+                );
+
+                let content = buffer_switch_mode.generate_buffer_content();
+                (
+                    Box::new(buffer_switch_mode) as Box<dyn Mode>,
+                    "buffer-kill".to_string(),
+                    content,
+                )
             }
             CommandType::FindFile => {
-                // TODO: Implement FindFileMode later
-                // For now, fall back to CommandMode
-                let command_names: Vec<String> = self
-                    .command_registry
-                    .all_commands()
-                    .iter()
-                    .map(|cmd| cmd.name.clone())
-                    .collect();
-                let mut command_mode = CommandMode::new();
-                command_mode.init_with_buffer(command_buffer_id, command_names);
-                
-                let content = command_mode.generate_buffer_content();
-                (Box::new(command_mode) as Box<dyn Mode>, "command".to_string(), content)
+                // Create FileSelectorMode for C-x C-f
+                let mut file_selector_mode = FileSelectorMode::new();
+                file_selector_mode.init_with_buffer(command_buffer_id);
+
+                let content = file_selector_mode.generate_buffer_content();
+                (
+                    Box::new(file_selector_mode) as Box<dyn Mode>,
+                    "file-selector".to_string(),
+                    content,
+                )
             }
         };
 
@@ -241,11 +312,7 @@ impl Editor {
         let mode_id = self.modes.insert(mode_box);
 
         // Create BufferHost with the appropriate mode
-        let mode_list = vec![(
-            mode_id,
-            mode_name,
-            self.modes.remove(mode_id).unwrap(),
-        )];
+        let mode_list = vec![(mode_id, mode_name, self.modes.remove(mode_id).unwrap())];
 
         let (buffer_client, _buffer_handle) =
             crate::buffer_host::create_buffer_host(command_buffer, mode_list, command_buffer_id);
@@ -278,7 +345,7 @@ impl Editor {
 
         // Save the current active window before switching
         self.previous_active_window = Some(self.active_window);
-        
+
         // Make the command window the active window so keys go to it
         self.active_window = window_id;
 
@@ -293,7 +360,7 @@ impl Editor {
                 let buffer_id = window.active_buffer;
                 self.windows.remove(window_id);
                 self.buffers.remove(buffer_id);
-                
+
                 // Clean up the buffer host - this is critical for proper state cleanup
                 self.buffer_hosts.remove(&buffer_id);
 
@@ -327,6 +394,10 @@ impl Editor {
                     }
                 }
 
+                // Record buffer access for the restored active window
+                let restored_buffer_id = self.windows[self.active_window].active_buffer;
+                self.record_buffer_access(restored_buffer_id);
+
                 self.calculate_window_layout();
                 return true;
             }
@@ -343,6 +414,38 @@ impl Editor {
                 None
             }
         })
+    }
+
+    /// Check if a buffer belongs to a command window
+    pub fn is_command_buffer(&self, buffer_id: BufferId) -> bool {
+        self.windows.iter().any(|(_, window)| {
+            window.active_buffer == buffer_id
+                && matches!(window.window_type, WindowType::Command { .. })
+        })
+    }
+
+    /// Update buffer history when switching to a buffer
+    pub fn record_buffer_access(&mut self, buffer_id: BufferId) {
+        // Remove buffer from history if it exists
+        self.buffer_history.retain(|&id| id != buffer_id);
+        // Add to front (most recent)
+        self.buffer_history.insert(0, buffer_id);
+        // Keep history reasonably sized
+        if self.buffer_history.len() > 20 {
+            self.buffer_history.truncate(20);
+        }
+    }
+
+    /// Get the previous buffer (most recent that's not current and not a command buffer)
+    pub fn get_previous_buffer(&self, current_buffer_id: BufferId) -> Option<BufferId> {
+        self.buffer_history
+            .iter()
+            .find(|&&id| {
+                id != current_buffer_id
+                    && self.buffers.contains_key(id)
+                    && !self.is_command_buffer(id)
+            })
+            .copied()
     }
 
     /// Get the available space for normal windows, accounting for command windows
@@ -584,6 +687,11 @@ impl Editor {
             .unwrap_or(0);
         let next_index = (current_index + 1) % window_ids.len();
         self.active_window = window_ids[next_index];
+
+        // Record buffer access for the newly active window
+        let new_buffer_id = self.windows[self.active_window].active_buffer;
+        self.record_buffer_access(new_buffer_id);
+
         self.active_window
     }
 
@@ -832,6 +940,44 @@ impl Editor {
                     ChromeAction::MarkDirty(DirtyRegion::FullScreen),
                 ]);
             }
+            KeyAction::KillBuffer => {
+                // If kill buffer window is already open, close it first
+                if let Some(existing_command_window_id) = self.find_command_window() {
+                    self.close_command_window(existing_command_window_id);
+                }
+
+                // Create kill buffer window at bottom with enough height for buffer list
+                let window_height = 10; // Fixed height for now
+                let _kill_buffer_window_id = self.create_command_window(
+                    CommandType::KillBuffer,
+                    CommandWindowPosition::Bottom,
+                    window_height,
+                );
+
+                return Ok(vec![
+                    ChromeAction::Echo("Kill buffer selection".to_string()),
+                    ChromeAction::MarkDirty(DirtyRegion::FullScreen),
+                ]);
+            }
+            KeyAction::FindFile => {
+                // If file selector window is already open, close it first
+                if let Some(existing_command_window_id) = self.find_command_window() {
+                    self.close_command_window(existing_command_window_id);
+                }
+
+                // Create file selector window at bottom with enough height for file list
+                let window_height = 10; // Fixed height for now
+                let _file_selector_window_id = self.create_command_window(
+                    CommandType::FindFile,
+                    CommandWindowPosition::Bottom,
+                    window_height,
+                );
+
+                return Ok(vec![
+                    ChromeAction::Echo("File selection".to_string()),
+                    ChromeAction::MarkDirty(DirtyRegion::FullScreen),
+                ]);
+            }
             KeyAction::Escape => {
                 // If command window is active, close it
                 if let Some(command_window_id) = self.find_command_window() {
@@ -848,9 +994,6 @@ impl Editor {
                     ChromeAction::Echo("Quitting".to_string()),
                     ChromeAction::Quit,
                 ]);
-            }
-            KeyAction::FindFile => {
-                return Ok(vec![ChromeAction::FileOpen]);
             }
             KeyAction::SplitHorizontal => {
                 return Ok(vec![ChromeAction::SplitHorizontal]);
@@ -976,15 +1119,18 @@ impl Editor {
             window.cursor
         };
 
-        let chrome_actions = if let Some(buffer_host) = self.buffer_hosts.get(&buffer_id) {
+        let chrome_actions = if let Some(buffer_host) = self.buffer_hosts.get(&buffer_id).cloned() {
             // Use async runtime to handle the async BufferHost call
-            let result = tokio::task::block_in_place(|| {
+            let response_result = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()
                     .block_on(async { buffer_host.handle_key(key_action, cursor_pos).await })
             });
 
-            match result {
-                Ok(response) => self.handle_buffer_response(response),
+            match response_result {
+                Ok(response) => tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current()
+                        .block_on(async { self.handle_buffer_response(response).await })
+                }),
                 Err(err) => vec![ChromeAction::Echo(format!("Buffer error: {}", err))],
             }
         } else {
@@ -995,7 +1141,7 @@ impl Editor {
     }
 
     /// Convert BufferResponse to ChromeActions
-    fn handle_buffer_response(
+    async fn handle_buffer_response(
         &mut self,
         response: crate::buffer_host::BufferResponse,
     ) -> Vec<ChromeAction> {
@@ -1005,8 +1151,7 @@ impl Editor {
             BufferResponse::ActionsCompleted {
                 dirty_regions,
                 new_cursor_pos,
-                command_to_execute,
-                buffer_to_switch,
+                editor_action,
             } => {
                 let mut actions = vec![];
 
@@ -1028,103 +1173,184 @@ impl Editor {
                     ));
                 }
 
-                // Handle command execution
-                if let Some(command_name) = command_to_execute {
-                    // Close the command window after command selection
-                    if let Some(command_window_id) = self.find_command_window() {
-                        self.close_command_window(command_window_id);
-                        actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
-                    }
-
-                    // Look up command in registry and execute it
-                    if let Some(command) = self.command_registry.get_command(&command_name) {
-                        let context = CommandContext {
-                            buffer_id: {
-                                let window = &self.windows[self.active_window];
-                                window.active_buffer
-                            },
-                            window_id: self.active_window,
-                            cursor_pos: {
-                                let window = &self.windows[self.active_window];
-                                window.cursor
-                            },
-                            buffer_content: {
-                                let window = &self.windows[self.active_window];
-                                let buffer = &self.buffers[window.active_buffer];
-                                buffer.content()
-                            },
-                            buffer_name: {
-                                let window = &self.windows[self.active_window];
-                                let buffer = &self.buffers[window.active_buffer];
-                                buffer.object()
-                            },
-                            buffer_modified: false, // TODO: Implement modified tracking
-                            current_line: {
-                                let window = &self.windows[self.active_window];
-                                let buffer = &self.buffers[window.active_buffer];
-                                let (_, line) = buffer.to_column_line(window.cursor);
-                                line + 1 // Convert to 1-based for display
-                            },
-                            current_column: {
-                                let window = &self.windows[self.active_window];
-                                let buffer = &self.buffers[window.active_buffer];
-                                let (col, _) = buffer.to_column_line(window.cursor);
-                                col + 1 // Convert to 1-based for display
-                            },
-                        };
-
-                        match (command.handler)(context) {
-                            Ok(command_actions) => {
-                                // Convert command actions to chrome actions
-                                actions.extend(command_actions);
+                // Handle editor action
+                if let Some(action) = editor_action {
+                    use crate::buffer_host::EditorAction;
+                    match action {
+                        EditorAction::ExecuteCommand(command_name) => {
+                            // Close the command window after command selection
+                            if let Some(command_window_id) = self.find_command_window() {
+                                self.close_command_window(command_window_id);
+                                actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
                             }
-                            Err(error) => {
-                                actions
-                                    .push(ChromeAction::Echo(format!("Command error: {}", error)));
+                            // TODO: Implement command execution
+                            actions.push(ChromeAction::Echo(format!(
+                                "Execute command: {}",
+                                command_name
+                            )));
+                        }
+                        EditorAction::SwitchToBuffer(target_buffer_id) => {
+                            // Close the buffer switch window after selection
+                            if let Some(command_window_id) = self.find_command_window() {
+                                self.close_command_window(command_window_id);
+                                actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
+                            }
+
+                            // Determine which window to switch the buffer in
+                            let window_to_switch =
+                                if let Some(prev_window_id) = self.previous_active_window {
+                                    if self.windows.contains_key(prev_window_id) {
+                                        prev_window_id
+                                    } else {
+                                        self.active_window
+                                    }
+                                } else {
+                                    self.active_window
+                                };
+
+                            // Switch the determined window to the selected buffer
+                            if self.buffers.contains_key(target_buffer_id) {
+                                let window = &mut self.windows.get_mut(window_to_switch).unwrap();
+                                window.active_buffer = target_buffer_id;
+                                window.cursor = 0;
+
+                                // Record this buffer access for buffer history
+                                self.record_buffer_access(target_buffer_id);
+
+                                let buffer = &self.buffers[target_buffer_id];
+                                let buffer_name = buffer.object();
+                                actions.push(ChromeAction::Echo(format!(
+                                    "Switched to buffer: {}",
+                                    buffer_name
+                                )));
+                                actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
+                            } else {
+                                actions.push(ChromeAction::Echo(
+                                    "Buffer no longer exists".to_string(),
+                                ));
                             }
                         }
-                    } else {
-                        actions.push(ChromeAction::Echo(format!(
-                            "Unknown command: {}",
-                            command_name
-                        )));
-                    }
-                }
+                        EditorAction::KillBuffer(buffer_id) => {
+                            // Close the kill buffer window after selection
+                            if let Some(command_window_id) = self.find_command_window() {
+                                self.close_command_window(command_window_id);
+                                actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
+                            }
 
-                // Handle buffer switching
-                if let Some(target_buffer_id) = buffer_to_switch {
-                    // Determine which window to switch the buffer in
-                    let window_to_switch = if let Some(prev_window_id) = self.previous_active_window {
-                        // Use the window that was active before the buffer switch window opened
-                        if self.windows.contains_key(prev_window_id) {
-                            prev_window_id
-                        } else {
-                            // Previous window was deleted, use current active window
-                            self.active_window
+                            // Implement buffer killing logic
+                            if self.buffers.contains_key(buffer_id) {
+                                let buffer_name = self.buffers[buffer_id].object().clone();
+
+                                // Find all windows using this buffer and switch them to another buffer
+                                let mut windows_to_switch = Vec::new();
+                                for (window_id, window) in &self.windows {
+                                    if window.active_buffer == buffer_id {
+                                        windows_to_switch.push(window_id);
+                                    }
+                                }
+
+                                // Find an alternative buffer to switch to (avoid command windows)
+                                let alternative_buffer = self
+                                    .buffers
+                                    .iter()
+                                    .find(|(bid, _)| {
+                                        *bid != buffer_id && !self.is_command_buffer(*bid)
+                                    })
+                                    .map(|(bid, _)| bid);
+
+                                if let Some(alt_buffer_id) = alternative_buffer {
+                                    // Switch all windows using the killed buffer to the alternative
+                                    for window_id in windows_to_switch {
+                                        if let Some(window) = self.windows.get_mut(window_id) {
+                                            window.active_buffer = alt_buffer_id;
+                                            window.cursor = 0;
+                                        }
+                                    }
+                                } else {
+                                    // No alternative buffer available - create a new scratch buffer like Emacs
+                                    use crate::mode::ScratchMode;
+                                    let scratch_mode = Box::new(ScratchMode {});
+                                    let scratch_mode_id = self.modes.insert(scratch_mode);
+
+                                    let scratch_buffer = Buffer::new(&[scratch_mode_id]);
+                                    scratch_buffer.set_object("*scratch*".to_string());
+                                    scratch_buffer.load_str("; This buffer is for text that is not saved.\n; To create a file, visit it with C-x C-f and enter text in its buffer.\n\n");
+                                    let scratch_buffer_id =
+                                        self.buffers.insert(scratch_buffer.clone());
+
+                                    // Create BufferHost for the scratch buffer
+                                    let mode_list = vec![(
+                                        scratch_mode_id,
+                                        "scratch".to_string(),
+                                        self.modes.remove(scratch_mode_id).unwrap(),
+                                    )];
+                                    let (buffer_client, _buffer_handle) =
+                                        buffer_host::create_buffer_host(
+                                            scratch_buffer,
+                                            mode_list,
+                                            scratch_buffer_id,
+                                        );
+                                    self.buffer_hosts.insert(scratch_buffer_id, buffer_client);
+
+                                    // Switch all windows using the killed buffer to the new scratch buffer
+                                    for window_id in windows_to_switch {
+                                        if let Some(window) = self.windows.get_mut(window_id) {
+                                            window.active_buffer = scratch_buffer_id;
+                                            window.cursor = 0;
+                                        }
+                                    }
+                                }
+
+                                // Remove the buffer host
+                                self.buffer_hosts.remove(&buffer_id);
+
+                                // Remove the buffer itself
+                                self.buffers.remove(buffer_id);
+
+                                actions.push(ChromeAction::Echo(format!(
+                                    "Killed buffer: {}",
+                                    buffer_name
+                                )));
+                                actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
+                            } else {
+                                actions.push(ChromeAction::Echo(
+                                    "Buffer no longer exists".to_string(),
+                                ));
+                            }
                         }
-                    } else {
-                        // No previous window saved, use current active window
-                        self.active_window
-                    };
+                        EditorAction::OpenFile(file_path) => {
+                            // Close the file selector window after selection
+                            if let Some(command_window_id) = self.find_command_window() {
+                                self.close_command_window(command_window_id);
+                                actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
+                            }
 
-                    // Close the buffer switch window after selection
-                    if let Some(command_window_id) = self.find_command_window() {
-                        self.close_command_window(command_window_id);
-                        actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
-                    }
+                            // Determine which window to open the file in
+                            let window_to_open =
+                                if let Some(prev_window_id) = self.previous_active_window {
+                                    if self.windows.contains_key(prev_window_id) {
+                                        prev_window_id
+                                    } else {
+                                        self.active_window
+                                    }
+                                } else {
+                                    self.active_window
+                                };
 
-                    // Switch the determined window to the selected buffer
-                    if self.buffers.contains_key(target_buffer_id) {
-                        let window = &mut self.windows.get_mut(window_to_switch).unwrap();
-                        window.active_buffer = target_buffer_id;
-                        window.cursor = 0; // Reset cursor to start of buffer
-                        
-                        let buffer = &self.buffers[target_buffer_id];
-                        let buffer_name = buffer.object();
-                        actions.push(ChromeAction::Echo(format!("Switched to buffer: {}", buffer_name)));
-                        actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
-                    } else {
-                        actions.push(ChromeAction::Echo("Buffer no longer exists".to_string()));
+                            // Open the file in the determined window
+                            match self.open_file_in_window(file_path, window_to_open).await {
+                                Ok(message) => {
+                                    actions.push(ChromeAction::Echo(message));
+                                    actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
+                                }
+                                Err(error) => {
+                                    actions.push(ChromeAction::Echo(format!(
+                                        "Error opening file: {}",
+                                        error
+                                    )));
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -1542,6 +1768,53 @@ impl Editor {
         // Insert the yanked text
         self.insert_text(text, position)
     }
+
+    /// Open a file in the specified window
+    async fn open_file_in_window(
+        &mut self,
+        file_path: std::path::PathBuf,
+        window_id: WindowId,
+    ) -> Result<String, String> {
+        use crate::mode::FileMode;
+
+        // Try to load the file
+        let buffer = match Buffer::from_file(&file_path.to_string_lossy(), &[]).await {
+            Ok(buffer) => buffer,
+            Err(_) => {
+                // File doesn't exist, create empty buffer
+                let buffer = Buffer::new(&[]);
+                buffer.set_object(file_path.to_string_lossy().to_string());
+                buffer
+            }
+        };
+
+        let buffer_id = self.buffers.insert(buffer.clone());
+
+        // Create FileMode for this file
+        let file_mode = Box::new(FileMode {
+            file_path: file_path.to_string_lossy().to_string(),
+        });
+        let file_mode_id = self.modes.insert(file_mode);
+
+        // Create BufferHost with FileMode for this buffer
+        let file_mode = self.modes.remove(file_mode_id).unwrap();
+        let mode_list = vec![(file_mode_id, "file".to_string(), file_mode)];
+
+        // Create BufferHost and client
+        let (buffer_client, _buffer_handle) =
+            crate::buffer_host::create_buffer_host(buffer, mode_list, buffer_id);
+        self.buffer_hosts.insert(buffer_id, buffer_client);
+
+        // Switch the window to the new buffer
+        if let Some(window) = self.windows.get_mut(window_id) {
+            window.active_buffer = buffer_id;
+            window.cursor = 0; // Reset cursor to start of buffer
+
+            Ok(format!("Opened: {}", file_path.display()))
+        } else {
+            Err("Window no longer exists".to_string())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1589,6 +1862,7 @@ mod tests {
             window_tree: WindowNode::new_leaf(window_id),
             kill_ring: KillRing::new(),
             command_registry: Default::default(),
+            buffer_history: vec![],
         }
     }
 

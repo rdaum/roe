@@ -42,6 +42,10 @@ pub enum ModeAction {
     ExecuteCommand(String),
     /// Switch to a specific buffer
     SwitchToBuffer(crate::BufferId),
+    /// Kill a specific buffer
+    KillBuffer(crate::BufferId),
+    /// Open a file by path
+    OpenFile(std::path::PathBuf),
 
     CursorUp,
     CursorDown,
@@ -167,6 +171,7 @@ impl Mode for ScratchMode {
                 ModeResult::Consumed(vec![ModeAction::ClearMark])
             }
             KeyAction::SwitchBuffer => ModeResult::Ignored,
+            KeyAction::KillBuffer => ModeResult::Ignored,
             KeyAction::Unbound => ModeResult::Ignored,
         }
     }
@@ -241,6 +246,7 @@ impl Mode for FileMode {
                 ModeResult::Consumed(vec![ModeAction::ClearMark])
             }
             KeyAction::SwitchBuffer => ModeResult::Ignored,
+            KeyAction::KillBuffer => ModeResult::Ignored,
             KeyAction::Unbound => ModeResult::Ignored,
         }
     }

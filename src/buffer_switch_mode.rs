@@ -2,6 +2,15 @@ use crate::keys::KeyAction;
 use crate::mode::{Mode, ModeResult, ModeAction, ActionPosition};
 use crate::{BufferId};
 
+/// Purpose of the buffer selection mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferSwitchPurpose {
+    /// Buffer switching (C-x b)
+    Switch,
+    /// Buffer killing (C-x k)
+    Kill,
+}
+
 /// Interactive buffer switching mode 
 /// This mode manages a command window buffer that displays available buffers
 pub struct BufferSwitchMode {
@@ -23,6 +32,8 @@ pub struct BufferSwitchMode {
     all_buffer_names: Vec<String>,
     /// All available buffer IDs (unfiltered)
     all_buffer_ids: Vec<BufferId>,
+    /// Purpose of this mode instance (switch vs kill)
+    purpose: BufferSwitchPurpose,
 }
 
 impl BufferSwitchMode {
@@ -38,6 +49,23 @@ impl BufferSwitchMode {
             buffer_id: None,
             all_buffer_names: Vec::new(),
             all_buffer_ids: Vec::new(),
+            purpose: BufferSwitchPurpose::Switch, // Default to switch
+        }
+    }
+    
+    /// Create a new BufferSwitchMode with specific purpose
+    pub fn new_with_purpose(purpose: BufferSwitchPurpose) -> Self {
+        Self {
+            input: String::new(),
+            matches: Vec::new(),
+            buffer_ids: Vec::new(),
+            selected_index: 0,
+            max_visible_buffers: 8, // Show 8 buffers at once
+            buffer_scroll_offset: 0,
+            buffer_id: None,
+            all_buffer_names: Vec::new(),
+            all_buffer_ids: Vec::new(),
+            purpose,
         }
     }
     
@@ -57,6 +85,18 @@ impl BufferSwitchMode {
         self.selected_index = 0;
         self.buffer_scroll_offset = 0;
         self.update_scroll_to_center();
+    }
+    
+    /// Initialize with buffer list and pre-select a specific buffer
+    pub fn init_with_buffer_and_preselect(&mut self, buffer_id: BufferId, buffer_list: Vec<(BufferId, String)>, current_buffer_id: BufferId) {
+        // First do normal initialization
+        self.init_with_buffer(buffer_id, buffer_list);
+        
+        // Then find and select the current buffer (for kill mode)
+        if let Some(index) = self.all_buffer_ids.iter().position(|&id| id == current_buffer_id) {
+            self.selected_index = index;
+            self.update_scroll_to_center();
+        }
     }
     
     /// Update matches based on current input using stored buffer list
@@ -235,12 +275,13 @@ impl Mode for BufferSwitchMode {
                 }
             }
             KeyAction::Enter => {
-                // Switch to the selected buffer
+                // Execute the appropriate action based on purpose
                 if let Some(buffer_id) = self.get_selected_buffer() {
-                    // Return a special action that the Editor can recognize as buffer switching
-                    ModeResult::Consumed(vec![
-                        ModeAction::SwitchToBuffer(buffer_id)
-                    ])
+                    let action = match self.purpose {
+                        BufferSwitchPurpose::Switch => ModeAction::SwitchToBuffer(buffer_id),
+                        BufferSwitchPurpose::Kill => ModeAction::KillBuffer(buffer_id),
+                    };
+                    ModeResult::Consumed(vec![action])
                 } else {
                     ModeResult::Ignored
                 }

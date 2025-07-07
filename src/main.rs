@@ -17,6 +17,7 @@ mod buffer_switch_mode;
 mod command_mode;
 mod command_registry;
 mod editor;
+mod file_selector_mode;
 mod keys;
 mod kill_ring;
 mod mode;
@@ -69,11 +70,11 @@ async fn terminal_main<W: Write>(stdout: W, file_paths: Vec<String>) -> Result<(
         let file_mode_id = modes.insert(file_mode);
 
         // Try to load the file, create empty buffer if it doesn't exist
-        let buffer = match Buffer::from_file(&file_path, &[]).await {
+        let buffer = match Buffer::from_file(&file_path, &[file_mode_id]).await {
             Ok(buffer) => buffer,
             Err(_) => {
-                // File doesn't exist, create empty buffer
-                let buffer = Buffer::new(&[]);
+                // File doesn't exist, create empty buffer with FileMode
+                let buffer = Buffer::new(&[file_mode_id]);
                 buffer.set_object(file_path.clone());
                 if file_path == "README.md" {
                     // Special case for README.md - add default content
@@ -176,7 +177,12 @@ async fn terminal_main<W: Write>(stdout: W, file_paths: Vec<String>) -> Result<(
         window_tree,
         kill_ring: kill_ring::KillRing::new(),
         command_registry: command_registry::create_default_registry(),
+        buffer_history: Vec::new(),
     };
+    
+    // Initialize buffer history with the current buffer
+    let initial_buffer_id = editor.windows[active_window_id].active_buffer;
+    editor.record_buffer_access(initial_buffer_id);
 
     // Create terminal renderer
     let mut renderer = TerminalRenderer::new(stdout);
