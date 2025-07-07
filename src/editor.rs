@@ -965,6 +965,13 @@ impl Editor {
             return Ok(vec![ChromeAction::Echo(self.echo_message.clone())]);
         }
 
+        // For unbound keys, capture the full key sequence before clearing
+        let unbound_key_sequence = if key_action == KeyAction::Unbound {
+            pressed.iter().map(|k| k.key).collect::<Vec<_>>()
+        } else {
+            vec![]
+        };
+
         let _ = self.key_state.take();
 
         // Clear the key chord after processing (action completed)
@@ -1126,6 +1133,10 @@ impl Editor {
                             let safe_target_line = target_line.min(max_line);
                             buffer.to_char_index(current_col, safe_target_line)
                         }
+                        CursorDirection::WordForward => buffer.move_word_forward(window.cursor),
+                        CursorDirection::WordBackward => buffer.move_word_backward(window.cursor),
+                        CursorDirection::ParagraphForward => buffer.move_paragraph_forward(window.cursor),
+                        CursorDirection::ParagraphBackward => buffer.move_paragraph_backward(window.cursor),
                     };
 
                     window.cursor = new_pos;
@@ -1185,7 +1196,15 @@ impl Editor {
                     return Ok(vec![ChromeAction::Echo("Quit".to_string())]);
                 }
             }
-            KeyAction::Unbound => return Ok(vec![ChromeAction::Huh]),
+            KeyAction::Unbound => {
+                // Include the key sequence in the undefined message, like Emacs
+                let unbound_message = if !unbound_key_sequence.is_empty() {
+                    format!("{} is undefined", self.format_key_chord(&unbound_key_sequence))
+                } else {
+                    "Key is undefined".to_string()
+                };
+                return Ok(vec![ChromeAction::Echo(unbound_message)]);
+            }
             _ => {}
         }
 

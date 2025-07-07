@@ -95,6 +95,10 @@ pub enum CursorDirection {
     BufferEnd,
     PageUp,
     PageDown,
+    WordForward,
+    WordBackward,
+    ParagraphForward,
+    ParagraphBackward,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -326,6 +330,42 @@ impl Bindings for DefaultBindings {
                 // M-w copy region (like C-w but without deleting)
                 (LogicalKey::Modifier(KeyModifier::Meta(_)), LogicalKey::AlphaNumeric('w')) => {
                     return KeyAction::KillRegion(false)
+                }
+                // M-f forward word
+                (LogicalKey::Modifier(KeyModifier::Meta(_)), LogicalKey::AlphaNumeric('f')) => {
+                    return KeyAction::Cursor(CursorDirection::WordForward)
+                }
+                // M-b backward word
+                (LogicalKey::Modifier(KeyModifier::Meta(_)), LogicalKey::AlphaNumeric('b')) => {
+                    return KeyAction::Cursor(CursorDirection::WordBackward)
+                }
+                // C-left backward word
+                (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::Left) => {
+                    return KeyAction::Cursor(CursorDirection::WordBackward)
+                }
+                // C-right forward word
+                (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::Right) => {
+                    return KeyAction::Cursor(CursorDirection::WordForward)
+                }
+                // M-v page up
+                (LogicalKey::Modifier(KeyModifier::Meta(_)), LogicalKey::AlphaNumeric('v')) => {
+                    return KeyAction::Cursor(CursorDirection::PageUp)
+                }
+                // M-up page up
+                (LogicalKey::Modifier(KeyModifier::Meta(_)), LogicalKey::Up) => {
+                    return KeyAction::Cursor(CursorDirection::PageUp)
+                }
+                // M-down page down
+                (LogicalKey::Modifier(KeyModifier::Meta(_)), LogicalKey::Down) => {
+                    return KeyAction::Cursor(CursorDirection::PageDown)
+                }
+                // M-{ backward paragraph
+                (LogicalKey::Modifier(KeyModifier::Meta(_)), LogicalKey::AlphaNumeric('{')) => {
+                    return KeyAction::Cursor(CursorDirection::ParagraphBackward)
+                }
+                // M-} forward paragraph
+                (LogicalKey::Modifier(KeyModifier::Meta(_)), LogicalKey::AlphaNumeric('}')) => {
+                    return KeyAction::Cursor(CursorDirection::ParagraphForward)
                 }
                 // Ctrl-End is buffer-end
                 (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::End) => {
