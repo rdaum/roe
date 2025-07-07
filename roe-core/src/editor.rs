@@ -2256,8 +2256,7 @@ impl Editor {
                                 result_actions.extend(save_actions);
                             }
                             Err(e) => {
-                                result_actions
-                                    .push(ChromeAction::Echo(format!("Save error: {e}")));
+                                result_actions.push(ChromeAction::Echo(format!("Save error: {e}")));
                             }
                         }
                     } else {

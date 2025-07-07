@@ -43,6 +43,8 @@ impl CommandMode {
             input: String::new(),
             matches: Vec::new(),
             selected_index: 0,
+            // TODO: This should be driven by terminal renderer hints about actual available space
+            // TODO: Need to rethink the entire menuing system architecture
             max_visible_completions: 8, // Show 8 completions at once
             completion_scroll_offset: 0,
             buffer_id: None,
@@ -59,10 +61,6 @@ impl CommandMode {
         self.matches = self.all_commands.clone(); // Start with all commands visible
         self.selected_index = 0;
         self.completion_scroll_offset = 0;
-
-        // TODO: This should be driven by terminal renderer hints about actual available space
-        // TODO: Need to rethink the entire menuing system architecture
-        self.max_visible_completions = 7; // Hardcoded to match what actually fits
 
         self.update_scroll_to_center();
     }

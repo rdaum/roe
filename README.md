@@ -1,4 +1,4 @@
-# Roe (Ryan's Own Emacs)
+# Roe / ᚱᛟ / Ryan's Own Emacs
 
 A minimalistic console text editor in the spirit of the Emacs family of editors, built in Rust.
 

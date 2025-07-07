@@ -30,6 +30,8 @@ pub const ECHO_AREA_HEIGHT: u16 = 1;
 pub const BG_COLOR: Color = Color::Black;
 pub const FG_COLOR: Color = Color::White;
 pub const MODE_LINE_BG_COLOR: Color = Color::Blue;
+pub const INACTIVE_MODE_LINE_BG_COLOR: Color = Color::DarkGrey;
+pub const RUNE_COLOR: Color = Color::Yellow;
 pub const BORDER_COLOR: Color = Color::DarkGrey;
 pub const ACTIVE_BORDER_COLOR: Color = Color::Cyan;
 // Unicode box drawing characters
@@ -189,15 +191,23 @@ impl<W: Write> TerminalRenderer<W> {
     ) -> Result<(), std::io::Error> {
         let window = &editor.windows[window_id];
         let buffer = &editor.buffers[window.active_buffer];
+        let is_active = window_id == editor.active_window;
 
-        // Calculate modeline position
-        let modeline_y = window.y + window.height_chars - 2; // One row above bottom border
+        // Calculate modeline position - now in the bottom border
+        let modeline_y = window.y + window.height_chars - 1; // Bottom border row
         let modeline_x = window.x + 1; // Inside left border
         let modeline_width = window.width_chars.saturating_sub(2) as usize; // Inside both borders
 
         if modeline_width == 0 {
             return Ok(());
         }
+
+        // Choose appropriate background color
+        let bg_color = if is_active {
+            MODE_LINE_BG_COLOR
+        } else {
+            INACTIVE_MODE_LINE_BG_COLOR
+        };
 
         // If All components are dirty, just redraw the entire modeline
         if dirty_components.contains(&ModelineComponent::All) {
@@ -225,14 +235,14 @@ impl<W: Write> TerminalRenderer<W> {
                     queue!(
                         &mut self.device,
                         cursor::MoveTo(modeline_x + clear_start as u16, modeline_y),
-                        Print(clear_spaces.on(MODE_LINE_BG_COLOR).with(FG_COLOR))
+                        Print(clear_spaces.on(bg_color).with(FG_COLOR))
                     )?;
 
                     // Then write the new position
                     queue!(
                         &mut self.device,
                         cursor::MoveTo(modeline_x + position_start as u16, modeline_y),
-                        Print(position_text.on(MODE_LINE_BG_COLOR).with(FG_COLOR))
+                        Print(position_text.on(bg_color).with(FG_COLOR))
                     )?;
                 }
                 ModelineComponent::BufferName => {
@@ -293,7 +303,7 @@ impl<W: Write> Renderer for TerminalRenderer<W> {
             // If entire buffer is dirty, mark all lines in the window as dirty
             if self.dirty_tracker.is_buffer_dirty(buffer_id) {
                 let buffer = &editor.buffers[buffer_id];
-                let content_height = window.height_chars.saturating_sub(3);
+                let content_height = window.height_chars.saturating_sub(2);
 
                 // Mark all visible lines as dirty for our incremental renderer
                 for line_idx in 0..content_height.min(buffer.buffer_len_lines() as u16) {
@@ -308,7 +318,7 @@ impl<W: Write> Renderer for TerminalRenderer<W> {
 
             // Render only dirty lines
             let content_y = window.y + 1;
-            let content_height = window.height_chars.saturating_sub(3);
+            let content_height = window.height_chars.saturating_sub(2);
 
             // Collect dirty lines to avoid borrowing issues
             let mut dirty_lines: Vec<(usize, (usize, usize))> = Vec::new();
@@ -535,7 +545,6 @@ fn draw_single_window_border(
 
     let right = window.x + window.width_chars - 1;
     let bottom = window.y + window.height_chars - 1;
-    let modeline_row = bottom - 1; // Modeline is one row above the bottom border
 
     // Draw corners
     queue!(
@@ -569,52 +578,11 @@ fn draw_single_window_border(
         )?;
     }
 
-    // Draw modeline separator (horizontal line above bottom border)
-    if window.x + 1 < right {
-        queue!(
-            device,
-            cursor::MoveTo(window.x, modeline_row),
-            Print(BORDER_T_RIGHT.with(border_color))
-        )?;
-        let horizontal_line = BORDER_HORIZONTAL.repeat((right - window.x - 1) as usize);
-        queue!(
-            device,
-            cursor::MoveTo(window.x + 1, modeline_row),
-            Print(horizontal_line.with(border_color))
-        )?;
-        queue!(
-            device,
-            cursor::MoveTo(right, modeline_row),
-            Print(BORDER_T_LEFT.with(border_color))
-        )?;
-    }
+    // Skip drawing bottom horizontal border - modeline will occupy this space
+    // The modeline will be drawn separately and fill the bottom border area
 
-    // Draw bottom horizontal border
-    if window.x + 1 < right {
-        let horizontal_line = BORDER_HORIZONTAL.repeat((right - window.x - 1) as usize);
-        queue!(
-            device,
-            cursor::MoveTo(window.x + 1, bottom),
-            Print(horizontal_line.with(border_color))
-        )?;
-    }
-
-    // Draw vertical borders (excluding modeline row)
-    for y in window.y + 1..modeline_row {
-        queue!(
-            device,
-            cursor::MoveTo(window.x, y),
-            Print(BORDER_VERTICAL.with(border_color))
-        )?;
-        queue!(
-            device,
-            cursor::MoveTo(right, y),
-            Print(BORDER_VERTICAL.with(border_color))
-        )?;
-    }
-
-    // Draw vertical borders for modeline row to bottom
-    for y in (modeline_row + 1)..bottom {
+    // Draw vertical borders (excluding bottom row which is now the modeline)
+    for y in window.y + 1..bottom {
         queue!(
             device,
             cursor::MoveTo(window.x, y),
@@ -633,7 +601,7 @@ fn draw_single_window_border(
     Ok(())
 }
 
-/// Draw the modeline for a specific window
+/// Draw the modeline for a specific window - now integrated into the bottom border
 fn draw_window_modeline(
     device: &mut impl Write,
     editor: &Editor,
@@ -641,9 +609,10 @@ fn draw_window_modeline(
 ) -> Result<(), std::io::Error> {
     let window = &editor.windows[window_id];
     let buffer = &editor.buffers[window.active_buffer];
+    let is_active = window_id == editor.active_window;
 
-    // Calculate modeline position and width
-    let modeline_y = window.y + window.height_chars - 2; // One row above bottom border
+    // Calculate modeline position and width - now in the bottom border
+    let modeline_y = window.y + window.height_chars - 1; // Bottom border row
     let modeline_x = window.x + 1; // Inside left border
     let modeline_width = window.width_chars.saturating_sub(2) as usize; // Inside both borders
 
@@ -651,21 +620,35 @@ fn draw_window_modeline(
         return Ok(());
     }
 
+    // Choose appropriate background color
+    let bg_color = if is_active {
+        MODE_LINE_BG_COLOR
+    } else {
+        INACTIVE_MODE_LINE_BG_COLOR
+    };
+
     // Move to modeline position
     queue!(device, cursor::MoveTo(modeline_x, modeline_y))?;
 
-    // Create modeline content
-    let mut modeline_content = String::new();
+    // Handle runes separately for color control, then build the rest
+    let rune_section = if is_active {
+        " ᚱᛟ "
+    } else {
+        "    " // Same width as " ᚱᛟ " but with spaces
+    };
+
+    // Build the rest of the modeline content
+    let mut rest_content = String::new();
 
     // Add buffer object name
-    let object_part = format!(" {} ", buffer.object());
-    modeline_content.push_str(&object_part);
+    let object_part = format!("{} ", buffer.object());
+    rest_content.push_str(&object_part);
 
     // Add mode name
     if let Some(mode_id) = buffer.modes().first() {
         if let Some(mode) = editor.modes.get(*mode_id) {
             let mode_part = format!("({}) ", mode.name());
-            modeline_content.push_str(&mode_part);
+            rest_content.push_str(&mode_part);
         }
     }
 
@@ -674,26 +657,31 @@ fn draw_window_modeline(
     let position_part = format!("{}:{} ", line + 1, col + 1); // 1-based for display
 
     // Calculate remaining space for position (right-aligned)
-    let used_space = modeline_content.len() + position_part.len();
+    let used_space = rune_section.len() + rest_content.len() + position_part.len();
     let remaining_space = modeline_width.saturating_sub(used_space);
 
     // Fill with spaces to right-align position
-    modeline_content.push_str(&" ".repeat(remaining_space));
-    modeline_content.push_str(&position_part);
+    rest_content.push_str(&" ".repeat(remaining_space));
+    rest_content.push_str(&position_part);
 
-    // Truncate if too long
-    if modeline_content.len() > modeline_width {
-        modeline_content.truncate(modeline_width);
-    } else if modeline_content.len() < modeline_width {
-        // Pad with spaces to fill the entire modeline
-        modeline_content.push_str(&" ".repeat(modeline_width - modeline_content.len()));
+    // Truncate rest_content if too long (preserve rune space)
+    let available_for_rest = modeline_width.saturating_sub(rune_section.len());
+    if rest_content.len() > available_for_rest {
+        rest_content.truncate(available_for_rest);
+    } else if rest_content.len() < available_for_rest {
+        // Pad with spaces to fill the entire remaining modeline
+        rest_content.push_str(&" ".repeat(available_for_rest - rest_content.len()));
     }
 
-    // Draw with modeline colors
-    queue!(
-        device,
-        Print(modeline_content.on(MODE_LINE_BG_COLOR).with(FG_COLOR))
-    )?;
+    // Draw rune section with distinct color for active windows
+    if is_active {
+        queue!(device, Print(rune_section.on(bg_color).with(RUNE_COLOR)))?;
+    } else {
+        queue!(device, Print(rune_section.on(bg_color).with(FG_COLOR)))?;
+    }
+
+    // Draw the rest of the modeline content
+    queue!(device, Print(rest_content.on(bg_color).with(FG_COLOR)))?;
 
     Ok(())
 }
@@ -707,11 +695,11 @@ pub fn draw_window(
     // Draw the buffer in the window
     let buffer = &editor.buffers[window.active_buffer];
 
-    // Calculate content area (inside the border, above the modeline)
+    // Calculate content area (inside the border, above the modeline which is now in the bottom border)
     let content_x = window.x + 1;
     let content_y = window.y + 1;
     let content_width = window.width_chars.saturating_sub(2);
-    let content_height = window.height_chars.saturating_sub(3); // Reserve space for modeline
+    let content_height = window.height_chars.saturating_sub(2); // Only subtract for top and bottom borders
 
     // Clear the content area first (only the content, not the whole line)
     for row in 0..content_height {
