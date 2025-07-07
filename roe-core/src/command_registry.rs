@@ -294,20 +294,7 @@ pub fn create_default_registry() -> CommandRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn dummy_context() -> CommandContext {
-        CommandContext {
-            buffer_content: "test".to_string(),
-            cursor_pos: 0,
-            buffer_id: slotmap::SlotMap::with_key().insert(()),
-            window_id: slotmap::SlotMap::with_key().insert(()),
-            buffer_name: "test.txt".to_string(),
-            buffer_modified: false,
-            current_line: 1,
-            current_column: 1,
-        }
-    }
-
+    
     #[test]
     fn test_command_registry_basic() {
         let mut registry = CommandRegistry::new();

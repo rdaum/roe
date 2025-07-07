@@ -90,8 +90,6 @@ impl BufferInner {
         Some(deleted)
     }
 
-    /// Return the position of the start of the line relative to the start position
-
     /// Return the position of the end of the line relative to the start position.
     pub fn eol_pos(&self, start_pos: usize) -> usize {
         // Handle empty buffer
@@ -502,8 +500,6 @@ impl Buffer {
     pub fn with_write<R>(&self, f: impl FnOnce(&mut BufferInner) -> R) -> R {
         f(&mut self.inner.write().unwrap())
     }
-
-    /// Get the underlying Arc<RwLock<BufferInner>> for cases where direct access is needed
 
     // Convenience methods for common operations that don't need multiple calls
 

@@ -36,7 +36,9 @@ pub enum ModeMessage {
 pub struct ModeActor {
     mode_impl: Box<dyn Mode>,
     receiver: mpsc::Receiver<ModeMessage>,
+    #[allow(dead_code)] // Used for potential future mode operations
     buffer: Buffer, // Shared buffer access
+    #[allow(dead_code)] // Used for identification in potential future operations
     mode_id: ModeId,
 }
 
@@ -79,6 +81,7 @@ impl ModeActor {
 /// Client handle to communicate with a mode actor
 pub struct ModeClient {
     sender: mpsc::Sender<ModeMessage>,
+    #[allow(dead_code)] // Used for identification in potential future operations
     mode_id: ModeId,
     name: String,
 }
@@ -207,6 +210,7 @@ pub struct BufferMessage {
 #[derive(Clone)]
 pub struct BufferHostClient {
     sender: mpsc::Sender<BufferMessage>,
+    #[allow(dead_code)] // Used for identification in potential future operations
     buffer_id: BufferId,
 }
 

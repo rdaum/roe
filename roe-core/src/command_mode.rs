@@ -111,6 +111,7 @@ impl CommandMode {
     }
 
     /// Update the buffer content with current prompt and completions
+    #[allow(dead_code)] // Used in potential future buffer content updates
     fn update_buffer_content(&self) {
         // This method will be called from within Mode implementation
         // where we have access to the buffer through the Editor
