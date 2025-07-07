@@ -413,16 +413,10 @@ impl Editor {
         self.buffer_hosts.insert(command_buffer_id, buffer_client);
 
         // Calculate position and size for command window
-        // Account for echo area (1 line at bottom)
-        const ECHO_AREA_HEIGHT: u16 = 1;
+        // Frame.available_lines already excludes echo area
         let (x, y) = match position {
             CommandWindowPosition::Top => (0, 0),
-            CommandWindowPosition::Bottom => (
-                0,
-                self.frame
-                    .available_lines
-                    .saturating_sub(height + ECHO_AREA_HEIGHT),
-            ),
+            CommandWindowPosition::Bottom => (0, self.frame.available_lines.saturating_sub(height)),
         };
 
         // Create command window

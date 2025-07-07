@@ -30,20 +30,20 @@ use std::io::Write;
 fn create_welcome_screen_content() -> String {
     // Include the ASCII art from rune.txt at compile time
     const RUNE_ART: &str = include_str!("../../rune.txt");
-    
+
     let mut content = String::new();
-    
+
     // Add the ASCII art
     content.push_str(RUNE_ART);
-    
+
     // Add some spacing
     content.push_str("\n\n");
-    
+
     // Add centered title - we'll center it manually for now
     let title = "ROE - Ryan's Own Emacs";
     let title_padding = " ".repeat(20); // Rough centering
     content.push_str(&format!("{}{}\n\n", title_padding, title));
-    
+
     // Add getting started information
     content.push_str("                        Getting Started:\n\n");
     content.push_str("                     C-x C-f  -  Find and open a file\n");
@@ -55,7 +55,7 @@ fn create_welcome_screen_content() -> String {
     content.push_str("                     C-x 3    -  Split window vertically\n");
     content.push_str("                     C-x o    -  Switch to other window\n\n");
     content.push_str("                     Press C-x C-f to open your first file!\n");
-    
+
     content
 }
 
@@ -144,8 +144,9 @@ async fn terminal_main<W: Write>(stdout: W, file_paths: Vec<String>) -> Result<(
     let buffer_ids: Vec<BufferId> = buffers.keys().collect();
 
     if buffer_ids.len() >= 2 {
-        // Two-window horizontal split
-        let window_height = (tsize.1 - ECHO_AREA_HEIGHT) / 2;
+        // Two-window horizontal split - frame already accounts for echo area
+        let available_height = tsize.1 - ECHO_AREA_HEIGHT;
+        let window_height = available_height / 2;
 
         // Top window (first file)
         let top_window = Window {
@@ -165,7 +166,7 @@ async fn terminal_main<W: Write>(stdout: W, file_paths: Vec<String>) -> Result<(
             x: 0,
             y: window_height,
             width_chars: tsize.0,
-            height_chars: (tsize.1 - ECHO_AREA_HEIGHT) - window_height,
+            height_chars: available_height - window_height,
             active_buffer: buffer_ids[1],
             start_line: 0,
             cursor: 0,
@@ -200,7 +201,7 @@ async fn terminal_main<W: Write>(stdout: W, file_paths: Vec<String>) -> Result<(
     }
 
     let mut editor = Editor {
-        frame: Frame::new(tsize.0, tsize.1),
+        frame: Frame::new(tsize.0, tsize.1 - ECHO_AREA_HEIGHT),
         buffers,
         buffer_hosts,
         windows,

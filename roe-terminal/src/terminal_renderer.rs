@@ -414,7 +414,7 @@ impl<W: Write> Renderer for TerminalRenderer<W> {
         // Draw echo area
         if !editor.echo_message.is_empty() {
             let (x, y) = echo_area_position(&editor.frame);
-            let available_width = editor.frame.available_columns.saturating_sub(x);
+            let available_width = editor.frame.columns.saturating_sub(x); // Use full terminal width
             let truncated_message = if editor.echo_message.len() > available_width as usize {
                 &editor.echo_message[..available_width.saturating_sub(3) as usize]
             } else {
@@ -455,7 +455,9 @@ impl<W: Write> Renderer for TerminalRenderer<W> {
 }
 
 pub fn echo_area_position(frame: &Frame) -> (u16, u16) {
-    (0, frame.rows - ECHO_AREA_HEIGHT)
+    // Echo area is at the bottom of the terminal, below the frame area
+    // Frame.available_lines is the usable area, so echo goes below that
+    (0, frame.available_lines)
 }
 
 /// Draw borders around all windows in a more sophisticated way that handles adjacency
@@ -642,6 +644,7 @@ fn draw_window_modeline(
     } else {
         "    " // Same width as " ᚱᛟ " but with spaces
     };
+    let rune_display_width = rune_section.chars().count(); // Use character count, not byte length
 
     // Build the rest of the modeline content
     let mut rest_content = String::new();
@@ -662,21 +665,24 @@ fn draw_window_modeline(
     let (col, line) = buffer.to_column_line(window.cursor);
     let position_part = format!("{}:{} ", line + 1, col + 1); // 1-based for display
 
-    // Calculate remaining space for position (right-aligned)
-    let used_space = rune_section.len() + rest_content.len() + position_part.len();
+    // Calculate remaining space for position (right-aligned) using character counts
+    let used_space =
+        rune_display_width + rest_content.chars().count() + position_part.chars().count();
     let remaining_space = modeline_width.saturating_sub(used_space);
 
     // Fill with spaces to right-align position
     rest_content.push_str(&" ".repeat(remaining_space));
     rest_content.push_str(&position_part);
 
-    // Truncate rest_content if too long (preserve rune space)
-    let available_for_rest = modeline_width.saturating_sub(rune_section.len());
-    if rest_content.len() > available_for_rest {
-        rest_content.truncate(available_for_rest);
-    } else if rest_content.len() < available_for_rest {
+    // Truncate rest_content if too long (preserve rune space) using character counts
+    let available_for_rest = modeline_width.saturating_sub(rune_display_width);
+    let rest_char_count = rest_content.chars().count();
+    if rest_char_count > available_for_rest {
+        // Truncate to character boundary, not byte boundary
+        rest_content = rest_content.chars().take(available_for_rest).collect();
+    } else if rest_char_count < available_for_rest {
         // Pad with spaces to fill the entire remaining modeline
-        rest_content.push_str(&" ".repeat(available_for_rest - rest_content.len()));
+        rest_content.push_str(&" ".repeat(available_for_rest - rest_char_count));
     }
 
     // Draw rune section with distinct color for active windows
@@ -873,7 +879,7 @@ pub fn echo(
     // Stash the cursor position
     let cursor_pos = crossterm::cursor::position()?;
 
-    let available_width = editor.frame.available_columns.saturating_sub(x);
+    let available_width = editor.frame.columns.saturating_sub(x); // Use full terminal width
     let truncated_message = if message.len() > available_width as usize {
         &message[..available_width.saturating_sub(3) as usize]
     } else {
@@ -947,8 +953,8 @@ pub async fn event_loop_with_renderer<W: Write>(
                 keys
             }
             Event::Resize(width, height) => {
-                // Handle terminal resize event
-                editor.handle_resize(width, height);
+                // Handle terminal resize event - subtract echo area height
+                editor.handle_resize(width, height.saturating_sub(ECHO_AREA_HEIGHT));
                 // Trigger full screen redraw
                 renderer.mark_dirty(DirtyRegion::FullScreen);
                 // No keys to process for resize event
