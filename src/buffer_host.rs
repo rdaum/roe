@@ -486,8 +486,6 @@ impl BufferHost {
                 ModeAction::CopyRegion => {
                     // Copy the region to kill-ring without deleting (will be handled at Editor level)
                     editor_action = Some(EditorAction::CopyRegion);
-                    // Clear the mark after copying to stop region highlighting
-                    self.buffer.clear_mark();
                     dirty_regions.push(DirtyRegion::Buffer { buffer_id: self.buffer_id });
                 }
                 ModeAction::Yank(position) => {

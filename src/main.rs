@@ -179,6 +179,7 @@ async fn terminal_main<W: Write>(stdout: W, file_paths: Vec<String>) -> Result<(
         command_registry: command_registry::create_default_registry(),
         buffer_history: Vec::new(),
         echo_message: String::new(),
+        echo_message_time: None,
         current_key_chord: Vec::new(),
     };
     

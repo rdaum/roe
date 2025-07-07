@@ -12,6 +12,10 @@ use crate::renderer::{DirtyRegion, ModelineComponent};
 use crate::{BufferId, ModeId, WindowId};
 use slotmap::SlotMap;
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
+
+/// How long echo messages remain visible (in seconds)
+const ECHO_TIMEOUT_SECS: u64 = 3;
 
 /// Type of window - normal editing window or special command window
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,6 +156,8 @@ pub struct Editor {
     pub buffer_history: Vec<BufferId>,
     /// Current echo area message
     pub echo_message: String,
+    /// When the echo message was set (for auto-clearing)
+    pub echo_message_time: Option<Instant>,
     /// Current key chord being typed (for echo area display)
     pub current_key_chord: Vec<LogicalKey>,
 }
@@ -431,6 +437,7 @@ impl Editor {
     /// Set the echo area message (this will override any chord display)
     pub fn set_echo_message(&mut self, message: String) {
         self.echo_message = message;
+        self.echo_message_time = Some(Instant::now());
         // Clear chord since we're showing a different message
         self.current_key_chord.clear();
     }
@@ -438,6 +445,7 @@ impl Editor {
     /// Clear the echo area message
     pub fn clear_echo_message(&mut self) {
         self.echo_message.clear();
+        self.echo_message_time = None;
     }
 
     /// Clear the current key chord sequence
@@ -451,6 +459,18 @@ impl Editor {
         if !self.current_key_chord.is_empty() {
             self.echo_message = self.format_key_chord(&self.current_key_chord);
         }
+    }
+
+    /// Check if echo message should be auto-cleared and clear it if needed
+    /// Returns true if the message was cleared
+    pub fn check_and_clear_expired_echo(&mut self) -> bool {
+        if let Some(echo_time) = self.echo_message_time {
+            if echo_time.elapsed() >= Duration::from_secs(ECHO_TIMEOUT_SECS) {
+                self.clear_echo_message();
+                return true;
+            }
+        }
+        false
     }
 
     /// Format a key chord in Emacs style (e.g., "C-x", "M-x", "C-x C-c")
@@ -944,6 +964,9 @@ impl Editor {
         &mut self,
         keys: Vec<LogicalKey>,
     ) -> Result<Vec<ChromeAction>, std::io::Error> {
+        // Check if echo message has expired and clear it
+        let echo_cleared = self.check_and_clear_expired_echo();
+        
         for key in keys {
             self.key_state.press(key);
         }
@@ -1234,7 +1257,13 @@ impl Editor {
             vec![ChromeAction::Echo("No buffer host available".to_string())]
         };
 
-        Ok(chrome_actions)
+        // If echo was cleared due to timeout, add an echo action to trigger redraw
+        let mut final_actions = chrome_actions;
+        if echo_cleared {
+            final_actions.push(ChromeAction::Echo(self.echo_message.clone()));
+        }
+        
+        Ok(final_actions)
     }
 
     /// Convert BufferResponse to ChromeActions
@@ -1777,14 +1806,20 @@ impl Editor {
         };
 
         if region_text.is_empty() {
+            // Clear mark for empty region
+            buffer.clear_mark();
             return vec![ChromeAction::Echo("Empty region".to_string())];
         }
 
         // Add to kill-ring without deleting
         self.kill_ring.kill(region_text.clone());
 
+        // Clear the mark after copying to stop region highlighting
+        buffer.clear_mark();
+
         vec![
             ChromeAction::Echo(format!("Copied region: {}", region_text.replace('\n', "\\n"))),
+            ChromeAction::MarkDirty(DirtyRegion::Buffer { buffer_id: window.active_buffer }),
         ]
     }
 
@@ -2003,6 +2038,7 @@ mod tests {
             command_registry: Default::default(),
             buffer_history: vec![],
             echo_message: "".to_string(),
+            echo_message_time: None,
             current_key_chord: vec![],
         }
     }

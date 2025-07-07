@@ -7,6 +7,7 @@ use crossterm::style::{Color, Print, Stylize};
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::{cursor, queue};
 use futures::{future::FutureExt, select, StreamExt};
+use tokio::time::{interval, Duration};
 use std::io::Write;
 
 pub const ECHO_AREA_HEIGHT: u16 = 1;
@@ -884,19 +885,31 @@ pub async fn event_loop_with_renderer<W: Write>(
     editor: &mut Editor,
 ) -> Result<(), std::io::Error> {
     let mut event_stream = EventStream::new();
+    let mut echo_timer = interval(Duration::from_millis(500)); // Check every 500ms
 
     loop {
         // Get the next event asynchronously
-        let mut maybe_event = event_stream.next().fuse();
         let event = select! {
-            event = maybe_event => {
+            event = event_stream.next().fuse() => {
                 match event {
-                    Some(Ok(event)) => event,
+                    Some(Ok(event)) => Some(event),
                     Some(Err(e)) => return Err(e),
                     None => continue, // Stream ended, shouldn't happen but handle gracefully
                 }
             }
+            _ = echo_timer.tick().fuse() => None, // Timer tick, check for expired echo
         };
+        
+        // Handle timer tick (check for expired echo messages)
+        if event.is_none() {
+            if editor.check_and_clear_expired_echo() {
+                // Echo message expired, trigger a redraw
+                renderer.render_full(editor)?;
+            }
+            continue;
+        }
+        
+        let event = event.unwrap();
         let keys = match event {
             Event::Key(keystroke) => {
                 let key = crossterm_key_translate(&keystroke.code);
