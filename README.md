@@ -2,22 +2,24 @@
 
 A minimalistic console text editor in the spirit of the Emacs family of editors, built in Rust.
 
-*Note: The name "Rymacs" is provisional and will change.*
+_Note: The name "Rymacs" is provisional and will change._
 
-This editor follows the Emacs tradition in three key ways: (a) it's buffer-oriented rather than file-oriented, (b) it
-uses the default GNU Emacs keybinding set, and (c) it's being architected with full programmability in mind (though not
-yet implemented). Unlike the current trend toward "modal" editors, this is a direct manipulation editor and proud of it.
+This editor follows the Emacs tradition in three key ways: (a) it's buffer-oriented rather than
+file-oriented, (b) it uses the default GNU Emacs keybinding set, and (c) it's being architected with
+full programmability in mind (though not yet implemented). Unlike the current trend toward "modal"
+editors, this is a direct manipulation editor and proud of it.
 
-Currently, all behavior is hard-wired in Rust rather than implemented in a scripting language like Lisp. However, the
-architecture has been designed from the ground up to delegate the bulk of editor logic to an embedded scripting system.
-The likely outcome will be to embed "Steel" Scheme, a Scheme interpreter written in Rust.
+Currently, all behavior is hard-wired in Rust rather than implemented in a scripting language like
+Lisp. However, the architecture has been designed from the ground up to delegate the bulk of editor
+logic to an embedded scripting system. The likely outcome will be to embed "Steel" Scheme, a Scheme
+interpreter written in Rust.
 
 ## Features
 
 - **Emacs-style keybindings**: Familiar keyboard shortcuts for Emacs users
-- **Buffer-oriented editing**: Work with buffers as the primary unit, not just files like other editors. Just like GNU
-  emacs.
-    - Even the command entry window is a buffer.
+- **Buffer-oriented editing**: Work with buffers as the primary unit, not just files like other
+  editors. Just like GNU emacs.
+  - Even the command entry window is a buffer.
 - **Window management**: Split windows horizontally/vertically, switch between them, same as emacs.
 - **Modular architecture**: Extensible mode system for different editing behaviors
 - **Terminal-based**: Lightweight, runs in your terminal
@@ -25,9 +27,9 @@ The likely outcome will be to embed "Steel" Scheme, a Scheme interpreter written
 
 ## Key Bindings
 
-*Note: The keybindings are currently hard-coded and cannot be redefined. There are also no macros yet (so how can you
-call it an Emacs!). However, the architecture has been designed to support both customizable keybindings and macro
-recording/playback in the future.*
+_Note: The keybindings are currently hard-coded and cannot be redefined. There are also no macros
+yet (so how can you call it an Emacs!). However, the architecture has been designed to support both
+customizable keybindings and macro recording/playback in the future._
 
 ### Cursor Movement
 
@@ -146,19 +148,20 @@ This is a work-in-progress editor. Currently implemented:
 - **Customizable keybindings**: Allow users to redefine key mappings
 - **Macro system**: Record and playback keystroke sequences
 - **Search and replace**: Interactive search, query-replace functionality
-- **Scripting support**: Embed "Steel" Scheme (a scheme interpreter written in Rust) or something similar, and rewrite
-  the basic text handling modes in it
+- **Scripting support**: Embed "Steel" Scheme (a scheme interpreter written in Rust) or something
+  similar, and rewrite the basic text handling modes in it
 - **Syntax highlighting**: TreeSitter integration for language-aware editing
 - **LSP integration**: Language server protocol support for modern development features
 - **Advanced editing**: Multiple cursors, rectangular selections, etc.
 
 ## Contributing & Feedback
 
-This editor is very much a work-in-progress and almost certainly has bugs. It also probably won't meet your real editing
-needs yet. However, feedback and bug reports are very welcome!
+This editor is very much a work-in-progress and almost certainly has bugs. It also probably won't
+meet your real editing needs yet. However, feedback and bug reports are very welcome!
 
-If you encounter issues or have suggestions, please file them in the project's issue tracker. Even if the editor isn't
-ready for daily use, your input helps guide development priorities and catch problems early.
+If you encounter issues or have suggestions, please file them in the project's issue tracker. Even
+if the editor isn't ready for daily use, your input helps guide development priorities and catch
+problems early.
 
 **Please report:**
 
@@ -166,4 +169,3 @@ ready for daily use, your input helps guide development priorities and catch pro
 - Missing features that are essential for your workflow
 - Performance issues
 - Ideas for improvements or missing Emacs functionality
-
