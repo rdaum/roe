@@ -222,18 +222,37 @@ impl Editor {}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum ChromeAction {
-    FileOpen,
+    /// Open the find-file dialog
+    FindFile,
+    /// Open the command palette (M-x)
     CommandMode,
+    /// Open buffer switch dialog
+    SwitchBuffer,
+    /// Open kill buffer dialog  
+    KillBuffer,
+    /// Save current buffer
+    Save,
+    /// Move cursor to position
     CursorMove((u16, u16)),
+    /// Unknown/unhandled action
     Huh,
+    /// Show message in echo area
     Echo(String),
+    /// Mark region as dirty for redraw
     MarkDirty(DirtyRegion),
+    /// Quit the editor
     Quit,
+    /// Split window horizontally
     SplitHorizontal,
+    /// Split window vertically  
     SplitVertical,
+    /// Switch to other window
     SwitchWindow,
+    /// Delete current window
     DeleteWindow,
+    /// Delete all other windows
     DeleteOtherWindows,
+    /// Show messages buffer
     ShowMessages,
 }
 
@@ -263,12 +282,14 @@ impl Editor {
         let (mode_box, mode_name, initial_content) = match command_type {
             CommandType::Execute => {
                 // Create CommandMode for M-x
-                let command_names: Vec<String> = self
+                let mut command_names: Vec<String> = self
                     .command_registry
                     .all_commands()
                     .iter()
+                    .filter(|cmd| cmd.name != crate::command_registry::CMD_COMMAND_MODE) // Exclude command-mode
                     .map(|cmd| cmd.name.clone())
                     .collect();
+                command_names.sort(); // Sort alphabetically
                 let mut command_mode = CommandMode::new();
                 command_mode.init_with_buffer(command_buffer_id, command_names);
 
@@ -392,9 +413,16 @@ impl Editor {
         self.buffer_hosts.insert(command_buffer_id, buffer_client);
 
         // Calculate position and size for command window
+        // Account for echo area (1 line at bottom)
+        const ECHO_AREA_HEIGHT: u16 = 1;
         let (x, y) = match position {
             CommandWindowPosition::Top => (0, 0),
-            CommandWindowPosition::Bottom => (0, self.frame.available_lines.saturating_sub(height)),
+            CommandWindowPosition::Bottom => (
+                0,
+                self.frame
+                    .available_lines
+                    .saturating_sub(height + ECHO_AREA_HEIGHT),
+            ),
         };
 
         // Create command window
@@ -1142,82 +1170,6 @@ impl Editor {
 
         // Some actions like save, quit, etc. are out of the control of the mode.
         match &key_action {
-            KeyAction::CommandMode => {
-                // If command window is already open, close it first
-                if let Some(existing_command_window_id) = self.find_command_window() {
-                    self.close_command_window(existing_command_window_id);
-                }
-
-                // Create command window at bottom with enough height for completions
-                let window_height = 10; // Fixed height for now
-                let _command_window_id = self.create_command_window(
-                    CommandType::Execute,
-                    CommandWindowPosition::Bottom,
-                    window_height,
-                );
-
-                return Ok(vec![
-                    ChromeAction::Echo("Command selection".to_string()),
-                    ChromeAction::MarkDirty(DirtyRegion::FullScreen),
-                ]);
-            }
-            KeyAction::SwitchBuffer => {
-                // If buffer switch window is already open, close it first
-                if let Some(existing_command_window_id) = self.find_command_window() {
-                    self.close_command_window(existing_command_window_id);
-                }
-
-                // Create buffer switch window at bottom with enough height for buffer list
-                let window_height = 10; // Fixed height for now
-                let _buffer_switch_window_id = self.create_command_window(
-                    CommandType::BufferSwitch,
-                    CommandWindowPosition::Bottom,
-                    window_height,
-                );
-
-                return Ok(vec![
-                    ChromeAction::Echo("Buffer selection".to_string()),
-                    ChromeAction::MarkDirty(DirtyRegion::FullScreen),
-                ]);
-            }
-            KeyAction::KillBuffer => {
-                // If kill buffer window is already open, close it first
-                if let Some(existing_command_window_id) = self.find_command_window() {
-                    self.close_command_window(existing_command_window_id);
-                }
-
-                // Create kill buffer window at bottom with enough height for buffer list
-                let window_height = 10; // Fixed height for now
-                let _kill_buffer_window_id = self.create_command_window(
-                    CommandType::KillBuffer,
-                    CommandWindowPosition::Bottom,
-                    window_height,
-                );
-
-                return Ok(vec![
-                    ChromeAction::Echo("Kill buffer selection".to_string()),
-                    ChromeAction::MarkDirty(DirtyRegion::FullScreen),
-                ]);
-            }
-            KeyAction::FindFile => {
-                // If file selector window is already open, close it first
-                if let Some(existing_command_window_id) = self.find_command_window() {
-                    self.close_command_window(existing_command_window_id);
-                }
-
-                // Create file selector window at bottom with enough height for file list
-                let window_height = 10; // Fixed height for now
-                let _file_selector_window_id = self.create_command_window(
-                    CommandType::FindFile,
-                    CommandWindowPosition::Bottom,
-                    window_height,
-                );
-
-                return Ok(vec![
-                    ChromeAction::Echo("File selection".to_string()),
-                    ChromeAction::MarkDirty(DirtyRegion::FullScreen),
-                ]);
-            }
             KeyAction::Escape => {
                 // If command window is active, close it
                 if let Some(command_window_id) = self.find_command_window() {
@@ -1228,27 +1180,6 @@ impl Editor {
                     ]);
                 }
                 // Otherwise, pass to modes
-            }
-            KeyAction::Quit => {
-                return Ok(vec![
-                    ChromeAction::Echo("Quitting".to_string()),
-                    ChromeAction::Quit,
-                ]);
-            }
-            KeyAction::SplitHorizontal => {
-                return Ok(vec![ChromeAction::SplitHorizontal]);
-            }
-            KeyAction::SplitVertical => {
-                return Ok(vec![ChromeAction::SplitVertical]);
-            }
-            KeyAction::SwitchWindow => {
-                return Ok(vec![ChromeAction::SwitchWindow]);
-            }
-            KeyAction::DeleteWindow => {
-                return Ok(vec![ChromeAction::DeleteWindow]);
-            }
-            KeyAction::DeleteOtherWindows => {
-                return Ok(vec![ChromeAction::DeleteOtherWindows]);
             }
 
             KeyAction::Cursor(cd) => {
@@ -1370,6 +1301,32 @@ impl Editor {
                 };
                 return Ok(vec![ChromeAction::Echo(unbound_message)]);
             }
+            KeyAction::Command(command_name) => {
+                // Execute command through unified command system
+                let context = self.create_command_context();
+
+                if let Some(command) = self.command_registry.get_command(command_name) {
+                    match command.execute(context) {
+                        Ok(actions) => return Ok(self.process_chrome_actions(actions)),
+                        Err(error_msg) => {
+                            return Ok(vec![ChromeAction::Echo(format!("Error: {error_msg}"))]);
+                        }
+                    }
+                } else {
+                    return Ok(vec![ChromeAction::Echo(format!(
+                        "Command not found: '{}'. Available commands: {}",
+                        command_name,
+                        self.command_registry
+                            .all_commands()
+                            .iter()
+                            .map(|c| &c.name)
+                            .take(5)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))]);
+                }
+            }
             _ => {}
         }
 
@@ -1454,10 +1411,25 @@ impl Editor {
                                 self.close_command_window(command_window_id);
                                 actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
                             }
-                            // TODO: Implement command execution
-                            actions.push(ChromeAction::Echo(format!(
-                                "Execute command: {command_name}"
-                            )));
+                            // Execute the command using the command registry
+                            let context = self.create_command_context();
+                            match crate::command_mode::CommandMode::execute_command(
+                                &command_name,
+                                &self.command_registry,
+                                context,
+                            ) {
+                                Ok(command_actions) => {
+                                    // Process actions through unified system
+                                    let mut processed_actions =
+                                        self.process_chrome_actions(command_actions);
+                                    actions.append(&mut processed_actions);
+                                }
+                                Err(error_msg) => {
+                                    actions.push(ChromeAction::Echo(format!(
+                                        "Command error: {error_msg}"
+                                    )));
+                                }
+                            }
                         }
                         EditorAction::SwitchToBuffer(target_buffer_id) => {
                             // Close the buffer switch window after selection
@@ -2181,6 +2153,139 @@ impl Editor {
             Ok(format!("Opened: {}", file_path.display()))
         } else {
             Err("Window no longer exists".to_string())
+        }
+    }
+
+    /// Create a CommandContext from the current editor state
+    /// Process ChromeActions and handle those that need editor state changes
+    fn process_chrome_actions(&mut self, actions: Vec<ChromeAction>) -> Vec<ChromeAction> {
+        let mut result_actions = Vec::new();
+
+        for action in actions {
+            match action {
+                ChromeAction::CommandMode => {
+                    // If command window is already open, close it first
+                    if let Some(existing_command_window_id) = self.find_command_window() {
+                        self.close_command_window(existing_command_window_id);
+                    }
+
+                    // Create command window at bottom with enough height for completions
+                    let window_height = 10; // Total window height
+                    let _command_window_id = self.create_command_window(
+                        CommandType::Execute,
+                        CommandWindowPosition::Bottom,
+                        window_height,
+                    );
+
+                    result_actions.push(ChromeAction::Echo("Command selection".to_string()));
+                    result_actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
+                }
+                ChromeAction::SwitchBuffer => {
+                    // If buffer switch window is already open, close it first
+                    if let Some(existing_command_window_id) = self.find_command_window() {
+                        self.close_command_window(existing_command_window_id);
+                    }
+
+                    // Create buffer switch window at bottom with enough height for buffer list
+                    let window_height = 10; // Dynamic sizing based on available space
+                    let _buffer_switch_window_id = self.create_command_window(
+                        CommandType::BufferSwitch,
+                        CommandWindowPosition::Bottom,
+                        window_height,
+                    );
+
+                    result_actions.push(ChromeAction::Echo("Buffer selection".to_string()));
+                    result_actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
+                }
+                ChromeAction::KillBuffer => {
+                    // If kill buffer window is already open, close it first
+                    if let Some(existing_command_window_id) = self.find_command_window() {
+                        self.close_command_window(existing_command_window_id);
+                    }
+
+                    // Create kill buffer window at bottom with enough height for buffer list
+                    let window_height = 10; // Dynamic sizing based on available space
+                    let _kill_buffer_window_id = self.create_command_window(
+                        CommandType::KillBuffer,
+                        CommandWindowPosition::Bottom,
+                        window_height,
+                    );
+
+                    result_actions.push(ChromeAction::Echo("Kill buffer selection".to_string()));
+                    result_actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
+                }
+                ChromeAction::FindFile => {
+                    // If file selector window is already open, close it first
+                    if let Some(existing_command_window_id) = self.find_command_window() {
+                        self.close_command_window(existing_command_window_id);
+                    }
+
+                    // Create file selector window at bottom with enough height for file list
+                    let window_height = 10; // Dynamic sizing based on available space
+                    let _file_selector_window_id = self.create_command_window(
+                        CommandType::FindFile,
+                        CommandWindowPosition::Bottom,
+                        window_height,
+                    );
+
+                    result_actions.push(ChromeAction::Echo(
+                        "Find file: opening file selector".to_string(),
+                    ));
+                    result_actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
+                }
+                ChromeAction::Save => {
+                    // Dispatch save action to the active buffer host
+                    let buffer_id = self.windows[self.active_window].active_buffer;
+                    let cursor_pos = self.windows[self.active_window].cursor;
+
+                    if let Some(buffer_host) = self.buffer_hosts.get(&buffer_id).cloned() {
+                        // Use async runtime to handle the async BufferHost call
+                        let response_result = tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(async {
+                                buffer_host.handle_key(KeyAction::Save, cursor_pos).await
+                            })
+                        });
+
+                        match response_result {
+                            Ok(response) => {
+                                let save_actions = tokio::task::block_in_place(|| {
+                                    tokio::runtime::Handle::current().block_on(async {
+                                        self.handle_buffer_response(response).await
+                                    })
+                                });
+                                result_actions.extend(save_actions);
+                            }
+                            Err(e) => {
+                                result_actions
+                                    .push(ChromeAction::Echo(format!("Save error: {e}")));
+                            }
+                        }
+                    } else {
+                        result_actions.push(ChromeAction::Echo("No buffer to save".to_string()));
+                    }
+                }
+                // All other actions pass through unchanged
+                other => result_actions.push(other),
+            }
+        }
+
+        result_actions
+    }
+
+    fn create_command_context(&self) -> crate::command_registry::CommandContext {
+        let window = &self.windows[self.active_window];
+        let buffer = &self.buffers[window.active_buffer];
+        let (current_column, current_line) = buffer.to_column_line(window.cursor);
+
+        crate::command_registry::CommandContext {
+            buffer_content: buffer.content(),
+            cursor_pos: window.cursor,
+            buffer_id: window.active_buffer,
+            window_id: self.active_window,
+            buffer_name: buffer.object(),
+            buffer_modified: false, // TODO: Implement buffer modification tracking
+            current_line: current_line + 1, // Convert to 1-based
+            current_column: current_column + 1, // Convert to 1-based
         }
     }
 }

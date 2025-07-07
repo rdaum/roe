@@ -84,10 +84,15 @@ impl<T: MenuItem> SelectionMenu<T> {
         }
     }
 
-    /// Move selection up
+    /// Move selection up with wrapping
     pub fn move_selection_up(&mut self) -> bool {
-        if !self.filtered_items.is_empty() && self.selected_index > 0 {
-            self.selected_index -= 1;
+        if !self.filtered_items.is_empty() {
+            if self.selected_index > 0 {
+                self.selected_index -= 1;
+            } else {
+                // Wrap to bottom
+                self.selected_index = self.filtered_items.len() - 1;
+            }
             self.update_scroll_to_center();
             true
         } else {
@@ -95,10 +100,15 @@ impl<T: MenuItem> SelectionMenu<T> {
         }
     }
 
-    /// Move selection down
+    /// Move selection down with wrapping
     pub fn move_selection_down(&mut self) -> bool {
-        if !self.filtered_items.is_empty() && self.selected_index < self.filtered_items.len() - 1 {
-            self.selected_index += 1;
+        if !self.filtered_items.is_empty() {
+            if self.selected_index < self.filtered_items.len() - 1 {
+                self.selected_index += 1;
+            } else {
+                // Wrap to top
+                self.selected_index = 0;
+            }
             self.update_scroll_to_center();
             true
         } else {

@@ -11,7 +11,7 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
-use crate::command_registry::{CommandContext, CommandRegistry};
+use crate::command_registry::{CommandContext, CommandRegistry, CMD_COMMAND_MODE};
 use crate::editor::ChromeAction;
 use crate::keys::KeyAction;
 use crate::mode::{ActionPosition, Mode, ModeAction, ModeResult};
@@ -59,6 +59,11 @@ impl CommandMode {
         self.matches = self.all_commands.clone(); // Start with all commands visible
         self.selected_index = 0;
         self.completion_scroll_offset = 0;
+
+        // TODO: This should be driven by terminal renderer hints about actual available space
+        // TODO: Need to rethink the entire menuing system architecture
+        self.max_visible_completions = 7; // Hardcoded to match what actually fits
+
         self.update_scroll_to_center();
     }
 
@@ -86,11 +91,12 @@ impl CommandMode {
 
     /// Update matches based on current input
     pub fn update_matches(&mut self, registry: &CommandRegistry) {
-        self.matches = if self.input.is_empty() {
+        let mut commands: Vec<String> = if self.input.is_empty() {
             // Show all commands if no input
             registry
                 .all_commands()
                 .iter()
+                .filter(|cmd| cmd.name != CMD_COMMAND_MODE) // Exclude command-mode from palette
                 .map(|cmd| cmd.name.clone())
                 .collect()
         } else {
@@ -98,9 +104,14 @@ impl CommandMode {
             registry
                 .find_commands(&self.input)
                 .iter()
+                .filter(|cmd| cmd.name != CMD_COMMAND_MODE) // Exclude command-mode from palette
                 .map(|cmd| cmd.name.clone())
                 .collect()
         };
+
+        // Sort alphabetically
+        commands.sort();
+        self.matches = commands;
 
         // Reset selection to first match
         self.selected_index = 0;
@@ -121,20 +132,29 @@ impl CommandMode {
     pub fn generate_buffer_content(&self) -> String {
         let mut content = String::new();
 
-        // Show user input on first line if any
-        if !self.input.is_empty() {
-            content.push_str(&format!("{}\n", self.input));
-        }
-
         // Completion lines with highlighting
         let visible_completions = self.visible_completions();
+
+        // Show user input on first line if any
+        if !self.input.is_empty() {
+            content.push_str(&self.input.to_string());
+            // Only add newline if we have completions to show below
+            if !visible_completions.is_empty() {
+                content.push('\n');
+            }
+        }
         for (idx, completion) in visible_completions.iter().enumerate() {
             let is_selected = self.visible_selection_index() == Some(idx);
             if is_selected {
                 // Mark selected item with arrow or highlighting
-                content.push_str(&format!("> {completion}\n"));
+                content.push_str(&format!("> {completion}"));
             } else {
-                content.push_str(&format!("  {completion}\n"));
+                content.push_str(&format!("  {completion}"));
+            }
+
+            // Add newline except for the last item
+            if idx < visible_completions.len() - 1 {
+                content.push('\n');
             }
         }
 
@@ -163,17 +183,27 @@ impl CommandMode {
                 CommandModeResult::Continue
             }
             KeyAction::Cursor(crate::keys::CursorDirection::Up) => {
-                // Move selection up
-                if !self.matches.is_empty() && self.selected_index > 0 {
-                    self.selected_index -= 1;
+                // Move selection up with wrapping
+                if !self.matches.is_empty() {
+                    if self.selected_index > 0 {
+                        self.selected_index -= 1;
+                    } else {
+                        // Wrap to bottom
+                        self.selected_index = self.matches.len() - 1;
+                    }
                     self.update_scroll_to_center();
                 }
                 CommandModeResult::Continue
             }
             KeyAction::Cursor(crate::keys::CursorDirection::Down) => {
-                // Move selection down
-                if !self.matches.is_empty() && self.selected_index < self.matches.len() - 1 {
-                    self.selected_index += 1;
+                // Move selection down with wrapping
+                if !self.matches.is_empty() {
+                    if self.selected_index < self.matches.len() - 1 {
+                        self.selected_index += 1;
+                    } else {
+                        // Wrap to top
+                        self.selected_index = 0;
+                    }
                     self.update_scroll_to_center();
                 }
                 CommandModeResult::Continue
@@ -344,8 +374,14 @@ impl Mode for CommandMode {
                 }
             }
             KeyAction::Cursor(crate::keys::CursorDirection::Up) => {
-                if !self.matches.is_empty() && self.selected_index > 0 {
-                    self.selected_index -= 1;
+                // Move selection up with wrapping
+                if !self.matches.is_empty() {
+                    if self.selected_index > 0 {
+                        self.selected_index -= 1;
+                    } else {
+                        // Wrap to bottom
+                        self.selected_index = self.matches.len() - 1;
+                    }
                     self.update_scroll_to_center();
                 }
                 // Always consume arrow keys in command mode, even if we can't move
@@ -355,8 +391,14 @@ impl Mode for CommandMode {
                 ])
             }
             KeyAction::Cursor(crate::keys::CursorDirection::Down) => {
-                if !self.matches.is_empty() && self.selected_index < self.matches.len() - 1 {
-                    self.selected_index += 1;
+                // Move selection down with wrapping
+                if !self.matches.is_empty() {
+                    if self.selected_index < self.matches.len() - 1 {
+                        self.selected_index += 1;
+                    } else {
+                        // Wrap to top
+                        self.selected_index = 0;
+                    }
                     self.update_scroll_to_center();
                 }
                 // Always consume arrow keys in command mode, even if we can't move

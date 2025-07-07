@@ -218,6 +218,7 @@ impl Mode for ScratchMode {
             KeyAction::SwitchBuffer => ModeResult::Ignored,
             KeyAction::KillBuffer => ModeResult::Ignored,
             KeyAction::Unbound => ModeResult::Ignored,
+            KeyAction::Command(_) => ModeResult::Ignored,
         }
     }
 
@@ -306,6 +307,7 @@ impl Mode for FileMode {
             KeyAction::SwitchBuffer => ModeResult::Ignored,
             KeyAction::KillBuffer => ModeResult::Ignored,
             KeyAction::Unbound => ModeResult::Ignored,
+            KeyAction::Command(_) => ModeResult::Ignored,
         }
     }
 

@@ -14,6 +14,27 @@
 use crate::editor::ChromeAction;
 use crate::{BufferId, WindowId};
 
+// Command name constants
+pub const CMD_COMMAND_MODE: &str = "command-mode";
+pub const CMD_FIND_FILE: &str = "find-file";
+pub const CMD_SAVE_BUFFER: &str = "save-buffer";
+pub const CMD_QUIT: &str = "quit";
+pub const CMD_EXIT: &str = "exit";
+pub const CMD_SPLIT_HORIZONTAL: &str = "split-window-horizontally";
+pub const CMD_SPLIT_VERTICAL: &str = "split-window-vertically";
+pub const CMD_DELETE_WINDOW: &str = "delete-window";
+pub const CMD_DELETE_OTHER_WINDOWS: &str = "delete-other-windows";
+pub const CMD_OTHER_WINDOW: &str = "other-window";
+pub const CMD_SPLIT_BELOW: &str = "split-window-below";
+pub const CMD_SPLIT_RIGHT: &str = "split-window-right";
+pub const CMD_DESCRIBE_BUFFER: &str = "describe-buffer";
+pub const CMD_DESCRIBE_MODE: &str = "describe-mode";
+pub const CMD_SWITCH_BUFFER: &str = "switch-to-buffer";
+pub const CMD_KILL_BUFFER: &str = "kill-buffer";
+pub const CMD_MESSAGES: &str = "messages";
+pub const CMD_SHOW_MESSAGES: &str = "show-messages";
+pub const CMD_KEYBOARD_QUIT: &str = "keyboard-quit";
+
 /// Context information passed to commands when they execute
 #[derive(Debug, Clone)]
 pub struct CommandContext {
@@ -154,34 +175,36 @@ pub fn create_default_registry() -> CommandRegistry {
 
     // File operations
     registry.register_command(Command::new(
-        "find-file",
+        CMD_FIND_FILE,
         "Open a file",
         CommandCategory::Global,
-        Box::new(|_context| Ok(vec![ChromeAction::FileOpen])),
+        Box::new(|_context| Ok(vec![ChromeAction::FindFile])),
     ));
 
     registry.register_command(Command::new(
-        "save-buffer",
+        CMD_SAVE_BUFFER,
         "Save current buffer to file",
         CommandCategory::Global,
-        Box::new(|context| {
-            Ok(vec![ChromeAction::Echo(format!(
-                "Saving {}...",
-                context.buffer_name
-            ))])
-        }),
+        Box::new(|_context| Ok(vec![ChromeAction::Save])),
     ));
 
     // Editor lifecycle
     registry.register_command(Command::new(
-        "quit",
+        CMD_COMMAND_MODE,
+        "Open command palette (M-x)",
+        CommandCategory::Global,
+        Box::new(|_context| Ok(vec![ChromeAction::CommandMode])),
+    ));
+
+    registry.register_command(Command::new(
+        CMD_QUIT,
         "Quit the editor",
         CommandCategory::Global,
         Box::new(|_context| Ok(vec![ChromeAction::Quit])),
     ));
 
     registry.register_command(Command::new(
-        "exit",
+        CMD_EXIT,
         "Exit the editor (alias for quit)",
         CommandCategory::Global,
         Box::new(|_context| Ok(vec![ChromeAction::Quit])),
@@ -189,35 +212,35 @@ pub fn create_default_registry() -> CommandRegistry {
 
     // Window management
     registry.register_command(Command::new(
-        "split-window-horizontally",
+        CMD_SPLIT_HORIZONTAL,
         "Split current window horizontally",
         CommandCategory::Global,
         Box::new(|_context| Ok(vec![ChromeAction::SplitHorizontal])),
     ));
 
     registry.register_command(Command::new(
-        "split-window-vertically",
+        CMD_SPLIT_VERTICAL,
         "Split current window vertically",
         CommandCategory::Global,
         Box::new(|_context| Ok(vec![ChromeAction::SplitVertical])),
     ));
 
     registry.register_command(Command::new(
-        "delete-window",
+        CMD_DELETE_WINDOW,
         "Delete current window",
         CommandCategory::Global,
         Box::new(|_context| Ok(vec![ChromeAction::DeleteWindow])),
     ));
 
     registry.register_command(Command::new(
-        "delete-other-windows",
+        CMD_DELETE_OTHER_WINDOWS,
         "Delete all windows except current",
         CommandCategory::Global,
         Box::new(|_context| Ok(vec![ChromeAction::DeleteOtherWindows])),
     ));
 
     registry.register_command(Command::new(
-        "other-window",
+        CMD_OTHER_WINDOW,
         "Switch to next window",
         CommandCategory::Global,
         Box::new(|_context| Ok(vec![ChromeAction::SwitchWindow])),
@@ -225,14 +248,14 @@ pub fn create_default_registry() -> CommandRegistry {
 
     // Alternative command names (common aliases)
     registry.register_command(Command::new(
-        "split-window-below",
+        CMD_SPLIT_BELOW,
         "Split current window horizontally (alias)",
         CommandCategory::Global,
         Box::new(|_context| Ok(vec![ChromeAction::SplitHorizontal])),
     ));
 
     registry.register_command(Command::new(
-        "split-window-right",
+        CMD_SPLIT_RIGHT,
         "Split current window vertically (alias)",
         CommandCategory::Global,
         Box::new(|_context| Ok(vec![ChromeAction::SplitVertical])),
@@ -240,7 +263,7 @@ pub fn create_default_registry() -> CommandRegistry {
 
     // Information commands
     registry.register_command(Command::new(
-        "describe-buffer",
+        CMD_DESCRIBE_BUFFER,
         "Show information about current buffer",
         CommandCategory::Global,
         Box::new(|context| {
@@ -255,7 +278,7 @@ pub fn create_default_registry() -> CommandRegistry {
     ));
 
     registry.register_command(Command::new(
-        "describe-mode",
+        CMD_DESCRIBE_MODE,
         "Show information about current major mode",
         CommandCategory::Global,
         Box::new(|_context| {
@@ -267,14 +290,28 @@ pub fn create_default_registry() -> CommandRegistry {
 
     // Buffer commands
     registry.register_command(Command::new(
-        "messages",
+        CMD_SWITCH_BUFFER,
+        "Switch to a buffer",
+        CommandCategory::Global,
+        Box::new(|_context| Ok(vec![ChromeAction::SwitchBuffer])),
+    ));
+
+    registry.register_command(Command::new(
+        CMD_KILL_BUFFER,
+        "Kill a buffer",
+        CommandCategory::Global,
+        Box::new(|_context| Ok(vec![ChromeAction::KillBuffer])),
+    ));
+
+    registry.register_command(Command::new(
+        CMD_MESSAGES,
         "Switch to Messages buffer",
         CommandCategory::Global,
         Box::new(|_context| Ok(vec![ChromeAction::ShowMessages])),
     ));
 
     registry.register_command(Command::new(
-        "show-messages",
+        CMD_SHOW_MESSAGES,
         "Switch to Messages buffer (alias)",
         CommandCategory::Global,
         Box::new(|_context| Ok(vec![ChromeAction::ShowMessages])),
@@ -282,7 +319,7 @@ pub fn create_default_registry() -> CommandRegistry {
 
     // Utility commands
     registry.register_command(Command::new(
-        "keyboard-quit",
+        CMD_KEYBOARD_QUIT,
         "Cancel current operation",
         CommandCategory::Global,
         Box::new(|_context| Ok(vec![ChromeAction::Echo("Quit".to_string())])),

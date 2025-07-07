@@ -11,6 +11,7 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
+use crate::command_registry::*;
 use std::time::Instant;
 
 pub trait Bindings {
@@ -18,82 +19,80 @@ pub trait Bindings {
 }
 
 /// An enumeration of our logical actions caused by keystrokes.
-/// E.g. Save, CursorLeft, CursorRight, AlphaNumeric('a'), InsertModeToggle, etc.
+/// Direct text manipulation and meta-actions stay as KeyActions.
+/// Complex UI/system actions become commands.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum KeyAction {
+    // Direct text manipulation (fast path)
+    /// Type a character
+    AlphaNumeric(char),
     /// Move the cursor in a direction
     Cursor(CursorDirection),
-    /// Toggle insert mode
-    InsertModeToggle,
-    /// Undo the last action
-    Undo,
-    /// Redo the last undone action
-    Redo,
-    /// Begin a selection
+    /// Delete the character under the cursor
+    Delete,
+    /// Backspace-delete the character before the cursor
+    Backspace,
+    /// Insert a newline
+    Enter,
+    /// Tab character or indentation
+    Tab,
+
+    // Basic editing operations (still direct for performance)
+    /// Begin a selection (set mark)
     MarkStart,
-    /// End a selection
-    #[allow(dead_code)]
-    MarkEnd,
     /// Add to kill-ring. If true, the selection is deleted, otherwise left present.
     KillRegion(bool),
     /// Kill line (whole or rest)
     KillLine(bool),
     /// Yank from kill-ring. If Some, yank that index, otherwise yank the last kill.
     Yank(Option<usize>),
-    /// Force the current line to obey the indent rules
-    #[allow(dead_code)]
-    ForceIndent,
-    /// Move cursor over one tab-stop
-    Tab,
-    /// Delete the character under the cursor
-    Delete,
-    /// Backspace-delete the character before the cursor
-    Backspace,
-    /// Insert a newline or receive command etc (maybe split those two up?)
-    Enter,
+
+    // All complex actions become commands
+    /// Execute a named command
+    Command(String),
+
+    // Special meta-actions
+    /// Wait for the next key, to form a chord
+    ChordNext,
     /// Escape key
     Escape,
-    /// Delete the "word" under the cursor
-    #[allow(dead_code)]
+    /// Cancel current operation
+    Cancel,
+    /// Unbound/unmapped key
+    Unbound,
+
+    // Additional action types that are still direct for performance/simplicity
+    /// Toggle insert mode
+    InsertModeToggle,
+    /// Undo last operation
+    Undo,
+    /// Redo last undone operation
+    Redo,
+    /// Delete word forward
     DeleteWord,
+    /// Backspace word backward
+    BackspaceWord,
     /// Toggle caps lock
     ToggleCapsLock,
     /// Toggle scroll lock
     ToggleScrollLock,
-    /// Backspace-delete the "word" before the cursor
-    #[allow(dead_code)]
-    BackspaceWord,
-    AlphaNumeric(char),
-    /// Wait for the next key, to form a chord
-    /// e.g. for C-x C-c etc.
-    /// The next non-Chord key will pull the sequence out of the KeyState
-    ChordNext,
-    /// Enter command mode in `echo` (M-x)
+    /// Force indentation
+    ForceIndent,
+    /// Mark end (unused but referenced)
+    MarkEnd,
+
+    // TEMPORARY: Keep these during transition
     CommandMode,
-    /// Save
     Save,
-    /// Quit
     Quit,
-    /// Find file
     FindFile,
-    /// Split window horizontally
     SplitHorizontal,
-    /// Split window vertically
     SplitVertical,
-    /// Switch to next window
     SwitchWindow,
-    /// Delete current window
     DeleteWindow,
-    /// Delete all other windows (keep only current)
     DeleteOtherWindows,
-    /// Switch to another buffer (C-x b)
     SwitchBuffer,
-    /// Kill a buffer (C-x k)
     KillBuffer,
-    /// Cancel current operation (Ctrl-G)
-    Cancel,
-    /// Unbound key
-    Unbound,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -338,7 +337,7 @@ impl Bindings for DefaultBindings {
                 }
                 // M-x command mode
                 (LogicalKey::Modifier(KeyModifier::Meta(_)), LogicalKey::AlphaNumeric('x')) => {
-                    return KeyAction::CommandMode
+                    return KeyAction::Command(CMD_COMMAND_MODE.to_string())
                 }
                 // M-w copy region (like C-w but without deleting)
                 (LogicalKey::Modifier(KeyModifier::Meta(_)), LogicalKey::AlphaNumeric('w')) => {
@@ -454,61 +453,79 @@ impl Bindings for DefaultBindings {
                     LogicalKey::Modifier(KeyModifier::Control(_)),
                     LogicalKey::AlphaNumeric(a),
                     LogicalKey::AlphaNumeric(b),
-                ) if *a == 'x' && *b == 'c' => return KeyAction::Quit,
+                ) if *a == 'x' && *b == 'c' => return KeyAction::Command(CMD_QUIT.to_string()),
                 // C-x C-s save
                 (
                     LogicalKey::Modifier(KeyModifier::Control(_)),
                     LogicalKey::AlphaNumeric(a),
                     LogicalKey::AlphaNumeric(b),
-                ) if *a == 'x' && *b == 's' => return KeyAction::Save,
+                ) if *a == 'x' && *b == 's' => {
+                    return KeyAction::Command(CMD_SAVE_BUFFER.to_string())
+                }
                 // C-x C-f find-file
                 (
                     LogicalKey::Modifier(KeyModifier::Control(_)),
                     LogicalKey::AlphaNumeric(a),
                     LogicalKey::AlphaNumeric(b),
-                ) if *a == 'x' && *b == 'f' => return KeyAction::FindFile,
+                ) if *a == 'x' && *b == 'f' => {
+                    return KeyAction::Command(CMD_FIND_FILE.to_string())
+                }
                 // C-x 2 split horizontally
                 (
                     LogicalKey::Modifier(KeyModifier::Control(_)),
                     LogicalKey::AlphaNumeric(a),
                     LogicalKey::AlphaNumeric(b),
-                ) if *a == 'x' && *b == '2' => return KeyAction::SplitHorizontal,
+                ) if *a == 'x' && *b == '2' => {
+                    return KeyAction::Command(CMD_SPLIT_HORIZONTAL.to_string())
+                }
                 // C-x 3 split vertically
                 (
                     LogicalKey::Modifier(KeyModifier::Control(_)),
                     LogicalKey::AlphaNumeric(a),
                     LogicalKey::AlphaNumeric(b),
-                ) if *a == 'x' && *b == '3' => return KeyAction::SplitVertical,
+                ) if *a == 'x' && *b == '3' => {
+                    return KeyAction::Command(CMD_SPLIT_VERTICAL.to_string())
+                }
                 // C-x o switch window
                 (
                     LogicalKey::Modifier(KeyModifier::Control(_)),
                     LogicalKey::AlphaNumeric(a),
                     LogicalKey::AlphaNumeric(b),
-                ) if *a == 'x' && *b == 'o' => return KeyAction::SwitchWindow,
+                ) if *a == 'x' && *b == 'o' => {
+                    return KeyAction::Command(CMD_OTHER_WINDOW.to_string())
+                }
                 // C-x 0 delete window
                 (
                     LogicalKey::Modifier(KeyModifier::Control(_)),
                     LogicalKey::AlphaNumeric(a),
                     LogicalKey::AlphaNumeric(b),
-                ) if *a == 'x' && *b == '0' => return KeyAction::DeleteWindow,
+                ) if *a == 'x' && *b == '0' => {
+                    return KeyAction::Command(CMD_DELETE_WINDOW.to_string())
+                }
                 // C-x 1 delete other windows
                 (
                     LogicalKey::Modifier(KeyModifier::Control(_)),
                     LogicalKey::AlphaNumeric(a),
                     LogicalKey::AlphaNumeric(b),
-                ) if *a == 'x' && *b == '1' => return KeyAction::DeleteOtherWindows,
+                ) if *a == 'x' && *b == '1' => {
+                    return KeyAction::Command(CMD_DELETE_OTHER_WINDOWS.to_string())
+                }
                 // C-x b switch buffer
                 (
                     LogicalKey::Modifier(KeyModifier::Control(_)),
                     LogicalKey::AlphaNumeric(a),
                     LogicalKey::AlphaNumeric(b),
-                ) if *a == 'x' && *b == 'b' => return KeyAction::SwitchBuffer,
+                ) if *a == 'x' && *b == 'b' => {
+                    return KeyAction::Command(CMD_SWITCH_BUFFER.to_string())
+                }
                 // C-x k kill buffer
                 (
                     LogicalKey::Modifier(KeyModifier::Control(_)),
                     LogicalKey::AlphaNumeric(a),
                     LogicalKey::AlphaNumeric(b),
-                ) if *a == 'x' && *b == 'k' => return KeyAction::KillBuffer,
+                ) if *a == 'x' && *b == 'k' => {
+                    return KeyAction::Command(CMD_KILL_BUFFER.to_string())
+                }
                 // Ctrl-Shift-W is kill-region non-destructive
                 (
                     LogicalKey::Modifier(KeyModifier::Control(_)),
