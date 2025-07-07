@@ -367,6 +367,9 @@ impl<W: Write> Renderer for TerminalRenderer<W> {
             }
         }
 
+        // Flush all queued drawing commands first
+        self.device.flush()?;
+
         // Move cursor to correct position and show it
         let active_window = &editor.windows[editor.active_window];
         let (col, line) =
@@ -375,7 +378,7 @@ impl<W: Write> Renderer for TerminalRenderer<W> {
         queue!(&mut self.device, cursor::MoveTo(x, y))?;
         queue!(&mut self.device, cursor::Show)?;
 
-        // Flush all queued commands
+        // Flush cursor positioning commands
         self.device.flush()?;
 
         Ok(())
@@ -429,6 +432,9 @@ impl<W: Write> Renderer for TerminalRenderer<W> {
             )?;
         }
 
+        // Flush all drawing commands first
+        self.device.flush()?;
+
         // Position cursor and show it
         let active_window = &editor.windows[editor.active_window];
         let (col, line) =
@@ -437,7 +443,7 @@ impl<W: Write> Renderer for TerminalRenderer<W> {
         queue!(&mut self.device, cursor::MoveTo(x, y))?;
         queue!(&mut self.device, cursor::Show)?;
 
-        // Flush
+        // Flush cursor positioning commands
         self.device.flush()?;
 
         Ok(())
