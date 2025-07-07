@@ -12,7 +12,7 @@
 //
 
 use crate::editor::{ChromeAction, OpenType};
-use crate::{BufferId, WindowId};
+use crate::{Buffer, BufferId, WindowId};
 
 // Command name constants
 pub const CMD_COMMAND_MODE: &str = "command-mode";
@@ -37,10 +37,10 @@ pub const CMD_SHOW_MESSAGES: &str = "show-messages";
 pub const CMD_KEYBOARD_QUIT: &str = "keyboard-quit";
 
 /// Context information passed to commands when they execute
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CommandContext {
-    /// Content of the current buffer
-    pub buffer_content: String,
+    /// Shared reference to the current buffer
+    pub buffer: Buffer,
     /// Current cursor position in the buffer
     pub cursor_pos: usize,
     /// ID of the current buffer
@@ -275,12 +275,10 @@ pub fn create_default_registry() -> CommandRegistry {
         "Show information about current buffer",
         CommandCategory::Global,
         Box::new(|context| {
+            let buffer_len = context.buffer.buffer_len_chars();
             Ok(vec![ChromeAction::Echo(format!(
                 "Buffer: {} ({}:{}) {} chars",
-                context.buffer_name,
-                context.current_line,
-                context.current_column,
-                context.buffer_content.len()
+                context.buffer_name, context.current_line, context.current_column, buffer_len
             ))])
         }),
     ));

@@ -2294,7 +2294,7 @@ impl Editor {
         let (current_column, current_line) = buffer.to_column_line(window.cursor);
 
         crate::command_registry::CommandContext {
-            buffer_content: buffer.content(),
+            buffer: buffer.clone(),
             cursor_pos: window.cursor,
             buffer_id: window.active_buffer,
             window_id: self.active_window,
