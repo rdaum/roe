@@ -26,6 +26,67 @@ use slotmap::SlotMap;
 use std::collections::HashMap;
 use std::io::Write;
 
+/// Parse command line arguments
+fn parse_args() -> EditorConfig {
+    let args: Vec<String> = std::env::args().collect();
+    let mut file_paths = Vec::new();
+    let mut init_file = None;
+    let mut i = 1; // Skip program name
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--init" | "-i" => {
+                // Next argument should be the init file path
+                if i + 1 < args.len() {
+                    init_file = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("Error: --init requires a file path");
+                    std::process::exit(1);
+                }
+            }
+            "--help" | "-h" => {
+                print_help();
+                std::process::exit(0);
+            }
+            arg if arg.starts_with('-') => {
+                eprintln!("Error: Unknown option '{arg}'");
+                print_help();
+                std::process::exit(1);
+            }
+            _ => {
+                // Regular file argument
+                file_paths.push(args[i].clone());
+                i += 1;
+            }
+        }
+    }
+
+    EditorConfig {
+        file_paths,
+        init_file,
+    }
+}
+
+/// Print help message
+fn print_help() {
+    println!("Roe - Ryan's Own Emacs");
+    println!();
+    println!("USAGE:");
+    println!("    roe [OPTIONS] [FILES...]");
+    println!();
+    println!("OPTIONS:");
+    println!("    -i, --init <FILE>    Specify Julia init file (default: init.jl)");
+    println!("    -h, --help           Print this help message");
+    println!();
+    println!("EXAMPLES:");
+    println!("    roe                          # Start with welcome screen");
+    println!("    roe file.txt                 # Open file.txt");
+    println!("    roe file1.txt file2.txt      # Open multiple files");
+    println!("    roe --init myconfig.jl       # Use custom init file");
+    println!("    roe -i ~/.config/init.jl main.rs   # Custom init + file");
+}
+
 /// Generate welcome screen content with ASCII art logo and getting started text
 fn create_welcome_screen_content() -> String {
     // Include the ASCII art from rune.txt at compile time
@@ -42,7 +103,7 @@ fn create_welcome_screen_content() -> String {
     // Add centered title - we'll center it manually for now
     let title = "ROE - Ryan's Own Emacs";
     let title_padding = " ".repeat(20); // Rough centering
-    content.push_str(&format!("{}{}\n\n", title_padding, title));
+    content.push_str(&format!("{title_padding}{title}\n\n"));
 
     // Add getting started information
     content.push_str("                        Getting Started:\n\n");
@@ -59,8 +120,14 @@ fn create_welcome_screen_content() -> String {
     content
 }
 
+// Configuration for the editor
+struct EditorConfig {
+    file_paths: Vec<String>,
+    init_file: Option<String>,
+}
+
 // Everything to run in raw_mode
-async fn terminal_main<W: Write>(stdout: W, file_paths: Vec<String>) -> Result<(), std::io::Error> {
+async fn terminal_main<W: Write>(stdout: W, config: EditorConfig) -> Result<(), std::io::Error> {
     assert!(crossterm::terminal::is_raw_mode_enabled()?);
     let _ws = crossterm::terminal::window_size()?;
 
@@ -69,13 +136,16 @@ async fn terminal_main<W: Write>(stdout: W, file_paths: Vec<String>) -> Result<(
 
     let tsize = crossterm::terminal::size()?;
 
+    // Initialize Julia runtime with Arc for sharing
+    let julia_runtime = roe_core::julia_runtime::create_shared_runtime().ok();
+
     let mut buffers: SlotMap<BufferId, Buffer> = SlotMap::default();
     let mut buffer_hosts: HashMap<BufferId, buffer_host::BufferHostClient> = HashMap::new();
     let mut modes: SlotMap<ModeId, Box<dyn Mode>> = SlotMap::default();
 
     let mut first_buffer_id = None;
 
-    if file_paths.is_empty() {
+    if config.file_paths.is_empty() {
         // No files specified, create welcome screen buffer
         let welcome_mode = Box::new(mode::MessagesMode {});
         let welcome_mode_id = modes.insert(welcome_mode);
@@ -94,11 +164,11 @@ async fn terminal_main<W: Write>(stdout: W, file_paths: Vec<String>) -> Result<(
         let mode_list = vec![(welcome_mode_id, "welcome".to_string(), welcome_mode)];
 
         let (buffer_client, _buffer_handle) =
-            buffer_host::create_buffer_host(buffer, mode_list, buffer_id);
+            buffer_host::create_buffer_host(buffer, mode_list, buffer_id, julia_runtime.clone());
         buffer_hosts.insert(buffer_id, buffer_client);
     } else {
         // Create buffers for all specified files
-        for file_path in file_paths {
+        for file_path in config.file_paths {
             // Create FileMode for this file
             let file_mode = Box::new(mode::FileMode {
                 file_path: file_path.clone(),
@@ -130,8 +200,12 @@ async fn terminal_main<W: Write>(stdout: W, file_paths: Vec<String>) -> Result<(
             let mode_list = vec![(file_mode_id, "file".to_string(), file_mode)];
 
             // Create BufferHost and client
-            let (buffer_client, _buffer_handle) =
-                buffer_host::create_buffer_host(buffer, mode_list, buffer_id);
+            let (buffer_client, _buffer_handle) = buffer_host::create_buffer_host(
+                buffer,
+                mode_list,
+                buffer_id,
+                julia_runtime.clone(),
+            );
             buffer_hosts.insert(buffer_id, buffer_client);
         }
     }
@@ -219,14 +293,33 @@ async fn terminal_main<W: Write>(stdout: W, file_paths: Vec<String>) -> Result<(
         current_key_chord: Vec::new(),
         mouse_drag_state: None,
         messages_buffer_id: None,
+        julia_runtime,
     };
 
     // Initialize buffer history with the current buffer
     let initial_buffer_id = editor.windows[active_window_id].active_buffer;
     editor.record_buffer_access(initial_buffer_id);
 
-    // Create terminal renderer
-    let mut renderer = TerminalRenderer::new(stdout);
+    // Try to load Julia configuration
+    if let Some(ref julia_runtime) = editor.julia_runtime {
+        let config_path = if let Some(init_file) = &config.init_file {
+            std::path::PathBuf::from(init_file)
+        } else {
+            roe_core::julia_runtime::RoeJuliaRuntime::default_config_path()
+        };
+
+        let mut runtime = julia_runtime.lock().await;
+        let _ = runtime.load_config(Some(config_path)).await;
+    }
+
+    // Load Julia theme and create terminal renderer with it
+    let julia_theme = if editor.julia_runtime.is_some() {
+        roe_terminal::terminal_renderer::load_julia_theme(&editor).await
+    } else {
+        roe_terminal::terminal_renderer::CachedTheme::default()
+    };
+
+    let mut renderer = TerminalRenderer::new_with_theme(stdout, julia_theme);
 
     // Initial full render
     renderer.render_full(&editor)?;
@@ -272,8 +365,8 @@ async fn main() -> Result<(), std::io::Error> {
 
     let mut stdout = std::io::stdout();
 
-    // Collect command line arguments (skip the program name)
-    let file_paths: Vec<String> = std::env::args().skip(1).collect();
+    // Parse command line arguments
+    let config = parse_args();
 
     // Set up terminal state
     crossterm::terminal::enable_raw_mode()?;
@@ -285,7 +378,7 @@ async fn main() -> Result<(), std::io::Error> {
     execute!(stdout, EnableMouseCapture)?;
 
     // Run the application
-    let result = terminal_main(&mut stdout, file_paths).await;
+    let result = terminal_main(&mut stdout, config).await;
 
     // Always clean up terminal state, regardless of success or failure
     if let Err(cleanup_err) = exit_state(&mut stdout) {

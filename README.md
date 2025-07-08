@@ -7,10 +7,11 @@ file-oriented, (b) it uses the default GNU Emacs keybinding set, and (c) it's be
 full programmability in mind (though not yet implemented). Unlike the current trend toward "modal"
 editors, this is a direct manipulation editor and proud of it.
 
-Currently, all behavior is hard-wired in Rust rather than implemented in a scripting language like
+Currently, all behavior is hard-wired in Rust rather than implemented in a high-level language like
 Lisp. However, the architecture has been designed from the ground up to delegate the bulk of editor
-logic to an embedded scripting system. The likely outcome will be to embed "Steel" Scheme, a Scheme
-interpreter written in Rust.
+logic to an embedded language system. We are integrating Julia as our implementation language,
+where most modes, commands, and editing behaviors will be implemented - similar to how elisp
+functions in Emacs.
 
 ## Screenshot
 
@@ -154,14 +155,14 @@ This is a work-in-progress editor. Currently implemented:
 - **Mouse integration**: Click-to-position cursor, window switching, border dragging for resizing
 - **Terminal UI**: Efficient rendering with borders, modelines, and echo area
 - **Auto-clearing messages**: Timed echo message clearing for better UX
+- **Julia integration**: Configuration loading from .roe.jl files and interactive Julia REPL mode
 
 ## Next steps / not yet implemented
 
 - **Customizable keybindings**: Allow users to redefine key mappings
 - **Macro system**: Record and playback keystroke sequences
 - **Search and replace**: Interactive search, query-replace functionality
-- **Scripting support**: Embed "Steel" Scheme (a scheme interpreter written in Rust) or something
-  similar, and rewrite the basic text handling modes in it
+- **Extended Julia integration**: Expand Julia's role as the primary implementation language for modes, commands, and editing behaviors, moving more functionality from hard-coded Rust to Julia
 - **Syntax highlighting**: TreeSitter integration for language-aware editing
 - **LSP integration**: Language server protocol support for modern development features
 - **Advanced editing**: Multiple cursors, rectangular selections, etc.

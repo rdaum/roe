@@ -14,3 +14,4 @@ roe-core = { path = "../roe-core" }
 roe-terminal = { path = "../roe-terminal" }
 slotmap = { workspace = true }
 tokio = { workspace = true }
+jlrs = { workspace = true }

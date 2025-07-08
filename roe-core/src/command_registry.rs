@@ -35,6 +35,7 @@ pub const CMD_VISIT_FILE: &str = "visit-file";
 pub const CMD_MESSAGES: &str = "messages";
 pub const CMD_SHOW_MESSAGES: &str = "show-messages";
 pub const CMD_KEYBOARD_QUIT: &str = "keyboard-quit";
+pub const CMD_JULIA_REPL: &str = "julia-repl";
 
 /// Context information passed to commands when they execute
 #[derive(Clone)]
@@ -329,6 +330,20 @@ pub fn create_default_registry() -> CommandRegistry {
         "Cancel current operation",
         CommandCategory::Global,
         Box::new(|_context| Ok(vec![ChromeAction::Echo("Quit".to_string())])),
+    ));
+
+    // Julia commands
+    registry.register_command(Command::new(
+        CMD_JULIA_REPL,
+        "Open Julia REPL buffer",
+        CommandCategory::Global,
+        Box::new(|_context| {
+            Ok(vec![ChromeAction::NewBufferWithMode {
+                buffer_name: "*Julia REPL*".to_string(),
+                mode_name: "julia-repl".to_string(),
+                initial_content: "julia> ".to_string(),
+            }])
+        }),
     ));
 
     registry

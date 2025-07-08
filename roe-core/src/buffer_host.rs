@@ -278,6 +278,8 @@ pub struct BufferHost {
     receiver: mpsc::Receiver<BufferMessage>,
     buffer_id: BufferId,
     mode_handles: Vec<tokio::task::JoinHandle<()>>, // Keep track of spawned mode tasks
+    julia_runtime:
+        Option<std::sync::Arc<tokio::sync::Mutex<crate::julia_runtime::RoeJuliaRuntime>>>,
 }
 
 impl BufferHost {
@@ -286,6 +288,9 @@ impl BufferHost {
         modes: Vec<(ModeId, String, Box<dyn Mode>)>,
         receiver: mpsc::Receiver<BufferMessage>,
         buffer_id: BufferId,
+        julia_runtime: Option<
+            std::sync::Arc<tokio::sync::Mutex<crate::julia_runtime::RoeJuliaRuntime>>,
+        >,
     ) -> Self {
         let mut mode_clients = Vec::new();
         let mut mode_handles = Vec::new();
@@ -314,6 +319,7 @@ impl BufferHost {
             receiver,
             buffer_id,
             mode_handles,
+            julia_runtime,
         }
     }
 
@@ -673,6 +679,35 @@ impl BufferHost {
                         buffer_id: self.buffer_id,
                     });
                 }
+                ModeAction::EvalJulia(expression) => {
+                    if let Some(ref julia_runtime) = self.julia_runtime {
+                        let result = {
+                            let runtime = julia_runtime.lock().await;
+                            runtime.eval_expression(&expression).await
+                        };
+
+                        let formatted_output = match result {
+                            Ok(output) => format!("{output}\njulia> "),
+                            Err(e) => format!("Error: {e}\njulia> "),
+                        };
+
+                        let buffer_len = self.buffer.buffer_len_chars();
+                        let output_len = formatted_output.len();
+                        self.buffer.insert_pos(formatted_output, buffer_len);
+                        new_cursor_pos = Some(buffer_len + output_len);
+                        dirty_regions.push(DirtyRegion::Buffer {
+                            buffer_id: self.buffer_id,
+                        });
+                    } else {
+                        let error_msg = "Error: Julia runtime not available\njulia> ";
+                        let buffer_len = self.buffer.buffer_len_chars();
+                        self.buffer.insert_pos(error_msg.to_string(), buffer_len);
+                        new_cursor_pos = Some(buffer_len + error_msg.len());
+                        dirty_regions.push(DirtyRegion::Buffer {
+                            buffer_id: self.buffer_id,
+                        });
+                    }
+                }
                 _ => {}
             }
         }
@@ -730,11 +765,14 @@ pub fn create_buffer_host(
     buffer: Buffer,
     modes: Vec<(ModeId, String, Box<dyn Mode>)>,
     buffer_id: BufferId,
+    julia_runtime: Option<
+        std::sync::Arc<tokio::sync::Mutex<crate::julia_runtime::RoeJuliaRuntime>>,
+    >,
 ) -> (BufferHostClient, tokio::task::JoinHandle<()>) {
     let (sender, receiver) = mpsc::channel(100);
 
     let client = BufferHostClient::new(sender, buffer_id);
-    let host = BufferHost::new(buffer, modes, receiver, buffer_id);
+    let host = BufferHost::new(buffer, modes, receiver, buffer_id, julia_runtime);
     let handle = host.spawn();
 
     (client, handle)

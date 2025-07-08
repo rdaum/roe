@@ -94,6 +94,9 @@ pub enum ModeAction {
     CursorLeft,
     CursorRight,
     NextLine,
+
+    /// Evaluate Julia expression and append result to buffer
+    EvalJulia(String),
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -355,6 +358,148 @@ impl Mode for FileMode {
                 )])
             }
             // Ignore other mouse events for now
+            _ => ModeResult::Ignored,
+        }
+    }
+}
+
+/// Julia REPL mode for interactive Julia evaluation
+pub struct JuliaReplMode {
+    /// Current input being typed
+    current_input: String,
+    /// Prompt string
+    prompt: String,
+}
+
+impl Default for JuliaReplMode {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl JuliaReplMode {
+    pub fn new() -> Self {
+        Self {
+            current_input: String::new(),
+            prompt: "julia> ".to_string(),
+        }
+    }
+}
+
+impl Mode for JuliaReplMode {
+    fn name(&self) -> &str {
+        "julia-repl"
+    }
+
+    fn perform(&mut self, action: &KeyAction) -> ModeResult {
+        match action {
+            KeyAction::Enter => {
+                if !self.current_input.trim().is_empty() {
+                    let expr = self.current_input.clone();
+                    self.current_input.clear();
+
+                    ModeResult::Consumed(vec![
+                        ModeAction::InsertText(ActionPosition::cursor(), "\n".to_string()),
+                        ModeAction::EvalJulia(expr),
+                    ])
+                } else {
+                    ModeResult::Consumed(vec![ModeAction::InsertText(
+                        ActionPosition::cursor(),
+                        format!("\n{}", self.prompt),
+                    )])
+                }
+            }
+            KeyAction::AlphaNumeric(ch) => {
+                self.current_input.push(*ch);
+                ModeResult::Consumed(vec![ModeAction::InsertText(
+                    ActionPosition::cursor(),
+                    ch.to_string(),
+                )])
+            }
+            KeyAction::Backspace => {
+                if !self.current_input.is_empty() {
+                    self.current_input.pop();
+                    ModeResult::Consumed(vec![ModeAction::DeleteText(ActionPosition::cursor(), -1)])
+                } else {
+                    // Don't allow backspacing over the prompt
+                    ModeResult::Ignored
+                }
+            }
+            KeyAction::Delete => {
+                ModeResult::Consumed(vec![ModeAction::DeleteText(ActionPosition::cursor(), 1)])
+            }
+            // Allow cursor movement and other navigation
+            KeyAction::Cursor(_) => ModeResult::Ignored,
+            KeyAction::Cancel => ModeResult::Consumed(vec![ModeAction::InsertText(
+                ActionPosition::cursor(),
+                format!("\n{}", self.prompt),
+            )]),
+            // Block most other editing operations to maintain REPL integrity
+            KeyAction::Tab => ModeResult::Ignored,
+            KeyAction::KillLine(_) => {
+                // Clear current input
+                let backspaces = self.current_input.len() as isize;
+                self.current_input.clear();
+                if backspaces > 0 {
+                    ModeResult::Consumed(vec![ModeAction::DeleteText(
+                        ActionPosition::cursor(),
+                        -backspaces,
+                    )])
+                } else {
+                    ModeResult::Ignored
+                }
+            }
+            KeyAction::MarkStart => ModeResult::Consumed(vec![ModeAction::SetMark]),
+            KeyAction::KillRegion(destructive) => {
+                if *destructive {
+                    ModeResult::Ignored
+                } else {
+                    ModeResult::Consumed(vec![ModeAction::CopyRegion])
+                }
+            }
+            KeyAction::Yank(index) => match index {
+                Some(idx) => ModeResult::Consumed(vec![ModeAction::YankIndex(
+                    ActionPosition::cursor(),
+                    *idx,
+                )]),
+                None => ModeResult::Consumed(vec![ModeAction::Yank(ActionPosition::cursor())]),
+            },
+            _ => ModeResult::Ignored,
+        }
+    }
+
+    fn available_commands(&self) -> Vec<Command> {
+        use crate::editor::ChromeAction;
+
+        vec![
+            Command::new(
+                "julia-clear-repl",
+                "Clear the Julia REPL buffer",
+                CommandCategory::Mode("julia-repl".to_string()),
+                Box::new(|_context| Ok(vec![ChromeAction::Echo("REPL cleared".to_string())])),
+            ),
+            Command::new(
+                "julia-restart",
+                "Restart the Julia runtime",
+                CommandCategory::Mode("julia-repl".to_string()),
+                Box::new(|_context| {
+                    Ok(vec![ChromeAction::Echo(
+                        "Julia runtime restarted".to_string(),
+                    )])
+                }),
+            ),
+        ]
+    }
+
+    fn handle_mouse(&mut self, event: &MouseEvent) -> ModeResult {
+        match event.event_type {
+            MouseEventType::LeftClick => {
+                // Move cursor to clicked position
+                ModeResult::Consumed(vec![ModeAction::MoveCursor(
+                    event.position.1,
+                    event.position.0,
+                )])
+            }
             _ => ModeResult::Ignored,
         }
     }

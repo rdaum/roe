@@ -223,6 +223,9 @@ pub struct Editor {
     pub mouse_drag_state: Option<MouseDragState>,
     /// Messages buffer for collecting echo messages and logs
     pub messages_buffer_id: Option<BufferId>,
+    /// Julia runtime for scripting and configuration
+    pub julia_runtime:
+        Option<std::sync::Arc<tokio::sync::Mutex<crate::julia_runtime::RoeJuliaRuntime>>>,
 }
 
 /// The main event loop, which receives keystrokes and dispatches them to the mode in the buffer
@@ -263,6 +266,12 @@ pub enum ChromeAction {
     DeleteOtherWindows,
     /// Show messages buffer
     ShowMessages,
+    /// Create a new buffer with a specific mode
+    NewBufferWithMode {
+        buffer_name: String,
+        mode_name: String,
+        initial_content: String,
+    },
 }
 
 impl Editor {
@@ -416,8 +425,12 @@ impl Editor {
                 .expect("Mode should exist in SlotMap"),
         )];
 
-        let (buffer_client, _buffer_handle) =
-            crate::buffer_host::create_buffer_host(command_buffer, mode_list, command_buffer_id);
+        let (buffer_client, _buffer_handle) = crate::buffer_host::create_buffer_host(
+            command_buffer,
+            mode_list,
+            command_buffer_id,
+            self.julia_runtime.clone(),
+        );
 
         // Insert the BufferHost using the buffer ID as the key for easy lookup/cleanup
         self.buffer_hosts.insert(command_buffer_id, buffer_client);
@@ -556,6 +569,7 @@ impl Editor {
                 messages_buffer,
                 mode_list,
                 messages_buffer_id,
+                self.julia_runtime.clone(),
             );
             self.buffer_hosts.insert(messages_buffer_id, buffer_client);
 
@@ -581,6 +595,47 @@ impl Editor {
             let buffer_len = buffer.buffer_len_chars();
             buffer.insert_pos(formatted_message, buffer_len);
         }
+    }
+
+    /// Create a new buffer with the specified mode
+    pub fn create_buffer_with_mode(
+        &mut self,
+        buffer_name: String,
+        mode_name: String,
+        initial_content: String,
+    ) -> Option<BufferId> {
+        // Create the appropriate mode based on mode_name
+        let mode_box: Box<dyn Mode> = match mode_name.as_str() {
+            "julia-repl" => Box::new(crate::mode::JuliaReplMode::new()),
+            "scratch" => Box::new(crate::mode::ScratchMode {}),
+            "messages" => Box::new(crate::mode::MessagesMode {}),
+            _ => return None, // Unknown mode
+        };
+
+        let mode_id = self.modes.insert(mode_box);
+
+        let buffer = Buffer::new(&[mode_id]);
+        buffer.set_object(buffer_name);
+        buffer.load_str(&initial_content);
+        let buffer_id = self.buffers.insert(buffer.clone());
+
+        // Create BufferHost for the new buffer
+        let mode_list = vec![(
+            mode_id,
+            mode_name,
+            self.modes
+                .remove(mode_id)
+                .expect("Mode should exist in SlotMap"),
+        )];
+        let (buffer_client, _buffer_handle) = crate::buffer_host::create_buffer_host(
+            buffer,
+            mode_list,
+            buffer_id,
+            self.julia_runtime.clone(),
+        );
+        self.buffer_hosts.insert(buffer_id, buffer_client);
+
+        Some(buffer_id)
     }
 
     /// Set the echo area message (this will override any chord display)
@@ -1539,6 +1594,7 @@ impl Editor {
                                             scratch_buffer,
                                             mode_list,
                                             scratch_buffer_id,
+                                            self.julia_runtime.clone(),
                                         );
                                     self.buffer_hosts.insert(scratch_buffer_id, buffer_client);
 
@@ -2156,8 +2212,12 @@ impl Editor {
         let mode_list = vec![(file_mode_id, "file".to_string(), file_mode)];
 
         // Create BufferHost and client
-        let (buffer_client, _buffer_handle) =
-            crate::buffer_host::create_buffer_host(buffer, mode_list, buffer_id);
+        let (buffer_client, _buffer_handle) = crate::buffer_host::create_buffer_host(
+            buffer,
+            mode_list,
+            buffer_id,
+            self.julia_runtime.clone(),
+        );
         self.buffer_hosts.insert(buffer_id, buffer_client);
 
         // Switch the window to the new buffer
@@ -2357,6 +2417,7 @@ mod tests {
             current_key_chord: vec![],
             mouse_drag_state: None,
             messages_buffer_id: None,
+            julia_runtime: None,
         }
     }
 

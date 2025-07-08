@@ -47,10 +47,116 @@ pub const _BORDER_T_UP: &str = "┴";
 pub const BORDER_T_RIGHT: &str = "├";
 pub const BORDER_T_LEFT: &str = "┤";
 
+/// Parse a hex color string (e.g., "#272822") to crossterm Color
+fn parse_hex_color(hex: &str) -> Color {
+    if hex.starts_with('#') && hex.len() == 7 {
+        if let Ok(r) = u8::from_str_radix(&hex[1..3], 16) {
+            if let Ok(g) = u8::from_str_radix(&hex[3..5], 16) {
+                if let Ok(b) = u8::from_str_radix(&hex[5..7], 16) {
+                    return Color::Rgb { r, g, b };
+                }
+            }
+        }
+    }
+    Color::White // fallback
+}
+
+/// Cached theme colors loaded from Julia at startup
+#[derive(Clone)]
+pub struct CachedTheme {
+    pub bg_color: Color,
+    pub fg_color: Color,
+    pub selection_color: Color,
+    pub mode_line_bg_color: Color,
+    pub inactive_mode_line_bg_color: Color,
+    pub rune_color: Color,
+    pub border_color: Color,
+    pub active_border_color: Color,
+}
+
+impl Default for CachedTheme {
+    fn default() -> Self {
+        Self {
+            bg_color: BG_COLOR,
+            fg_color: FG_COLOR,
+            selection_color: Color::Yellow,
+            mode_line_bg_color: MODE_LINE_BG_COLOR,
+            inactive_mode_line_bg_color: INACTIVE_MODE_LINE_BG_COLOR,
+            rune_color: RUNE_COLOR,
+            border_color: BORDER_COLOR,
+            active_border_color: ACTIVE_BORDER_COLOR,
+        }
+    }
+}
+
+/// Load theme colors from Julia runtime at startup
+pub async fn load_julia_theme(editor: &Editor) -> CachedTheme {
+    let mut theme = CachedTheme::default();
+    let mut loaded_colors = Vec::new();
+
+    if let Some(ref julia_runtime) = editor.julia_runtime {
+        // Load colours/colors from Julia config (supporting both Canadian and American spelling)
+
+        // Try "colours" first (Canadian), then "colors" (American)
+        let bg_result = {
+            let runtime = julia_runtime.lock().await;
+            match runtime.get_config("colours.background").await {
+                Ok(Some(value)) => Ok(Some(value)),
+                _ => runtime.get_config("colors.background").await,
+            }
+        };
+        if let Ok(Some(bg)) = bg_result {
+            if let Some(color_str) = bg.as_string() {
+                loaded_colors.push(format!("bg:{color_str}"));
+                let parsed_color = parse_hex_color(&color_str);
+                theme.bg_color = parsed_color;
+            }
+        }
+
+        let fg_result = {
+            let runtime = julia_runtime.lock().await;
+            match runtime.get_config("colours.foreground").await {
+                Ok(Some(value)) => Ok(Some(value)),
+                _ => runtime.get_config("colors.foreground").await,
+            }
+        };
+        if let Ok(Some(fg)) = fg_result {
+            if let Some(color_str) = fg.as_string() {
+                loaded_colors.push(format!("fg:{color_str}"));
+                let parsed_color = parse_hex_color(&color_str);
+                theme.fg_color = parsed_color;
+            }
+        }
+
+        let sel_result = {
+            let runtime = julia_runtime.lock().await;
+            match runtime.get_config("colours.selection").await {
+                Ok(Some(value)) => Ok(Some(value)),
+                _ => runtime.get_config("colors.selection").await,
+            }
+        };
+        if let Ok(Some(sel)) = sel_result {
+            if let Some(color_str) = sel.as_string() {
+                loaded_colors.push(format!("sel:{color_str}"));
+                let parsed_color = parse_hex_color(&color_str);
+                theme.selection_color = parsed_color;
+            }
+        }
+
+        // Note: loaded_colors is used for tracking what was loaded
+        let _ = loaded_colors;
+    }
+
+    // Return the configured theme
+
+    theme
+}
+
 /// Terminal-specific renderer using crossterm
 pub struct TerminalRenderer<W: Write> {
     device: W,
     dirty_tracker: DirtyTracker,
+    theme: CachedTheme,
 }
 
 impl<W: Write> TerminalRenderer<W> {
@@ -58,6 +164,15 @@ impl<W: Write> TerminalRenderer<W> {
         Self {
             device,
             dirty_tracker: DirtyTracker::new(),
+            theme: CachedTheme::default(),
+        }
+    }
+
+    pub fn new_with_theme(device: W, theme: CachedTheme) -> Self {
+        Self {
+            device,
+            dirty_tracker: DirtyTracker::new(),
+            theme,
         }
     }
 
@@ -86,10 +201,11 @@ impl<W: Write> TerminalRenderer<W> {
             let content_x = window.x + 1;
             let content_width = window.width_chars.saturating_sub(2);
             let spaces = " ".repeat(content_width as usize);
+
             queue!(
                 &mut self.device,
                 cursor::MoveTo(content_x, screen_row),
-                Print(spaces.with(FG_COLOR).on(BG_COLOR))
+                Print(spaces.with(self.theme.fg_color).on(self.theme.bg_color))
             )?;
             return Ok(());
         }
@@ -104,9 +220,14 @@ impl<W: Write> TerminalRenderer<W> {
 
         queue!(&mut self.device, cursor::MoveTo(content_x, screen_row))?;
         let clear_spaces = " ".repeat(content_width as usize);
+
         queue!(
             &mut self.device,
-            Print(clear_spaces.with(FG_COLOR).on(BG_COLOR))
+            Print(
+                clear_spaces
+                    .with(self.theme.fg_color)
+                    .on(self.theme.bg_color)
+            )
         )?;
 
         queue!(&mut self.device, cursor::MoveTo(content_x, screen_row))?;
@@ -121,7 +242,11 @@ impl<W: Write> TerminalRenderer<W> {
                 let text_to_render: String = chars_to_render.iter().collect();
                 queue!(
                     &mut self.device,
-                    Print(text_to_render.on(Color::Yellow).with(Color::Black))
+                    Print(
+                        text_to_render
+                            .on(self.theme.selection_color)
+                            .with(Color::Black)
+                    )
                 )?;
 
                 // Fill the remaining width with highlighted spaces for full-line highlighting
@@ -130,7 +255,11 @@ impl<W: Write> TerminalRenderer<W> {
                     let highlighted_spaces = " ".repeat(remaining_width);
                     queue!(
                         &mut self.device,
-                        Print(highlighted_spaces.on(Color::Yellow).with(Color::Black))
+                        Print(
+                            highlighted_spaces
+                                .on(self.theme.selection_color)
+                                .with(Color::Black)
+                        )
                     )?;
                 }
             } else {
@@ -149,7 +278,11 @@ impl<W: Write> TerminalRenderer<W> {
                         // Normal character
                         queue!(
                             &mut self.device,
-                            Print(ch.to_string().with(FG_COLOR).on(BG_COLOR))
+                            Print(
+                                ch.to_string()
+                                    .with(self.theme.fg_color)
+                                    .on(self.theme.bg_color)
+                            )
                         )?;
                     }
                 }
@@ -173,7 +306,11 @@ impl<W: Write> TerminalRenderer<W> {
             let text_to_render: String = chars_to_render.iter().collect();
             queue!(
                 &mut self.device,
-                Print(text_to_render.with(FG_COLOR).on(BG_COLOR))
+                Print(
+                    text_to_render
+                        .with(self.theme.fg_color)
+                        .on(self.theme.bg_color)
+                )
             )?;
         }
 
@@ -204,14 +341,14 @@ impl<W: Write> TerminalRenderer<W> {
 
         // Choose appropriate background color
         let bg_color = if is_active {
-            MODE_LINE_BG_COLOR
+            self.theme.mode_line_bg_color
         } else {
-            INACTIVE_MODE_LINE_BG_COLOR
+            self.theme.inactive_mode_line_bg_color
         };
 
         // If All components are dirty, just redraw the entire modeline
         if dirty_components.contains(&ModelineComponent::All) {
-            return draw_window_modeline(&mut self.device, editor, window_id);
+            return draw_window_modeline(&mut self.device, editor, window_id, &self.theme);
         }
 
         // Handle specific component updates
@@ -235,23 +372,23 @@ impl<W: Write> TerminalRenderer<W> {
                     queue!(
                         &mut self.device,
                         cursor::MoveTo(modeline_x + clear_start as u16, modeline_y),
-                        Print(clear_spaces.on(bg_color).with(FG_COLOR))
+                        Print(clear_spaces.on(bg_color).with(self.theme.fg_color))
                     )?;
 
                     // Then write the new position
                     queue!(
                         &mut self.device,
                         cursor::MoveTo(modeline_x + position_start as u16, modeline_y),
-                        Print(position_text.on(bg_color).with(FG_COLOR))
+                        Print(position_text.on(bg_color).with(self.theme.fg_color))
                     )?;
                 }
                 ModelineComponent::BufferName => {
                     // For now, redraw entire modeline since buffer name affects layout
-                    return draw_window_modeline(&mut self.device, editor, window_id);
+                    return draw_window_modeline(&mut self.device, editor, window_id, &self.theme);
                 }
                 ModelineComponent::ModeName => {
                     // For now, redraw entire modeline since mode name affects layout
-                    return draw_window_modeline(&mut self.device, editor, window_id);
+                    return draw_window_modeline(&mut self.device, editor, window_id, &self.theme);
                 }
                 ModelineComponent::All => {
                     // Already handled above
@@ -394,11 +531,11 @@ impl<W: Write> Renderer for TerminalRenderer<W> {
         // Draw all windows
         for window_id in editor.windows.keys() {
             let window = &editor.windows[window_id];
-            draw_window(&mut self.device, editor, window)?;
+            draw_window(&mut self.device, editor, window, &self.theme)?;
         }
 
         // Draw all borders and modelines
-        draw_all_window_borders(&mut self.device, editor)?;
+        draw_all_window_borders(&mut self.device, editor, &self.theme)?;
 
         // Draw command windows
         for window_id in editor.windows.keys() {
@@ -407,7 +544,7 @@ impl<W: Write> Renderer for TerminalRenderer<W> {
                 window.window_type,
                 roe_core::editor::WindowType::Command { .. }
             ) {
-                draw_command_window(&mut self.device, editor, window_id)?;
+                draw_command_window(&mut self.device, editor, window_id, &self.theme)?;
             }
         }
 
@@ -428,7 +565,11 @@ impl<W: Write> Renderer for TerminalRenderer<W> {
             queue!(
                 &mut self.device,
                 cursor::MoveTo(x, y),
-                Print(truncated_message.with(FG_COLOR).on(BG_COLOR))
+                Print(
+                    truncated_message
+                        .with(self.theme.fg_color)
+                        .on(self.theme.bg_color)
+                )
             )?;
         }
 
@@ -464,6 +605,7 @@ pub fn echo_area_position(frame: &Frame) -> (u16, u16) {
 pub fn draw_all_window_borders(
     device: &mut impl Write,
     editor: &Editor,
+    theme: &CachedTheme,
 ) -> Result<(), std::io::Error> {
     // Create a grid to track what's already drawn to avoid conflicts
     let mut border_grid = vec![
@@ -525,7 +667,7 @@ pub fn draw_all_window_borders(
 
     // Second pass: actually draw the borders
     for window_id in editor.windows.keys() {
-        draw_single_window_border(device, editor, window_id, &border_grid)?;
+        draw_single_window_border(device, editor, window_id, &border_grid, theme)?;
     }
 
     Ok(())
@@ -537,13 +679,14 @@ fn draw_single_window_border(
     editor: &Editor,
     window_id: WindowId,
     _border_grid: &[Vec<char>],
+    theme: &CachedTheme,
 ) -> Result<(), std::io::Error> {
     let window = &editor.windows[window_id];
     let is_active = window_id == editor.active_window;
     let border_color = if is_active {
-        ACTIVE_BORDER_COLOR
+        theme.active_border_color
     } else {
-        BORDER_COLOR
+        theme.border_color
     };
 
     // Only draw borders if the window has space for them
@@ -604,7 +747,7 @@ fn draw_single_window_border(
     }
 
     // Draw the actual modeline content
-    draw_window_modeline(device, editor, window_id)?;
+    draw_window_modeline(device, editor, window_id, theme)?;
 
     Ok(())
 }
@@ -614,6 +757,7 @@ fn draw_window_modeline(
     device: &mut impl Write,
     editor: &Editor,
     window_id: WindowId,
+    theme: &CachedTheme,
 ) -> Result<(), std::io::Error> {
     let window = &editor.windows[window_id];
     let buffer = &editor.buffers[window.active_buffer];
@@ -630,9 +774,9 @@ fn draw_window_modeline(
 
     // Choose appropriate background color
     let bg_color = if is_active {
-        MODE_LINE_BG_COLOR
+        theme.mode_line_bg_color
     } else {
-        INACTIVE_MODE_LINE_BG_COLOR
+        theme.inactive_mode_line_bg_color
     };
 
     // Move to modeline position
@@ -687,13 +831,22 @@ fn draw_window_modeline(
 
     // Draw rune section with distinct color for active windows
     if is_active {
-        queue!(device, Print(rune_section.on(bg_color).with(RUNE_COLOR)))?;
+        queue!(
+            device,
+            Print(rune_section.on(bg_color).with(theme.rune_color))
+        )?;
     } else {
-        queue!(device, Print(rune_section.on(bg_color).with(FG_COLOR)))?;
+        queue!(
+            device,
+            Print(rune_section.on(bg_color).with(theme.fg_color))
+        )?;
     }
 
     // Draw the rest of the modeline content
-    queue!(device, Print(rest_content.on(bg_color).with(FG_COLOR)))?;
+    queue!(
+        device,
+        Print(rest_content.on(bg_color).with(theme.fg_color))
+    )?;
 
     Ok(())
 }
@@ -703,6 +856,7 @@ pub fn draw_window(
     device: &mut impl Write,
     editor: &Editor,
     window: &Window,
+    theme: &CachedTheme,
 ) -> Result<(), std::io::Error> {
     // Draw the buffer in the window
     let buffer = &editor.buffers[window.active_buffer];
@@ -719,7 +873,7 @@ pub fn draw_window(
         queue!(
             device,
             cursor::MoveTo(content_x, content_y + row),
-            Print(spaces.with(FG_COLOR).on(BG_COLOR))
+            Print(spaces.with(theme.fg_color).on(theme.bg_color))
         )?;
     }
 
@@ -791,7 +945,10 @@ pub fn draw_window(
                         )?;
                     } else {
                         // Normal character
-                        queue!(device, Print(ch.to_string().with(FG_COLOR).on(BG_COLOR)))?;
+                        queue!(
+                            device,
+                            Print(ch.to_string().with(theme.fg_color).on(theme.bg_color))
+                        )?;
                     }
                 }
 
@@ -811,7 +968,10 @@ pub fn draw_window(
             }
         } else {
             // No region selected, draw normally
-            queue!(device, Print(truncated_line.with(FG_COLOR).on(BG_COLOR)))?;
+            queue!(
+                device,
+                Print(truncated_line.with(theme.fg_color).on(theme.bg_color))
+            )?;
         }
     }
 
@@ -873,6 +1033,7 @@ pub fn echo(
     device: &mut impl Write,
     editor: &mut Editor,
     message: &str,
+    theme: &CachedTheme,
 ) -> Result<(), std::io::Error> {
     let (x, y) = echo_area_position(&editor.frame);
 
@@ -889,7 +1050,7 @@ pub fn echo(
     queue!(
         device,
         cursor::MoveTo(x, y),
-        Print(truncated_message.with(FG_COLOR).on(BG_COLOR))
+        Print(truncated_message.with(theme.fg_color).on(theme.bg_color))
     )?;
     // Restore the cursor position
     queue!(device, cursor::MoveTo(cursor_pos.0, cursor_pos.1))?;
@@ -983,7 +1144,7 @@ pub async fn event_loop_with_renderer<W: Write>(
                 ChromeAction::Echo(message) => {
                     // Set the echo message in the editor and render it
                     editor.set_echo_message(message.clone());
-                    echo(&mut renderer.device, editor, &message)?;
+                    echo(&mut renderer.device, editor, &message, &renderer.theme)?;
                 }
 
                 ChromeAction::OpenFile(_) => {}
@@ -1030,6 +1191,24 @@ pub async fn event_loop_with_renderer<W: Write>(
                     }
                     renderer.mark_dirty(DirtyRegion::FullScreen);
                 }
+                ChromeAction::NewBufferWithMode {
+                    buffer_name,
+                    mode_name,
+                    initial_content,
+                } => {
+                    // Create a new buffer with the specified mode
+                    let cursor_pos = initial_content.len();
+                    if let Some(buffer_id) =
+                        editor.create_buffer_with_mode(buffer_name, mode_name, initial_content)
+                    {
+                        // Switch current window to the new buffer
+                        if let Some(current_window) = editor.windows.get_mut(editor.active_window) {
+                            current_window.active_buffer = buffer_id;
+                            current_window.cursor = cursor_pos; // Position cursor at end of initial content
+                        }
+                        renderer.mark_dirty(DirtyRegion::FullScreen);
+                    }
+                }
             }
         }
 
@@ -1044,12 +1223,13 @@ fn draw_command_window(
     device: &mut impl Write,
     editor: &Editor,
     window_id: WindowId,
+    theme: &CachedTheme,
 ) -> Result<(), std::io::Error> {
     let window = &editor.windows[window_id];
 
     // Just draw the command window like a normal window with dark blue background
     // The buffer content will handle showing the completions and highlighting
-    draw_window(device, editor, window)?;
+    draw_window(device, editor, window, theme)?;
 
     Ok(())
 }
