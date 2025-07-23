@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "roe",
+    "rol",
     "roe-core",
     "roe-terminal",
 ]
@@ -12,4 +13,3 @@ futures = "0.3"
 ropey = "1.6"
 slotmap = "1.0"
 tokio = { version = "1.0", features = ["full"] }
-jlrs = { version = "0.21" , features = ["julia-1-11", "tokio-rt"]}

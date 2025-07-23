@@ -1,0 +1,17 @@
+[package]
+name = "rol"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+boxcar = "0.2"
+papaya = "0.2"
+ahash = "0.8"
+once_cell = "1.21"
+im = "15.1.0"
+
+# Cranelift JIT dependencies
+cranelift = "0.108"
+cranelift-jit = "0.108"
+cranelift-module = "0.108"
+cranelift-native = "0.108"

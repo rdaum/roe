@@ -223,9 +223,6 @@ pub struct Editor {
     pub mouse_drag_state: Option<MouseDragState>,
     /// Messages buffer for collecting echo messages and logs
     pub messages_buffer_id: Option<BufferId>,
-    /// Julia runtime for scripting and configuration
-    pub julia_runtime:
-        Option<std::sync::Arc<tokio::sync::Mutex<crate::julia_runtime::RoeJuliaRuntime>>>,
 }
 
 /// The main event loop, which receives keystrokes and dispatches them to the mode in the buffer
@@ -429,7 +426,6 @@ impl Editor {
             command_buffer,
             mode_list,
             command_buffer_id,
-            self.julia_runtime.clone(),
         );
 
         // Insert the BufferHost using the buffer ID as the key for easy lookup/cleanup
@@ -569,7 +565,6 @@ impl Editor {
                 messages_buffer,
                 mode_list,
                 messages_buffer_id,
-                self.julia_runtime.clone(),
             );
             self.buffer_hosts.insert(messages_buffer_id, buffer_client);
 
@@ -631,7 +626,6 @@ impl Editor {
             buffer,
             mode_list,
             buffer_id,
-            self.julia_runtime.clone(),
         );
         self.buffer_hosts.insert(buffer_id, buffer_client);
 
@@ -1594,7 +1588,6 @@ impl Editor {
                                             scratch_buffer,
                                             mode_list,
                                             scratch_buffer_id,
-                                            self.julia_runtime.clone(),
                                         );
                                     self.buffer_hosts.insert(scratch_buffer_id, buffer_client);
 
@@ -2216,7 +2209,6 @@ impl Editor {
             buffer,
             mode_list,
             buffer_id,
-            self.julia_runtime.clone(),
         );
         self.buffer_hosts.insert(buffer_id, buffer_client);
 
@@ -2417,7 +2409,6 @@ mod tests {
             current_key_chord: vec![],
             mouse_drag_state: None,
             messages_buffer_id: None,
-            julia_runtime: None,
         }
     }
 

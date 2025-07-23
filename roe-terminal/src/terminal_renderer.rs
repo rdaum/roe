@@ -47,20 +47,6 @@ pub const _BORDER_T_UP: &str = "┴";
 pub const BORDER_T_RIGHT: &str = "├";
 pub const BORDER_T_LEFT: &str = "┤";
 
-/// Parse a hex color string (e.g., "#272822") to crossterm Color
-fn parse_hex_color(hex: &str) -> Color {
-    if hex.starts_with('#') && hex.len() == 7 {
-        if let Ok(r) = u8::from_str_radix(&hex[1..3], 16) {
-            if let Ok(g) = u8::from_str_radix(&hex[3..5], 16) {
-                if let Ok(b) = u8::from_str_radix(&hex[5..7], 16) {
-                    return Color::Rgb { r, g, b };
-                }
-            }
-        }
-    }
-    Color::White // fallback
-}
-
 /// Cached theme colors loaded from Julia at startup
 #[derive(Clone)]
 pub struct CachedTheme {
@@ -89,68 +75,6 @@ impl Default for CachedTheme {
     }
 }
 
-/// Load theme colors from Julia runtime at startup
-pub async fn load_julia_theme(editor: &Editor) -> CachedTheme {
-    let mut theme = CachedTheme::default();
-    let mut loaded_colors = Vec::new();
-
-    if let Some(ref julia_runtime) = editor.julia_runtime {
-        // Load colours/colors from Julia config (supporting both Canadian and American spelling)
-
-        // Try "colours" first (Canadian), then "colors" (American)
-        let bg_result = {
-            let runtime = julia_runtime.lock().await;
-            match runtime.get_config("colours.background").await {
-                Ok(Some(value)) => Ok(Some(value)),
-                _ => runtime.get_config("colors.background").await,
-            }
-        };
-        if let Ok(Some(bg)) = bg_result {
-            if let Some(color_str) = bg.as_string() {
-                loaded_colors.push(format!("bg:{color_str}"));
-                let parsed_color = parse_hex_color(&color_str);
-                theme.bg_color = parsed_color;
-            }
-        }
-
-        let fg_result = {
-            let runtime = julia_runtime.lock().await;
-            match runtime.get_config("colours.foreground").await {
-                Ok(Some(value)) => Ok(Some(value)),
-                _ => runtime.get_config("colors.foreground").await,
-            }
-        };
-        if let Ok(Some(fg)) = fg_result {
-            if let Some(color_str) = fg.as_string() {
-                loaded_colors.push(format!("fg:{color_str}"));
-                let parsed_color = parse_hex_color(&color_str);
-                theme.fg_color = parsed_color;
-            }
-        }
-
-        let sel_result = {
-            let runtime = julia_runtime.lock().await;
-            match runtime.get_config("colours.selection").await {
-                Ok(Some(value)) => Ok(Some(value)),
-                _ => runtime.get_config("colors.selection").await,
-            }
-        };
-        if let Ok(Some(sel)) = sel_result {
-            if let Some(color_str) = sel.as_string() {
-                loaded_colors.push(format!("sel:{color_str}"));
-                let parsed_color = parse_hex_color(&color_str);
-                theme.selection_color = parsed_color;
-            }
-        }
-
-        // Note: loaded_colors is used for tracking what was loaded
-        let _ = loaded_colors;
-    }
-
-    // Return the configured theme
-
-    theme
-}
 
 /// Terminal-specific renderer using crossterm
 pub struct TerminalRenderer<W: Write> {

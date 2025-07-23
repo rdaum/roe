@@ -136,9 +136,6 @@ async fn terminal_main<W: Write>(stdout: W, config: EditorConfig) -> Result<(), 
 
     let tsize = crossterm::terminal::size()?;
 
-    // Initialize Julia runtime with Arc for sharing
-    let julia_runtime = roe_core::julia_runtime::create_shared_runtime().ok();
-
     let mut buffers: SlotMap<BufferId, Buffer> = SlotMap::default();
     let mut buffer_hosts: HashMap<BufferId, buffer_host::BufferHostClient> = HashMap::new();
     let mut modes: SlotMap<ModeId, Box<dyn Mode>> = SlotMap::default();
@@ -164,7 +161,7 @@ async fn terminal_main<W: Write>(stdout: W, config: EditorConfig) -> Result<(), 
         let mode_list = vec![(welcome_mode_id, "welcome".to_string(), welcome_mode)];
 
         let (buffer_client, _buffer_handle) =
-            buffer_host::create_buffer_host(buffer, mode_list, buffer_id, julia_runtime.clone());
+            buffer_host::create_buffer_host(buffer, mode_list, buffer_id);
         buffer_hosts.insert(buffer_id, buffer_client);
     } else {
         // Create buffers for all specified files
@@ -204,7 +201,6 @@ async fn terminal_main<W: Write>(stdout: W, config: EditorConfig) -> Result<(), 
                 buffer,
                 mode_list,
                 buffer_id,
-                julia_runtime.clone(),
             );
             buffer_hosts.insert(buffer_id, buffer_client);
         }
@@ -293,31 +289,13 @@ async fn terminal_main<W: Write>(stdout: W, config: EditorConfig) -> Result<(), 
         current_key_chord: Vec::new(),
         mouse_drag_state: None,
         messages_buffer_id: None,
-        julia_runtime,
     };
 
     // Initialize buffer history with the current buffer
     let initial_buffer_id = editor.windows[active_window_id].active_buffer;
     editor.record_buffer_access(initial_buffer_id);
 
-    // Try to load Julia configuration
-    if let Some(ref julia_runtime) = editor.julia_runtime {
-        let config_path = if let Some(init_file) = &config.init_file {
-            std::path::PathBuf::from(init_file)
-        } else {
-            roe_core::julia_runtime::RoeJuliaRuntime::default_config_path()
-        };
-
-        let mut runtime = julia_runtime.lock().await;
-        let _ = runtime.load_config(Some(config_path)).await;
-    }
-
-    // Load Julia theme and create terminal renderer with it
-    let julia_theme = if editor.julia_runtime.is_some() {
-        roe_terminal::terminal_renderer::load_julia_theme(&editor).await
-    } else {
-        roe_terminal::terminal_renderer::CachedTheme::default()
-    };
+    let julia_theme = roe_terminal::terminal_renderer::CachedTheme::default();
 
     let mut renderer = TerminalRenderer::new_with_theme(stdout, julia_theme);
 

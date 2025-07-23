@@ -10,4 +10,3 @@ futures = { workspace = true }
 ropey = { workspace = true }
 slotmap = { workspace = true }
 tokio = { workspace = true }
-jlrs = { workspace = true }
