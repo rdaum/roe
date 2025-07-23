@@ -3,6 +3,7 @@
 
 use crate::var::{Var, BOOLEAN_FALSE, BOOLEAN_TRUE, HIGH16_TAG, MIN_NUMBER, DOUBLE_ENCODE_OFFSET, NULL, SYMBOL_TAG, LIST_POINTER_TAG, STRING_POINTER_TAG, POINTER_TAG_MASK, MIN_POINTER};
 use cranelift::prelude::*;
+use cranelift::prelude::isa::CallConv;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
 
@@ -267,6 +268,34 @@ impl VarBuilder {
         self.make_double(builder, sum)
     }
     
+    pub fn emit_int_sub(&self, builder: &mut FunctionBuilder, lhs: Value, rhs: Value) -> Value {
+        let a = self.extract_int(builder, lhs);
+        let b = self.extract_int(builder, rhs);
+        let diff = builder.ins().isub(a, b);
+        self.make_int(builder, diff)
+    }
+    
+    pub fn emit_double_sub(&self, builder: &mut FunctionBuilder, lhs: Value, rhs: Value) -> Value {
+        let a = self.extract_double(builder, lhs);
+        let b = self.extract_double(builder, rhs);
+        let diff = builder.ins().fsub(a, b);
+        self.make_double(builder, diff)
+    }
+    
+    pub fn emit_int_lt(&self, builder: &mut FunctionBuilder, lhs: Value, rhs: Value) -> Value {
+        let a = self.extract_int(builder, lhs);
+        let b = self.extract_int(builder, rhs);
+        let lt = builder.ins().icmp(IntCC::SignedLessThan, a, b);
+        self.make_bool(builder, lt)
+    }
+    
+    pub fn emit_double_lt(&self, builder: &mut FunctionBuilder, lhs: Value, rhs: Value) -> Value {
+        let a = self.extract_double(builder, lhs);
+        let b = self.extract_double(builder, rhs);
+        let lt = builder.ins().fcmp(FloatCC::LessThan, a, b);
+        self.make_bool(builder, lt)
+    }
+    
     /// Emit arithmetic addition with proper type coercion
     /// int + int = int, otherwise coerce to double
     pub fn emit_arithmetic_add(&self, builder: &mut FunctionBuilder, lhs: Value, rhs: Value) -> Value {
@@ -298,6 +327,86 @@ impl VarBuilder {
         let lhs_float = self.coerce_to_double(builder, lhs);
         let rhs_float = self.coerce_to_double(builder, rhs);
         let float_result = self.emit_double_add(builder, lhs_float, rhs_float);
+        builder.ins().jump(merge_block, &[float_result]);
+        
+        // Merge point
+        builder.switch_to_block(merge_block);
+        builder.seal_block(merge_block);
+        
+        builder.block_params(merge_block)[0]
+    }
+    
+    /// Emit arithmetic subtraction with proper type coercion
+    /// int - int = int, otherwise coerce to double
+    pub fn emit_arithmetic_sub(&self, builder: &mut FunctionBuilder, lhs: Value, rhs: Value) -> Value {
+        // Check if both operands are integers
+        let lhs_is_int = self.is_int(builder, lhs);
+        let rhs_is_int = self.is_int(builder, rhs);
+        let both_ints = builder.ins().band(lhs_is_int, rhs_is_int);
+        
+        // Create blocks for int and float paths
+        let int_block = builder.create_block();
+        let float_block = builder.create_block();
+        let merge_block = builder.create_block();
+        
+        // Add block parameter for the result
+        builder.append_block_param(merge_block, types::I64);
+        
+        // Branch based on types
+        builder.ins().brif(both_ints, int_block, &[], float_block, &[]);
+        
+        // Integer path: both are ints, use int arithmetic
+        builder.switch_to_block(int_block);
+        builder.seal_block(int_block);
+        let int_result = self.emit_int_sub(builder, lhs, rhs);
+        builder.ins().jump(merge_block, &[int_result]);
+        
+        // Float path: at least one is float, coerce both and use float arithmetic
+        builder.switch_to_block(float_block);
+        builder.seal_block(float_block);
+        let lhs_float = self.coerce_to_double(builder, lhs);
+        let rhs_float = self.coerce_to_double(builder, rhs);
+        let float_result = self.emit_double_sub(builder, lhs_float, rhs_float);
+        builder.ins().jump(merge_block, &[float_result]);
+        
+        // Merge point
+        builder.switch_to_block(merge_block);
+        builder.seal_block(merge_block);
+        
+        builder.block_params(merge_block)[0]
+    }
+    
+    /// Emit arithmetic less-than comparison with proper type coercion
+    /// Always returns a boolean
+    pub fn emit_arithmetic_lt(&self, builder: &mut FunctionBuilder, lhs: Value, rhs: Value) -> Value {
+        // Check if both operands are integers
+        let lhs_is_int = self.is_int(builder, lhs);
+        let rhs_is_int = self.is_int(builder, rhs);
+        let both_ints = builder.ins().band(lhs_is_int, rhs_is_int);
+        
+        // Create blocks for int and float paths
+        let int_block = builder.create_block();
+        let float_block = builder.create_block();
+        let merge_block = builder.create_block();
+        
+        // Add block parameter for the result
+        builder.append_block_param(merge_block, types::I64);
+        
+        // Branch based on types
+        builder.ins().brif(both_ints, int_block, &[], float_block, &[]);
+        
+        // Integer path: both are ints, use int comparison
+        builder.switch_to_block(int_block);
+        builder.seal_block(int_block);
+        let int_result = self.emit_int_lt(builder, lhs, rhs);
+        builder.ins().jump(merge_block, &[int_result]);
+        
+        // Float path: at least one is float, coerce both and use float comparison
+        builder.switch_to_block(float_block);
+        builder.seal_block(float_block);
+        let lhs_float = self.coerce_to_double(builder, lhs);
+        let rhs_float = self.coerce_to_double(builder, rhs);
+        let float_result = self.emit_double_lt(builder, lhs_float, rhs_float);
         builder.ins().jump(merge_block, &[float_result]);
         
         // Merge point
@@ -377,6 +486,65 @@ impl VarBuilder {
         let b = self.extract_double(builder, rhs);
         let eq = builder.ins().fcmp(FloatCC::Equal, a, b);
         self.make_bool(builder, eq)
+    }
+    
+    /// Check if a Var is a closure
+    pub fn is_closure(&self, builder: &mut FunctionBuilder, var: Value) -> Value {
+        // Check if the tag matches CLOSURE_POINTER_TAG
+        let tag_mask = builder.ins().iconst(types::I64, crate::var::POINTER_TAG_MASK as i64);
+        let closure_tag = builder.ins().iconst(types::I64, crate::var::CLOSURE_POINTER_TAG as i64);
+        let min_pointer = builder.ins().iconst(types::I64, crate::var::MIN_POINTER as i64);
+        
+        // Check if low 2 bits are 00 (pointer)
+        let low_bits_mask = builder.ins().iconst(types::I64, 0x03);
+        let low_bits = builder.ins().band(var, low_bits_mask);
+        let zero = builder.ins().iconst(types::I64, 0);
+        let is_pointer = builder.ins().icmp(IntCC::Equal, low_bits, zero);
+        
+        // Check if >= MIN_POINTER
+        let is_valid_ptr = builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, var, min_pointer);
+        
+        // Check if tag matches closure tag
+        let var_tag = builder.ins().band(var, tag_mask);
+        let is_closure_tag = builder.ins().icmp(IntCC::Equal, var_tag, closure_tag);
+        
+        // All conditions must be true
+        let ptr_and_valid = builder.ins().band(is_pointer, is_valid_ptr);
+        builder.ins().band(ptr_and_valid, is_closure_tag)
+    }
+    
+    /// Extract closure pointer from a Var (assumes it's been checked to be a closure)
+    pub fn extract_closure_ptr(&self, builder: &mut FunctionBuilder, var: Value) -> Value {
+        // Remove the closure tag to get the raw pointer
+        let tag_mask = builder.ins().iconst(types::I64, crate::var::POINTER_TAG_MASK as i64);
+        let inverted_mask = builder.ins().bnot(tag_mask);
+        builder.ins().band(var, inverted_mask)
+    }
+    
+    /// Call a closure with the given arguments
+    pub fn call_closure(&self, builder: &mut FunctionBuilder, closure_ptr: Value, args_ptr: Value, arg_count: u32) -> Value {
+        // Load the function pointer from the closure struct
+        // LispClosure layout: [func_ptr: *const u8][arity: u32][captured_env: u64]
+        let func_ptr = builder.ins().load(types::I64, MemFlags::trusted(), closure_ptr, 0);
+        
+        // Load the captured environment from offset 12 (8 bytes func_ptr + 4 bytes arity)
+        let captured_env = builder.ins().load(types::I64, MemFlags::trusted(), closure_ptr, 12);
+        
+        // Create the function signature: fn(args: *const Var, arg_count: u32, captured_env: u64) -> u64
+        let mut sig = Signature::new(CallConv::SystemV);
+        sig.params.push(AbiParam::new(types::I64)); // args pointer
+        sig.params.push(AbiParam::new(types::I32)); // arg count
+        sig.params.push(AbiParam::new(types::I64)); // captured environment
+        sig.returns.push(AbiParam::new(types::I64)); // return value
+        
+        let sig_ref = builder.import_signature(sig);
+        
+        // Prepare arguments
+        let arg_count_val = builder.ins().iconst(types::I32, arg_count as i64);
+        
+        // Make the indirect call
+        let call_inst = builder.ins().call_indirect(sig_ref, func_ptr, &[args_ptr, arg_count_val, captured_env]);
+        builder.inst_results(call_inst)[0]
     }
 }
 

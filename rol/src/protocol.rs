@@ -57,6 +57,7 @@ pub fn get_protocol(var_type: VarType) -> &'static TypeProtocol {
         VarType::String => &STRING_PROTOCOL,
         VarType::Environment => &ENVIRONMENT_PROTOCOL,
         VarType::Pointer => &POINTER_PROTOCOL,
+        VarType::Closure => &CLOSURE_PROTOCOL,
     }
 }
 
@@ -403,4 +404,52 @@ static POINTER_PROTOCOL: TypeProtocol = TypeProtocol {
     is_truthy: |_| true, // Pointers are always truthy
     clone: |ptr| ptr as *mut (),
     drop: |_| {},
+};
+
+static CLOSURE_PROTOCOL: TypeProtocol = TypeProtocol {
+    to_string: |ptr| {
+        unsafe {
+            let closure = ptr as *const crate::heap::LispClosure;
+            format!("closure(arity={})", (*closure).arity)
+        }
+    },
+    
+    // Basic hashing and comparison for closures
+    hash: |ptr| ptr as u64,
+    equals: |a, b| a == b,
+    compare: |a, b| {
+        if a < b { -1 } else if a > b { 1 } else { 0 }
+    },
+    
+    // Closure-specific operations - return arity as length
+    length: Some(|ptr| unsafe {
+        let closure = ptr as *const crate::heap::LispClosure;
+        (*closure).arity as i32
+    }),
+    get: Some(|_, _| Var::none()),
+    put: None,
+    next: None,
+    
+    // Closures are callable
+    call: Some(|ptr, args| {
+        unsafe {
+            let closure = ptr as *const crate::heap::LispClosure;
+            let result_bits = (*closure).call(args);
+            Var::from_u64(result_bits)
+        }
+    }),
+    
+    is_truthy: |_| true, // Closures are always truthy
+    
+    // Memory management for closures
+    clone: |ptr| {
+        // For now, just return the same pointer (shared ownership)
+        // In a real implementation, we'd properly clone the closure
+        ptr as *mut ()
+    },
+    drop: |ptr| {
+        unsafe {
+            crate::heap::LispClosure::free(ptr as *mut crate::heap::LispClosure);
+        }
+    },
 };

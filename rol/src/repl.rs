@@ -97,6 +97,15 @@ impl Repl {
             crate::var::VarType::Pointer => {
                 format!("#<pointer>")
             }
+            crate::var::VarType::Closure => {
+                if let Some(closure_ptr) = var.as_closure() {
+                    unsafe {
+                        format!("#<closure:{}>", (*closure_ptr).arity)
+                    }
+                } else {
+                    format!("#<closure:invalid>")
+                }
+            }
         }
     }
     
@@ -124,6 +133,14 @@ impl Repl {
                     
                     if line == "help" || line == ":help" {
                         self.print_help();
+                        continue;
+                    }
+                    
+                    if line == ":fib" {
+                        println!("Creating fibonacci function...");
+                        println!("For now, fibonacci must be implemented as lambda expressions.");
+                        println!("Try this when lambda support is complete:");
+                        println!("  (let ((fib (lambda (n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))))) (fib 10))");
                         continue;
                     }
                     

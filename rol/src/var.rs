@@ -34,6 +34,7 @@ pub const MIN_POINTER: u64 = 0x04;
 pub const GENERIC_POINTER_TAG: u64 = 0x0000000000000000;
 pub const LIST_POINTER_TAG: u64 = 0x1000000000000000;
 pub const STRING_POINTER_TAG: u64 = 0x2000000000000000;
+pub const CLOSURE_POINTER_TAG: u64 = 0x3000000000000000;
 pub const ENVIRONMENT_POINTER_TAG: u64 = 0x5000000000000000;
 pub const POINTER_TAG_MASK: u64 = 0xF000000000000000;
 
@@ -64,6 +65,7 @@ pub enum VarType {
     List,
     String,
     Environment,
+    Closure,
 }
 
 impl Default for Var {
@@ -87,6 +89,8 @@ impl Var {
             VarType::String
         } else if self.is_environment() {
             VarType::Environment
+        } else if self.is_closure() {
+            VarType::Closure
         } else if self.is_int() {
             VarType::I32
         } else if self.is_double() {
@@ -149,6 +153,13 @@ impl Var {
     pub fn environment(env: *mut Environment) -> Self {
         let ptr = env as u64;
         let tagged_ptr = ptr | ENVIRONMENT_POINTER_TAG;
+        Self(ValueUnion { value: tagged_ptr })
+    }
+    
+    /// Create a Var from a closure pointer
+    pub fn closure(ptr: *mut crate::heap::LispClosure) -> Self {
+        let ptr_bits = ptr as u64;
+        let tagged_ptr = ptr_bits | CLOSURE_POINTER_TAG;
         Self(ValueUnion { value: tagged_ptr })
     }
 
@@ -216,6 +227,11 @@ impl Var {
     pub fn is_environment(&self) -> bool {
         let v = unsafe { self.0.value };
         (v & 0x03) == 0 && v >= MIN_POINTER && (v & POINTER_TAG_MASK) == ENVIRONMENT_POINTER_TAG
+    }
+    
+    pub fn is_closure(&self) -> bool {
+        let v = unsafe { self.0.value };
+        (v & 0x03) == 0 && v >= MIN_POINTER && (v & POINTER_TAG_MASK) == CLOSURE_POINTER_TAG
     }
 
     unsafe fn as_pointer<T>(&self) -> Option<*const T> {
@@ -307,6 +323,15 @@ impl Var {
             None
         }
     }
+    
+    pub fn as_closure(&self) -> Option<*mut crate::heap::LispClosure> {
+        if self.is_closure() {
+            let ptr_bits = unsafe { self.0.value } & !POINTER_TAG_MASK;
+            Some(ptr_bits as *mut crate::heap::LispClosure)
+        } else {
+            None
+        }
+    }
 
     pub fn as_u64(&self) -> u64 {
         unsafe { self.0.value }
@@ -368,6 +393,7 @@ impl Var {
             VarType::List => !self.as_list().unwrap().is_empty(),
             VarType::String => !self.as_string().unwrap().is_empty(),
             VarType::Environment => true, // Environments are always truthy
+            VarType::Closure => true, // Closures are always truthy
         }
     }
 
@@ -496,6 +522,15 @@ impl fmt::Debug for Var {
                 } else {
                     write!(f, "Var::Environment(invalid)")
                 }
+            },
+            VarType::Closure => {
+                if let Some(closure_ptr) = self.as_closure() {
+                    unsafe {
+                        write!(f, "Var::Closure(arity={})", (*closure_ptr).arity)
+                    }
+                } else {
+                    write!(f, "Var::Closure(invalid)")
+                }
             }
         }
     }
@@ -533,6 +568,15 @@ impl fmt::Display for Var {
                     }
                 } else {
                     write!(f, "env(invalid)")
+                }
+            },
+            VarType::Closure => {
+                if let Some(closure_ptr) = self.as_closure() {
+                    unsafe {
+                        write!(f, "closure(arity={})", (*closure_ptr).arity)
+                    }
+                } else {
+                    write!(f, "closure(invalid)")
                 }
             }
         }

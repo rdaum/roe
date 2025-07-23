@@ -225,3 +225,85 @@ impl std::fmt::Debug for LispVector {
         }
     }
 }
+
+/// Native closure type for JIT-compiled functions.
+/// Layout: [func_ptr: *const u8][arity: u32][captured_env: u64]
+/// A closure contains the compiled function pointer, parameter count, and captured environment.
+#[repr(C)]
+pub struct LispClosure {
+    /// Pointer to the JIT-compiled function
+    /// Function signature: fn(args: *const Var, arg_count: u32, captured_env: u64) -> u64
+    pub func_ptr: *const u8,
+    /// Number of parameters this function expects
+    pub arity: u32,
+    /// Captured lexical environment (as Var bits)
+    pub captured_env: u64,
+}
+
+impl LispClosure {
+    /// Create a new closure with the given function pointer, arity, and captured environment
+    pub fn new(func_ptr: *const u8, arity: u32, captured_env: u64) -> *mut LispClosure {
+        let layout = Layout::new::<LispClosure>();
+        let ptr = unsafe { alloc(layout) as *mut LispClosure };
+        
+        if ptr.is_null() {
+            panic!("Failed to allocate memory for LispClosure");
+        }
+        
+        unsafe {
+            (*ptr).func_ptr = func_ptr;
+            (*ptr).arity = arity;
+            (*ptr).captured_env = captured_env;
+        }
+        
+        ptr
+    }
+    
+    /// Get the function pointer
+    pub unsafe fn get_function_ptr(&self) -> *const u8 {
+        self.func_ptr
+    }
+    
+    /// Get the arity (number of parameters)
+    pub unsafe fn get_arity(&self) -> u32 {
+        self.arity
+    }
+    
+    /// Get the captured environment
+    pub unsafe fn get_captured_env(&self) -> u64 {
+        self.captured_env
+    }
+    
+    /// Call this closure with the given arguments
+    /// Returns the result as a u64 (Var bits)
+    pub unsafe fn call(&self, args: &[Var]) -> u64 {
+        // Verify arity
+        if args.len() != self.arity as usize {
+            panic!("Wrong number of arguments: expected {}, got {}", self.arity, args.len());
+        }
+        
+        // Cast function pointer to the expected signature
+        // Function signature: fn(args: *const Var, arg_count: u32, captured_env: u64) -> u64
+        let func: fn(*const Var, u32, u64) -> u64 = unsafe { std::mem::transmute(self.func_ptr) };
+        
+        // Call the function
+        func(args.as_ptr(), args.len() as u32, self.captured_env)
+    }
+    
+    /// Free this closure
+    pub unsafe fn free(ptr: *mut LispClosure) {
+        if ptr.is_null() {
+            return;
+        }
+        
+        let layout = Layout::new::<LispClosure>();
+        unsafe { dealloc(ptr as *mut u8, layout) };
+    }
+}
+
+impl std::fmt::Debug for LispClosure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LispClosure(func_ptr: {:p}, arity: {}, captured_env: 0x{:016x})", 
+               self.func_ptr, self.arity, self.captured_env)
+    }
+}
