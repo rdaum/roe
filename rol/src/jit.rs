@@ -1,7 +1,7 @@
 //! Cranelift JIT integration for NaN-boxed Var operations.
 //! Provides helpers for emitting cranelift IR that manipulates our Var type efficiently.
 
-use crate::var::{BOOLEAN_FALSE, BOOLEAN_TRUE, HIGH16_TAG, MIN_NUMBER, DOUBLE_ENCODE_OFFSET, NULL, SYMBOL_TAG, LIST_POINTER_TAG, STRING_POINTER_TAG, POINTER_TAG_MASK, MIN_POINTER};
+use crate::var::{Var, BOOLEAN_FALSE, BOOLEAN_TRUE, HIGH16_TAG, MIN_NUMBER, DOUBLE_ENCODE_OFFSET, NULL, SYMBOL_TAG, LIST_POINTER_TAG, STRING_POINTER_TAG, POINTER_TAG_MASK, MIN_POINTER};
 use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
@@ -265,6 +265,105 @@ impl VarBuilder {
         let b = self.extract_double(builder, rhs);
         let sum = builder.ins().fadd(a, b);
         self.make_double(builder, sum)
+    }
+    
+    /// Emit arithmetic addition with proper type coercion
+    /// int + int = int, otherwise coerce to double
+    pub fn emit_arithmetic_add(&self, builder: &mut FunctionBuilder, lhs: Value, rhs: Value) -> Value {
+        // Check if both operands are integers
+        let lhs_is_int = self.is_int(builder, lhs);
+        let rhs_is_int = self.is_int(builder, rhs);
+        let both_ints = builder.ins().band(lhs_is_int, rhs_is_int);
+        
+        // Create blocks for int and float paths
+        let int_block = builder.create_block();
+        let float_block = builder.create_block();
+        let merge_block = builder.create_block();
+        
+        // Add block parameter for the result
+        builder.append_block_param(merge_block, types::I64);
+        
+        // Branch based on types
+        builder.ins().brif(both_ints, int_block, &[], float_block, &[]);
+        
+        // Integer path: both are ints, use int arithmetic
+        builder.switch_to_block(int_block);
+        builder.seal_block(int_block);
+        let int_result = self.emit_int_add(builder, lhs, rhs);
+        builder.ins().jump(merge_block, &[int_result]);
+        
+        // Float path: at least one is float, coerce both and use float arithmetic
+        builder.switch_to_block(float_block);
+        builder.seal_block(float_block);
+        let lhs_float = self.coerce_to_double(builder, lhs);
+        let rhs_float = self.coerce_to_double(builder, rhs);
+        let float_result = self.emit_double_add(builder, lhs_float, rhs_float);
+        builder.ins().jump(merge_block, &[float_result]);
+        
+        // Merge point
+        builder.switch_to_block(merge_block);
+        builder.seal_block(merge_block);
+        
+        builder.block_params(merge_block)[0]
+    }
+    
+    /// Coerce a Var to double - if it's an int, convert to double; if already double, pass through
+    pub fn coerce_to_double(&self, builder: &mut FunctionBuilder, var: Value) -> Value {
+        let is_int = self.is_int(builder, var);
+        
+        // Create blocks for int conversion and passthrough
+        let convert_block = builder.create_block();
+        let passthrough_block = builder.create_block();
+        let merge_block = builder.create_block();
+        
+        // Add block parameter for the result
+        builder.append_block_param(merge_block, types::I64);
+        
+        // Branch based on type
+        builder.ins().brif(is_int, convert_block, &[], passthrough_block, &[]);
+        
+        // Convert int to double
+        builder.switch_to_block(convert_block);
+        builder.seal_block(convert_block);
+        let int_val = self.extract_int(builder, var);
+        let float_val = builder.ins().fcvt_from_sint(types::F64, int_val);
+        let double_var = self.make_double(builder, float_val);
+        builder.ins().jump(merge_block, &[double_var]);
+        
+        // Pass through (assume it's already a double)
+        builder.switch_to_block(passthrough_block);
+        builder.seal_block(passthrough_block);
+        builder.ins().jump(merge_block, &[var]);
+        
+        // Merge point
+        builder.switch_to_block(merge_block);
+        builder.seal_block(merge_block);
+        
+        builder.block_params(merge_block)[0]
+    }
+    
+    /// Check if a Var is truthy (not 0, 0.0, or false)
+    pub fn is_truthy(&self, builder: &mut FunctionBuilder, var: Value) -> Value {
+        // Check for integer 0
+        let int_zero = builder.ins().iconst(types::I64, Var::int(0).as_u64() as i64);
+        let is_int_zero = builder.ins().icmp(IntCC::Equal, var, int_zero);
+        
+        // Check for float 0.0
+        let float_zero = builder.ins().iconst(types::I64, Var::float(0.0).as_u64() as i64);
+        let is_float_zero = builder.ins().icmp(IntCC::Equal, var, float_zero);
+        
+        // Check for false
+        let bool_false = builder.ins().iconst(types::I64, Var::bool(false).as_u64() as i64);
+        let is_bool_false = builder.ins().icmp(IntCC::Equal, var, bool_false);
+        
+        // Var is falsy if it's any of these three values
+        let is_falsy_1 = builder.ins().bor(is_int_zero, is_float_zero);
+        let is_falsy = builder.ins().bor(is_falsy_1, is_bool_false);
+        
+        // Return the logical negation (truthy = !falsy)
+        // Since is_falsy is already an i1, we can use icmp with 0 to negate it
+        let zero_i1 = builder.ins().iconst(types::I8, 0);
+        builder.ins().icmp(IntCC::Equal, is_falsy, zero_i1)
     }
     
     pub fn emit_int_equals(&self, builder: &mut FunctionBuilder, lhs: Value, rhs: Value) -> Value {

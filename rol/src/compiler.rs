@@ -284,10 +284,8 @@ fn compile_expr_recursive(
             // Compile condition
             let cond_value = compile_expr_recursive(condition, builder, env, ctx, var_builder, env_get_ref, env_create_ref, env_set_ref)?;
             
-            // Check if condition is truthy by comparing against encoded 0.0
-            // TODO: Implement proper Var truthiness check using VarBuilder
-            let encoded_false = builder.ins().iconst(types::I64, Var::float(0.0).as_u64() as i64);
-            let is_true = builder.ins().icmp(IntCC::NotEqual, cond_value, encoded_false);
+            // Check if condition is truthy using proper Var truthiness logic
+            let is_true = var_builder.is_truthy(builder, cond_value);
             
             // Create blocks
             let then_block = builder.create_block();
@@ -347,7 +345,9 @@ fn compile_builtin_recursive(
         BuiltinOp::Add => {
             let lhs = compile_expr_recursive(&args[0], builder, env, ctx, var_builder, env_get_ref, env_create_ref, env_set_ref)?;
             let rhs = compile_expr_recursive(&args[1], builder, env, ctx, var_builder, env_get_ref, env_create_ref, env_set_ref)?;
-            let result = var_builder.emit_double_add(builder, lhs, rhs);
+            
+            // Use proper type coercion: int + int = int, otherwise float
+            let result = var_builder.emit_arithmetic_add(builder, lhs, rhs);
             Ok(result)
         }
         
