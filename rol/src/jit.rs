@@ -720,8 +720,8 @@ mod tests {
         let int_var = Var::int(42);
         let double_var = Var::float(3.14);
         let bool_var = Var::bool(true);
-        let _none_var = Var::none();
-        let _symbol_var = Var::symbol(12345);
+        let none_var = Var::none();
+        let symbol_var = Var::symbol(12345);
         
         // Test int detection
         let result = unsafe { func(int_var.as_u64(), 0) };
@@ -977,8 +977,8 @@ mod tests {
         let int_var = Var::int(42);
         let double_var = Var::float(3.14);
         let bool_var = Var::bool(true);
-        let _none_var = Var::none();
-        let _symbol_var = Var::symbol(12345);
+        let none_var = Var::none();
+        let symbol_var = Var::symbol(12345);
         
         let list_var = Var::empty_list();
         let string_var = Var::string("test");

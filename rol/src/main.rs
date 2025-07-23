@@ -1,3 +1,5 @@
+mod ast;
+mod compiler;
 mod environment;
 mod gc;
 mod heap;
