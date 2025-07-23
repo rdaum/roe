@@ -3,6 +3,7 @@
 
 use crate::var::Var;
 use crate::heap::{LispString, LispVector};
+use crate::environment::Environment;
 
 /// Trait for objects that can be traced by the garbage collector.
 /// All heap-allocated types must implement this.
@@ -67,10 +68,37 @@ impl GcTrace for LispVector {
     }
 }
 
+impl GcTrace for Environment {
+    fn trace_children<F>(&self, mut visitor: F) 
+    where F: FnMut(&Var) 
+    {
+        // Visit parent environment if present
+        if let Some(parent) = self.parent() {
+            visitor(&parent);
+        }
+        
+        // Visit all slots in this environment - they might contain heap references
+        unsafe {
+            let slots = self.as_slice();
+            for slot_value in slots {
+                visitor(slot_value);
+            }
+        }
+    }
+    
+    fn size_bytes(&self) -> usize {
+        std::mem::size_of::<Environment>() + 
+        (self.size as usize * std::mem::size_of::<Var>())
+    }
+    
+    fn type_name(&self) -> &'static str {
+        "Environment"
+    }
+}
+
 /// Determine if a Var contains a heap reference that needs GC tracing.
 pub fn var_needs_tracing(var: &Var) -> bool {
-    var.is_list() || var.is_string()
-    // Could extend to other heap types: symbols, closures, etc.
+    var.is_list() || var.is_string() || var.is_environment()
 }
 
 /// Extract heap object from a Var for GC tracing.
@@ -84,6 +112,10 @@ pub unsafe fn var_as_gc_object(var: &Var) -> Option<GcObjectRef> {
         let ptr_bits = var.as_u64() & !crate::var::POINTER_TAG_MASK;
         let ptr = ptr_bits as *const LispString;
         Some(GcObjectRef::String(ptr))
+    } else if var.is_environment() {
+        let ptr_bits = var.as_u64() & !crate::var::POINTER_TAG_MASK;
+        let ptr = ptr_bits as *const Environment;
+        Some(GcObjectRef::Environment(ptr))
     } else {
         None
     }
@@ -93,6 +125,7 @@ pub unsafe fn var_as_gc_object(var: &Var) -> Option<GcObjectRef> {
 pub enum GcObjectRef {
     String(*const LispString),
     Vector(*const LispVector),
+    Environment(*const Environment),
 }
 
 impl GcObjectRef {
@@ -101,24 +134,27 @@ impl GcObjectRef {
     where F: FnMut(&Var)
     {
         match self {
-            GcObjectRef::String(ptr) => (*ptr).as_ref().unwrap().trace_children(visitor),
-            GcObjectRef::Vector(ptr) => (*ptr).as_ref().unwrap().trace_children(visitor),
+            GcObjectRef::String(ptr) => unsafe { (*ptr).as_ref().unwrap().trace_children(visitor) },
+            GcObjectRef::Vector(ptr) => unsafe { (*ptr).as_ref().unwrap().trace_children(visitor) },
+            GcObjectRef::Environment(ptr) => unsafe { (*ptr).as_ref().unwrap().trace_children(visitor) },
         }
     }
     
     /// Get size in bytes for GC accounting.
     pub unsafe fn size_bytes(&self) -> usize {
         match self {
-            GcObjectRef::String(ptr) => (*ptr).as_ref().unwrap().size_bytes(),
-            GcObjectRef::Vector(ptr) => (*ptr).as_ref().unwrap().size_bytes(),
+            GcObjectRef::String(ptr) => unsafe { (*ptr).as_ref().unwrap().size_bytes() },
+            GcObjectRef::Vector(ptr) => unsafe { (*ptr).as_ref().unwrap().size_bytes() },
+            GcObjectRef::Environment(ptr) => unsafe { (*ptr).as_ref().unwrap().size_bytes() },
         }
     }
     
     /// Get type name for debugging.
     pub unsafe fn type_name(&self) -> &'static str {
         match self {
-            GcObjectRef::String(ptr) => (*ptr).as_ref().unwrap().type_name(),
-            GcObjectRef::Vector(ptr) => (*ptr).as_ref().unwrap().type_name(),
+            GcObjectRef::String(ptr) => unsafe { (*ptr).as_ref().unwrap().type_name() },
+            GcObjectRef::Vector(ptr) => unsafe { (*ptr).as_ref().unwrap().type_name() },
+            GcObjectRef::Environment(ptr) => unsafe { (*ptr).as_ref().unwrap().type_name() },
         }
     }
 }
@@ -171,20 +207,23 @@ pub unsafe fn trace_from_roots<R: GcRootSet>(
     
     // Process worklist until empty
     while let Some(var) = worklist.pop() {
-        if let Some(obj_ref) = var_as_gc_object(&var) {
+        if let Some(obj_ref) = unsafe { var_as_gc_object(&var) } {
             // Mark this object as reachable
             let ptr = match obj_ref {
                 GcObjectRef::String(ptr) => ptr as *const u8,
                 GcObjectRef::Vector(ptr) => ptr as *const u8,
+                GcObjectRef::Environment(ptr) => ptr as *const u8,
             };
             mark_object(ptr);
             
             // Add children to worklist
-            obj_ref.trace_children(|child_var| {
-                if var_needs_tracing(child_var) {
-                    worklist.push(*child_var);
-                }
-            });
+            unsafe {
+                obj_ref.trace_children(|child_var| {
+                    if var_needs_tracing(child_var) {
+                        worklist.push(*child_var);
+                    }
+                });
+            }
         }
     }
 }
@@ -238,7 +277,7 @@ mod tests {
         let outer_list = Var::list(&[inner_list, string, Var::none()]);
         
         // Should trace all nested heap objects
-        let mut root_set = SimpleRootSet {
+        let root_set = SimpleRootSet {
             stack_vars: vec![outer_list],
             globals: vec![],
             jit_live: vec![],
@@ -253,5 +292,127 @@ mod tests {
         
         // Should mark outer list, inner list, and string
         assert_eq!(marked_objects.len(), 3);
+    }
+    
+    #[test]
+    fn test_environment_tracing() {
+        unsafe {
+            // Create environment with heap-allocated values
+            let string_var = Var::string("test");
+            let list_var = Var::list(&[Var::int(1), Var::int(2)]);
+            let env_values = [Var::int(42), string_var, list_var];
+            let env_ptr = crate::environment::Environment::from_values(&env_values, None);
+            let env_var = Var::environment(env_ptr);
+            
+            // Environment should trace its slot values
+            if let Some(obj_ref) = var_as_gc_object(&env_var) {
+                let mut traced_vars = Vec::new();
+                obj_ref.trace_children(|var| traced_vars.push(*var));
+                
+                // Should trace all 3 slot values (no parent)
+                assert_eq!(traced_vars.len(), 3);
+                assert_eq!(traced_vars[0].as_int(), Some(42));
+                assert_eq!(traced_vars[1].as_string(), Some("test"));
+                assert!(traced_vars[2].is_list());
+            }
+            
+            // Clean up
+            crate::environment::Environment::free(env_ptr);
+        }
+    }
+    
+    #[test]
+    fn test_environment_parent_tracing() {
+        unsafe {
+            // Create parent and child environments
+            let parent_values = [Var::string("parent"), Var::int(100)];
+            let parent_ptr = crate::environment::Environment::from_values(&parent_values, None);
+            let parent_var = Var::environment(parent_ptr);
+            
+            let child_values = [Var::string("child")];
+            let child_ptr = crate::environment::Environment::from_values(&child_values, Some(parent_var));
+            let child_var = Var::environment(child_ptr);
+            
+            // Child environment should trace both parent and its own slots
+            if let Some(obj_ref) = var_as_gc_object(&child_var) {
+                let mut traced_vars = Vec::new();
+                obj_ref.trace_children(|var| traced_vars.push(*var));
+                
+                // Should trace parent + 1 slot value
+                assert_eq!(traced_vars.len(), 2);
+                
+                // First should be parent environment
+                assert!(traced_vars[0].is_environment());
+                // Second should be child's slot value
+                assert_eq!(traced_vars[1].as_string(), Some("child"));
+            }
+            
+            // Clean up
+            crate::environment::Environment::free(child_ptr);
+            crate::environment::Environment::free(parent_ptr);
+        }
+    }
+    
+    #[test]
+    fn test_environment_gc_integration() {
+        unsafe {
+            // Create complex environment chain with heap objects
+            let parent_string = Var::string("parent_data");
+            let parent_list = Var::list(&[Var::int(1), Var::string("nested")]);
+            let parent_values = [parent_string, parent_list];
+            let parent_ptr = crate::environment::Environment::from_values(&parent_values, None);
+            let parent_var = Var::environment(parent_ptr);
+            
+            let child_string = Var::string("child_data");
+            let child_values = [child_string, Var::int(200)];
+            let child_ptr = crate::environment::Environment::from_values(&child_values, Some(parent_var));
+            let child_var = Var::environment(child_ptr);
+            
+            // Add environment to root set
+            let root_set = SimpleRootSet {
+                stack_vars: vec![child_var],
+                globals: vec![],
+                jit_live: vec![],
+            };
+            
+            let mut marked_objects = Vec::new();
+            trace_from_roots(&root_set, |ptr| {
+                marked_objects.push(ptr);
+            });
+            
+            // Should mark:
+            // 1. Child environment
+            // 2. Parent environment (from child's parent reference)
+            // 3. Child's string ("child_data")
+            // 4. Parent's string ("parent_data")
+            // 5. Parent's list
+            // 6. Nested string in parent's list ("nested")
+            assert_eq!(marked_objects.len(), 6);
+            
+            // Clean up
+            crate::environment::Environment::free(child_ptr);
+            crate::environment::Environment::free(parent_ptr);
+        }
+    }
+    
+    #[test]
+    fn test_environment_size_calculation() {
+        unsafe {
+            let env_values = [Var::int(1), Var::int(2), Var::int(3)];
+            let env_ptr = crate::environment::Environment::from_values(&env_values, None);
+            let env_var = Var::environment(env_ptr);
+            
+            if let Some(obj_ref) = var_as_gc_object(&env_var) {
+                let size = obj_ref.size_bytes();
+                let expected_size = std::mem::size_of::<crate::environment::Environment>() + 
+                                  (3 * std::mem::size_of::<Var>());
+                assert_eq!(size, expected_size);
+                
+                assert_eq!(obj_ref.type_name(), "Environment");
+            }
+            
+            // Clean up
+            crate::environment::Environment::free(env_ptr);
+        }
     }
 }

@@ -8,7 +8,6 @@ boxcar = "0.2"
 papaya = "0.2"
 ahash = "0.8"
 once_cell = "1.21"
-im = "15.1.0"
 
 # Cranelift JIT dependencies
 cranelift = "0.108"

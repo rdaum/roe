@@ -16,7 +16,7 @@ impl VarJIT {
     pub fn new() -> Self {
         // Use cranelift-native to get the appropriate target for this machine
         let isa_builder = cranelift_native::builder().unwrap_or_else(|msg| {
-            panic!("host machine is not supported: {}", msg);
+            panic!("host machine is not supported: {msg}");
         });
         let isa = isa_builder.finish(settings::Flags::new(settings::builder())).unwrap();
         
@@ -720,8 +720,8 @@ mod tests {
         let int_var = Var::int(42);
         let double_var = Var::float(3.14);
         let bool_var = Var::bool(true);
-        let none_var = Var::none();
-        let symbol_var = Var::symbol(12345);
+        let _none_var = Var::none();
+        let _symbol_var = Var::symbol(12345);
         
         // Test int detection
         let result = unsafe { func(int_var.as_u64(), 0) };
@@ -977,8 +977,8 @@ mod tests {
         let int_var = Var::int(42);
         let double_var = Var::float(3.14);
         let bool_var = Var::bool(true);
-        let none_var = Var::none();
-        let symbol_var = Var::symbol(12345);
+        let _none_var = Var::none();
+        let _symbol_var = Var::symbol(12345);
         
         let list_var = Var::empty_list();
         let string_var = Var::string("test");

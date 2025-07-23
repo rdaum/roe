@@ -9,6 +9,7 @@
 //! TODO: Will not work on BigEndian platforms
 //! Based on https://github.com/zuiderkwast/Var/blob/master/Var.h
 
+use crate::environment::Environment;
 use crate::heap::{LispString, LispVector};
 use crate::protocol::{TypeProtocol, get_protocol};
 use crate::symbol::Symbol;
@@ -33,6 +34,7 @@ pub const MIN_POINTER: u64 = 0x04;
 pub const GENERIC_POINTER_TAG: u64 = 0x0000000000000000;
 pub const LIST_POINTER_TAG: u64 = 0x1000000000000000;
 pub const STRING_POINTER_TAG: u64 = 0x2000000000000000;
+pub const ENVIRONMENT_POINTER_TAG: u64 = 0x5000000000000000;
 pub const POINTER_TAG_MASK: u64 = 0xF000000000000000;
 
 pub const SYMBOL_TAG: u64 = 0x0009000000000000;
@@ -61,6 +63,7 @@ pub enum VarType {
     Symbol,
     List,
     String,
+    Environment,
 }
 
 impl Default for Var {
@@ -82,6 +85,8 @@ impl Var {
             VarType::List
         } else if self.is_string() {
             VarType::String
+        } else if self.is_environment() {
+            VarType::Environment
         } else if self.is_int() {
             VarType::I32
         } else if self.is_double() {
@@ -141,6 +146,12 @@ impl Var {
         Self(ValueUnion { value: tagged_ptr })
     }
 
+    pub fn environment(env: *mut Environment) -> Self {
+        let ptr = env as u64;
+        let tagged_ptr = ptr | ENVIRONMENT_POINTER_TAG;
+        Self(ValueUnion { value: tagged_ptr })
+    }
+
     pub fn is_none(&self) -> bool {
         unsafe { self.0.value == NULL }
     }
@@ -152,7 +163,7 @@ impl Var {
 
     pub fn is_number(&self) -> bool {
         let v = unsafe { self.0.value };
-        v >= MIN_NUMBER && !self.is_symbol() && !self.is_list() && !self.is_string()
+        v >= MIN_NUMBER && !self.is_symbol() && !self.is_list() && !self.is_string() && !self.is_environment()
     }
 
     pub fn is_int(&self) -> bool {
@@ -200,6 +211,11 @@ impl Var {
     pub fn is_string(&self) -> bool {
         let v = unsafe { self.0.value };
         (v & 0x03) == 0 && v >= MIN_POINTER && (v & POINTER_TAG_MASK) == STRING_POINTER_TAG
+    }
+
+    pub fn is_environment(&self) -> bool {
+        let v = unsafe { self.0.value };
+        (v & 0x03) == 0 && v >= MIN_POINTER && (v & POINTER_TAG_MASK) == ENVIRONMENT_POINTER_TAG
     }
 
     unsafe fn as_pointer<T>(&self) -> Option<*const T> {
@@ -283,6 +299,15 @@ impl Var {
         }
     }
 
+    pub fn as_environment(&self) -> Option<*mut Environment> {
+        if self.is_environment() {
+            let ptr_bits = unsafe { self.0.value } & !POINTER_TAG_MASK;
+            Some(ptr_bits as *mut Environment)
+        } else {
+            None
+        }
+    }
+
     pub fn as_u64(&self) -> u64 {
         unsafe { self.0.value }
     }
@@ -342,6 +367,7 @@ impl Var {
             VarType::Pointer => true,
             VarType::List => !self.as_list().unwrap().is_empty(),
             VarType::String => !self.as_string().unwrap().is_empty(),
+            VarType::Environment => true, // Environments are always truthy
         }
     }
 
@@ -462,6 +488,15 @@ impl fmt::Debug for Var {
             VarType::Symbol => write!(f, "Var::Symbol({})", self.as_symbol().unwrap()),
             VarType::List => write!(f, "Var::List({:?})", self.as_list().unwrap()),
             VarType::String => write!(f, "Var::String({:?})", self.as_string().unwrap()),
+            VarType::Environment => {
+                if let Some(env_ptr) = self.as_environment() {
+                    unsafe {
+                        write!(f, "Var::Environment(size={})", (*env_ptr).size)
+                    }
+                } else {
+                    write!(f, "Var::Environment(invalid)")
+                }
+            }
         }
     }
 }
@@ -491,6 +526,15 @@ impl fmt::Display for Var {
                 write!(f, "]")
             }
             VarType::String => write!(f, "{}", self.as_string().unwrap()),
+            VarType::Environment => {
+                if let Some(env_ptr) = self.as_environment() {
+                    unsafe {
+                        write!(f, "env(size={})", (*env_ptr).size)
+                    }
+                } else {
+                    write!(f, "env(invalid)")
+                }
+            }
         }
     }
 }
@@ -1134,7 +1178,6 @@ mod tests {
 
     #[test]
     fn test_list_basic_creation() {
-        use im::Vector;
 
         // Test simple list creation
         let list_var = Var::empty_list();
@@ -1152,8 +1195,6 @@ mod tests {
 
     #[test]
     fn test_list_and_string_basic() {
-        use std::sync::Arc;
-        use im::Vector;
 
         // Test list creation and access
         let elements = [Var::int(1), Var::int(2), Var::int(3)];
@@ -1201,8 +1242,6 @@ mod tests {
 
     #[test]
     fn test_protocol_system() {
-        use std::sync::Arc;
-        use im::Vector;
 
         // Test list protocol
         let elements = [Var::int(1), Var::int(2), Var::int(3)];
@@ -1256,6 +1295,7 @@ mod tests {
         // Different types can't be compared
         assert_eq!(a.protocol_compare(&s), None);
     }
+
 
     #[test]
     fn test_comprehensive_arithmetic_matrix() {

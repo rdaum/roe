@@ -49,11 +49,11 @@ impl LispString {
     }
     
     /// Get the string data as a byte slice
-    pub unsafe fn as_bytes(&self) -> &[u8] {
+    pub unsafe fn as_bytes(&self) -> &[u8] { unsafe {
         let data_ptr = (self as *const LispString as *const u8)
             .add(std::mem::size_of::<LispString>());
         slice::from_raw_parts(data_ptr, self.length as usize)
-    }
+    }}
     
     /// Get the string data as a string slice  
     pub unsafe fn as_str(&self) -> &str {
@@ -61,7 +61,7 @@ impl LispString {
     }
     
     /// Free the memory for this LispString
-    pub unsafe fn free(ptr: *mut LispString) {
+    pub unsafe fn free(ptr: *mut LispString) { unsafe {
         if ptr.is_null() {
             return;
         }
@@ -72,7 +72,7 @@ impl LispString {
         
         let layout = Layout::from_size_align_unchecked(total_size, align);
         dealloc(ptr as *mut u8, layout);
-    }
+    }}
 }
 
 /// Native vector type optimized for JIT access.
@@ -145,21 +145,21 @@ impl LispVector {
     }
     
     /// Get the elements as a slice
-    pub unsafe fn as_slice(&self) -> &[Var] {
+    pub unsafe fn as_slice(&self) -> &[Var] { unsafe {
         let data_ptr = (self as *const LispVector as *mut u8)
             .add(std::mem::size_of::<LispVector>()) as *const Var;
         slice::from_raw_parts(data_ptr, self.length as usize)
-    }
+    }}
     
     /// Get the elements as a mutable slice
-    pub unsafe fn as_mut_slice(&mut self) -> &mut [Var] {
+    pub unsafe fn as_mut_slice(&mut self) -> &mut [Var] { unsafe {
         let data_ptr = (self as *mut LispVector as *mut u8)
             .add(std::mem::size_of::<LispVector>()) as *mut Var;
         slice::from_raw_parts_mut(data_ptr, self.length as usize)
-    }
+    }}
     
     /// Push an element to the vector (may reallocate)
-    pub unsafe fn push(ptr: *mut LispVector, element: Var) -> *mut LispVector {
+    pub unsafe fn push(ptr: *mut LispVector, element: Var) -> *mut LispVector { unsafe {
         let length = (*ptr).length;
         let capacity = (*ptr).capacity;
         
@@ -191,10 +191,10 @@ impl LispVector {
             
             new_ptr
         }
-    }
+    }}
     
     /// Free the memory for this LispVector
-    pub unsafe fn free(ptr: *mut LispVector) {
+    pub unsafe fn free(ptr: *mut LispVector) { unsafe {
         if ptr.is_null() {
             return;
         }
@@ -206,7 +206,7 @@ impl LispVector {
         
         let layout = Layout::from_size_align_unchecked(total_size, align);
         dealloc(ptr as *mut u8, layout);
-    }
+    }}
 }
 
 // For debugging

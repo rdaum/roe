@@ -55,6 +55,7 @@ pub fn get_protocol(var_type: VarType) -> &'static TypeProtocol {
         VarType::Symbol => &SYMBOL_PROTOCOL,
         VarType::List => &LIST_PROTOCOL,
         VarType::String => &STRING_PROTOCOL,
+        VarType::Environment => &ENVIRONMENT_PROTOCOL,
         VarType::Pointer => &POINTER_PROTOCOL,
     }
 }
@@ -337,9 +338,57 @@ static STRING_PROTOCOL: TypeProtocol = TypeProtocol {
     drop: |_| {}, // Memory management handled by Rust
 };
 
+static ENVIRONMENT_PROTOCOL: TypeProtocol = TypeProtocol {
+    to_string: |ptr| {
+        let var = unsafe { &*(ptr as *const Var) };
+        if let Some(env_ptr) = var.as_environment() {
+            unsafe {
+                format!("env(size={})", (*env_ptr).size)
+            }
+        } else {
+            "env(invalid)".to_string()
+        }
+    },
+    hash: |ptr| {
+        let var = unsafe { &*(ptr as *const Var) };
+        if let Some(env_ptr) = var.as_environment() {
+            env_ptr as u64
+        } else {
+            0
+        }
+    },
+    equals: |lhs, rhs| {
+        let lvar = unsafe { &*(lhs as *const Var) };
+        let rvar = unsafe { &*(rhs as *const Var) };
+        lvar.as_environment() == rvar.as_environment()
+    },
+    compare: |lhs, rhs| {
+        let lvar = unsafe { &*(lhs as *const Var) };
+        let rvar = unsafe { &*(rhs as *const Var) };
+        let l_ptr = lvar.as_environment().unwrap_or(std::ptr::null_mut()) as u64;
+        let r_ptr = rvar.as_environment().unwrap_or(std::ptr::null_mut()) as u64;
+        if l_ptr < r_ptr { -1 } else if l_ptr > r_ptr { 1 } else { 0 }
+    },
+    length: Some(|ptr| {
+        let var = unsafe { &*(ptr as *const Var) };
+        if let Some(env_ptr) = var.as_environment() {
+            unsafe { (*env_ptr).size as i32 }
+        } else {
+            0
+        }
+    }),
+    get: None, // Environments are not directly indexed by external code
+    put: None, // Environments are not directly modified by external code
+    next: None, // Environments are not iterable
+    call: None, // Environments are not callable
+    is_truthy: |_| true, // Environments are always truthy
+    clone: |ptr| ptr as *mut (), // Environments can be shared
+    drop: |_| {}, // Memory management handled by Rust
+};
+
 static POINTER_PROTOCOL: TypeProtocol = TypeProtocol {
     to_string: |ptr| {
-        format!("ptr({:p})", ptr)
+        format!("ptr({ptr:p})")
     },
     hash: |ptr| ptr as u64,
     equals: |lhs, rhs| lhs == rhs,

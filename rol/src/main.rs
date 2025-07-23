@@ -1,3 +1,4 @@
+mod environment;
 mod gc;
 mod heap;
 mod jit;
