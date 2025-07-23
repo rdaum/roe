@@ -9,7 +9,8 @@ use crate::var::Var;
 
 use cranelift::prelude::*;
 use cranelift_jit::JITModule;
-use cranelift_module::{Linkage, Module};
+use cranelift_module::{Linkage, Module, FuncId};
+use cranelift::codegen::ir::FuncRef;
 use std::collections::HashMap;
 
 /// Compilation context that tracks variables and their lexical addresses
@@ -59,6 +60,9 @@ pub struct Compiler {
     var_builder: VarBuilder,
     ctx: codegen::Context,
     builder_context: FunctionBuilderContext,
+    env_get_id: FuncId,
+    env_create_id: FuncId,
+    env_set_id: FuncId,
 }
 
 impl Compiler {
@@ -70,15 +74,50 @@ impl Compiler {
         });
         let isa = isa_builder.finish(settings::Flags::new(settings::builder())).unwrap();
         
-        let builder = cranelift_jit::JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
-        let module = JITModule::new(builder);
+        let mut builder = cranelift_jit::JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+        
+        // Add symbols for our environment functions
+        builder.symbol("env_get", crate::environment::env_get as *const u8);
+        builder.symbol("env_create", crate::environment::env_create as *const u8);  
+        builder.symbol("env_set", crate::environment::env_set as *const u8);
+        
+        let mut module = JITModule::new(builder);
         let var_builder = VarBuilder::new();
+        
+        // Declare external environment functions
+        let mut env_get_sig = module.make_signature();
+        env_get_sig.params.push(AbiParam::new(types::I64)); // env: u64
+        env_get_sig.params.push(AbiParam::new(types::I32)); // depth: u32  
+        env_get_sig.params.push(AbiParam::new(types::I32)); // offset: u32
+        env_get_sig.returns.push(AbiParam::new(types::I64)); // -> u64
+        
+        let mut env_create_sig = module.make_signature();
+        env_create_sig.params.push(AbiParam::new(types::I32)); // slot_count: u32
+        env_create_sig.params.push(AbiParam::new(types::I64)); // parent: u64
+        env_create_sig.returns.push(AbiParam::new(types::I64)); // -> u64
+        
+        let mut env_set_sig = module.make_signature();
+        env_set_sig.params.push(AbiParam::new(types::I64)); // env: u64
+        env_set_sig.params.push(AbiParam::new(types::I32)); // depth: u32
+        env_set_sig.params.push(AbiParam::new(types::I32)); // offset: u32
+        env_set_sig.params.push(AbiParam::new(types::I64)); // value: u64
+        env_set_sig.returns.push(AbiParam::new(types::I64)); // -> u64 (updated env)
+        
+        let env_get_id = module.declare_function("env_get", Linkage::Import, &env_get_sig)
+            .expect("Failed to declare env_get");
+        let env_create_id = module.declare_function("env_create", Linkage::Import, &env_create_sig)
+            .expect("Failed to declare env_create");  
+        let env_set_id = module.declare_function("env_set", Linkage::Import, &env_set_sig)
+            .expect("Failed to declare env_set");
         
         Self {
             module,
             var_builder,
             ctx: codegen::Context::new(),
             builder_context: FunctionBuilderContext::new(),
+            env_get_id,
+            env_create_id,
+            env_set_id,
         }
     }
     
@@ -106,6 +145,11 @@ impl Compiler {
         
         let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.builder_context);
         
+        // Import the external environment functions into this function
+        let env_get_ref = self.module.declare_func_in_func(self.env_get_id, &mut builder.func);
+        let env_create_ref = self.module.declare_func_in_func(self.env_create_id, &mut builder.func);
+        let env_set_ref = self.module.declare_func_in_func(self.env_set_id, &mut builder.func);
+        
         // Create entry block
         let entry_block = builder.create_block();
         builder.append_block_params_for_function_params(entry_block);
@@ -118,7 +162,7 @@ impl Compiler {
         // Compile the expression
         let ctx = CompileContext::new();
         let var_builder = &self.var_builder;
-        let result = compile_expr_recursive(expr, &mut builder, env_param, &ctx, var_builder)?;
+        let result = compile_expr_recursive(expr, &mut builder, env_param, &ctx, var_builder, env_get_ref, env_create_ref, env_set_ref)?;
         
         // Return the result
         builder.ins().return_(&[result]);
@@ -149,6 +193,9 @@ fn compile_expr_recursive(
     env: Value,
     ctx: &CompileContext,
     var_builder: &VarBuilder,
+    env_get_ref: FuncRef,
+    env_create_ref: FuncRef,
+    env_set_ref: FuncRef,
 ) -> Result<Value, String> {
     match expr {
         Expr::Literal(var) => {
@@ -160,12 +207,12 @@ fn compile_expr_recursive(
         Expr::Variable(sym) => {
             // Look up variable in environment
             if let Some(addr) = ctx.lookup(*sym) {
-                // Call env_get(env, depth, offset) -> u64
-                let _depth_val = builder.ins().iconst(types::I32, addr.depth as i64);
-                let _offset_val = builder.ins().iconst(types::I32, addr.offset as i64);
-                // TODO: Call the actual env_get function
-                // For now, return a placeholder
-                Ok(builder.ins().iconst(types::I64, 0))
+                // Call env_get(env, depth, offset)
+                let depth_val = builder.ins().iconst(types::I32, addr.depth as i64);
+                let offset_val = builder.ins().iconst(types::I32, addr.offset as i64);
+                let call_inst = builder.ins().call(env_get_ref, &[env, depth_val, offset_val]);
+                let result = builder.inst_results(call_inst)[0];
+                Ok(result)
             } else {
                 Err(format!("Unbound variable: {}", sym.as_string()))
             }
@@ -175,7 +222,7 @@ fn compile_expr_recursive(
             // Check if it's a builtin operation
             if let Expr::Variable(sym) = func.as_ref() {
                 if let Some(builtin) = BuiltinOp::from_symbol(*sym) {
-                    return compile_builtin_recursive(builtin, args, builder, env, ctx, var_builder);
+                    return compile_builtin_recursive(builtin, args, builder, env, ctx, var_builder, env_get_ref, env_create_ref, env_set_ref);
                 }
             }
             
@@ -185,30 +232,47 @@ fn compile_expr_recursive(
         
         Expr::Let { bindings, body } => {
             // Create new environment with space for bindings
-            let _slot_count = bindings.len() as u32;
-            let _count_val = builder.ins().iconst(types::I32, _slot_count as i64);
-            // TODO: Call the actual env_create function
-            // For now, use the parent environment
-            let new_env = env;
+            let slot_count = bindings.len() as u32;
+            let count_val = builder.ins().iconst(types::I32, slot_count as i64);
+            
+            // Call env_create(slot_count, parent_env)
+            let create_call = builder.ins().call(env_create_ref, &[count_val, env]);
+            let new_env = builder.inst_results(create_call)[0];
             
             // Create new context for the let body
-            let mut new_ctx = ctx.push_scope();
+            // Existing bindings from outer scopes need their depth incremented
+            let mut new_bindings = HashMap::new();
+            for (symbol, addr) in &ctx.bindings {
+                let new_addr = LexicalAddress {
+                    depth: addr.depth + 1, // Existing variables are now one level deeper
+                    offset: addr.offset,
+                };
+                new_bindings.insert(*symbol, new_addr);
+            }
+            
+            let mut new_ctx = CompileContext {
+                bindings: new_bindings,
+                depth: ctx.depth + 1, // We are in a deeper scope
+            };
             
             // Compile and store each binding
             for (i, (var, expr)) in bindings.iter().enumerate() {
                 // Compile the binding expression in the outer context
-                let _value = compile_expr_recursive(expr, builder, env, ctx, var_builder)?;
+                let value = compile_expr_recursive(expr, builder, env, ctx, var_builder, env_get_ref, env_create_ref, env_set_ref)?;
                 
-                // TODO: Store in the new environment
-                let _depth_val = builder.ins().iconst(types::I32, 0);
-                let _offset_val = builder.ins().iconst(types::I32, i as i64);
+                // Store in the new environment at depth 0 (current level)
+                let depth_val = builder.ins().iconst(types::I32, 0);
+                let offset_val = builder.ins().iconst(types::I32, i as i64);
+                let set_call = builder.ins().call(env_set_ref, &[new_env, depth_val, offset_val, value]);
+                let _updated_env = builder.inst_results(set_call)[0]; // Updated environment (might be reallocated)
                 
-                // Add to new context
-                new_ctx.bind(*var, i as u32);
+                // Add to new context at depth 0 (new bindings are in the current environment)
+                let addr = LexicalAddress { depth: 0, offset: i as u32 };
+                new_ctx.bindings.insert(*var, addr);
             }
             
             // Compile the body with the new environment and context
-            compile_expr_recursive(body, builder, new_env, &new_ctx, var_builder)
+            compile_expr_recursive(body, builder, new_env, &new_ctx, var_builder, env_get_ref, env_create_ref, env_set_ref)
         }
         
         Expr::Lambda { .. } => {
@@ -218,7 +282,7 @@ fn compile_expr_recursive(
         
         Expr::If { condition, then_expr, else_expr } => {
             // Compile condition
-            let cond_value = compile_expr_recursive(condition, builder, env, ctx, var_builder)?;
+            let cond_value = compile_expr_recursive(condition, builder, env, ctx, var_builder, env_get_ref, env_create_ref, env_set_ref)?;
             
             // Check if condition is truthy by comparing against encoded 0.0
             // TODO: Implement proper Var truthiness check using VarBuilder
@@ -239,13 +303,13 @@ fn compile_expr_recursive(
             // Compile then branch
             builder.switch_to_block(then_block);
             builder.seal_block(then_block);
-            let then_result = compile_expr_recursive(then_expr, builder, env, ctx, var_builder)?;
+            let then_result = compile_expr_recursive(then_expr, builder, env, ctx, var_builder, env_get_ref, env_create_ref, env_set_ref)?;
             builder.ins().jump(merge_block, &[then_result]);
             
             // Compile else branch
             builder.switch_to_block(else_block);
             builder.seal_block(else_block);
-            let else_result = compile_expr_recursive(else_expr, builder, env, ctx, var_builder)?;
+            let else_result = compile_expr_recursive(else_expr, builder, env, ctx, var_builder, env_get_ref, env_create_ref, env_set_ref)?;
             builder.ins().jump(merge_block, &[else_result]);
             
             // Merge point
@@ -265,6 +329,9 @@ fn compile_builtin_recursive(
     env: Value,
     ctx: &CompileContext,
     var_builder: &VarBuilder,
+    env_get_ref: FuncRef,
+    env_create_ref: FuncRef,
+    env_set_ref: FuncRef,
 ) -> Result<Value, String> {
     // Validate arity
     if let Some(expected_arity) = op.arity() {
@@ -278,8 +345,8 @@ fn compile_builtin_recursive(
     
     match op {
         BuiltinOp::Add => {
-            let lhs = compile_expr_recursive(&args[0], builder, env, ctx, var_builder)?;
-            let rhs = compile_expr_recursive(&args[1], builder, env, ctx, var_builder)?;
+            let lhs = compile_expr_recursive(&args[0], builder, env, ctx, var_builder, env_get_ref, env_create_ref, env_set_ref)?;
+            let rhs = compile_expr_recursive(&args[1], builder, env, ctx, var_builder, env_get_ref, env_create_ref, env_set_ref)?;
             let result = var_builder.emit_double_add(builder, lhs, rhs);
             Ok(result)
         }
@@ -558,5 +625,129 @@ mod tests {
         let result_bits_false = func_false(0);
         let result_var_false = Var::from_u64(result_bits_false);
         assert_eq!(result_var_false.as_double(), Some(24.0));
+    }
+    
+    #[test]
+    fn test_execute_let_binding() {
+        let mut compiler = Compiler::new();
+        
+        // Create (let ((x 5.0)) (+ x 2.0)) = 7.0
+        use crate::symbol::Symbol;
+        let x_sym = Symbol::mk("x");
+        let expr = Expr::let_binding(
+            vec![(x_sym, Expr::number(5.0))],
+            Expr::call(
+                Expr::variable("+"),
+                vec![Expr::variable("x"), Expr::number(2.0)]
+            )
+        );
+        
+        // Compile and execute
+        let func_ptr = compiler.compile_expr(&expr).unwrap();
+        let func: fn(u64) -> u64 = unsafe { std::mem::transmute(func_ptr) };
+        
+        // Create an empty environment to pass in
+        use crate::environment::Environment;
+        let empty_env_ptr = unsafe { Environment::from_values(&[], None) };
+        let empty_env = Var::environment(empty_env_ptr).as_u64();
+        let result_bits = func(empty_env);
+        
+        // Clean up
+        unsafe { Environment::free(empty_env_ptr) };
+        
+        // Check result - add debugging
+        let result_var = Var::from_u64(result_bits);
+        println!("Result bits: 0x{:016x}", result_bits);
+        println!("Result var type: {:?}", result_var.get_type());
+        if let Some(d) = result_var.as_double() {
+            println!("Result as double: {}", d);
+        } else {
+            println!("Not a double, as_int: {:?}", result_var.as_int());
+        }
+        assert_eq!(result_var.as_double(), Some(7.0));
+    }
+    
+    #[test]
+    fn test_execute_nested_let_bindings() {
+        let mut compiler = Compiler::new();
+        
+        // Create (let ((x 3.0)) (let ((y 4.0)) (+ x y))) = 7.0
+        use crate::symbol::Symbol;
+        let x_sym = Symbol::mk("x");
+        let y_sym = Symbol::mk("y");
+        
+        let inner_let = Expr::let_binding(
+            vec![(y_sym, Expr::number(4.0))],
+            Expr::call(
+                Expr::variable("+"),
+                vec![Expr::variable("x"), Expr::variable("y")]
+            )
+        );
+        
+        let outer_let = Expr::let_binding(
+            vec![(x_sym, Expr::number(3.0))],
+            inner_let
+        );
+        
+        // Compile and execute
+        let func_ptr = compiler.compile_expr(&outer_let).unwrap();
+        let func: fn(u64) -> u64 = unsafe { std::mem::transmute(func_ptr) };
+        
+        use crate::environment::Environment;
+        let empty_env_ptr = unsafe { Environment::from_values(&[], None) };
+        let empty_env = Var::environment(empty_env_ptr).as_u64();
+        let result_bits = func(empty_env);
+        
+        // Clean up
+        unsafe { Environment::free(empty_env_ptr) };
+        
+        // Check result
+        let result_var = Var::from_u64(result_bits);
+        assert_eq!(result_var.as_double(), Some(7.0));
+    }
+    
+    #[test]
+    fn test_execute_multiple_bindings() {
+        let mut compiler = Compiler::new();
+        
+        // Create (let ((x 2.0) (y 3.0) (z 1.0)) (+ (+ x y) z)) = 6.0
+        use crate::symbol::Symbol;
+        let x_sym = Symbol::mk("x");
+        let y_sym = Symbol::mk("y");
+        let z_sym = Symbol::mk("z");
+        
+        let expr = Expr::let_binding(
+            vec![
+                (x_sym, Expr::number(2.0)),
+                (y_sym, Expr::number(3.0)),
+                (z_sym, Expr::number(1.0))
+            ],
+            Expr::call(
+                Expr::variable("+"),
+                vec![
+                    Expr::call(
+                        Expr::variable("+"),
+                        vec![Expr::variable("x"), Expr::variable("y")]
+                    ),
+                    Expr::variable("z")
+                ]
+            )
+        );
+        
+        // Compile and execute
+        let func_ptr = compiler.compile_expr(&expr).unwrap();
+        let func: fn(u64) -> u64 = unsafe { std::mem::transmute(func_ptr) };
+        
+        use crate::environment::Environment;
+        let empty_env_ptr = unsafe { Environment::from_values(&[], None) };
+        let empty_env = Var::environment(empty_env_ptr).as_u64();
+        let result_bits = func(empty_env);
+        
+        // Clean up
+        unsafe { Environment::free(empty_env_ptr) };
+        
+        // Check result
+        let result_var = Var::from_u64(result_bits);
+        assert_eq!(result_var.as_double(), Some(6.0));
     }
 }

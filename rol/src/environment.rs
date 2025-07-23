@@ -217,20 +217,18 @@ pub extern "C" fn env_get(env_bits: u64, depth: u32, offset: u32) -> u64 {
 }
 
 /// Set a value in environment using lexical addressing.
-/// Returns 1 if successful, 0 if failed.
+/// Returns the environment (unchanged) as u64.
 #[unsafe(no_mangle)]
-pub extern "C" fn env_set(env_bits: u64, depth: u32, offset: u32, value_bits: u64) -> u32 {
+pub extern "C" fn env_set(env_bits: u64, depth: u32, offset: u32, value_bits: u64) -> u64 {
     let env_var = Var::from_u64(env_bits);
     if let Some(env_ptr) = env_var.as_environment() {
         let addr = LexicalAddress { depth, offset };
         let value = Var::from_u64(value_bits);
         unsafe {
-            if (*env_ptr).assign(addr, value) {
-                return 1;
-            }
+            (*env_ptr).assign(addr, value);
         }
     }
-    0
+    env_bits // Return the environment unchanged
 }
 
 /// Get direct slot value from current environment frame (depth=0 optimized path).
@@ -578,14 +576,16 @@ mod tests {
             assert_eq!(val.as_int(), Some(200));
             
             // Test lexical set - parent frame
-            assert_eq!(env_set(child_bits, 1, 1, Var::int(999).as_u64()), 1);
+            let result = env_set(child_bits, 1, 1, Var::int(999).as_u64());
+            assert_eq!(result, child_bits); // env_set returns the environment unchanged
             let val = Var::from_u64(env_get(child_bits, 1, 1));
             assert_eq!(val.as_int(), Some(999));
             
             // Test out of bounds
             assert_eq!(env_get(child_bits, 0, 5), Var::none().as_u64());
             assert_eq!(env_get(child_bits, 5, 0), Var::none().as_u64());
-            assert_eq!(env_set(child_bits, 0, 5, Var::int(1).as_u64()), 0);
+            let result = env_set(child_bits, 0, 5, Var::int(1).as_u64());
+            assert_eq!(result, child_bits); // env_set always returns the environment even if out of bounds
             
             // Clean up
             let child_var = Var::from_u64(child_bits);
@@ -639,7 +639,7 @@ mod tests {
         assert_eq!(env_get_local(0, 0), Var::none().as_u64());
         assert_eq!(env_set_local(0, 0, Var::int(1).as_u64()), 0);
         assert_eq!(env_get(0, 0, 0), Var::none().as_u64());
-        assert_eq!(env_set(0, 0, 0, Var::int(1).as_u64()), 0);
+        assert_eq!(env_set(0, 0, 0, Var::int(1).as_u64()), 0); // returns 0 (unchanged env) for invalid env
         
         // Test invalid Var type (not environment)
         let int_bits = Var::int(42).as_u64();
