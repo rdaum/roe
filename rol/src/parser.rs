@@ -677,7 +677,7 @@ mod tests {
     
     #[test]
     fn test_parse_lambda() {
-        let expr = parse_expr_string("(lambda (x y) (+ x y))").unwrap();
+        let expr = parse_expr_string("(lambda [x y] (+ x y))").unwrap();
         
         match expr {
             Expr::Lambda { params, body } => {

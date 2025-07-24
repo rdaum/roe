@@ -42,8 +42,10 @@ impl Repl {
         // Compile to bytecode
         let function = self.bytecode_compiler.compile_expr(&expr).map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)) as Box<dyn std::error::Error>)?;
         
-        // JIT compile bytecode to machine code with lambda registry
-        let func_ptr = self.jit.compile_function(&function, &self.bytecode_compiler.lambda_registry).map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)) as Box<dyn std::error::Error>)?;
+        // JIT compile bytecode to machine code with lambda registry and recursive call info
+        let recursive_calls = self.bytecode_compiler.get_recursive_calls();
+        let global_symbol_table = self.bytecode_compiler.get_global_symbol_table();
+        let func_ptr = self.jit.compile_function(&function, &self.bytecode_compiler.lambda_registry, recursive_calls, global_symbol_table).map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)) as Box<dyn std::error::Error>)?;
         
         // Execute the compiled function with JIT context
         let result = self.jit.execute_function(func_ptr);

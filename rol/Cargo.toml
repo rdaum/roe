@@ -16,3 +16,8 @@ cranelift = "0.108"
 cranelift-jit = "0.108"
 cranelift-module = "0.108"
 cranelift-native = "0.108"
+
+[[bin]]
+name = "fib_bench"
+path = "src/fib_bench.rs"
+

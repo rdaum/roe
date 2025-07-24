@@ -917,9 +917,9 @@ mod tests {
     fn test_unimplemented_builtin() {
         let mut compiler = Compiler::new();
         
-        // Create (- 5.0 3.0) - subtraction not yet implemented
+        // Create (* 5.0 3.0) - multiplication not yet implemented  
         let expr = Expr::call(
-            Expr::variable("-"),
+            Expr::variable("*"),
             vec![Expr::number(5.0), Expr::number(3.0)]
         );
         
@@ -1153,7 +1153,7 @@ mod tests {
         println!("Creating high-performance arithmetic lambda test...");
         
         // Test a lambda that does arithmetic (avoiding if for now since that has issues)
-        let arith_expr = parse_expr_string("(lambda (n) (+ (+ n 1) (- n 1)))").unwrap();
+        let arith_expr = parse_expr_string("(lambda [n] (+ (+ n 1) (- n 1)))").unwrap();
         
         let func_ptr = compiler.compile_expr(&arith_expr).expect("Failed to compile arithmetic lambda");
         
@@ -1285,7 +1285,7 @@ mod tests {
         let mut compiler = Compiler::new();
         
         // Create the same arithmetic lambda
-        let lambda_expr = parse_expr_string("(lambda (n) (+ (+ n 1) (- n 1)))").unwrap();
+        let lambda_expr = parse_expr_string("(lambda [n] (+ (+ n 1) (- n 1)))").unwrap();
         let func_ptr = compiler.compile_expr(&lambda_expr).expect("Failed to compile lambda");
         
         let env_ptr = Environment::from_values(&[], None);

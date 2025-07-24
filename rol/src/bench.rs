@@ -2,6 +2,7 @@
 //! Compares JIT-compiled ROL performance against native Rust implementations.
 
 use crate::repl::Repl;
+use crate::bytecode;
 use std::time::Instant;
 
 /// Native Rust recursive Fibonacci implementation
@@ -19,8 +20,8 @@ fn run_fibonacci_benchmark() -> Result<(), Box<dyn std::error::Error>> {
     println!("======================");
     println!();
     
-    // Test with Fibonacci of 15 for reasonable timing with recursive implementation  
-    let n = 15;
+    // Test with Fibonacci of 25 for profiling - higher number for longer execution
+    let n = 25; // Higher number for profiling
     println!("Computing Fibonacci of {n}");
     println!();
     
@@ -33,6 +34,8 @@ fn run_fibonacci_benchmark() -> Result<(), Box<dyn std::error::Error>> {
     // Now that if expressions work correctly, we can use proper recursive Fibonacci
     let fib_def = "(defn fib [n] (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))";
     
+    println!("  Compiling recursive function...");
+    
     // Measure compilation time
     let compile_start = Instant::now();
     repl.eval(fib_def)?;
@@ -40,10 +43,16 @@ fn run_fibonacci_benchmark() -> Result<(), Box<dyn std::error::Error>> {
     
     println!("  Compilation time: {compile_time:?}");
     
+    // Reset call counter before execution
+    bytecode::get_and_reset_call_count();
+    
     // Measure execution time
     let exec_start = Instant::now();
     let rol_result = repl.eval(&format!("(fib {n})"))?;
     let exec_time = exec_start.elapsed();
+    
+    // Get the number of function calls made
+    let call_count = bytecode::get_and_reset_call_count();
     
     println!("  Debug: ROL result type: {:?}", rol_result.get_type());
     println!("  Debug: ROL result value: {rol_result:?}");
@@ -61,6 +70,7 @@ fn run_fibonacci_benchmark() -> Result<(), Box<dyn std::error::Error>> {
     };
     
     println!("  Execution time:   {exec_time:?}");
+    println!("  Function calls:   {call_count}");
     println!("  Result:           {rol_value}");
     println!("  Total time:       {:?}", compile_time + exec_time);
     println!();
@@ -94,6 +104,8 @@ fn run_fibonacci_benchmark() -> Result<(), Box<dyn std::error::Error>> {
     println!("  ROL vs Rust (exec only): {slowdown_exec:.2}x slower");
     println!("  Compilation overhead:    {:.2}% of total", 
              (compile_time.as_secs_f64() / total_rol_time.as_secs_f64()) * 100.0);
+    println!("  Avg time per call:       {:.2}µs", 
+             (exec_time.as_secs_f64() * 1_000_000.0) / call_count as f64);
     
     if slowdown_exec < 10.0 {
         println!("  ✓ Good JIT performance - within 10x of native Rust");

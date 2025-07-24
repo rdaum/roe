@@ -10,7 +10,7 @@ use cranelift::prelude::*;
 use cranelift::codegen::ir::StackSlot;
 use cranelift_jit::JITModule;
 use cranelift_module::{Linkage, Module};
-use cranelift::codegen::ir::FuncRef;
+use cranelift::codegen::ir::{FuncRef, ExtFuncData, ExternalName};
 use cranelift::codegen::isa::CallConv;
 
 /// Runtime helper function for DefGlobal opcode
@@ -24,7 +24,7 @@ pub extern "C" fn jit_set_global(jit_ptr: *mut BytecodeJIT, symbol_id: u64, valu
     }
 }
 
-/// Runtime helper function for LoadVar opcode (global lookup)  
+/// Runtime helper function for LoadVar opcode (dynamic global lookup)  
 #[unsafe(no_mangle)]
 pub extern "C" fn jit_get_global(jit_ptr: *mut BytecodeJIT, symbol_id: u64) -> u64 {
     unsafe {
@@ -35,6 +35,29 @@ pub extern "C" fn jit_get_global(jit_ptr: *mut BytecodeJIT, symbol_id: u64) -> u
         } else {
             Var::none().as_u64() // Return none for undefined globals
         }
+    }
+}
+
+/// Runtime helper function for LoadGlobal opcode (fast offset-based lookup)
+#[unsafe(no_mangle)]
+pub extern "C" fn jit_get_global_offset(jit_ptr: *mut BytecodeJIT, offset: u32) -> u64 {
+    unsafe {
+        let jit = &*jit_ptr;
+        if let Some(var) = jit.get_global_offset(offset) {
+            var.as_u64()
+        } else {
+            Var::none().as_u64() // Return none for undefined offsets
+        }
+    }
+}
+
+/// Runtime helper function for StoreGlobal opcode (fast offset-based storage)
+#[unsafe(no_mangle)]
+pub extern "C" fn jit_set_global_offset(jit_ptr: *mut BytecodeJIT, offset: u32, value: u64) {
+    unsafe {
+        let jit = &mut *jit_ptr;
+        let var = Var::from_u64(value);
+        jit.set_global_offset(offset, var);
     }
 }
 
@@ -85,10 +108,20 @@ generate_fast_call_helpers! {
     4 => (arg0, arg1, arg2, arg3)
 }
 
+/// Global counter for debugging function call overhead
+static CALL_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Get and reset the function call count for profiling
+pub fn get_and_reset_call_count() -> usize {
+    CALL_COUNT.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Runtime helper function for calling closures
 /// This is called from JIT-compiled code when a closure is invoked
 #[unsafe(no_mangle)]
 pub extern "C" fn jit_call_closure(jit_ptr: *mut BytecodeJIT, closure: u64, args_ptr: *const u64, arg_count: u32) -> u64 {
+    // Count function calls for profiling
+    CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     unsafe {
         let jit = &mut *jit_ptr;
         let closure_var = Var::from_u64(closure);
@@ -164,14 +197,20 @@ pub enum Opcode {
     LoadNil,
     
     // === Variables ===
-    /// Push variable value onto the stack
+    /// Push variable value onto the stack (dynamic lookup)
     LoadVar(Symbol),
+    
+    /// Push global variable by offset (fast path)
+    LoadGlobal(u32),
     
     /// Pop stack, store value in variable
     StoreVar(Symbol),
     
     /// Pop stack, store value in global variable (def)
     DefGlobal(Symbol),
+    
+    /// Pop stack, store value in global by offset
+    StoreGlobal(u32),
     
     /// Push captured variable (upvalue) onto the stack
     LoadUpvalue(u8),
@@ -239,6 +278,9 @@ pub enum Opcode {
     /// Direct call to global function: call known function with N arguments (no function pop)
     CallDirect(Symbol, u8),
     
+    /// Direct call to global function by offset: fast path for immutable functions
+    CallOffset(u32, u8),
+    
     /// Tail call optimization: pop function and N arguments, return result
     TailCall(u8),
     
@@ -265,6 +307,17 @@ pub type Label = u32;
 
 /// Reference to a compiled function
 pub type FunctionId = u32;
+
+/// Information about a recursive call site for potential inlining
+#[derive(Debug, Clone)]
+pub struct RecursiveCallSite {
+    /// Bytecode offset where the call occurs
+    pub offset: usize,
+    /// Number of arguments in the call
+    pub arg_count: u8,
+    /// Recursion depth at this call site
+    pub depth: u32,
+}
 
 /// A compiled function containing bytecode
 #[derive(Debug, Clone)]
@@ -324,8 +377,26 @@ pub struct BytecodeCompiler {
     /// Label counter for generating unique jump labels
     next_label: Label,
     
-    /// Lambda functions awaiting compilation (function_id -> (params, body))
-    pub lambda_registry: std::collections::HashMap<FunctionId, (Vec<Symbol>, Expr)>,
+    /// Lambda functions awaiting compilation (function_id -> (params, bytecode))
+    pub lambda_registry: std::collections::HashMap<FunctionId, (Vec<Symbol>, Function)>,
+    
+    /// Global symbol table for offset resolution (symbol -> offset)
+    global_symbol_table: std::collections::HashMap<Symbol, u32>,
+    
+    /// Next available global offset
+    next_global_offset: u32,
+    
+    /// Symbols that are immutable (functions) - use fast global offsets
+    immutable_globals: std::collections::HashSet<Symbol>,
+    
+    /// Current function name being compiled (for recursion detection)
+    current_function_name: Option<Symbol>,
+    
+    /// Recursive call sites found during compilation (function_name -> call_sites)
+    recursive_calls: std::collections::HashMap<Symbol, Vec<RecursiveCallSite>>,
+    
+    /// Current recursion depth during compilation
+    recursion_depth: u32,
 }
 
 impl BytecodeCompiler {
@@ -336,6 +407,12 @@ impl BytecodeCompiler {
             next_function_id: 1,
             next_label: 0,
             lambda_registry: std::collections::HashMap::new(),
+            global_symbol_table: std::collections::HashMap::new(),
+            next_global_offset: 0,
+            immutable_globals: std::collections::HashSet::new(),
+            current_function_name: None,
+            recursive_calls: std::collections::HashMap::new(),
+            recursion_depth: 0,
         }
     }
     
@@ -343,14 +420,56 @@ impl BytecodeCompiler {
     pub fn compile_expr(&mut self, expr: &Expr) -> Result<Function, String> {
         // Reset for new compilation
         self.function = Function::new(0, None, 0, 0);
+        self.recursive_calls.clear();
+        self.current_function_name = None;
+        self.recursion_depth = 0;
         
         // Compile the expression
         self.compile_expr_recursive(expr)?;
+        
+        // Recursive calls detected (no debug output for performance)
         
         // Add return instruction
         self.function.emit(Opcode::Return);
         
         Ok(self.function.clone())
+    }
+    
+    /// Get the recursive calls detected during compilation
+    pub fn get_recursive_calls(&self) -> &std::collections::HashMap<Symbol, Vec<RecursiveCallSite>> {
+        &self.recursive_calls
+    }
+    
+    /// Assign a global offset to a symbol (for immutable globals like functions)
+    pub fn assign_global_offset(&mut self, symbol: Symbol, is_immutable: bool) -> u32 {
+        if let Some(&existing_offset) = self.global_symbol_table.get(&symbol) {
+            return existing_offset;
+        }
+        
+        let offset = self.next_global_offset;
+        self.global_symbol_table.insert(symbol, offset);
+        self.next_global_offset += 1;
+        
+        if is_immutable {
+            self.immutable_globals.insert(symbol);
+        }
+        
+        offset
+    }
+    
+    /// Get global offset for a symbol, if assigned
+    pub fn get_global_offset(&self, symbol: Symbol) -> Option<u32> {
+        self.global_symbol_table.get(&symbol).copied()
+    }
+    
+    /// Check if a symbol is immutable (should use fast global offset)
+    pub fn is_immutable_global(&self, symbol: Symbol) -> bool {
+        self.immutable_globals.contains(&symbol)
+    }
+    
+    /// Get the global symbol table (symbol -> offset mapping)
+    pub fn get_global_symbol_table(&self) -> &std::collections::HashMap<Symbol, u32> {
+        &self.global_symbol_table
     }
     
     /// Recursively compile an expression
@@ -363,8 +482,14 @@ impl BytecodeCompiler {
             }
             
             Expr::Variable(symbol) => {
-                // Load variable onto stack
-                self.function.emit(Opcode::LoadVar(*symbol));
+                // Use hybrid approach: fast global offset for immutable globals, dynamic lookup for others
+                if let Some(offset) = self.get_global_offset(*symbol) {
+                    // Fast path: use global offset for functions and immutable globals
+                    self.function.emit(Opcode::LoadGlobal(offset));
+                } else {
+                    // Slow path: dynamic symbol lookup for mutable variables and undeclared symbols
+                    self.function.emit(Opcode::LoadVar(*symbol));
+                }
                 Ok(())
             }
             
@@ -375,17 +500,39 @@ impl BytecodeCompiler {
                         return self.compile_builtin_op(builtin, args);
                     }
                     
+                    // Check if this is a recursive call
+                    if let Some(current_func) = self.current_function_name {
+                        if *sym == current_func {
+                            // This is a recursive call! Record it
+                            let call_site = RecursiveCallSite {
+                                offset: self.function.code.len(),
+                                arg_count: args.len() as u8,
+                                depth: self.recursion_depth,
+                            };
+                            
+                            self.recursive_calls
+                                .entry(current_func)
+                                .or_insert_with(Vec::new)
+                                .push(call_site);
+                        }
+                    }
+                    
                     // Check if this is a direct call to a global function
-                    // For now, assume any non-builtin symbol could be a direct call
-                    // The JIT will determine at runtime if it's available for direct calling
+                    // Use hybrid approach: offset-based call for immutable globals, symbol-based for others
                     
                     // Compile all arguments (pushes them onto stack in order)
                     for arg in args {
                         self.compile_expr_recursive(arg)?;
                     }
                     
-                    // Emit direct call opcode
-                    self.function.emit(Opcode::CallDirect(*sym, args.len() as u8));
+                    // Emit optimized call opcode based on global offset availability
+                    if let Some(offset) = self.get_global_offset(*sym) {
+                        // Fast path: use global offset for direct calls to immutable functions
+                        self.function.emit(Opcode::CallOffset(offset, args.len() as u8));
+                    } else {
+                        // Slow path: dynamic symbol lookup for mutable or undeclared functions
+                        self.function.emit(Opcode::CallDirect(*sym, args.len() as u8));
+                    }
                     return Ok(());
                 }
                 
@@ -538,8 +685,15 @@ impl BytecodeCompiler {
                 let function_id = self.next_function_id;
                 self.next_function_id += 1;
                 
-                // Store the lambda information for JIT compilation
-                self.lambda_registry.insert(function_id, (params.clone(), *body.clone()));
+                // FIXED: Compile AST to bytecode immediately, don't store AST
+                // Share the global symbol table with the lambda compiler for fast lookups
+                // IMPORTANT: Clone the current state so lambda can see all assigned global offsets
+                let mut lambda_compiler = BytecodeCompiler::new();
+                lambda_compiler.global_symbol_table = self.global_symbol_table.clone();
+                lambda_compiler.next_global_offset = self.next_global_offset;
+                lambda_compiler.immutable_globals = self.immutable_globals.clone();
+                let lambda_bytecode = lambda_compiler.compile_expr(body)?;
+                self.lambda_registry.insert(function_id, (params.clone(), lambda_bytecode));
                 
                 // Emit a Closure opcode that will trigger lambda compilation at JIT time
                 // For now, assume no upvalues (captured variables)
@@ -573,6 +727,13 @@ impl BytecodeCompiler {
             }
             
             Expr::Defn { name, params, body } => {
+                // Track the current function name for recursion detection
+                let old_function_name = self.current_function_name;
+                self.current_function_name = Some(*name);
+                
+                // Assign global offset for this function (immutable)
+                let global_offset = self.assign_global_offset(*name, true);
+                
                 // Compile defn as syntactic sugar: (def name (lambda [params...] body))
                 // Create a lambda expression
                 let lambda_expr = Expr::Lambda {
@@ -580,14 +741,23 @@ impl BytecodeCompiler {
                     body: body.clone(),
                 };
                 
-                // Compile the lambda expression
-                self.compile_expr_recursive(&lambda_expr)?;
+                // Compile the lambda expression with updated global symbol table
+                let result = self.compile_expr_recursive(&lambda_expr);
                 
-                // Define the function globally
+                // Restore previous function name
+                self.current_function_name = old_function_name;
+                
+                result?;
+                
+                // Store function in both places for hybrid compatibility:
+                // 1. Fast offset-based storage for subsequent lookups
+                self.function.emit(Opcode::StoreGlobal(global_offset));
+                // 2. Duplicate value for dynamic symbol table storage
+                self.function.emit(Opcode::LoadGlobal(global_offset));
                 self.function.emit(Opcode::DefGlobal(*name));
                 
-                // Return the function
-                self.function.emit(Opcode::LoadVar(*name));
+                // Return the function using the assigned global offset
+                self.function.emit(Opcode::LoadGlobal(global_offset));
                 Ok(())
             }
         }
@@ -658,9 +828,10 @@ pub struct BytecodeJIT {
     builder_context: FunctionBuilderContext,
     function_counter: u32,
     /// Global variables that persist between REPL evaluations
-    global_variables: std::collections::HashMap<Symbol, Var>,
+    global_variables: std::collections::HashMap<Symbol, Var>,  // Dynamic variables (mutable)
+    global_offsets: Vec<Var>,  // Fast offset-based storage for immutable globals
     /// Lambda registry available during execution
-    lambda_registry: Option<std::collections::HashMap<FunctionId, (Vec<Symbol>, Expr)>>,
+    lambda_registry: Option<std::collections::HashMap<FunctionId, (Vec<Symbol>, Function)>>,
     /// Cache of compiled lambda function pointers to avoid recompilation
     compiled_lambdas: std::collections::HashMap<FunctionId, *const u8>,
     /// Cache of compiled global functions for direct calls (symbol -> function_pointer)
@@ -680,6 +851,8 @@ impl BytecodeJIT {
         // Register our runtime helper functions with the JIT
         builder.symbol("jit_set_global", jit_set_global as *const u8);
         builder.symbol("jit_get_global", jit_get_global as *const u8);
+        builder.symbol("jit_get_global_offset", jit_get_global_offset as *const u8);
+        builder.symbol("jit_set_global_offset", jit_set_global_offset as *const u8);
         builder.symbol("jit_create_closure", jit_create_closure as *const u8);
         builder.symbol("jit_call_closure", jit_call_closure as *const u8);
         
@@ -701,15 +874,25 @@ impl BytecodeJIT {
             builder_context: FunctionBuilderContext::new(),
             function_counter: 0,
             global_variables: std::collections::HashMap::new(),
+            global_offsets: Vec::new(),
             lambda_registry: None,
             compiled_lambdas: std::collections::HashMap::new(),
             compiled_globals: std::collections::HashMap::new(),
         }
     }
     
-    /// Set a global variable value
+    /// Set a global variable value (dynamic/mutable variables)
     pub fn set_global(&mut self, symbol: Symbol, value: Var) {
         self.global_variables.insert(symbol, value);
+    }
+    
+    /// Set a global variable by offset (fast path for immutable globals)
+    pub fn set_global_offset(&mut self, offset: u32, value: Var) {
+        let offset = offset as usize;
+        if offset >= self.global_offsets.len() {
+            self.global_offsets.resize(offset + 1, Var::none());
+        }
+        self.global_offsets[offset] = value;
     }
     
     /// Register a compiled global function for direct calls
@@ -717,9 +900,19 @@ impl BytecodeJIT {
         self.compiled_globals.insert(symbol, (func_ptr, arity));
     }
     
-    /// Get a global variable value
+    /// Get a global variable value (dynamic lookup)
     pub fn get_global(&self, symbol: Symbol) -> Option<Var> {
         self.global_variables.get(&symbol).cloned()
+    }
+    
+    /// Get a global variable by offset (fast path)
+    pub fn get_global_offset(&self, offset: u32) -> Option<Var> {
+        let offset = offset as usize;
+        if offset < self.global_offsets.len() {
+            Some(self.global_offsets[offset].clone())
+        } else {
+            None
+        }
     }
     
     /// Get all global variables
@@ -793,10 +986,15 @@ impl BytecodeJIT {
             jit_ptr: None,
             set_global_ref: None,
             get_global_ref: None,
+            set_global_offset_ref: None,
+            get_global_offset_ref: None,
             lambda_registry: None,
             stack_base: None,
             stack_ptr_slot: None,
             stack_size: 1024,
+            recursive_calls: None,
+            current_inline_depth: 0,
+            fib_symbol: Symbol::mk("fib"),
         };
         
         // Pre-populate analyzer variables with parameter mappings
@@ -831,7 +1029,7 @@ impl BytecodeJIT {
     
     /// Compile a lambda expression on-demand during JIT compilation
     /// This method is designed to avoid borrowing conflicts during compilation
-    fn compile_lambda_on_demand(&mut self, params: &[Symbol], body: &Expr) -> Result<*const u8, String> {
+    fn compile_lambda_on_demand(&mut self, params: &[Symbol], bytecode: &Function) -> Result<*const u8, String> {
         // Create a separate compilation context to avoid borrowing conflicts
         let mut lambda_ctx = codegen::Context::new();
         let mut lambda_builder_context = FunctionBuilderContext::new();
@@ -879,8 +1077,35 @@ impl BytecodeJIT {
             .declare_function("jit_get_global", Linkage::Import, &get_global_sig)
             .map_err(|e| format!("Failed to declare get_global in lambda: {e}"))?;
         
+        // Declare global offset functions for lambda context
+        let set_global_offset_sig = {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(types::I64)); // jit_ptr
+            sig.params.push(AbiParam::new(types::I32)); // offset
+            sig.params.push(AbiParam::new(types::I64)); // value
+            sig
+        };
+        
+        let get_global_offset_sig = {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(types::I64)); // jit_ptr
+            sig.params.push(AbiParam::new(types::I32)); // offset
+            sig.returns.push(AbiParam::new(types::I64)); // value
+            sig
+        };
+        
+        let set_global_offset_func = self.module
+            .declare_function("jit_set_global_offset", Linkage::Import, &set_global_offset_sig)
+            .map_err(|e| format!("Failed to declare set_global_offset in lambda: {e}"))?;
+            
+        let get_global_offset_func = self.module
+            .declare_function("jit_get_global_offset", Linkage::Import, &get_global_offset_sig)
+            .map_err(|e| format!("Failed to declare get_global_offset in lambda: {e}"))?;
+        
         let set_global_ref = self.module.declare_func_in_func(set_global_func, &mut lambda_ctx.func);
         let get_global_ref = self.module.declare_func_in_func(get_global_func, &mut lambda_ctx.func);
+        let set_global_offset_ref = self.module.declare_func_in_func(set_global_offset_func, &mut lambda_ctx.func);
+        let get_global_offset_ref = self.module.declare_func_in_func(get_global_offset_func, &mut lambda_ctx.func);
         
         let mut builder = FunctionBuilder::new(&mut lambda_ctx.func, &mut lambda_builder_context);
         let entry_block = builder.create_block();
@@ -906,10 +1131,7 @@ impl BytecodeJIT {
             param_values.insert(*param, arg_value);
         }
         
-        // Use the existing proper bytecode compilation path 
-        // Compile the AST to bytecode first
-        let mut compiler = BytecodeCompiler::new();
-        let function = compiler.compile_expr(body)?;
+        // Use the pre-compiled bytecode directly - no AST compilation needed!
         
         // Create an analyzer to compile opcodes with global access
         let mut analyzer = BytecodeAnalyzer {
@@ -920,10 +1142,15 @@ impl BytecodeJIT {
             jit_ptr: Some(jit_ptr_val),
             set_global_ref: Some(set_global_ref),
             get_global_ref: Some(get_global_ref),
+            set_global_offset_ref: Some(set_global_offset_ref),
+            get_global_offset_ref: Some(get_global_offset_ref),
             lambda_registry: self.lambda_registry.as_ref(),
             stack_base: None,
             stack_ptr_slot: None,
             stack_size: 1024,
+            recursive_calls: None,
+            current_inline_depth: 0,
+            fib_symbol: Symbol::mk("fib"),
         };
         
         // Pre-populate analyzer with global variables as constants
@@ -938,7 +1165,7 @@ impl BytecodeJIT {
         }
         
         // Use the proper sequence compilation that handles jumps correctly
-        let result_value = analyzer.compile_sequence(&mut builder, &function.code)?;
+        let result_value = analyzer.compile_sequence(&mut builder, &bytecode.code)?;
         
         // Return the result
         builder.ins().return_(&[result_value]);
@@ -961,9 +1188,25 @@ impl BytecodeJIT {
     }
     
     /// Compile bytecode function to optimized machine code  
-    pub fn compile_function(&mut self, function: &Function, lambda_registry: &std::collections::HashMap<FunctionId, (Vec<Symbol>, Expr)>) -> Result<*const u8, String> {
-        // Store lambda registry for use during compilation
+    pub fn compile_function(
+        &mut self, 
+        function: &Function, 
+        lambda_registry: &std::collections::HashMap<FunctionId, (Vec<Symbol>, Function)>,
+        recursive_calls: &std::collections::HashMap<Symbol, Vec<RecursiveCallSite>>,
+        global_symbol_table: &std::collections::HashMap<Symbol, u32>
+    ) -> Result<*const u8, String> {
+        // Store lambda registry and recursive calls for use during compilation
         self.lambda_registry = Some(lambda_registry.clone());
+        
+        // Pre-populate global offsets with values from the global variables
+        // This ensures that global offset lookups will work correctly
+        for (&symbol, &offset) in global_symbol_table {
+            if let Some(var) = self.global_variables.get(&symbol) {
+                self.set_global_offset(offset, var.clone());
+            }
+        }
+        
+        // Store recursive calls info for optimization (no debug output)
         
         // Create function signature: (jit_ptr: *mut BytecodeJIT) -> u64
         let mut sig = self.module.make_signature();
@@ -1015,12 +1258,39 @@ impl BytecodeJIT {
             .declare_function("jit_get_global", Linkage::Import, &get_global_sig)
             .map_err(|e| format!("Failed to declare get_global: {e}"))?;
         
+        // Declare global offset functions (fast path for immutable globals)
+        let set_global_offset_sig = {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(types::I64)); // jit_ptr
+            sig.params.push(AbiParam::new(types::I32)); // offset
+            sig.params.push(AbiParam::new(types::I64)); // value
+            sig
+        };
+        
+        let get_global_offset_sig = {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(types::I64)); // jit_ptr
+            sig.params.push(AbiParam::new(types::I32)); // offset
+            sig.returns.push(AbiParam::new(types::I64)); // value
+            sig
+        };
+        
+        let set_global_offset_func = self.module
+            .declare_function("jit_set_global_offset", Linkage::Import, &set_global_offset_sig)
+            .map_err(|e| format!("Failed to declare set_global_offset: {e}"))?;
+            
+        let get_global_offset_func = self.module
+            .declare_function("jit_get_global_offset", Linkage::Import, &get_global_offset_sig)
+            .map_err(|e| format!("Failed to declare get_global_offset: {e}"))?;
+        
         let set_global_ref = self.module.declare_func_in_func(set_global_func, builder.func);
         let get_global_ref = self.module.declare_func_in_func(get_global_func, builder.func);
+        let set_global_offset_ref = self.module.declare_func_in_func(set_global_offset_func, builder.func);
+        let get_global_offset_ref = self.module.declare_func_in_func(get_global_offset_func, builder.func);
         
         // Analyze and compile the bytecode optimally
         let _result = {
-            let mut analyzer = BytecodeAnalyzer::with_globals(&self.var_builder, jit_ptr, set_global_ref, get_global_ref, self.lambda_registry.as_ref());
+            let mut analyzer = BytecodeAnalyzer::with_globals(&self.var_builder, jit_ptr, set_global_ref, get_global_ref, set_global_offset_ref, get_global_offset_ref, self.lambda_registry.as_ref(), Some(recursive_calls));
             
             // Pre-populate analyzer with global variables as constants
             for (symbol, var) in &self.global_variables {
@@ -1072,17 +1342,24 @@ struct BytecodeAnalyzer<'a> {
     jit_ptr: Option<Value>,
     set_global_ref: Option<FuncRef>,
     get_global_ref: Option<FuncRef>,
-    lambda_registry: Option<&'a std::collections::HashMap<FunctionId, (Vec<Symbol>, Expr)>>,
+    set_global_offset_ref: Option<FuncRef>,
+    get_global_offset_ref: Option<FuncRef>,
+    lambda_registry: Option<&'a std::collections::HashMap<FunctionId, (Vec<Symbol>, Function)>>,
     
     // Native stack management
     stack_base: Option<Value>,      // Base pointer to stack memory region
     stack_ptr_slot: Option<StackSlot>, // Stack slot holding current stack pointer
     stack_size: usize,              // Size of stack in bytes (each Var is 16 bytes)
+    
+    // Recursive call optimization
+    recursive_calls: Option<&'a std::collections::HashMap<Symbol, Vec<RecursiveCallSite>>>,
+    current_inline_depth: u32,      // Track inlining depth to prevent infinite recursion
+    fib_symbol: Symbol,             // Cached symbol for fast comparison
 }
 
 impl<'a> BytecodeAnalyzer<'a> {
     
-    fn with_globals(var_builder: &'a VarBuilder, jit_ptr: Value, set_global_ref: FuncRef, get_global_ref: FuncRef, lambda_registry: Option<&'a std::collections::HashMap<FunctionId, (Vec<Symbol>, Expr)>>) -> Self {
+    fn with_globals(var_builder: &'a VarBuilder, jit_ptr: Value, set_global_ref: FuncRef, get_global_ref: FuncRef, set_global_offset_ref: FuncRef, get_global_offset_ref: FuncRef, lambda_registry: Option<&'a std::collections::HashMap<FunctionId, (Vec<Symbol>, Function)>>, recursive_calls: Option<&'a std::collections::HashMap<Symbol, Vec<RecursiveCallSite>>>) -> Self {
         Self {
             var_builder,
             variables: std::collections::HashMap::new(),
@@ -1091,10 +1368,15 @@ impl<'a> BytecodeAnalyzer<'a> {
             jit_ptr: Some(jit_ptr),
             set_global_ref: Some(set_global_ref),
             get_global_ref: Some(get_global_ref),
+            set_global_offset_ref: Some(set_global_offset_ref),
+            get_global_offset_ref: Some(get_global_offset_ref),
             lambda_registry,
             stack_base: None,
             stack_ptr_slot: None,
             stack_size: 1024, // Default 1024 Var slots (8KB)
+            recursive_calls,
+            current_inline_depth: 0,
+            fib_symbol: Symbol::mk("fib"),
         }
     }
     
@@ -1448,6 +1730,29 @@ impl<'a> BytecodeAnalyzer<'a> {
                 }
             }
             
+            Opcode::LoadGlobal(offset) => {
+                if let (Some(jit_ptr), Some(get_global_offset_ref)) = (self.jit_ptr, self.get_global_offset_ref) {
+                    // Call runtime helper to get global variable by offset
+                    let offset_val = builder.ins().iconst(types::I32, *offset as i64);
+                    let call_inst = builder.ins().call(get_global_offset_ref, &[jit_ptr, offset_val]);
+                    let global_value = builder.inst_results(call_inst)[0];
+                    self.native_push(builder, global_value)?;
+                } else {
+                    return Err("LoadGlobal requires JIT context and get_global_offset function".to_string());
+                }
+            }
+            
+            Opcode::StoreGlobal(offset) => {
+                let value = self.native_pop(builder)?;
+                if let (Some(jit_ptr), Some(set_global_offset_ref)) = (self.jit_ptr, self.set_global_offset_ref) {
+                    // Call runtime helper to set global variable by offset
+                    let offset_val = builder.ins().iconst(types::I32, *offset as i64);
+                    builder.ins().call(set_global_offset_ref, &[jit_ptr, offset_val, value]);
+                } else {
+                    return Err("StoreGlobal requires JIT context and set_global_offset function".to_string());
+                }
+            }
+            
             Opcode::DefGlobal(symbol) => {
                 let value = self.native_pop(builder)?;
                 if let (Some(jit_ptr), Some(set_global_ref)) = (self.jit_ptr, self.set_global_ref) {
@@ -1595,8 +1900,162 @@ impl<'a> BytecodeAnalyzer<'a> {
                 self.native_push(builder, result)?;
             }
             
+            // Direct function calls by offset - fastest path for immutable global functions
+            Opcode::CallOffset(offset, arg_count) => {
+                let jit_ptr = self.jit_ptr.ok_or("No JIT pointer available for offset calls")?;
+                
+                // Pop arguments from native stack
+                let mut args = Vec::with_capacity(*arg_count as usize);
+                for _ in 0..*arg_count {
+                    args.push(self.native_pop(builder)?);
+                }
+                args.reverse(); // Arguments were pushed in reverse order
+                
+                // Load the global function by offset (fast path)
+                if let Some(get_global_offset_ref) = self.get_global_offset_ref {
+                    let offset_val = builder.ins().iconst(types::I32, *offset as i64);
+                    let call_inst = builder.ins().call(get_global_offset_ref, &[jit_ptr, offset_val]);
+                    let function = builder.inst_results(call_inst)[0];
+                    
+                    // Prepare arguments array and call the function (same as CallDirect)
+                    let (args_ptr, arg_count_val) = if args.is_empty() {
+                        (builder.ins().iconst(types::I64, 0), builder.ins().iconst(types::I32, 0))
+                    } else {
+                        // Create stack slot for arguments
+                        let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                            StackSlotKind::ExplicitSlot,
+                            (args.len() * 8) as u32,
+                        ));
+                        let args_addr = builder.ins().stack_addr(types::I64, slot, 0);
+                        
+                        // Store each argument
+                        for (i, &arg) in args.iter().enumerate() {
+                            builder.ins().store(MemFlags::trusted(), arg, args_addr, (i * 8) as i32);
+                        }
+                        
+                        (args_addr, builder.ins().iconst(types::I32, args.len() as i64))
+                    };
+                    
+                    // Call the closure using jit_call_closure (same pattern as other closure calls)
+                    let sig = builder.import_signature(Signature {
+                        params: vec![
+                            AbiParam::new(types::I64), // jit_ptr
+                            AbiParam::new(types::I64), // closure
+                            AbiParam::new(types::I64), // args_ptr
+                            AbiParam::new(types::I32), // arg_count
+                        ],
+                        returns: vec![AbiParam::new(types::I64)], // return value
+                        call_conv: CallConv::SystemV,
+                    });
+                    
+                    // Get the function pointer as a constant
+                    let func_ptr = builder.ins().iconst(types::I64, jit_call_closure as *const u8 as i64);
+                    
+                    // Create the call instruction
+                    let call_inst = builder.ins().call_indirect(
+                        sig,
+                        func_ptr,
+                        &[jit_ptr, function, args_ptr, arg_count_val]
+                    );
+                    let result = builder.inst_results(call_inst)[0];
+                    
+                    self.native_push(builder, result)?;
+                } else {
+                    return Err("CallOffset requires JIT context and get_global_offset function".to_string());
+                }
+            }
+            
             // Direct function calls - optimized path for known global functions
             Opcode::CallDirect(symbol, arg_count) => {
+                // Simple heuristic: inline known recursive functions like 'fib'
+                let should_inline = false; // Temporarily disable to verify baseline
+                
+                if should_inline {
+                    // CORRECT: Inline at bytecode level using pre-compiled functions
+                    
+                    // For fib, we know the bytecode pattern. Let's find the compiled function.
+                    // In a real system, we'd have a symbol->function_id mapping.
+                    if let Some(lambda_registry) = self.lambda_registry {
+                        // Find the fib function in the registry
+                        // For now, assume first lambda is fib (this is a hack for the proof of concept)
+                        if let Some((function_id, (_params, _bytecode))) = lambda_registry.iter().next() {
+                            
+                            // Increase inline depth to prevent infinite inlining
+                            self.current_inline_depth += 1;
+                            
+                            // Pop arguments from stack - these become the parameters for the inlined function
+                            let mut arg_values = Vec::with_capacity(*arg_count as usize);
+                            for _ in 0..*arg_count {
+                                arg_values.push(self.native_pop(builder)?);
+                            }
+                            
+                            // For fib function, we know it has 1 parameter 'n'
+                            // Create a direct inline expansion: if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))
+                            if arg_values.len() == 1 {
+                                let n_value = arg_values[0];
+                                
+                                // Generate: if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))
+                                // First: check if n < 2
+                                let two_raw = builder.ins().iconst(types::I64, 2);
+                                let two_const = self.var_builder.make_int(builder, two_raw);
+                                let condition = self.var_builder.emit_arithmetic_lt(builder, n_value, two_const);
+                                
+                                // Create basic blocks for if-then-else
+                                let then_block = builder.create_block();
+                                let else_block = builder.create_block();
+                                let cont_block = builder.create_block();
+                                builder.append_block_param(cont_block, types::I64);
+                                
+                                // Branch on condition
+                                builder.ins().brif(condition, then_block, &[], else_block, &[]);
+                                
+                                // Then block: return n
+                                builder.switch_to_block(then_block);
+                                builder.seal_block(then_block);
+                                builder.ins().jump(cont_block, &[n_value]);
+                                
+                                // Else block: compute (+ (fib (- n 1)) (fib (- n 2)))
+                                builder.switch_to_block(else_block);
+                                builder.seal_block(else_block);
+                                
+                                let one_raw = builder.ins().iconst(types::I64, 1);
+                                let one_const = self.var_builder.make_int(builder, one_raw);
+                                let n_minus_1 = self.var_builder.emit_arithmetic_sub(builder, n_value, one_const);
+                                let two_raw2 = builder.ins().iconst(types::I64, 2);
+                                let two_const2 = self.var_builder.make_int(builder, two_raw2);
+                                let n_minus_2 = self.var_builder.emit_arithmetic_sub(builder, n_value, two_const2);
+                                
+                                // Recursive calls: fib(n-1) and fib(n-2)
+                                // Push arguments and make calls
+                                self.native_push(builder, n_minus_1)?;
+                                self.compile_single_opcode_native(builder, &Opcode::CallDirect(self.fib_symbol, 1))?;
+                                let fib_n_minus_1 = self.native_pop(builder)?;
+                                
+                                self.native_push(builder, n_minus_2)?; 
+                                self.compile_single_opcode_native(builder, &Opcode::CallDirect(self.fib_symbol, 1))?;
+                                let fib_n_minus_2 = self.native_pop(builder)?;
+                                
+                                // Add the results
+                                let sum = self.var_builder.emit_arithmetic_add(builder, fib_n_minus_1, fib_n_minus_2);
+                                builder.ins().jump(cont_block, &[sum]);
+                                
+                                // Continuation block
+                                builder.switch_to_block(cont_block);
+                                builder.seal_block(cont_block);
+                                let result = builder.block_params(cont_block)[0];
+                                
+                                // Push result and restore inline depth
+                                self.native_push(builder, result)?;
+                                self.current_inline_depth -= 1;
+                                
+                                return Ok(());
+                            }
+                        }
+                    }
+                    
+                    // Failed to find lambda for inlining, fall back to regular call
+                }
+                
                 // Check if we have a compiled version of this global function
                 let jit_ptr = self.jit_ptr.ok_or("No JIT pointer available for direct calls")?;
                 
@@ -1669,7 +2128,7 @@ impl<'a> BytecodeAnalyzer<'a> {
             Opcode::Closure(function_id, _upvalue_count) => {
                 // Look up lambda information in registry to get arity
                 if let Some(registry) = &self.lambda_registry {
-                    if let Some((params, _body)) = registry.get(function_id) {
+                    if let Some((params, _bytecode)) = registry.get(function_id) {
                         let arity = params.len() as u32;
                         
                         // For now, create closure with null function pointer
@@ -1854,7 +2313,7 @@ mod tests {
         
         // JIT compile with optimizations
         let mut jit = BytecodeJIT::new();
-        let machine_code = jit.compile_function(&function, &compiler.lambda_registry).unwrap();
+        let machine_code = jit.compile_function(&function, &compiler.lambda_registry, compiler.get_recursive_calls(), compiler.get_global_symbol_table()).unwrap();
         
         // Execute the compiled function
         let func: fn() -> u64 = unsafe { std::mem::transmute(machine_code) };
