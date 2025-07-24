@@ -10,9 +10,7 @@ use crate::var::Var;
 pub trait GcTrace {
     /// Visit all GC-managed references contained within this object.
     /// The visitor function should be called for each Var that contains a heap reference.
-    fn trace_children<F>(&self, visitor: F)
-    where
-        F: FnMut(&Var);
+    fn trace_children(&self, visitor: &mut dyn FnMut(&Var));
 
     /// Get the size of this object in bytes for GC accounting.
     fn size_bytes(&self) -> usize;
@@ -32,10 +30,7 @@ pub trait GcRootSet {
 }
 
 impl GcTrace for LispString {
-    fn trace_children<F>(&self, _visitor: F)
-    where
-        F: FnMut(&Var),
-    {
+    fn trace_children(&self, _visitor: &mut dyn FnMut(&Var)) {
         // Strings have no child references - they're leaf objects
     }
 
@@ -49,10 +44,7 @@ impl GcTrace for LispString {
 }
 
 impl GcTrace for LispTuple {
-    fn trace_children<F>(&self, mut visitor: F)
-    where
-        F: FnMut(&Var),
-    {
+    fn trace_children(&self, visitor: &mut dyn FnMut(&Var)) {
         // Visit all elements in the vector - they might contain heap references
         unsafe {
             let elements = self.as_slice();
@@ -72,10 +64,7 @@ impl GcTrace for LispTuple {
 }
 
 impl GcTrace for Environment {
-    fn trace_children<F>(&self, mut visitor: F)
-    where
-        F: FnMut(&Var),
-    {
+    fn trace_children(&self, visitor: &mut dyn FnMut(&Var)) {
         // Visit parent environment if present
         if let Some(parent) = self.parent() {
             visitor(&parent);
@@ -100,10 +89,7 @@ impl GcTrace for Environment {
 }
 
 impl GcTrace for LispClosure {
-    fn trace_children<F>(&self, mut visitor: F)
-    where
-        F: FnMut(&Var),
-    {
+    fn trace_children(&self, visitor: &mut dyn FnMut(&Var)) {
         // Trace the captured environment - it might contain heap references
         let captured_env_var = Var::from_u64(self.captured_env);
         if crate::gc::var_needs_tracing(&captured_env_var) {
@@ -159,10 +145,7 @@ pub enum GcObjectRef {
 
 impl GcObjectRef {
     /// Trace children of this object, regardless of concrete type.
-    pub unsafe fn trace_children<F>(&self, visitor: F)
-    where
-        F: FnMut(&Var),
-    {
+    pub unsafe fn trace_children(&self, visitor: &mut dyn FnMut(&Var)) {
         match self {
             GcObjectRef::String(ptr) => unsafe { (*ptr).as_ref().unwrap().trace_children(visitor) },
             GcObjectRef::Vector(ptr) => unsafe { (*ptr).as_ref().unwrap().trace_children(visitor) },
@@ -196,14 +179,16 @@ impl GcObjectRef {
     }
 }
 
-/// Example GC root set implementation for a simple runtime.
+use std::sync::atomic::{AtomicPtr, Ordering};
+
+/// GC root set implementation using atomic pointers for thread safety.
 pub struct SimpleRootSet {
-    /// Stack-allocated Vars
-    pub stack_vars: Vec<Var>,
-    /// Global variables  
-    pub globals: Vec<Var>,
-    /// JIT live values (would be more complex in practice)
-    pub jit_live: Vec<Var>,
+    /// Stack-reachable heap objects (stored as raw pointers to trait objects)
+    pub stack_roots: Vec<AtomicPtr<*mut dyn GcTrace>>,
+    /// Global heap objects (stored as raw pointers to trait objects)
+    pub global_roots: Vec<AtomicPtr<*mut dyn GcTrace>>,
+    /// JIT live heap objects (would be more complex in practice)
+    pub jit_roots: Vec<AtomicPtr<*mut dyn GcTrace>>,
 }
 
 impl GcRootSet for SimpleRootSet {
@@ -211,19 +196,34 @@ impl GcRootSet for SimpleRootSet {
     where
         F: FnMut(&Var),
     {
-        // Visit all stack variables
-        for var in &self.stack_vars {
-            visitor(var);
+        // Visit all stack-reachable heap objects
+        for atomic_root in &self.stack_roots {
+            let root_ptr = atomic_root.load(Ordering::Acquire);
+            if !root_ptr.is_null() {
+                unsafe {
+                    (**root_ptr).trace_children(&mut visitor);
+                }
+            }
         }
 
-        // Visit all global variables
-        for var in &self.globals {
-            visitor(var);
+        // Visit all global heap objects
+        for atomic_root in &self.global_roots {
+            let root_ptr = atomic_root.load(Ordering::Acquire);
+            if !root_ptr.is_null() {
+                unsafe {
+                    (**root_ptr).trace_children(&mut visitor);
+                }
+            }
         }
 
-        // Visit all JIT live values
-        for var in &self.jit_live {
-            visitor(var);
+        // Visit all JIT live heap objects
+        for atomic_root in &self.jit_roots {
+            let root_ptr = atomic_root.load(Ordering::Acquire);
+            if !root_ptr.is_null() {
+                unsafe {
+                    (**root_ptr).trace_children(&mut visitor);
+                }
+            }
         }
     }
 }
@@ -254,7 +254,7 @@ pub unsafe fn trace_from_roots<R: GcRootSet>(roots: &R, mut mark_object: impl Fn
 
             // Add children to worklist
             unsafe {
-                obj_ref.trace_children(|child_var| {
+                obj_ref.trace_children(&mut |child_var| {
                     if var_needs_tracing(child_var) {
                         worklist.push(*child_var);
                     }
@@ -276,7 +276,7 @@ mod tests {
         unsafe {
             if let Some(obj_ref) = var_as_gc_object(&string_var) {
                 let mut child_count = 0;
-                obj_ref.trace_children(|_| child_count += 1);
+                obj_ref.trace_children(&mut |_| child_count += 1);
                 assert_eq!(child_count, 0, "Strings should have no children");
             }
         }
@@ -291,7 +291,7 @@ mod tests {
         unsafe {
             if let Some(obj_ref) = var_as_gc_object(&list_var) {
                 let mut traced_vars = Vec::new();
-                obj_ref.trace_children(|var| traced_vars.push(*var));
+                obj_ref.trace_children(&mut |var: &Var| traced_vars.push(*var));
 
                 assert_eq!(traced_vars.len(), 3);
                 assert_eq!(traced_vars[0].as_int(), Some(42));
@@ -310,9 +310,9 @@ mod tests {
 
         // Should trace all nested heap objects
         let root_set = SimpleRootSet {
-            stack_vars: vec![outer_list],
-            globals: vec![],
-            jit_live: vec![],
+            stack_roots: vec![],
+            global_roots: vec![],
+            jit_roots: vec![],
         };
 
         let mut marked_objects = Vec::new();
@@ -339,7 +339,7 @@ mod tests {
             // Environment should trace its slot values
             if let Some(obj_ref) = var_as_gc_object(&env_var) {
                 let mut traced_vars = Vec::new();
-                obj_ref.trace_children(|var| traced_vars.push(*var));
+                obj_ref.trace_children(&mut |var: &Var| traced_vars.push(*var));
 
                 // Should trace all 3 slot values (no parent)
                 assert_eq!(traced_vars.len(), 3);
@@ -369,7 +369,7 @@ mod tests {
             // Child environment should trace both parent and its own slots
             if let Some(obj_ref) = var_as_gc_object(&child_var) {
                 let mut traced_vars = Vec::new();
-                obj_ref.trace_children(|var| traced_vars.push(*var));
+                obj_ref.trace_children(&mut |var: &Var| traced_vars.push(*var));
 
                 // Should trace parent + 1 slot value
                 assert_eq!(traced_vars.len(), 2);
@@ -404,9 +404,9 @@ mod tests {
 
             // Add environment to root set
             let root_set = SimpleRootSet {
-                stack_vars: vec![child_var],
-                globals: vec![],
-                jit_live: vec![],
+                stack_roots: vec![],
+                global_roots: vec![],
+                jit_roots: vec![],
             };
 
             let mut marked_objects = Vec::new();

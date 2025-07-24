@@ -214,7 +214,7 @@ impl Scanning<RolVM> for RolVM {
                 eprintln!("[GC] Scanning object at {:p} (type: {})", 
                          obj_addr.to_ptr::<u8>(), gc_obj.type_name());
                 
-                gc_obj.trace_children(|child_var| {
+                gc_obj.trace_children(&mut |child_var| {
                     if crate::gc::var_needs_tracing(child_var) {
                         let child_addr = address_from_var(child_var);
                         edge_visitor.visit_slot(child_addr);
@@ -234,10 +234,22 @@ impl Scanning<RolVM> for RolVM {
         // Scan thread-local root set (stack frames, local vars, etc.)
         if let Some(root_set_mutex) = get_current_root_set() {
             if let Ok(root_set) = root_set_mutex.try_lock() {
+                // First, register the root objects themselves
+                for atomic_root in &root_set.stack_roots {
+                    let root_ptr_ptr = atomic_root.load(std::sync::atomic::Ordering::Acquire);
+                    if !root_ptr_ptr.is_null() {
+                        let root_ptr = unsafe { *root_ptr_ptr };
+                        let addr = unsafe { Address::from_ptr(root_ptr as *const u8) };
+                        eprintln!("[GC] Found thread root object at {:p}", root_ptr);
+                        factory.create_process_roots_work(vec![addr]);
+                    }
+                }
+                
+                // Then trace their children
                 root_set.trace_roots(|var| {
                     if crate::gc::var_needs_tracing(var) {
                         let addr = address_from_var(var);
-                        eprintln!("[GC] Found thread root at {:p}", addr.to_ptr::<u8>());
+                        eprintln!("[GC] Found child from thread root at {:p}", addr.to_ptr::<u8>());
                         factory.create_process_roots_work(vec![addr]);
                     }
                 });
@@ -250,13 +262,25 @@ impl Scanning<RolVM> for RolVM {
     fn scan_vm_specific_roots(_tls: VMWorkerThread, mut factory: impl RootsWorkFactory<Address>) {
         eprintln!("[GC] Scanning VM-specific roots (globals, symbols, etc.)");
         
-        // Scan global root set (global variables, interned symbols, etc.)
+        // Scan global root set (global variables, etc.)
         if let Some(root_set_mutex) = get_global_root_set() {
             if let Ok(root_set) = root_set_mutex.try_lock() {
+                // First, register the root objects themselves
+                for atomic_root in &root_set.global_roots {
+                    let root_ptr_ptr = atomic_root.load(std::sync::atomic::Ordering::Acquire);
+                    if !root_ptr_ptr.is_null() {
+                        let root_ptr = unsafe { *root_ptr_ptr };
+                        let addr = unsafe { Address::from_ptr(root_ptr as *const u8) };
+                        eprintln!("[GC] Found global root object at {:p}", root_ptr);
+                        factory.create_process_roots_work(vec![addr]);
+                    }
+                }
+                
+                // Then trace their children
                 root_set.trace_roots(|var| {
                     if crate::gc::var_needs_tracing(var) {
                         let addr = address_from_var(var);
-                        eprintln!("[GC] Found global root at {:p}", addr.to_ptr::<u8>());
+                        eprintln!("[GC] Found child from global root at {:p}", addr.to_ptr::<u8>());
                         factory.create_process_roots_work(vec![addr]);
                     }
                 });
@@ -330,7 +354,7 @@ fn get_current_root_set() -> Option<&'static Mutex<SimpleRootSet>> {
 }
 
 /// Convert a raw pointer to a Var for GC scanning
-fn var_from_address(addr: Address) -> crate::var::Var {
+pub fn var_from_address(addr: Address) -> crate::var::Var {
     crate::var::Var::from_u64(addr.as_usize() as u64)
 }
 
@@ -367,15 +391,15 @@ pub fn initialize_mmtk() -> Result<(), &'static str> {
     
     // Initialize root sets
     GLOBAL_ROOT_SET.set(Mutex::new(SimpleRootSet {
-        stack_vars: Vec::new(),
-        globals: Vec::new(),
-        jit_live: Vec::new(),
+        stack_roots: Vec::new(),
+        global_roots: Vec::new(),
+        jit_roots: Vec::new(),
     })).map_err(|_| "Failed to initialize global root set")?;
     
     CURRENT_ROOT_SET.set(Mutex::new(SimpleRootSet {
-        stack_vars: Vec::new(),
-        globals: Vec::new(),
-        jit_live: Vec::new(),
+        stack_roots: Vec::new(),
+        global_roots: Vec::new(),
+        jit_roots: Vec::new(),
     })).map_err(|_| "Failed to initialize current root set")?;
     
     println!("MMTk MarkSweep plan initialized with stop-the-world GC");
@@ -477,22 +501,51 @@ pub unsafe fn mmtk_dealloc_placeholder(ptr: *mut u8, size: usize) {
     unsafe { dealloc(ptr, layout); }
 }
 
-/// Register a variable as a global root (survives across function calls)
-pub fn register_global_root(var: crate::var::Var) {
+/// Register a heap object as a global root (survives across function calls)
+pub fn register_global_root(ptr: *mut dyn crate::gc::GcTrace) {
     if let Some(root_set_mutex) = get_global_root_set() {
         if let Ok(mut root_set) = root_set_mutex.lock() {
-            eprintln!("[GC] Registering global root: {:?}", var);
-            root_set.globals.push(var);
+            eprintln!("[GC] Registering global root: {:p}", ptr);
+            // Allocate space for the trait object pointer on the heap for atomic storage
+            let ptr_box = Box::new(ptr);
+            let ptr_raw = Box::into_raw(ptr_box);
+            root_set.global_roots.push(std::sync::atomic::AtomicPtr::new(ptr_raw));
         }
     }
 }
 
-/// Register a variable as a thread-local root (stack variable, local scope)
-pub fn register_thread_root(var: crate::var::Var) {
+/// Register a heap object as a thread-local root (stack variable, local scope)  
+pub fn register_thread_root(ptr: *mut dyn crate::gc::GcTrace) {
     if let Some(root_set_mutex) = get_current_root_set() {
         if let Ok(mut root_set) = root_set_mutex.lock() {
-            eprintln!("[GC] Registering thread root: {:?}", var);
-            root_set.stack_vars.push(var);
+            eprintln!("[GC] Registering thread root: {:p}", ptr);
+            // Allocate space for the trait object pointer on the heap for atomic storage
+            let ptr_box = Box::new(ptr);
+            let ptr_raw = Box::into_raw(ptr_box);
+            root_set.stack_roots.push(std::sync::atomic::AtomicPtr::new(ptr_raw));
+        }
+    }
+}
+
+/// Unregister a specific heap object from thread roots
+pub fn unregister_thread_root(ptr: *mut dyn crate::gc::GcTrace) {
+    if let Some(root_set_mutex) = get_current_root_set() {
+        if let Ok(mut root_set) = root_set_mutex.lock() {
+            root_set.stack_roots.retain(|atomic_ptr| {
+                let stored_ptr_ptr = atomic_ptr.load(std::sync::atomic::Ordering::Acquire);
+                if !stored_ptr_ptr.is_null() {
+                    let stored_ptr = unsafe { *stored_ptr_ptr };
+                    let should_retain = !std::ptr::eq(stored_ptr, ptr);
+                    // If we're removing this entry, clean up the boxed pointer
+                    if !should_retain {
+                        let _ = unsafe { Box::from_raw(stored_ptr_ptr) };
+                    }
+                    should_retain
+                } else {
+                    true // Keep null entries for now
+                }
+            });
+            eprintln!("[GC] Unregistered thread root: {:p}", ptr);
         }
     }
 }
@@ -501,18 +554,35 @@ pub fn register_thread_root(var: crate::var::Var) {
 pub fn clear_thread_roots() {
     if let Some(root_set_mutex) = get_current_root_set() {
         if let Ok(mut root_set) = root_set_mutex.lock() {
-            eprintln!("[GC] Clearing {} thread roots", root_set.stack_vars.len());
-            root_set.stack_vars.clear();
+            eprintln!("[GC] Clearing {} thread roots", root_set.stack_roots.len());
+            // Clean up all the boxed pointers before clearing
+            for atomic_ptr in &root_set.stack_roots {
+                let stored_ptr_ptr = atomic_ptr.load(std::sync::atomic::Ordering::Acquire);
+                if !stored_ptr_ptr.is_null() {
+                    let _ = unsafe { Box::from_raw(stored_ptr_ptr) };
+                }
+            }
+            root_set.stack_roots.clear();
         }
     }
 }
 
-/// Register multiple variables as roots (bulk operation)
-pub fn register_thread_roots(vars: &[crate::var::Var]) {
-    if let Some(root_set_mutex) = get_current_root_set() {
-        if let Ok(mut root_set) = root_set_mutex.lock() {
-            eprintln!("[GC] Registering {} thread roots", vars.len());
-            root_set.stack_vars.extend_from_slice(vars);
+/// Helper: Register a heap object from a Var (extracts pointer and converts to trait object)
+pub fn register_var_as_root(var: crate::var::Var, is_global: bool) {
+    unsafe {
+        if let Some(gc_obj) = crate::gc::var_as_gc_object(&var) {
+            let trait_ptr: *mut dyn crate::gc::GcTrace = match gc_obj {
+                crate::gc::GcObjectRef::String(ptr) => ptr as *mut crate::heap::LispString as *mut dyn crate::gc::GcTrace,
+                crate::gc::GcObjectRef::Vector(ptr) => ptr as *mut crate::heap::LispTuple as *mut dyn crate::gc::GcTrace,
+                crate::gc::GcObjectRef::Environment(ptr) => ptr as *mut crate::environment::Environment as *mut dyn crate::gc::GcTrace,
+                crate::gc::GcObjectRef::Closure(ptr) => ptr as *mut crate::heap::LispClosure as *mut dyn crate::gc::GcTrace,
+            };
+            
+            if is_global {
+                register_global_root(trait_ptr);
+            } else {
+                register_thread_root(trait_ptr);
+            }
         }
     }
 }
@@ -600,13 +670,13 @@ mod tests {
         let string1 = Var::string("root string");
         let tuple1 = Var::tuple(&[Var::int(42), Var::string("nested")]);
         
-        // Register as thread roots
-        register_thread_root(string1);
-        register_thread_root(tuple1);
+        // Register as thread roots using the helper
+        register_var_as_root(string1, false);
+        register_var_as_root(tuple1, false);
         
         // Also test global root
         let global_var = Var::string("global data");
-        register_global_root(global_var);
+        register_var_as_root(global_var, true);
         
         println!("Triggering GC to test root scanning...");
         trigger_gc();

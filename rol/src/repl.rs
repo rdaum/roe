@@ -3,6 +3,7 @@
 
 use crate::bytecode::{BytecodeCompiler, BytecodeJIT};
 use crate::environment::Environment;
+use crate::mmtk_binding::{initialize_mmtk, mmtk_bind_mutator, register_var_as_root, clear_thread_roots};
 use crate::parser::parse_expr_string;
 use crate::var::Var;
 use rustyline::DefaultEditor;
@@ -19,12 +20,26 @@ pub struct Repl {
 impl Repl {
     /// Create a new REPL instance
     pub fn new() -> std::result::Result<Self, ReadlineError> {
+        // Initialize MMTk garbage collector
+        if let Err(e) = initialize_mmtk() {
+            eprintln!("Warning: Failed to initialize MMTk GC: {}", e);
+        }
+        
+        // Bind mutator for this thread
+        if let Err(e) = mmtk_bind_mutator() {
+            eprintln!("Warning: Failed to bind MMTk mutator: {}", e);
+        }
+
         let bytecode_compiler = BytecodeCompiler::new();
         let jit = BytecodeJIT::new();
         let editor = DefaultEditor::new()?;
 
         // Create a global environment (empty for now)
         let global_env_ptr = Environment::from_values(&[], None);
+        
+        // Register the global environment as a global root
+        let global_env_var = Var::environment(global_env_ptr);
+        register_var_as_root(global_env_var, true); // true = global root
 
         Ok(Self {
             bytecode_compiler,
@@ -63,6 +78,12 @@ impl Repl {
 
         // Execute the compiled function with JIT context
         let result = self.jit.execute_function(func_ptr);
+
+        // Register the result as a thread root if it's a heap object
+        // This ensures the GC doesn't collect the result while it's being used
+        if crate::gc::var_needs_tracing(&result) {
+            register_var_as_root(result, false); // false = thread root (temporary)
+        }
 
         // Return result
         Ok(result)
@@ -167,9 +188,14 @@ impl Repl {
                     match self.eval(line) {
                         Ok(result) => {
                             println!("{}", self.format_result(&result));
+                            // Clear thread roots after displaying the result
+                            // This allows GC to collect temporary objects from this evaluation
+                            clear_thread_roots();
                         }
                         Err(err) => {
                             println!("Error: {err}");
+                            // Clear thread roots even on error to prevent accumulation
+                            clear_thread_roots();
                         }
                     }
                 }
@@ -260,6 +286,40 @@ mod tests {
     fn test_repl_creation() {
         let repl = Repl::new();
         assert!(repl.is_ok());
+    }
+
+    #[test]
+    fn test_gc_integration_string_evaluation() {
+        // Test that string evaluation works with GC root registration
+        let mut repl = Repl::new().expect("Failed to create REPL");
+        
+        // Evaluate a string literal - should register as thread root and work
+        let result = repl.eval(r#""hello world""#).expect("Failed to evaluate string");
+        
+        // Verify the result is a string 
+        assert!(result.is_string());
+        if let Some(s) = result.as_string() {
+            assert_eq!(s, "hello world");
+        }
+        
+        println!("String evaluation with GC integration: PASSED");
+    }
+
+    #[test]
+    fn test_gc_integration_tuple_evaluation() {
+        // Test that tuple evaluation works with GC root registration
+        let mut repl = Repl::new().expect("Failed to create REPL");
+        
+        // Evaluate an empty tuple - should register as thread root and work
+        let result = repl.eval("()").expect("Failed to evaluate empty tuple");
+        
+        // Verify the result is a tuple
+        assert!(result.is_tuple());
+        if let Some(elements) = result.as_tuple() {
+            assert_eq!(elements.len(), 0);
+        }
+        
+        println!("Tuple evaluation with GC integration: PASSED");
     }
 
     #[test]
