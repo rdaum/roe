@@ -23,15 +23,15 @@ impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ParseError::UnexpectedToken { expected, found } => {
-                write!(f, "Expected {}, but found {}", expected, found)
+                write!(f, "Expected {expected}, but found {found}")
             }
             ParseError::UnexpectedEof { expected } => {
-                write!(f, "Unexpected end of input, expected {}", expected)
+                write!(f, "Unexpected end of input, expected {expected}")
             }
             ParseError::InvalidSpecialForm { form, reason } => {
-                write!(f, "Invalid {} form: {}", form, reason)
+                write!(f, "Invalid {form} form: {reason}")
             }
-            ParseError::Generic(msg) => write!(f, "{}", msg),
+            ParseError::Generic(msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -123,7 +123,7 @@ impl Parser {
                 self.advance();
                 // For now, treat keywords as literal symbols
                 // TODO: Add proper keyword support to Var and AST
-                Ok(Expr::Literal(Var::string(&format!(":{}", keyword))))
+                Ok(Expr::Literal(Var::string(&format!(":{keyword}"))))
             }
             Token::String(s) => {
                 let value = s.clone();
@@ -172,6 +172,8 @@ impl Parser {
                 "while" => return self.parse_while(),
                 "for" => return self.parse_for(),
                 "def" => return self.parse_def(),
+                "var" => return self.parse_var(),
+                "defn" => return self.parse_defn(),
                 _ => {
                     // Regular function call
                     let mut args = Vec::new();
@@ -344,13 +346,13 @@ impl Parser {
     
     /// Parse a lambda expression: (lambda (param1 param2 ...) body)
     fn parse_lambda(&mut self) -> Result<Expr, ParseError> {
-        // We already consumed "lambda", now expect parameter tuple
-        self.consume(Token::LeftParen, "(")?;
+        // We already consumed "lambda", now expect parameter vector [x y z]
+        self.consume(Token::LeftBracket, "[")?;
         
         let mut params = Vec::new();
         
         // Parse parameters
-        while !matches!(self.current_token(), Token::RightParen | Token::Eof) {
+        while !matches!(self.current_token(), Token::RightBracket | Token::Eof) {
             let param_expr = self.parse_expr()?;
             let param_symbol = match param_expr {
                 Expr::Variable(sym) => sym,
@@ -364,7 +366,7 @@ impl Parser {
             params.push(param_symbol);
         }
         
-        self.consume(Token::RightParen, ")")?;
+        self.consume(Token::RightBracket, "]")?;
         
         // Parse the body
         let body = self.parse_expr()?;
@@ -440,6 +442,78 @@ impl Parser {
         Ok(Expr::Def {
             var: var_symbol,
             value: Box::new(value),
+        })
+    }
+    
+    /// Parse a var expression: (var name value)
+    fn parse_var(&mut self) -> Result<Expr, ParseError> {
+        // We already consumed "var"
+        let var_expr = self.parse_expr()?;
+        let var_symbol = match var_expr {
+            Expr::Variable(sym) => sym,
+            _ => {
+                return Err(ParseError::InvalidSpecialForm {
+                    form: "var".to_string(),
+                    reason: "variable must be a symbol".to_string(),
+                });
+            }
+        };
+        
+        let value = self.parse_expr()?;
+        
+        self.consume(Token::RightParen, ")")?;
+        
+        Ok(Expr::VarDef {
+            var: var_symbol,
+            value: Box::new(value),
+        })
+    }
+    
+    /// Parse a defn expression: (defn name [params...] body)
+    fn parse_defn(&mut self) -> Result<Expr, ParseError> {
+        // We already consumed "defn"
+        
+        // Get function name
+        let name_expr = self.parse_expr()?;
+        let name_symbol = match name_expr {
+            Expr::Variable(sym) => sym,
+            _ => {
+                return Err(ParseError::InvalidSpecialForm {
+                    form: "defn".to_string(),
+                    reason: "function name must be a symbol".to_string(),
+                });
+            }
+        };
+        
+        // Parse parameter list [param1 param2 ...]
+        self.consume(Token::LeftBracket, "[")?;
+        let mut params = Vec::new();
+        
+        while !matches!(self.current_token(), Token::RightBracket | Token::Eof) {
+            let param_expr = self.parse_expr()?;
+            let param_symbol = match param_expr {
+                Expr::Variable(sym) => sym,
+                _ => {
+                    return Err(ParseError::InvalidSpecialForm {
+                        form: "defn".to_string(),
+                        reason: "parameter must be a symbol".to_string(),
+                    });
+                }
+            };
+            params.push(param_symbol);
+        }
+        
+        self.consume(Token::RightBracket, "]")?;
+        
+        // Parse the body expression
+        let body = self.parse_expr()?;
+        
+        self.consume(Token::RightParen, ")")?;
+        
+        Ok(Expr::Defn {
+            name: name_symbol,
+            params,
+            body: Box::new(body),
         })
     }
     

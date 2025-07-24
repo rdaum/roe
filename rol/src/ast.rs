@@ -57,6 +57,19 @@ pub enum Expr {
         var: Symbol,
         value: Box<Expr>,
     },
+    
+    /// Mutable global variable: (var name value)
+    VarDef {
+        var: Symbol,
+        value: Box<Expr>,
+    },
+    
+    /// Function definition: (defn name [params...] body)
+    Defn {
+        name: Symbol,
+        params: Vec<Symbol>,
+        body: Box<Expr>,
+    },
 }
 
 impl Expr {

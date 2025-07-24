@@ -5,7 +5,6 @@ use crate::ast::{Expr, BuiltinOp};
 use crate::environment::LexicalAddress;
 use crate::jit::VarBuilder;
 use crate::symbol::Symbol;
-use crate::var::Var;
 
 use cranelift::prelude::*;
 use cranelift_jit::JITModule;
@@ -149,9 +148,9 @@ impl Compiler {
         let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.builder_context);
         
         // Import the external environment functions into this function
-        let env_get_ref = self.module.declare_func_in_func(self.env_get_id, &mut builder.func);
-        let env_create_ref = self.module.declare_func_in_func(self.env_create_id, &mut builder.func);
-        let env_set_ref = self.module.declare_func_in_func(self.env_set_id, &mut builder.func);
+        let env_get_ref = self.module.declare_func_in_func(self.env_get_id, builder.func);
+        let env_create_ref = self.module.declare_func_in_func(self.env_create_id, builder.func);
+        let env_set_ref = self.module.declare_func_in_func(self.env_set_id, builder.func);
         
         // Create entry block
         let entry_block = builder.create_block();
@@ -288,6 +287,23 @@ impl Compiler {
                 }, closures))
             }
             
+            Expr::VarDef { var, value } => {
+                let (new_value, closures) = self.precompile_lambdas(value, captured_env)?;
+                Ok((Expr::VarDef {
+                    var: *var,
+                    value: Box::new(new_value),
+                }, closures))
+            }
+            
+            Expr::Defn { name, params, body } => {
+                let (new_body, closures) = self.precompile_lambdas(body, captured_env)?;
+                Ok((Expr::Defn {
+                    name: *name,
+                    params: params.clone(),
+                    body: Box::new(new_body),
+                }, closures))
+            }
+            
             // Base cases - no lambdas to process
             Expr::Literal(_) | Expr::Variable(_) => {
                 Ok((expr.clone(), vec![]))
@@ -297,7 +313,7 @@ impl Compiler {
 
     /// Compile a lambda expression into a closure
     /// Returns a closure that can be called with the specified arguments
-    pub fn compile_lambda(&mut self, params: &[Symbol], body: &Expr, captured_env: u64) -> Result<*const u8, String> {
+    pub fn compile_lambda(&mut self, params: &[Symbol], body: &Expr, _captured_env: u64) -> Result<*const u8, String> {
         // Create function signature: fn(args: *const Var, arg_count: u32, captured_env: u64) -> u64
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(types::I64)); // args pointer
@@ -322,9 +338,9 @@ impl Compiler {
         let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.builder_context);
         
         // Import the external environment functions into this function
-        let env_get_ref = self.module.declare_func_in_func(self.env_get_id, &mut builder.func);
-        let env_create_ref = self.module.declare_func_in_func(self.env_create_id, &mut builder.func);
-        let env_set_ref = self.module.declare_func_in_func(self.env_set_id, &mut builder.func);
+        let env_get_ref = self.module.declare_func_in_func(self.env_get_id, builder.func);
+        let env_create_ref = self.module.declare_func_in_func(self.env_create_id, builder.func);
+        let env_set_ref = self.module.declare_func_in_func(self.env_set_id, builder.func);
         
         // Create entry block
         let entry_block = builder.create_block();
@@ -539,6 +555,16 @@ fn compile_expr_recursive(
         Expr::Def { .. } => {
             // Def not implemented in recursive compiler
             Err("Def not supported in recursive compiler".to_string())
+        }
+        
+        Expr::VarDef { .. } => {
+            // VarDef not implemented in recursive compiler
+            Err("VarDef not supported in recursive compiler".to_string())
+        }
+        
+        Expr::Defn { .. } => {
+            // Defn not implemented in recursive compiler
+            Err("Defn not supported in recursive compiler".to_string())
         }
     }
 }
@@ -1025,10 +1051,10 @@ mod tests {
         
         // Check result - add debugging
         let result_var = Var::from_u64(result_bits);
-        println!("Result bits: 0x{:016x}", result_bits);
+        println!("Result bits: 0x{result_bits:016x}");
         println!("Result var type: {:?}", result_var.get_type());
         if let Some(d) = result_var.as_double() {
-            println!("Result as double: {}", d);
+            println!("Result as double: {d}");
         } else {
             println!("Not a double, as_int: {:?}", result_var.as_int());
         }
@@ -1176,12 +1202,12 @@ mod tests {
             
             let duration = start_time.elapsed();
             let total_calls = iterations as usize * test_cases.len();
-            println!("Completed {} iterations in {:?}", total_calls, duration);
+            println!("Completed {total_calls} iterations in {duration:?}");
             if total_calls > 0 {
                 println!("Average time per call: {:?}", duration / total_calls as u32);
             }
-            println!("Successful calls: {}/{}", successful_calls, total_calls);
-            println!("Total computed values: {}", total_results);
+            println!("Successful calls: {successful_calls}/{total_calls}");
+            println!("Total computed values: {total_results}");
             
             // Test individual calls to verify correctness
             println!("Verifying individual results:");
@@ -1192,9 +1218,9 @@ mod tests {
                 
                 if let Some(actual) = result_var.as_int() {
                     let status = if actual == expected { "✓" } else { "✗" };
-                    println!("f({}) = {} (expected: {}) {}", n, actual, expected, status);
+                    println!("f({n}) = {actual} (expected: {expected}) {status}");
                 } else {
-                    println!("f({}) returned non-integer: {:?}", n, result_var);
+                    println!("f({n}) returned non-integer: {result_var:?}");
                 }
             }
             
@@ -1206,7 +1232,7 @@ mod tests {
                 let result_bits = unsafe { (*closure_ptr).call(&args) };
                 let result_var = Var::from_u64(result_bits);
                 let duration = start.elapsed();
-                println!("f({}) = {:?} (took {:?})", n, result_var, duration);
+                println!("f({n}) = {result_var:?} (took {duration:?})");
             }
             
         } else {
@@ -1250,9 +1276,9 @@ mod tests {
         let native_total_calls = iterations * test_values.len();
         let native_avg_ns = native_duration.as_nanos() / native_total_calls as u128;
         
-        println!("  Completed {} calls in {:?}", native_total_calls, native_duration);
-        println!("  Average: {}ns per call", native_avg_ns);
-        println!("  Total computed: {}", native_total);
+        println!("  Completed {native_total_calls} calls in {native_duration:?}");
+        println!("  Average: {native_avg_ns}ns per call");
+        println!("  Total computed: {native_total}");
         
         // === JIT LAMBDA BENCHMARK ===
         println!("\n⚡ JIT Lambda Benchmark:");
@@ -1295,21 +1321,21 @@ mod tests {
                 jit_duration.as_nanos() / jit_total_calls as u128
             };
             
-            println!("  Completed {} calls in {:?}", jit_total_calls, jit_duration);
-            println!("  Successful: {}/{}", successful_calls, jit_total_calls);
-            println!("  Average: {}ns per call", jit_avg_ns);
-            println!("  Total computed: {}", jit_total);
+            println!("  Completed {jit_total_calls} calls in {jit_duration:?}");
+            println!("  Successful: {successful_calls}/{jit_total_calls}");
+            println!("  Average: {jit_avg_ns}ns per call");
+            println!("  Total computed: {jit_total}");
             
             // === PERFORMANCE COMPARISON ===
             println!("\n📈 Performance Analysis:");
-            println!("  Native Rust: {}ns per call", native_avg_ns);
-            println!("  JIT Lambda:  {}ns per call", jit_avg_ns);
+            println!("  Native Rust: {native_avg_ns}ns per call");
+            println!("  JIT Lambda:  {jit_avg_ns}ns per call");
             
             if jit_avg_ns > 0 && native_avg_ns > 0 {
                 let overhead_ratio = jit_avg_ns as f64 / native_avg_ns as f64;
                 let overhead_percent = (overhead_ratio - 1.0) * 100.0;
                 
-                println!("  JIT Overhead: {:.1}x slower ({:.1}% overhead)", overhead_ratio, overhead_percent);
+                println!("  JIT Overhead: {overhead_ratio:.1}x slower ({overhead_percent:.1}% overhead)");
                 
                 if overhead_ratio < 2.0 {
                     println!("  🎉 Excellent! JIT performance is within 2x of native");
@@ -1333,9 +1359,9 @@ mod tests {
                     
                     if let Some(jit_result) = result_var.as_int() {
                         let status = if jit_result == native_result { "✓" } else { "✗" };
-                        println!("  f({}) = native:{}, jit:{} {}", n, native_result, jit_result, status);
+                        println!("  f({n}) = native:{native_result}, jit:{jit_result} {status}");
                     } else {
-                        println!("  f({}) = native:{}, jit:None ✗", n, native_result);
+                        println!("  f({n}) = native:{native_result}, jit:None ✗");
                     }
                 }
             } else {

@@ -1271,8 +1271,8 @@ mod tests {
         assert_eq!(string_var2.get_type(), VarType::String);
 
         // Test Display
-        assert_eq!(format!("{}", tuple_var), "[1, 2, 3]");
-        assert_eq!(format!("{}", string_var), "hello world");
+        assert_eq!(format!("{tuple_var}"), "[1, 2, 3]");
+        assert_eq!(format!("{string_var}"), "hello world");
 
         // Test truthy/falsy
         assert!(tuple_var.is_truthy()); // Non-empty tuple is truthy

@@ -1,4 +1,5 @@
 mod ast;
+mod bench;
 mod bytecode;
 mod compiler;
 mod environment;
@@ -14,8 +15,9 @@ mod symbol;
 mod var;
 
 fn main() {
+
     if let Err(err) = repl::start_repl() {
-        eprintln!("REPL error: {}", err);
+        eprintln!("REPL error: {err}");
         std::process::exit(1);
     }
 }

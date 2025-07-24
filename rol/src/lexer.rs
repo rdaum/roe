@@ -35,11 +35,11 @@ impl fmt::Display for Token {
             Token::RightParen => write!(f, ")"),
             Token::LeftBracket => write!(f, "["),
             Token::RightBracket => write!(f, "]"),
-            Token::Integer(n) => write!(f, "{}", n),
-            Token::Float(n) => write!(f, "{}", n),
-            Token::Symbol(s) => write!(f, "{}", s),
-            Token::Keyword(s) => write!(f, ":{}", s),
-            Token::String(s) => write!(f, "\"{}\"", s),
+            Token::Integer(n) => write!(f, "{n}"),
+            Token::Float(n) => write!(f, "{n}"),
+            Token::Symbol(s) => write!(f, "{s}"),
+            Token::Keyword(s) => write!(f, ":{s}"),
+            Token::String(s) => write!(f, "\"{s}\""),
             Token::Eof => write!(f, "EOF"),
         }
     }
@@ -56,7 +56,7 @@ impl Lexer {
     /// Create a new lexer for the given input string
     pub fn new(input: &str) -> Self {
         let chars: Vec<char> = input.chars().collect();
-        let current_char = chars.get(0).copied();
+        let current_char = chars.first().copied();
         
         Self {
             input: chars,
@@ -122,11 +122,11 @@ impl Lexer {
         if is_float {
             number_str.parse::<f64>()
                 .map(Token::Float)
-                .map_err(|_| format!("Invalid float: {}", number_str))
+                .map_err(|_| format!("Invalid float: {number_str}"))
         } else {
             number_str.parse::<i32>()
                 .map(Token::Integer)
-                .map_err(|_| format!("Invalid integer: {}", number_str))
+                .map_err(|_| format!("Invalid integer: {number_str}"))
         }
     }
     
@@ -187,7 +187,7 @@ impl Lexer {
                     Some('\\') => string_content.push('\\'),
                     Some('"') => string_content.push('"'),
                     Some(other) => {
-                        return Err(format!("Invalid escape sequence: \\{}", other));
+                        return Err(format!("Invalid escape sequence: \\{other}"));
                     }
                     None => {
                         return Err("Unexpected end of input in string escape".to_string());
@@ -268,7 +268,7 @@ impl Lexer {
                 }
                 
                 Some(ch) => {
-                    return Err(format!("Unexpected character: '{}'", ch));
+                    return Err(format!("Unexpected character: '{ch}'"));
                 }
             }
         }

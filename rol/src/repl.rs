@@ -14,7 +14,6 @@ pub struct Repl {
     jit: BytecodeJIT,
     editor: DefaultEditor,
     global_env_ptr: *mut Environment,
-    global_env_var: Var,
 }
 
 impl Repl {
@@ -26,14 +25,12 @@ impl Repl {
         
         // Create a global environment (empty for now)
         let global_env_ptr = Environment::from_values(&[], None);
-        let global_env_var = Var::environment(global_env_ptr);
         
         Ok(Self {
             bytecode_compiler,
             jit,
             editor,
             global_env_ptr,
-            global_env_var,
         })
     }
     
@@ -45,8 +42,8 @@ impl Repl {
         // Compile to bytecode
         let function = self.bytecode_compiler.compile_expr(&expr).map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)) as Box<dyn std::error::Error>)?;
         
-        // JIT compile bytecode to machine code
-        let func_ptr = self.jit.compile_function(&function).map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)) as Box<dyn std::error::Error>)?;
+        // JIT compile bytecode to machine code with lambda registry
+        let func_ptr = self.jit.compile_function(&function, &self.bytecode_compiler.lambda_registry).map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)) as Box<dyn std::error::Error>)?;
         
         // Execute the compiled function with JIT context
         let result = self.jit.execute_function(func_ptr);
@@ -56,51 +53,51 @@ impl Repl {
     }
     
     /// Format a Var for display in the REPL
-    fn format_result(&self, var: &Var) -> String {
+    pub fn format_result(&self, var: &Var) -> String {
         match var.get_type() {
             crate::var::VarType::I32 => {
                 if let Some(n) = var.as_int() {
-                    format!("{}", n)
+                    format!("{n}")
                 } else {
-                    format!("{:?}", var)
+                    format!("{var:?}")
                 }
             }
             crate::var::VarType::F64 => {
                 if let Some(n) = var.as_double() {
-                    format!("{}", n)
+                    format!("{n}")
                 } else {
-                    format!("{:?}", var)
+                    format!("{var:?}")
                 }
             }
             crate::var::VarType::String => {
                 if let Some(s) = var.as_string() {
-                    format!("\"{}\"", s)
+                    format!("\"{s}\"")
                 } else {
-                    format!("{:?}", var)
+                    format!("{var:?}")
                 }
             }
             crate::var::VarType::Bool => {
                 if let Some(b) = var.as_bool() {
                     if b { "true".to_string() } else { "false".to_string() }
                 } else {
-                    format!("{:?}", var)
+                    format!("{var:?}")
                 }
             }
             crate::var::VarType::Tuple => {
                 // TODO: Format lists nicely
-                format!("{:?}", var)
+                format!("{var:?}")
             }
             crate::var::VarType::Environment => {
-                format!("#<environment>")
+                "#<environment>".to_string()
             }
             crate::var::VarType::Symbol => {
-                format!("{:?}", var)
+                format!("{var:?}")
             }
             crate::var::VarType::None => {
                 "nil".to_string()
             }
             crate::var::VarType::Pointer => {
-                format!("#<pointer>")
+                "#<pointer>".to_string()
             }
             crate::var::VarType::Closure => {
                 if let Some(closure_ptr) = var.as_closure() {
@@ -108,7 +105,7 @@ impl Repl {
                         format!("#<closure:{}>", (*closure_ptr).arity)
                     }
                 } else {
-                    format!("#<closure:invalid>")
+                    "#<closure:invalid>".to_string()
                 }
             }
         }
@@ -158,7 +155,7 @@ impl Repl {
                             println!("{}", self.format_result(&result));
                         }
                         Err(err) => {
-                            println!("Error: {}", err);
+                            println!("Error: {err}");
                         }
                     }
                 }
@@ -171,7 +168,7 @@ impl Repl {
                     break;
                 }
                 Err(err) => {
-                    println!("Error: {:?}", err);
+                    println!("Error: {err:?}");
                     break;
                 }
             }

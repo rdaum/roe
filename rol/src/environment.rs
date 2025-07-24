@@ -484,9 +484,9 @@ mod tests {
             }
             
             // Test Display/Debug formatting
-            let debug_str = format!("{:?}", env_var);
+            let debug_str = format!("{env_var:?}");
             assert!(debug_str.contains("Environment(size=3)"));
-            let display_str = format!("{}", env_var);
+            let display_str = format!("{env_var}");
             assert!(display_str.contains("env(size=3)"));
             
             Environment::free(env);

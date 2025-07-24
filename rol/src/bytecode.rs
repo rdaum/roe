@@ -1,37 +1,6 @@
 //! Stack-based bytecode virtual machine.
 //! Optimized JIT compiler that analyzes bytecode sequences and generates efficient machine code.
 
-macro_rules! impl_binary_ops {
-    ($($opcode:ident => $method:ident,)*) => {
-        $(
-            Opcode::$opcode => {
-                if stack.len() < 2 { 
-                    return Err(format!("Stack underflow for {}", stringify!($opcode))); 
-                }
-                let b = stack.pop().unwrap();
-                let a = stack.pop().unwrap();
-                let result = self.var_builder.$method(builder, a, b);
-                stack.push(result);
-            }
-        )*
-    };
-}
-
-macro_rules! impl_unary_ops {
-    ($($opcode:ident => $method:ident,)*) => {
-        $(
-            Opcode::$opcode => {
-                if stack.is_empty() { 
-                    return Err(format!("Stack underflow for {}", stringify!($opcode))); 
-                }
-                let a = stack.pop().unwrap();
-                let result = self.var_builder.$method(builder, a);
-                stack.push(result);
-            }
-        )*
-    };
-}
-
 use crate::ast::{Expr, BuiltinOp};
 use crate::jit::VarBuilder;
 use crate::symbol::Symbol;
@@ -41,6 +10,7 @@ use cranelift::prelude::*;
 use cranelift_jit::JITModule;
 use cranelift_module::{Linkage, Module};
 use cranelift::codegen::ir::FuncRef;
+use cranelift::codegen::isa::CallConv;
 
 /// Runtime helper function for DefGlobal opcode
 #[unsafe(no_mangle)]
@@ -63,6 +33,71 @@ pub extern "C" fn jit_get_global(jit_ptr: *mut BytecodeJIT, symbol_id: u64) -> u
             var.as_u64()
         } else {
             Var::none().as_u64() // Return none for undefined globals
+        }
+    }
+}
+
+/// Runtime helper function for creating closures from lambda expressions
+#[unsafe(no_mangle)]
+pub extern "C" fn jit_create_closure(_jit_ptr: *mut BytecodeJIT, arity: u32, _body_bytes: *const u8, _body_len: u64) -> u64 {
+    // For now, create a simple closure that just stores arity
+    // TODO: Implement proper lambda body compilation
+    let closure_ptr = crate::heap::LispClosure::new(
+        std::ptr::null(), // Function pointer - will be set later
+        arity,
+        0 // No captured environment for now
+    );
+    Var::closure(closure_ptr).as_u64()
+}
+
+/// Runtime helper function for calling closures
+/// This is called from JIT-compiled code when a closure is invoked
+#[unsafe(no_mangle)]
+pub extern "C" fn jit_call_closure(jit_ptr: *mut BytecodeJIT, closure: u64, args_ptr: *const u64, arg_count: u32) -> u64 {
+    unsafe {
+        let jit = &mut *jit_ptr;
+        let closure_var = Var::from_u64(closure);
+        
+        if let Some(closure_ptr) = closure_var.as_closure() {
+            let closure_obj = &*closure_ptr;
+            
+            // Check if the function is already compiled
+            if closure_obj.func_ptr.is_null() {
+                // Need to compile the lambda on-demand
+                let function_id = closure_obj.captured_env as u32; // We stored function_id here
+                
+                // Clone the registry to avoid borrowing conflicts
+                let registry_clone = jit.lambda_registry.clone();
+                
+                if let Some(registry) = registry_clone {
+                    if let Some((params, body)) = registry.get(&function_id) {
+                        // Compile the lambda body now
+                        match jit.compile_lambda_on_demand(params, body) {
+                            Ok(compiled_ptr) => {
+                                // Cache the compiled function pointer
+                                jit.compiled_lambdas.insert(function_id, compiled_ptr);
+                                
+                                // Call the compiled function directly
+                                let func: extern "C" fn(*const u64, u32, u64) -> u64 = std::mem::transmute(compiled_ptr);
+                                return func(args_ptr, arg_count, 0);
+                            }
+                            Err(_) => {
+                                return Var::none().as_u64();
+                            }
+                        }
+                    }
+                }
+                
+                // Lambda not found or compilation failed
+                Var::none().as_u64()
+            } else {
+                // Function is already compiled, call it directly
+                let func: extern "C" fn(*const u64, u32, u64) -> u64 = std::mem::transmute(closure_obj.func_ptr);
+                func(args_ptr, arg_count, closure_obj.captured_env)
+            }
+        } else {
+            // Not a valid closure
+            Var::none().as_u64()
         }
     }
 }
@@ -234,6 +269,9 @@ pub struct BytecodeCompiler {
     
     /// Label counter for generating unique jump labels
     next_label: Label,
+    
+    /// Lambda functions awaiting compilation (function_id -> (params, body))
+    pub lambda_registry: std::collections::HashMap<FunctionId, (Vec<Symbol>, Expr)>,
 }
 
 impl BytecodeCompiler {
@@ -243,6 +281,7 @@ impl BytecodeCompiler {
             function: Function::new(0, None, 0, 0),
             next_function_id: 1,
             next_label: 0,
+            lambda_registry: std::collections::HashMap::new(),
         }
     }
     
@@ -265,7 +304,7 @@ impl BytecodeCompiler {
         match expr {
             Expr::Literal(var) => {
                 // Push literal value onto stack
-                self.function.emit(Opcode::LoadConst(var.clone()));
+                self.function.emit(Opcode::LoadConst(*var));
                 Ok(())
             }
             
@@ -427,9 +466,18 @@ impl BytecodeCompiler {
                 Ok(())
             }
             
-            Expr::Lambda { params: _, body: _ } => {
-                // Lambda placeholder - not implemented yet
-                self.function.emit(Opcode::LoadConst(Var::none()));
+            Expr::Lambda { params, body } => {
+                // Register this lambda for later compilation
+                let function_id = self.next_function_id;
+                self.next_function_id += 1;
+                
+                // Store the lambda information for JIT compilation
+                self.lambda_registry.insert(function_id, (params.clone(), *body.clone()));
+                
+                // Emit a Closure opcode that will trigger lambda compilation at JIT time
+                // For now, assume no upvalues (captured variables)
+                let upvalue_count = 0;
+                self.function.emit(Opcode::Closure(function_id, upvalue_count));
                 Ok(())
             }
             
@@ -442,6 +490,37 @@ impl BytecodeCompiler {
                 
                 // Return the defined value
                 self.function.emit(Opcode::LoadVar(*var));
+                Ok(())
+            }
+            
+            Expr::VarDef { var, value } => {
+                // Compile the value expression
+                self.compile_expr_recursive(value)?;
+                
+                // Define mutable global variable (for now, same as DefGlobal)
+                self.function.emit(Opcode::DefGlobal(*var));
+                
+                // Return the defined value
+                self.function.emit(Opcode::LoadVar(*var));
+                Ok(())
+            }
+            
+            Expr::Defn { name, params, body } => {
+                // Compile defn as syntactic sugar: (def name (lambda [params...] body))
+                // Create a lambda expression
+                let lambda_expr = Expr::Lambda {
+                    params: params.clone(),
+                    body: body.clone(),
+                };
+                
+                // Compile the lambda expression
+                self.compile_expr_recursive(&lambda_expr)?;
+                
+                // Define the function globally
+                self.function.emit(Opcode::DefGlobal(*name));
+                
+                // Return the function
+                self.function.emit(Opcode::LoadVar(*name));
                 Ok(())
             }
         }
@@ -513,6 +592,10 @@ pub struct BytecodeJIT {
     function_counter: u32,
     /// Global variables that persist between REPL evaluations
     global_variables: std::collections::HashMap<Symbol, Var>,
+    /// Lambda registry available during execution
+    lambda_registry: Option<std::collections::HashMap<FunctionId, (Vec<Symbol>, Expr)>>,
+    /// Cache of compiled lambda function pointers to avoid recompilation
+    compiled_lambdas: std::collections::HashMap<FunctionId, *const u8>,
 }
 
 impl BytecodeJIT {
@@ -528,6 +611,8 @@ impl BytecodeJIT {
         // Register our runtime helper functions with the JIT
         builder.symbol("jit_set_global", jit_set_global as *const u8);
         builder.symbol("jit_get_global", jit_get_global as *const u8);
+        builder.symbol("jit_create_closure", jit_create_closure as *const u8);
+        builder.symbol("jit_call_closure", jit_call_closure as *const u8);
         
         let module = JITModule::new(builder);
         
@@ -538,6 +623,8 @@ impl BytecodeJIT {
             builder_context: FunctionBuilderContext::new(),
             function_counter: 0,
             global_variables: std::collections::HashMap::new(),
+            lambda_registry: None,
+            compiled_lambdas: std::collections::HashMap::new(),
         }
     }
     
@@ -563,8 +650,248 @@ impl BytecodeJIT {
         Var::from_u64(result_bits)
     }
     
+    /// Compile a lambda function body to machine code
+    pub fn compile_lambda(&mut self, params: &[Symbol], body: &Expr) -> Result<*const u8, String> {
+        // Create function signature: fn(args: *const Var, arg_count: u32, captured_env: u64) -> u64
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64)); // args pointer
+        sig.params.push(AbiParam::new(types::I32)); // arg count
+        sig.params.push(AbiParam::new(types::I64)); // captured environment
+        sig.returns.push(AbiParam::new(types::I64)); // return Var as u64
+        
+        // Generate unique function name
+        let func_name = format!("lambda_{}", self.function_counter);
+        self.function_counter += 1;
+        
+        // Create the function
+        let func_id = self.module
+            .declare_function(&func_name, Linkage::Export, &sig)
+            .map_err(|e| format!("Failed to declare lambda function: {e}"))?;
+            
+        // Clear the context and set up function
+        self.ctx.clear();
+        self.ctx.func.signature = sig;
+        
+        let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.builder_context);
+        
+        // Create entry block
+        let entry_block = builder.create_block();
+        builder.append_block_params_for_function_params(entry_block);
+        builder.switch_to_block(entry_block);
+        builder.seal_block(entry_block);
+        
+        // Get function parameters
+        let args_ptr = builder.block_params(entry_block)[0];
+        let _arg_count = builder.block_params(entry_block)[1];
+        let _captured_env_param = builder.block_params(entry_block)[2];
+        
+        // Create a parameter lookup mechanism
+        // We need to load parameters from the args array based on their index
+        let mut param_values = std::collections::HashMap::new();
+        for (i, &param_symbol) in params.iter().enumerate() {
+            // Load the parameter from the args array: args[i]
+            let param_offset = builder.ins().iconst(types::I64, i as i64);
+            let param_ptr = builder.ins().iadd(args_ptr, param_offset);
+            let param_value = builder.ins().load(types::I64, MemFlags::new(), param_ptr, 0);
+            param_values.insert(param_symbol, param_value);
+        }
+        
+        // Compile the lambda body with parameter bindings
+        // For now, use a simplified approach that handles basic cases
+        // Use the proper bytecode compilation path
+        let mut compiler = BytecodeCompiler::new();
+        let function = compiler.compile_expr(body)?;
+        
+        // Create an analyzer to compile opcodes
+        let mut analyzer = BytecodeAnalyzer {
+            var_builder: &self.var_builder,
+            variables: std::collections::HashMap::new(),
+            scope_stack: Vec::new(),
+            label_blocks: std::collections::HashMap::new(),
+            jit_ptr: None,
+            set_global_ref: None,
+            get_global_ref: None,
+            lambda_registry: None,
+        };
+        
+        // Compile the bytecode with parameter mapping
+        let mut stack = Vec::new();
+        for opcode in &function.code {
+            match opcode {
+                Opcode::LoadVar(symbol) => {
+                    if let Some(&param_value) = param_values.get(symbol) {
+                        stack.push(param_value);
+                    } else {
+                        analyzer.compile_single_opcode(&mut builder, opcode, &mut stack)?;
+                    }
+                }
+                _ => {
+                    analyzer.compile_single_opcode(&mut builder, opcode, &mut stack)?;
+                }
+            }
+        }
+        
+        let result = if let Some(value) = stack.pop() {
+            value
+        } else {
+            self.var_builder.make_none(&mut builder)
+        };
+        
+        // Return the result
+        builder.ins().return_(&[result]);
+        
+        // Finalize the function
+        builder.finalize();
+        
+        // Define the function in the module
+        self.module
+            .define_function(func_id, &mut self.ctx)
+            .map_err(|e| format!("Failed to define lambda function: {e}"))?;
+            
+        // Finalize the module and get the function pointer
+        self.module
+            .finalize_definitions()
+            .map_err(|e| format!("Failed to finalize lambda: {e}"))?;
+            
+        let code_ptr = self.module.get_finalized_function(func_id);
+        Ok(code_ptr)
+    }
+    
+    /// Simplified lambda body compilation for basic expressions
+    
+    /// Compile a lambda expression on-demand during JIT compilation
+    /// This method is designed to avoid borrowing conflicts during compilation
+    fn compile_lambda_on_demand(&mut self, params: &[Symbol], body: &Expr) -> Result<*const u8, String> {
+        // Create a separate compilation context to avoid borrowing conflicts
+        let mut lambda_ctx = codegen::Context::new();
+        let mut lambda_builder_context = FunctionBuilderContext::new();
+        
+        // Create function signature: fn(args: *const Var, arg_count: u32, captured_env: u64) -> u64
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64)); // args pointer
+        sig.params.push(AbiParam::new(types::I32)); // arg count
+        sig.params.push(AbiParam::new(types::I64)); // captured environment
+        sig.returns.push(AbiParam::new(types::I64)); // return Var as u64
+        
+        // Generate unique function name
+        let func_name = format!("lambda_{}", self.function_counter);
+        self.function_counter += 1;
+        
+        let func_id = self.module
+            .declare_function(&func_name, Linkage::Export, &sig)
+            .map_err(|e| format!("Failed to declare lambda function: {e}"))?;
+            
+        lambda_ctx.clear();
+        lambda_ctx.func.signature = sig;
+        
+        // Declare global access functions for this lambda context BEFORE creating builder
+        let set_global_sig = {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(types::I64)); // jit_ptr
+            sig.params.push(AbiParam::new(types::I64)); // symbol_id
+            sig.params.push(AbiParam::new(types::I64)); // value
+            sig
+        };
+        
+        let get_global_sig = {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(types::I64)); // jit_ptr
+            sig.params.push(AbiParam::new(types::I64)); // symbol_id
+            sig.returns.push(AbiParam::new(types::I64)); // value
+            sig
+        };
+        
+        let set_global_func = self.module
+            .declare_function("jit_set_global", Linkage::Import, &set_global_sig)
+            .map_err(|e| format!("Failed to declare set_global in lambda: {e}"))?;
+            
+        let get_global_func = self.module
+            .declare_function("jit_get_global", Linkage::Import, &get_global_sig)
+            .map_err(|e| format!("Failed to declare get_global in lambda: {e}"))?;
+        
+        let set_global_ref = self.module.declare_func_in_func(set_global_func, &mut lambda_ctx.func);
+        let get_global_ref = self.module.declare_func_in_func(get_global_func, &mut lambda_ctx.func);
+        
+        let mut builder = FunctionBuilder::new(&mut lambda_ctx.func, &mut lambda_builder_context);
+        let entry_block = builder.create_block();
+        builder.append_block_params_for_function_params(entry_block);
+        builder.switch_to_block(entry_block);
+        builder.seal_block(entry_block);
+        
+        // Get function parameters
+        let args_ptr = builder.block_params(entry_block)[0];  
+        let _arg_count = builder.block_params(entry_block)[1];
+        let _captured_env = builder.block_params(entry_block)[2];
+        
+        // Create JIT pointer value for global access
+        let jit_ptr_val = builder.ins().iconst(types::I64, self as *const BytecodeJIT as i64);
+        
+        // Create parameter bindings by loading from args array
+        let mut param_values = std::collections::HashMap::new();
+        for (i, param) in params.iter().enumerate() {
+            // Load argument from args array: args_ptr[i]
+            let arg_offset = builder.ins().iconst(types::I64, (i * 8) as i64); // Each Var is 8 bytes
+            let arg_addr = builder.ins().iadd(args_ptr, arg_offset);
+            let arg_value = builder.ins().load(types::I64, MemFlags::trusted(), arg_addr, 0);
+            param_values.insert(*param, arg_value);
+        }
+        
+        // Use the existing proper bytecode compilation path 
+        // Compile the AST to bytecode first
+        let mut compiler = BytecodeCompiler::new();
+        let function = compiler.compile_expr(body)?;
+        
+        // Create an analyzer to compile opcodes with global access
+        let mut analyzer = BytecodeAnalyzer {
+            var_builder: &self.var_builder,
+            variables: std::collections::HashMap::new(),
+            scope_stack: Vec::new(),
+            label_blocks: std::collections::HashMap::new(),
+            jit_ptr: Some(jit_ptr_val),
+            set_global_ref: Some(set_global_ref),
+            get_global_ref: Some(get_global_ref),
+            lambda_registry: self.lambda_registry.as_ref(),
+        };
+        
+        // Pre-populate analyzer with global variables as constants
+        for (symbol, var) in &self.global_variables {
+            let const_value = builder.ins().iconst(types::I64, var.as_u64() as i64);
+            analyzer.variables.insert(*symbol, const_value);
+        }
+        
+        // Pre-populate analyzer variables with parameter mappings
+        for (symbol, &value) in &param_values {
+            analyzer.variables.insert(*symbol, value);
+        }
+        
+        // Use the proper sequence compilation that handles jumps correctly
+        let result_value = analyzer.compile_sequence(&mut builder, &function.code)?;
+        
+        // Return the result
+        builder.ins().return_(&[result_value]);
+        
+        // Finalize the function
+        builder.finalize();
+        
+        // Define the function in the module
+        self.module
+            .define_function(func_id, &mut lambda_ctx)
+            .map_err(|e| format!("Failed to define lambda function: {e}"))?;
+            
+        self.module.clear_context(&mut lambda_ctx);
+        self.module.finalize_definitions()
+            .map_err(|e| format!("Failed to finalize lambda definitions: {e}"))?;
+            
+        // Get the finalized function pointer
+        let func_ptr = self.module.get_finalized_function(func_id);
+        Ok(func_ptr)
+    }
+    
     /// Compile bytecode function to optimized machine code  
-    pub fn compile_function(&mut self, function: &Function) -> Result<*const u8, String> {
+    pub fn compile_function(&mut self, function: &Function, lambda_registry: &std::collections::HashMap<FunctionId, (Vec<Symbol>, Expr)>) -> Result<*const u8, String> {
+        // Store lambda registry for use during compilation
+        self.lambda_registry = Some(lambda_registry.clone());
+        
         // Create function signature: (jit_ptr: *mut BytecodeJIT) -> u64
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(types::I64)); // JIT context pointer
@@ -619,8 +946,8 @@ impl BytecodeJIT {
         let get_global_ref = self.module.declare_func_in_func(get_global_func, builder.func);
         
         // Analyze and compile the bytecode optimally
-        let result = {
-            let mut analyzer = BytecodeAnalyzer::with_globals(&self.var_builder, jit_ptr, set_global_ref, get_global_ref);
+        let _result = {
+            let mut analyzer = BytecodeAnalyzer::with_globals(&self.var_builder, jit_ptr, set_global_ref, get_global_ref, self.lambda_registry.as_ref());
             
             // Pre-populate analyzer with global variables as constants
             for (symbol, var) in &self.global_variables {
@@ -654,9 +981,14 @@ impl BytecodeJIT {
             .map_err(|e| format!("Failed to finalize: {e}"))?;
             
         let code_ptr = self.module.get_finalized_function(func_id);
+        
+        // Note: Keep lambda_registry available for runtime lambda compilation
+        
         Ok(code_ptr)
     }
 }
+
+/// Helper function for lambda body compilation to avoid borrowing issues
 
 /// Analyzes bytecode sequences and compiles them to optimized machine code
 struct BytecodeAnalyzer<'a> {
@@ -667,6 +999,7 @@ struct BytecodeAnalyzer<'a> {
     jit_ptr: Option<Value>,
     set_global_ref: Option<FuncRef>,
     get_global_ref: Option<FuncRef>,
+    lambda_registry: Option<&'a std::collections::HashMap<FunctionId, (Vec<Symbol>, Expr)>>,
 }
 
 impl<'a> BytecodeAnalyzer<'a> {
@@ -679,10 +1012,11 @@ impl<'a> BytecodeAnalyzer<'a> {
             jit_ptr: None,
             set_global_ref: None,
             get_global_ref: None,
+            lambda_registry: None,
         }
     }
     
-    fn with_globals(var_builder: &'a VarBuilder, jit_ptr: Value, set_global_ref: FuncRef, get_global_ref: FuncRef) -> Self {
+    fn with_globals(var_builder: &'a VarBuilder, jit_ptr: Value, set_global_ref: FuncRef, get_global_ref: FuncRef, lambda_registry: Option<&'a std::collections::HashMap<FunctionId, (Vec<Symbol>, Expr)>>) -> Self {
         Self {
             var_builder,
             variables: std::collections::HashMap::new(),
@@ -691,6 +1025,7 @@ impl<'a> BytecodeAnalyzer<'a> {
             jit_ptr: Some(jit_ptr),
             set_global_ref: Some(set_global_ref),
             get_global_ref: Some(get_global_ref),
+            lambda_registry,
         }
     }
     
@@ -1023,7 +1358,7 @@ impl<'a> BytecodeAnalyzer<'a> {
                     let global_value = builder.inst_results(call_inst)[0];
                     stack.push(global_value);
                 } else {
-                    return Err(format!("Undefined variable: {:?}", symbol));
+                    return Err(format!("Undefined variable: {symbol:?}"));
                 }
             }
             
@@ -1201,8 +1536,98 @@ impl<'a> BytecodeAnalyzer<'a> {
                 // No stack effect
             }
             
+            Opcode::Call(arg_count) => {
+                // Call opcode: pop function and N arguments, push result
+                if stack.len() < (*arg_count as usize + 1) {
+                    return Err(format!("Stack underflow for Call: need {} items, have {}", arg_count + 1, stack.len()));
+                }
+                
+                // Pop arguments (in reverse order since stack is LIFO)
+                let mut args = Vec::new();
+                for _ in 0..*arg_count {
+                    args.push(stack.pop().unwrap());
+                }
+                args.reverse(); // Put arguments in correct order
+                
+                // Pop function
+                let function = stack.pop().unwrap();
+                
+                // Call the jit_call_closure runtime helper
+                let jit_ptr = self.jit_ptr.ok_or("No JIT pointer available for closure calls")?;
+                
+                // Prepare arguments array on stack
+                let (args_ptr, arg_count_val) = if args.is_empty() {
+                    (builder.ins().iconst(types::I64, 0), builder.ins().iconst(types::I32, 0))
+                } else {
+                    // Create stack slot for arguments
+                    let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        (args.len() * 8) as u32,
+                    ));
+                    let args_addr = builder.ins().stack_addr(types::I64, slot, 0);
+                    
+                    // Store each argument
+                    for (i, &arg) in args.iter().enumerate() {
+                        builder.ins().store(MemFlags::trusted(), arg, args_addr, (i * 8) as i32);
+                    }
+                    
+                    (args_addr, builder.ins().iconst(types::I32, args.len() as i64))
+                };
+                
+                // Import the signature first
+                let sig = builder.import_signature(Signature {
+                    params: vec![
+                        AbiParam::new(types::I64), // jit_ptr
+                        AbiParam::new(types::I64), // closure
+                        AbiParam::new(types::I64), // args_ptr
+                        AbiParam::new(types::I32), // arg_count
+                    ],
+                    returns: vec![AbiParam::new(types::I64)], // return value
+                    call_conv: CallConv::SystemV,
+                });
+                
+                // Get the function pointer as a constant
+                let func_ptr = builder.ins().iconst(types::I64, jit_call_closure as *const u8 as i64);
+                
+                // Create the call instruction
+                let call_inst = builder.ins().call_indirect(
+                    sig,
+                    func_ptr,
+                    &[jit_ptr, function, args_ptr, arg_count_val]
+                );
+                
+                let result = builder.inst_results(call_inst)[0];
+                
+                stack.push(result);
+            }
+            
+            Opcode::Closure(function_id, _upvalue_count) => {
+                // Look up lambda information in registry to get arity
+                if let Some(registry) = &self.lambda_registry {
+                    if let Some((params, _body)) = registry.get(function_id) {
+                        let arity = params.len() as u32;
+                        
+                        // For now, create closure with null function pointer
+                        // Lambda compilation will happen on-demand when the function is called
+                        let closure_ptr = crate::heap::LispClosure::new(
+                            std::ptr::null(), // Function pointer - will be compiled when needed
+                            arity,
+                            *function_id as u64  // Store function_id in captured_env for lazy compilation
+                        );
+                        
+                        let closure_var = crate::var::Var::closure(closure_ptr);
+                        let closure_value = builder.ins().iconst(types::I64, closure_var.as_u64() as i64);
+                        stack.push(closure_value);
+                    } else {
+                        return Err(format!("Lambda function {function_id} not found in registry"));
+                    }
+                } else {
+                    return Err("No lambda registry available for Closure opcode".to_string());
+                }
+            }
+            
             _ => {
-                return Err(format!("Bytecode instruction {:?} not yet implemented", opcode));
+                return Err(format!("Bytecode instruction {opcode:?} not yet implemented"));
             }
         }
         Ok(())
@@ -1235,6 +1660,7 @@ impl<'a> BytecodeAnalyzer<'a> {
             Ok(self.var_builder.make_none(builder))
         }
     }
+    
 }
 
 #[cfg(test)]
@@ -1258,7 +1684,7 @@ mod tests {
         
         // JIT compile with optimizations
         let mut jit = BytecodeJIT::new();
-        let machine_code = jit.compile_function(&function).unwrap();
+        let machine_code = jit.compile_function(&function, &compiler.lambda_registry).unwrap();
         
         // Execute the compiled function
         let func: fn() -> u64 = unsafe { std::mem::transmute(machine_code) };
