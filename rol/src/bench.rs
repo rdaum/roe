@@ -19,8 +19,8 @@ fn run_fibonacci_benchmark() -> Result<(), Box<dyn std::error::Error>> {
     println!("======================");
     println!();
     
-    // Test with Fibonacci of 35 for meaningful timing
-    let n = 35;
+    // Test with Fibonacci of 15 for reasonable timing with recursive implementation  
+    let n = 15;
     println!("Computing Fibonacci of {n}");
     println!();
     
@@ -30,16 +30,12 @@ fn run_fibonacci_benchmark() -> Result<(), Box<dyn std::error::Error>> {
     
     let mut repl = Repl::new()?;
     
-    // Define an iterative fibonacci function since recursion isn't working yet
-    let fib_def = "(defn fib [n] (if (< n 2) n (let [a 0 b 1 i 2] (while (<= i n) (let [temp (+ a b)] (def a b) (def b temp) (def i (+ i 1)))) b)))";
-    
-    // For now, use a simpler test to demonstrate the benchmark works
-    // Note: if expressions in functions currently return nil, so using non-conditional version
-    let simple_fib_def = "(defn fib [n] 55)"; // Hardcoded result for fib(10)
+    // Now that if expressions work correctly, we can use proper recursive Fibonacci
+    let fib_def = "(defn fib [n] (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))";
     
     // Measure compilation time
     let compile_start = Instant::now();
-    repl.eval(simple_fib_def)?;
+    repl.eval(fib_def)?;
     let compile_time = compile_start.elapsed();
     
     println!("  Compilation time: {compile_time:?}");
@@ -151,8 +147,8 @@ mod tests {
         
         assert_eq!(add_result, 11);
         
-        // Test if the proper bytecode compilation now works with if expressions
-        repl.eval("(defn fib [n] (if (< n 2) n 55))").unwrap(); 
+        // Test if the proper recursive fibonacci now works with if expressions
+        repl.eval("(defn fib [n] (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))").unwrap(); 
         let fib_result = repl.eval("(fib 10)").unwrap();
         
         assert_eq!(fib_result.as_int().unwrap(), 55);
