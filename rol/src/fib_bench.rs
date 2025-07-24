@@ -46,10 +46,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Run fibonacci computation in a loop
     for i in 0..iterations {
-        if i % 100 == 0 {
-            println!("Iteration {}/{}", i, iterations);
-        }
-
         let result = repl.eval(&format!("(fib {})", fib_n))?;
 
         // Verify result is correct (fib(20) = 6765)

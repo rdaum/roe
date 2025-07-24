@@ -680,7 +680,7 @@ fn compile_expr_recursive(
                 env_create_ref,
                 env_set_ref,
             )?;
-            builder.ins().jump(merge_block, &[then_result]);
+            builder.ins().jump(merge_block, [then_result.into()].iter());
 
             // Compile else branch
             builder.switch_to_block(else_block);
@@ -695,7 +695,7 @@ fn compile_expr_recursive(
                 env_create_ref,
                 env_set_ref,
             )?;
-            builder.ins().jump(merge_block, &[else_result]);
+            builder.ins().jump(merge_block, [else_result.into()].iter());
 
             // Merge point
             builder.switch_to_block(merge_block);
@@ -919,7 +919,7 @@ fn compile_function_call_recursive(
     builder.switch_to_block(error_block);
     builder.seal_block(error_block);
     let error_result = var_builder.make_none(builder);
-    builder.ins().jump(cont_block, &[error_result]);
+    builder.ins().jump(cont_block, [error_result.into()].iter());
 
     // Success block: actually call the closure
     builder.switch_to_block(success_block);
@@ -937,6 +937,7 @@ fn compile_function_call_recursive(
         let arg_array_ptr = builder.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
             arg_count * 8,
+            3,
         ));
         let arg_array_addr = builder.ins().stack_addr(types::I64, arg_array_ptr, 0);
 
@@ -950,12 +951,12 @@ fn compile_function_call_recursive(
 
         // Call the closure function
         let result = var_builder.call_closure(builder, closure_ptr, arg_array_addr, arg_count);
-        builder.ins().jump(cont_block, &[result]);
+        builder.ins().jump(cont_block, [result.into()].iter());
     } else {
         // No arguments - pass null pointer
         let null_ptr = builder.ins().iconst(types::I64, 0);
         let result = var_builder.call_closure(builder, closure_ptr, null_ptr, 0);
-        builder.ins().jump(cont_block, &[result]);
+        builder.ins().jump(cont_block, [result.into()].iter());
     }
 
     // Continuation block

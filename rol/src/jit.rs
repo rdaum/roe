@@ -39,7 +39,7 @@ macro_rules! impl_arithmetic_binop {
             let rhs_int = self.extract_int(builder, rhs);
             let int_result = builder.ins().$int_op(lhs_int, rhs_int);
             let int_var = self.make_int(builder, int_result);
-            builder.ins().jump(merge_block, &[int_var]);
+            builder.ins().jump(merge_block, [int_var.into()].iter());
 
             // Float path: at least one is a double, use float operation
             builder.switch_to_block(float_block);
@@ -50,7 +50,7 @@ macro_rules! impl_arithmetic_binop {
             let rhs_f64 = self.extract_double(builder, rhs_double);
             let float_result = builder.ins().$float_op(lhs_f64, rhs_f64);
             let float_var = self.make_double(builder, float_result);
-            builder.ins().jump(merge_block, &[float_var]);
+            builder.ins().jump(merge_block, [float_var.into()].iter());
 
             // Merge point
             builder.switch_to_block(merge_block);
@@ -90,7 +90,7 @@ macro_rules! impl_comparison_binop {
             let int_cmp = builder.ins().icmp(IntCC::$int_cond, lhs_int, rhs_int);
             let int_result = builder.ins().uextend(types::I64, int_cmp);
             let int_var = self.make_bool(builder, int_result);
-            builder.ins().jump(merge_block, &[int_var]);
+            builder.ins().jump(merge_block, [int_var.into()].iter());
 
             // Float path: at least one is a double, use float comparison
             builder.switch_to_block(float_block);
@@ -102,7 +102,7 @@ macro_rules! impl_comparison_binop {
             let float_cmp = builder.ins().fcmp(FloatCC::$float_cond, lhs_f64, rhs_f64);
             let float_result = builder.ins().uextend(types::I64, float_cmp);
             let float_var = self.make_bool(builder, float_result);
-            builder.ins().jump(merge_block, &[float_var]);
+            builder.ins().jump(merge_block, [float_var.into()].iter());
 
             // Merge point
             builder.switch_to_block(merge_block);
@@ -443,7 +443,7 @@ impl VarBuilder {
         builder.switch_to_block(int_block);
         builder.seal_block(int_block);
         let int_result = self.emit_int_add(builder, lhs, rhs);
-        builder.ins().jump(merge_block, &[int_result]);
+        builder.ins().jump(merge_block, [int_result.into()].iter());
 
         // Float path: at least one is float, coerce both and use float arithmetic
         builder.switch_to_block(float_block);
@@ -451,7 +451,7 @@ impl VarBuilder {
         let lhs_float = self.coerce_to_double(builder, lhs);
         let rhs_float = self.coerce_to_double(builder, rhs);
         let float_result = self.emit_double_add(builder, lhs_float, rhs_float);
-        builder.ins().jump(merge_block, &[float_result]);
+        builder.ins().jump(merge_block, [float_result.into()].iter());
 
         // Merge point
         builder.switch_to_block(merge_block);
@@ -490,7 +490,7 @@ impl VarBuilder {
         builder.switch_to_block(int_block);
         builder.seal_block(int_block);
         let int_result = self.emit_int_sub(builder, lhs, rhs);
-        builder.ins().jump(merge_block, &[int_result]);
+        builder.ins().jump(merge_block, [int_result.into()].iter());
 
         // Float path: at least one is float, coerce both and use float arithmetic
         builder.switch_to_block(float_block);
@@ -498,7 +498,7 @@ impl VarBuilder {
         let lhs_float = self.coerce_to_double(builder, lhs);
         let rhs_float = self.coerce_to_double(builder, rhs);
         let float_result = self.emit_double_sub(builder, lhs_float, rhs_float);
-        builder.ins().jump(merge_block, &[float_result]);
+        builder.ins().jump(merge_block, [float_result.into()].iter());
 
         // Merge point
         builder.switch_to_block(merge_block);
@@ -537,7 +537,7 @@ impl VarBuilder {
         builder.switch_to_block(int_block);
         builder.seal_block(int_block);
         let int_result = self.emit_int_lt(builder, lhs, rhs);
-        builder.ins().jump(merge_block, &[int_result]);
+        builder.ins().jump(merge_block, [int_result.into()].iter());
 
         // Float path: at least one is float, coerce both and use float comparison
         builder.switch_to_block(float_block);
@@ -545,7 +545,7 @@ impl VarBuilder {
         let lhs_float = self.coerce_to_double(builder, lhs);
         let rhs_float = self.coerce_to_double(builder, rhs);
         let float_result = self.emit_double_lt(builder, lhs_float, rhs_float);
-        builder.ins().jump(merge_block, &[float_result]);
+        builder.ins().jump(merge_block, [float_result.into()].iter());
 
         // Merge point
         builder.switch_to_block(merge_block);
@@ -589,7 +589,7 @@ impl VarBuilder {
         let rhs_int = self.extract_int(builder, rhs);
         let int_result = builder.ins().srem(lhs_int, rhs_int);
         let int_var = self.make_int(builder, int_result);
-        builder.ins().jump(merge_block, &[int_var]);
+        builder.ins().jump(merge_block, [int_var.into()].iter());
 
         // Float path: for simplicity, convert to integers for modulo
         // (In a real implementation, you might want floating-point modulo)
@@ -605,7 +605,7 @@ impl VarBuilder {
         let float_result = builder.ins().srem(lhs_int, rhs_int);
         let float_result_i64 = builder.ins().sextend(types::I64, float_result);
         let float_var = self.make_int(builder, float_result_i64);
-        builder.ins().jump(merge_block, &[float_var]);
+        builder.ins().jump(merge_block, [float_var.into()].iter());
 
         // Merge point
         builder.switch_to_block(merge_block);
@@ -674,12 +674,12 @@ impl VarBuilder {
         let int_val = self.extract_int(builder, var);
         let float_val = builder.ins().fcvt_from_sint(types::F64, int_val);
         let double_var = self.make_double(builder, float_val);
-        builder.ins().jump(merge_block, &[double_var]);
+        builder.ins().jump(merge_block, [double_var.into()].iter());
 
         // Pass through (assume it's already a double)
         builder.switch_to_block(passthrough_block);
         builder.seal_block(passthrough_block);
-        builder.ins().jump(merge_block, &[var]);
+        builder.ins().jump(merge_block, [var.into()].iter());
 
         // Merge point
         builder.switch_to_block(merge_block);
@@ -843,14 +843,14 @@ impl VarBuilder {
         let int_val = builder.ins().band_imm(var, 0xFFFFFFFF);
         let int_nonzero = builder.ins().icmp_imm(IntCC::NotEqual, int_val, 0);
         let int_result = builder.ins().uextend(types::I32, int_nonzero);
-        builder.ins().jump(merge_block, &[int_result]);
+        builder.ins().jump(merge_block, [int_result.into()].iter());
 
         // Bool/other block: assume truthy unless zero
         builder.switch_to_block(bool_block);
         builder.seal_block(bool_block);
         let other_nonzero = builder.ins().icmp_imm(IntCC::NotEqual, var, 0);
         let other_result = builder.ins().uextend(types::I32, other_nonzero);
-        builder.ins().jump(merge_block, &[other_result]);
+        builder.ins().jump(merge_block, [other_result.into()].iter());
 
         // Merge results
         builder.switch_to_block(merge_block);

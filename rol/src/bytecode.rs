@@ -1491,7 +1491,7 @@ impl<'a> BytecodeAnalyzer<'a> {
         // Use Cranelift's stack allocation instead of malloc
         // Allocate a large stack slot for our VM stack
         let stack_slot = builder
-            .create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, stack_bytes));
+            .create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, stack_bytes, 3));
 
         // Get the address of the stack slot as our stack base
         let stack_base = builder.ins().stack_addr(types::I64, stack_slot, 0);
@@ -1499,7 +1499,7 @@ impl<'a> BytecodeAnalyzer<'a> {
 
         // Allocate stack slot to hold current stack pointer (starts at base)
         self.stack_ptr_slot = Some(
-            builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8)),
+            builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3)),
         );
 
         // Initialize stack pointer to base
@@ -1771,7 +1771,7 @@ impl<'a> BytecodeAnalyzer<'a> {
             self.compile_single_opcode_native(builder, opcode)?;
         }
         let then_result = self.native_pop(builder)?;
-        builder.ins().jump(end_block, &[then_result]);
+        builder.ins().jump(end_block, [then_result.into()].iter());
 
         // Compile else branch
         builder.switch_to_block(else_block);
@@ -1780,7 +1780,7 @@ impl<'a> BytecodeAnalyzer<'a> {
             self.compile_single_opcode_native(builder, opcode)?;
         }
         let else_result = self.native_pop(builder)?;
-        builder.ins().jump(end_block, &[else_result]);
+        builder.ins().jump(end_block, [else_result.into()].iter());
 
         // End block
         builder.switch_to_block(end_block);
@@ -1844,13 +1844,13 @@ impl<'a> BytecodeAnalyzer<'a> {
             builder.switch_to_block(then_block);
             builder.seal_block(then_block);
             let popped_value = self.native_pop(builder)?;
-            builder.ins().jump(merge_block, &[popped_value]);
+            builder.ins().jump(merge_block, [popped_value.into()].iter());
 
             // Else: return none
             builder.switch_to_block(else_block);
             builder.seal_block(else_block);
             let none_value = self.var_builder.make_none(builder);
-            builder.ins().jump(merge_block, &[none_value]);
+            builder.ins().jump(merge_block, [none_value.into()].iter());
 
             // Merge
             builder.switch_to_block(merge_block);
@@ -2120,6 +2120,7 @@ impl<'a> BytecodeAnalyzer<'a> {
                         let slot = builder.create_sized_stack_slot(StackSlotData::new(
                             StackSlotKind::ExplicitSlot,
                             (args.len() * 8) as u32,
+                            3,
                         ));
                         let args_addr = builder.ins().stack_addr(types::I64, slot, 0);
 
@@ -2225,7 +2226,7 @@ impl<'a> BytecodeAnalyzer<'a> {
                                 // Then block: return n
                                 builder.switch_to_block(then_block);
                                 builder.seal_block(then_block);
-                                builder.ins().jump(cont_block, &[n_value]);
+                                builder.ins().jump(cont_block, [n_value.into()].iter());
 
                                 // Else block: compute (+ (fib (- n 1)) (fib (- n 2)))
                                 builder.switch_to_block(else_block);
@@ -2264,7 +2265,7 @@ impl<'a> BytecodeAnalyzer<'a> {
                                     fib_n_minus_1,
                                     fib_n_minus_2,
                                 );
-                                builder.ins().jump(cont_block, &[sum]);
+                                builder.ins().jump(cont_block, [sum.into()].iter());
 
                                 // Continuation block
                                 builder.switch_to_block(cont_block);
@@ -2320,6 +2321,7 @@ impl<'a> BytecodeAnalyzer<'a> {
                         let slot = builder.create_sized_stack_slot(StackSlotData::new(
                             StackSlotKind::ExplicitSlot,
                             (args.len() * 8) as u32,
+                            3,
                         ));
                         let args_addr = builder.ins().stack_addr(types::I64, slot, 0);
 
@@ -2534,6 +2536,7 @@ impl<'a> BytecodeAnalyzer<'a> {
             let slot = builder.create_sized_stack_slot(StackSlotData::new(
                 StackSlotKind::ExplicitSlot,
                 (args.len() * 8) as u32,
+                3,
             ));
             let args_addr = builder.ins().stack_addr(types::I64, slot, 0);
 
