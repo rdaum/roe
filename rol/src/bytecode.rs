@@ -854,6 +854,7 @@ pub struct BytecodeJIT {
     ctx: codegen::Context,
     builder_context: FunctionBuilderContext,
     function_counter: u32,
+    isa: cranelift::codegen::isa::OwnedTargetIsa,
     /// Global variables that persist between REPL evaluations
     global_variables: std::collections::HashMap<Symbol, Var>, // Dynamic variables (mutable)
     global_offsets: Vec<Var>, // Fast offset-based storage for immutable globals
@@ -876,7 +877,7 @@ impl BytecodeJIT {
             .unwrap();
 
         let mut builder =
-            cranelift_jit::JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+            cranelift_jit::JITBuilder::with_isa(isa.clone(), cranelift_module::default_libcall_names());
 
         // Register our runtime helper functions with the JIT
         builder.symbol("jit_set_global", jit_set_global as *const u8);
@@ -903,12 +904,18 @@ impl BytecodeJIT {
             ctx: codegen::Context::new(),
             builder_context: FunctionBuilderContext::new(),
             function_counter: 0,
+            isa,
             global_variables: std::collections::HashMap::new(),
             global_offsets: Vec::new(),
             lambda_registry: None,
             compiled_lambdas: std::collections::HashMap::new(),
             compiled_globals: std::collections::HashMap::new(),
         }
+    }
+
+    /// Get the native calling convention for this platform
+    fn native_call_conv(&self) -> CallConv {
+        self.isa.default_call_conv()
     }
 
     /// Set a global variable value (dynamic/mutable variables)
@@ -980,6 +987,7 @@ impl BytecodeJIT {
         self.ctx.clear();
         self.ctx.func.signature = sig;
 
+        let call_conv = self.native_call_conv(); // Get this before mutable borrow
         let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.builder_context);
 
         // Create entry block
@@ -1022,6 +1030,7 @@ impl BytecodeJIT {
             set_global_offset_ref: None,
             get_global_offset_ref: None,
             lambda_registry: None,
+            call_conv,
             stack_base: None,
             stack_ptr_slot: None,
             stack_size: 1024,
@@ -1207,6 +1216,7 @@ impl BytecodeJIT {
             set_global_offset_ref: Some(set_global_offset_ref),
             get_global_offset_ref: Some(get_global_offset_ref),
             lambda_registry: self.lambda_registry.as_ref(),
+            call_conv: self.native_call_conv(),
             stack_base: None,
             stack_ptr_slot: None,
             stack_size: 1024,
@@ -1288,6 +1298,7 @@ impl BytecodeJIT {
         self.ctx.clear();
         self.ctx.func.signature = sig;
 
+        let call_conv = self.native_call_conv(); // Get this before mutable borrow
         let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.builder_context);
         let entry_block = builder.create_block();
         builder.append_block_params_for_function_params(entry_block);
@@ -1383,6 +1394,7 @@ impl BytecodeJIT {
                 get_global_offset_ref,
                 self.lambda_registry.as_ref(),
                 Some(recursive_calls),
+                call_conv,
             );
 
             // Pre-populate analyzer with global variables as constants
@@ -1438,6 +1450,7 @@ struct BytecodeAnalyzer<'a> {
     set_global_offset_ref: Option<FuncRef>,
     get_global_offset_ref: Option<FuncRef>,
     lambda_registry: Option<&'a std::collections::HashMap<FunctionId, (Vec<Symbol>, Function)>>,
+    call_conv: CallConv,
 
     // Native stack management
     stack_base: Option<Value>, // Base pointer to stack memory region
@@ -1451,6 +1464,10 @@ struct BytecodeAnalyzer<'a> {
 }
 
 impl<'a> BytecodeAnalyzer<'a> {
+    /// Get the native calling convention for this platform
+    fn native_call_conv(&self) -> CallConv {
+        self.call_conv
+    }
     fn with_globals(
         var_builder: &'a VarBuilder,
         jit_ptr: Value,
@@ -1460,6 +1477,7 @@ impl<'a> BytecodeAnalyzer<'a> {
         get_global_offset_ref: FuncRef,
         lambda_registry: Option<&'a std::collections::HashMap<FunctionId, (Vec<Symbol>, Function)>>,
         recursive_calls: Option<&'a std::collections::HashMap<Symbol, Vec<RecursiveCallSite>>>,
+        call_conv: CallConv,
     ) -> Self {
         Self {
             var_builder,
@@ -1472,6 +1490,7 @@ impl<'a> BytecodeAnalyzer<'a> {
             set_global_offset_ref: Some(set_global_offset_ref),
             get_global_offset_ref: Some(get_global_offset_ref),
             lambda_registry,
+            call_conv,
             stack_base: None,
             stack_ptr_slot: None,
             stack_size: 1024, // Default 1024 Var slots (8KB)
@@ -2149,7 +2168,7 @@ impl<'a> BytecodeAnalyzer<'a> {
                             AbiParam::new(types::I32), // arg_count
                         ],
                         returns: vec![AbiParam::new(types::I64)], // return value
-                        call_conv: CallConv::SystemV,
+                        call_conv: self.native_call_conv(),
                     });
 
                     // Get the function pointer as a constant
@@ -2350,7 +2369,7 @@ impl<'a> BytecodeAnalyzer<'a> {
                             AbiParam::new(types::I32), // arg_count
                         ],
                         returns: vec![AbiParam::new(types::I64)], // return value
-                        call_conv: CallConv::SystemV,
+                        call_conv: self.native_call_conv(),
                     });
 
                     // Get the function pointer as a constant
@@ -2447,7 +2466,7 @@ impl<'a> BytecodeAnalyzer<'a> {
                     AbiParam::new(types::I64), // closure
                 ],
                 returns: vec![AbiParam::new(types::I64)],
-                call_conv: CallConv::SystemV,
+                call_conv: self.native_call_conv(),
             }),
             1 => builder.import_signature(Signature {
                 params: vec![
@@ -2456,7 +2475,7 @@ impl<'a> BytecodeAnalyzer<'a> {
                     AbiParam::new(types::I64), // arg0
                 ],
                 returns: vec![AbiParam::new(types::I64)],
-                call_conv: CallConv::SystemV,
+                call_conv: self.native_call_conv(),
             }),
             2 => builder.import_signature(Signature {
                 params: vec![
@@ -2466,7 +2485,7 @@ impl<'a> BytecodeAnalyzer<'a> {
                     AbiParam::new(types::I64), // arg1
                 ],
                 returns: vec![AbiParam::new(types::I64)],
-                call_conv: CallConv::SystemV,
+                call_conv: self.native_call_conv(),
             }),
             3 => builder.import_signature(Signature {
                 params: vec![
@@ -2477,7 +2496,7 @@ impl<'a> BytecodeAnalyzer<'a> {
                     AbiParam::new(types::I64), // arg2
                 ],
                 returns: vec![AbiParam::new(types::I64)],
-                call_conv: CallConv::SystemV,
+                call_conv: self.native_call_conv(),
             }),
             4 => builder.import_signature(Signature {
                 params: vec![
@@ -2489,7 +2508,7 @@ impl<'a> BytecodeAnalyzer<'a> {
                     AbiParam::new(types::I64), // arg3
                 ],
                 returns: vec![AbiParam::new(types::I64)],
-                call_conv: CallConv::SystemV,
+                call_conv: self.native_call_conv(),
             }),
             _ => return Err("Fast call only supports ≤4 arguments".to_string()),
         };
@@ -2562,7 +2581,7 @@ impl<'a> BytecodeAnalyzer<'a> {
                 AbiParam::new(types::I32), // arg_count
             ],
             returns: vec![AbiParam::new(types::I64)],
-            call_conv: CallConv::SystemV,
+            call_conv: self.native_call_conv(),
         });
 
         let func_ptr = builder

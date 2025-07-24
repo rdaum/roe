@@ -1,8 +1,8 @@
 //! Native heap-allocated types for Lisp runtime.
-//! These types are designed for JIT access and will later integrate with mmtk GC.
+//! These types are designed for JIT access and integrate with mmtk GC.
 
+use crate::mmtk_binding::{mmtk_alloc, mmtk_alloc_placeholder, mmtk_dealloc_placeholder};
 use crate::var::Var;
-use std::alloc::{Layout, alloc, dealloc};
 use std::ptr;
 use std::slice;
 use std::str;
@@ -25,12 +25,18 @@ impl LispString {
 
         // Calculate total size: header + string data
         let header_size = std::mem::size_of::<LispString>();
-        let total_size = header_size + bytes.len();
-        let align = std::mem::align_of::<LispString>();
+        let data_size = bytes.len();
+        let total_size = header_size + data_size;
+        
+        // Round up to 8-byte alignment as required by MMTk
+        let aligned_size = (total_size + 7) & !7;
 
-        // Allocate memory
-        let layout = Layout::from_size_align(total_size, align).unwrap();
-        let ptr = unsafe { alloc(layout) as *mut LispString };
+        // Allocate memory using MMTk
+        let ptr = if crate::mmtk_binding::is_mmtk_initialized() {
+            mmtk_alloc(aligned_size) as *mut LispString
+        } else {
+            mmtk_alloc_placeholder(aligned_size) as *mut LispString
+        };
 
         if ptr.is_null() {
             panic!("Failed to allocate memory for LispString");
@@ -64,17 +70,15 @@ impl LispString {
 
     /// Free the memory for this LispString
     pub unsafe fn free(ptr: *mut LispString) {
+        if ptr.is_null() {
+            return;
+        }
+
+        let header_size = std::mem::size_of::<LispString>();
+        let total_size = header_size + unsafe { (*ptr).length as usize };
+
         unsafe {
-            if ptr.is_null() {
-                return;
-            }
-
-            let header_size = std::mem::size_of::<LispString>();
-            let total_size = header_size + (*ptr).length as usize;
-            let align = std::mem::align_of::<LispString>();
-
-            let layout = Layout::from_size_align_unchecked(total_size, align);
-            dealloc(ptr as *mut u8, layout);
+            mmtk_dealloc_placeholder(ptr as *mut u8, total_size);
         }
     }
 }
@@ -100,11 +104,16 @@ impl LispTuple {
         let header_size = std::mem::size_of::<LispTuple>();
         let elements_size = capacity as usize * std::mem::size_of::<Var>();
         let total_size = header_size + elements_size;
-        let align = std::mem::align_of::<LispTuple>();
+        
+        // Round up to 8-byte alignment as required by MMTk
+        let aligned_size = (total_size + 7) & !7;
 
-        // Allocate memory
-        let layout = Layout::from_size_align(total_size, align).unwrap();
-        let ptr = unsafe { alloc(layout) as *mut LispTuple };
+        // Allocate memory using MMTk
+        let ptr = if crate::mmtk_binding::is_mmtk_initialized() {
+            mmtk_alloc(aligned_size) as *mut LispTuple
+        } else {
+            mmtk_alloc_placeholder(aligned_size) as *mut LispTuple
+        };
 
         if ptr.is_null() {
             panic!("Failed to allocate memory for LispVector");
@@ -205,18 +214,16 @@ impl LispTuple {
 
     /// Free the memory for this LispVector
     pub unsafe fn free(ptr: *mut LispTuple) {
+        if ptr.is_null() {
+            return;
+        }
+
+        let header_size = std::mem::size_of::<LispTuple>();
+        let elements_size = unsafe { (*ptr).capacity as usize } * std::mem::size_of::<Var>();
+        let total_size = header_size + elements_size;
+
         unsafe {
-            if ptr.is_null() {
-                return;
-            }
-
-            let header_size = std::mem::size_of::<LispTuple>();
-            let elements_size = (*ptr).capacity as usize * std::mem::size_of::<Var>();
-            let total_size = header_size + elements_size;
-            let align = std::mem::align_of::<LispTuple>();
-
-            let layout = Layout::from_size_align_unchecked(total_size, align);
-            dealloc(ptr as *mut u8, layout);
+            mmtk_dealloc_placeholder(ptr as *mut u8, total_size);
         }
     }
 }
@@ -251,8 +258,14 @@ pub struct LispClosure {
 impl LispClosure {
     /// Create a new closure with the given function pointer, arity, and captured environment
     pub fn new(func_ptr: *const u8, arity: u32, captured_env: u64) -> *mut LispClosure {
-        let layout = Layout::new::<LispClosure>();
-        let ptr = unsafe { alloc(layout) as *mut LispClosure };
+        let size = std::mem::size_of::<LispClosure>();
+        // Round up to 8-byte alignment as required by MMTk
+        let aligned_size = (size + 7) & !7;
+        let ptr = if crate::mmtk_binding::is_mmtk_initialized() {
+            mmtk_alloc(aligned_size) as *mut LispClosure
+        } else {
+            mmtk_alloc_placeholder(aligned_size) as *mut LispClosure
+        };
 
         if ptr.is_null() {
             panic!("Failed to allocate memory for LispClosure");
@@ -308,8 +321,10 @@ impl LispClosure {
             return;
         }
 
-        let layout = Layout::new::<LispClosure>();
-        unsafe { dealloc(ptr as *mut u8, layout) };
+        let size = std::mem::size_of::<LispClosure>();
+        unsafe {
+            mmtk_dealloc_placeholder(ptr as *mut u8, size);
+        }
     }
 }
 

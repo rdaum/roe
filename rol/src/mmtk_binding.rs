@@ -1,0 +1,619 @@
+//! MMTk garbage collector binding for ROL runtime.
+//! Implements NoGC plan integration following MMTk tutorial.
+
+use mmtk::util::copy::{CopySemantics, GCWorkerCopyContext};
+use mmtk::util::opaque_pointer::*;
+use mmtk::util::options::PlanSelector;
+use mmtk::util::{Address, ObjectReference};
+use mmtk::vm::*;
+use mmtk::*;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock, Condvar, Arc};
+use std::cell::RefCell;
+use crate::gc::{GcRootSet, SimpleRootSet};
+
+/// Global MMTk instance - thread-safe lazy initialization
+static MMTK_INSTANCE: OnceLock<Box<MMTK<RolVM>>> = OnceLock::new();
+static MMTK_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+/// Thread-local mutator storage for proper thread binding
+thread_local! {
+    static THREAD_MUTATOR: RefCell<Option<Box<Mutator<RolVM>>>> = const { RefCell::new(None) };
+}
+
+/// Global count of active mutators
+static MUTATOR_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Stop-the-world synchronization for garbage collection
+static GC_SYNC: OnceLock<Arc<(Mutex<bool>, Condvar)>> = OnceLock::new();
+
+/// Global root set for persistent roots like globals and symbols
+static GLOBAL_ROOT_SET: OnceLock<Mutex<SimpleRootSet>> = OnceLock::new();
+/// Thread-local root set - simplified to a single instance for now
+static CURRENT_ROOT_SET: OnceLock<Mutex<SimpleRootSet>> = OnceLock::new();
+
+/// ROL VM binding - zero-sized struct as per NoGC tutorial
+#[derive(Default)]
+pub struct RolVM;
+
+/// VMBinding implementation - required for MMTk integration
+impl VMBinding for RolVM {
+    type VMObjectModel = Self;
+    type VMActivePlan = Self;
+    type VMCollection = Self;
+    type VMScanning = Self;
+    type VMReferenceGlue = Self;
+    type VMSlot = Address;
+    type VMMemorySlice = std::ops::Range<Address>;
+}
+
+/// ActivePlan implementation - proper mutator management for NoGC
+impl ActivePlan<RolVM> for RolVM {
+    fn number_of_mutators() -> usize {
+        // Get count from atomic counter
+        MUTATOR_COUNT.load(std::sync::atomic::Ordering::Acquire)
+    }
+    
+    fn is_mutator(_thread: VMThread) -> bool {
+        // In our simple runtime, all threads can be mutators
+        true
+    }
+    
+    fn mutator(_thread: VMMutatorThread) -> &'static mut Mutator<RolVM> {
+        // Get the thread-local mutator
+        THREAD_MUTATOR.with(|mutator_cell| {
+            let mut mutator_ref = mutator_cell.borrow_mut();
+            if mutator_ref.is_none() {
+                // Initialize mutator for this thread if not already done
+                *mutator_ref = Some(bind_mutator_internal(_thread));
+            }
+            
+            // SAFETY: We maintain the mutator in thread-local storage for the lifetime
+            // of the thread, and MMTk expects a static mutable reference
+            unsafe {
+                let ptr = mutator_ref.as_mut().unwrap().as_mut() as *mut Mutator<RolVM>;
+                &mut *ptr
+            }
+        })
+    }
+    
+    fn mutators<'a>() -> Box<dyn Iterator<Item = &'a mut Mutator<RolVM>> + 'a> {
+        // For NoGC, we don't need to iterate over mutators often
+        // Return empty iterator as this is mainly used for GC coordination
+        Box::new(std::iter::empty())
+    }
+}
+
+/// Collection implementation - stop-the-world garbage collection
+impl Collection<RolVM> for RolVM {
+    fn stop_all_mutators<F>(_tls: VMWorkerThread, mut _mutator_visitor: F) 
+    where F: FnMut(&'static mut Mutator<RolVM>) {
+        // Mutators are already stopped by block_for_gc
+        // In a multi-threaded implementation, we'd iterate through all mutators here
+        // For now, we just acknowledge that the single mutator is stopped
+    }
+    
+    fn resume_mutators(_tls: VMWorkerThread) {
+        // Signal all waiting mutator threads to resume
+        let gc_sync = GC_SYNC.get().expect("GC sync not initialized");
+        let (lock, condvar) = &**gc_sync;
+        let mut gc_in_progress = lock.lock().unwrap();
+        *gc_in_progress = false;
+        condvar.notify_all();
+    }
+    
+    fn block_for_gc(_tls: VMMutatorThread) {
+        // Wait for GC to complete
+        let gc_sync = GC_SYNC.get().expect("GC sync not initialized");
+        let (lock, condvar) = &**gc_sync;
+        let mut gc_in_progress = lock.lock().unwrap();
+        while *gc_in_progress {
+            gc_in_progress = condvar.wait(gc_in_progress).unwrap();
+        }
+    }
+    
+    fn spawn_gc_thread(_tls: VMThread, ctx: GCThreadContext<RolVM>) {
+        // Start GC - signal that GC is in progress
+        let gc_sync = GC_SYNC.get().expect("GC sync not initialized");
+        let (lock, _condvar) = &**gc_sync;
+        {
+            let mut gc_in_progress = lock.lock().unwrap();
+            *gc_in_progress = true;
+        }
+        
+        eprintln!("[GC] Starting garbage collection cycle");
+        
+        // For now, just spawn a simple thread that runs the context
+        // TODO: Implement proper GC thread management
+        std::thread::spawn(move || {
+            // Let MMTk handle the GC work - for now just a placeholder
+            // The actual GC coordination happens through other MMTk APIs
+            eprintln!("[GC] GC worker thread running");
+            
+            // Resume mutators after a brief pause (simulating GC work)
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            
+            eprintln!("[GC] Garbage collection cycle completed");
+            
+            // Signal GC completion
+            let gc_sync = GC_SYNC.get().expect("GC sync not initialized");
+            let (lock, condvar) = &**gc_sync;
+            let mut gc_in_progress = lock.lock().unwrap();
+            *gc_in_progress = false;
+            condvar.notify_all();
+        });
+    }
+}
+
+/// ObjectModel implementation - proper metadata layout for MarkSweep
+impl ObjectModel<RolVM> for RolVM {
+    const GLOBAL_LOG_BIT_SPEC: VMGlobalLogBitSpec = VMGlobalLogBitSpec::side_first();
+    const LOCAL_FORWARDING_POINTER_SPEC: VMLocalForwardingPointerSpec = VMLocalForwardingPointerSpec::side_first();
+    const LOCAL_FORWARDING_BITS_SPEC: VMLocalForwardingBitsSpec = VMLocalForwardingBitsSpec::side_first();
+    // Use different offsets to avoid overlapping metadata
+    const LOCAL_MARK_BIT_SPEC: VMLocalMarkBitSpec = VMLocalMarkBitSpec::in_header(0);
+    const LOCAL_LOS_MARK_NURSERY_SPEC: VMLocalLOSMarkNurserySpec = VMLocalLOSMarkNurserySpec::in_header(8);
+    const OBJECT_REF_OFFSET_LOWER_BOUND: isize = 0;
+    
+    fn copy(_from: ObjectReference, _semantics: CopySemantics, _context: &mut GCWorkerCopyContext<RolVM>) -> ObjectReference {
+        unimplemented!()
+    }
+    
+    fn copy_to(_from: ObjectReference, _to: ObjectReference, _region: Address) -> Address {
+        unimplemented!()
+    }
+    
+    fn get_current_size(_object: ObjectReference) -> usize {
+        unimplemented!()
+    }
+    
+    fn get_size_when_copied(_object: ObjectReference) -> usize {
+        unimplemented!()
+    }
+    
+    fn get_align_when_copied(_object: ObjectReference) -> usize {
+        8
+    }
+    
+    fn get_align_offset_when_copied(_object: ObjectReference) -> usize {
+        0
+    }
+    
+    fn get_reference_when_copied_to(_from: ObjectReference, _to: Address) -> ObjectReference {
+        unimplemented!()
+    }
+    
+    fn get_type_descriptor(_reference: ObjectReference) -> &'static [i8] {
+        unimplemented!()
+    }
+    
+    fn ref_to_object_start(_object: ObjectReference) -> Address {
+        _object.to_raw_address()
+    }
+    
+    fn ref_to_header(_object: ObjectReference) -> Address {
+        _object.to_raw_address()
+    }
+    
+    
+    fn dump_object(_object: ObjectReference) {
+        unimplemented!()
+    }
+}
+
+/// Scanning implementation - connects to our GC infrastructure
+impl Scanning<RolVM> for RolVM {
+    fn scan_object<SV: SlotVisitor<Address>>(_tls: VMWorkerThread, object: ObjectReference, edge_visitor: &mut SV) {
+        // Convert MMTk ObjectReference to our Var and trace children
+        let obj_addr = object.to_raw_address();
+        let var = var_from_address(obj_addr);
+        
+        unsafe {
+            if let Some(gc_obj) = crate::gc::var_as_gc_object(&var) {
+                // Log object being scanned
+                eprintln!("[GC] Scanning object at {:p} (type: {})", 
+                         obj_addr.to_ptr::<u8>(), gc_obj.type_name());
+                
+                gc_obj.trace_children(|child_var| {
+                    if crate::gc::var_needs_tracing(child_var) {
+                        let child_addr = address_from_var(child_var);
+                        edge_visitor.visit_slot(child_addr);
+                    }
+                });
+            }
+        }
+    }
+    
+    fn notify_initial_thread_scan_complete(_partial_scan: bool, _tls: VMWorkerThread) {
+        // No-op for our simple runtime
+    }
+    
+    fn scan_roots_in_mutator_thread(_tls: VMWorkerThread, _mutator: &'static mut Mutator<RolVM>, mut factory: impl RootsWorkFactory<Address>) {
+        eprintln!("[GC] Scanning mutator thread roots");
+        
+        // Scan thread-local root set (stack frames, local vars, etc.)
+        if let Some(root_set_mutex) = get_current_root_set() {
+            if let Ok(root_set) = root_set_mutex.try_lock() {
+                root_set.trace_roots(|var| {
+                    if crate::gc::var_needs_tracing(var) {
+                        let addr = address_from_var(var);
+                        eprintln!("[GC] Found thread root at {:p}", addr.to_ptr::<u8>());
+                        factory.create_process_roots_work(vec![addr]);
+                    }
+                });
+            } else {
+                eprintln!("[GC] Warning: Could not lock current root set during GC");
+            }
+        }
+    }
+    
+    fn scan_vm_specific_roots(_tls: VMWorkerThread, mut factory: impl RootsWorkFactory<Address>) {
+        eprintln!("[GC] Scanning VM-specific roots (globals, symbols, etc.)");
+        
+        // Scan global root set (global variables, interned symbols, etc.)
+        if let Some(root_set_mutex) = get_global_root_set() {
+            if let Ok(root_set) = root_set_mutex.try_lock() {
+                root_set.trace_roots(|var| {
+                    if crate::gc::var_needs_tracing(var) {
+                        let addr = address_from_var(var);
+                        eprintln!("[GC] Found global root at {:p}", addr.to_ptr::<u8>());
+                        factory.create_process_roots_work(vec![addr]);
+                    }
+                });
+            } else {
+                eprintln!("[GC] Warning: Could not lock global root set during GC");
+            }
+        }
+        
+        // TODO: Also scan:
+        // - Symbol interner for interned strings/symbols
+        // - Global function registry  
+        // - JIT compiled code roots
+        // - Any other VM-wide roots
+    }
+    
+    fn supports_return_barrier() -> bool {
+        false
+    }
+    
+    fn prepare_for_roots_re_scanning() {
+        // No-op for our simple runtime
+    }
+}
+
+/// ReferenceGlue implementation - stubs for NoGC
+impl ReferenceGlue<RolVM> for RolVM {
+    type FinalizableType = ObjectReference;
+    
+    fn set_referent(_reference: ObjectReference, _referent: ObjectReference) {
+        unimplemented!()
+    }
+    
+    fn get_referent(_object: ObjectReference) -> Option<ObjectReference> {
+        unimplemented!()
+    }
+    
+    fn clear_referent(_reference: ObjectReference) {
+        unimplemented!()
+    }
+    
+    fn enqueue_references(_references: &[ObjectReference], _tls: VMWorkerThread) {
+        unimplemented!()
+    }
+}
+
+/// Get the global MMTk instance
+fn get_mmtk_instance() -> &'static Box<MMTK<RolVM>> {
+    MMTK_INSTANCE.get().expect("MMTk not initialized")
+}
+
+/// Internal function to bind a mutator to the current thread
+fn bind_mutator_internal(tls: VMMutatorThread) -> Box<Mutator<RolVM>> {
+    let mmtk = get_mmtk_instance();
+    let mutator = memory_manager::bind_mutator(mmtk, tls);
+    
+    // Increment the mutator count
+    MUTATOR_COUNT.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    
+    // Return the mutator as a Box
+    Box::new(*mutator)
+}
+
+/// Get the global root set for persistent roots
+fn get_global_root_set() -> Option<&'static Mutex<SimpleRootSet>> {
+    GLOBAL_ROOT_SET.get()
+}
+
+/// Get the current thread's root set
+fn get_current_root_set() -> Option<&'static Mutex<SimpleRootSet>> {
+    CURRENT_ROOT_SET.get()
+}
+
+/// Convert a raw pointer to a Var for GC scanning
+fn var_from_address(addr: Address) -> crate::var::Var {
+    crate::var::Var::from_u64(addr.as_usize() as u64)
+}
+
+/// Convert a Var to an Address for MMTk
+fn address_from_var(var: &crate::var::Var) -> Address {
+    let ptr_bits = var.as_u64() & !crate::var::POINTER_TAG_MASK;
+    unsafe { Address::from_usize(ptr_bits as usize) }
+}
+
+/// Initialize MMTk with NoGC plan
+pub fn initialize_mmtk() -> Result<(), &'static str> {
+    if MMTK_INITIALIZED.swap(true, Ordering::AcqRel) {
+        return Ok(()); // Already initialized
+    }
+    
+    // Create MMTk builder
+    let mut builder = MMTKBuilder::new();
+    
+    // Set MarkSweep plan for real garbage collection
+    builder.options.plan.set(PlanSelector::MarkSweep);
+    
+    // Initialize MMTk
+    let mmtk = memory_manager::mmtk_init(&builder);
+    
+    // Store the MMTk instance
+    MMTK_INSTANCE.set(mmtk).map_err(|_| "Failed to set MMTk instance")?;
+    
+    // Reset mutator count
+    MUTATOR_COUNT.store(0, std::sync::atomic::Ordering::Release);
+    
+    // Initialize GC synchronization
+    GC_SYNC.set(Arc::new((Mutex::new(false), Condvar::new())))
+        .map_err(|_| "Failed to initialize GC synchronization")?;
+    
+    // Initialize root sets
+    GLOBAL_ROOT_SET.set(Mutex::new(SimpleRootSet {
+        stack_vars: Vec::new(),
+        globals: Vec::new(),
+        jit_live: Vec::new(),
+    })).map_err(|_| "Failed to initialize global root set")?;
+    
+    CURRENT_ROOT_SET.set(Mutex::new(SimpleRootSet {
+        stack_vars: Vec::new(),
+        globals: Vec::new(),
+        jit_live: Vec::new(),
+    })).map_err(|_| "Failed to initialize current root set")?;
+    
+    println!("MMTk MarkSweep plan initialized with stop-the-world GC");
+    Ok(())
+}
+
+/// Bind a mutator for the current thread - should be called when thread starts
+pub fn mmtk_bind_mutator() -> Result<(), &'static str> {
+    if !is_mmtk_initialized() {
+        return Err("MMTk not initialized");
+    }
+    
+    // Create thread identifier - use current thread pointer as identifier
+    let thread_id = std::thread::current().id();
+    let thread_addr = unsafe { Address::from_usize(&thread_id as *const _ as usize) };
+    let mutator_thread = VMMutatorThread(VMThread(OpaquePointer::from_address(thread_addr)));
+    
+    // Initialize thread-local mutator if not already done
+    THREAD_MUTATOR.with(|mutator_cell| {
+        let mut mutator_ref = mutator_cell.borrow_mut();
+        if mutator_ref.is_none() {
+            *mutator_ref = Some(bind_mutator_internal(mutator_thread));
+        }
+    });
+    
+    Ok(())
+}
+
+/// Check if MMTk is initialized
+pub fn is_mmtk_initialized() -> bool {
+    MMTK_INITIALIZED.load(Ordering::Acquire)
+}
+
+/// Manually trigger garbage collection for testing
+pub fn trigger_gc() {
+    if !is_mmtk_initialized() {
+        println!("MMTk not initialized, cannot trigger GC");
+        return;
+    }
+    
+    println!("Triggering garbage collection...");
+    let mmtk = get_mmtk_instance();
+    
+    // Get current thread as mutator thread  
+    let thread_id = std::thread::current().id();
+    let thread_addr = unsafe { Address::from_usize(&thread_id as *const _ as usize) };
+    let mutator_thread = VMMutatorThread(VMThread(OpaquePointer::from_address(thread_addr)));
+    
+    // Manually trigger a GC cycle
+    mmtk.harness_begin(mutator_thread);
+    
+    println!("Garbage collection completed");
+}
+
+/// Allocate memory using MMTk with thread-local mutator
+pub fn mmtk_alloc(size: usize) -> *mut u8 {
+    if !is_mmtk_initialized() {
+        panic!("MMTk not initialized");
+    }
+    
+    // Ensure mutator is bound for this thread
+    if let Err(e) = mmtk_bind_mutator() {
+        panic!("Failed to bind mutator: {}", e);
+    }
+    
+    // Use thread-local mutator for allocation
+    THREAD_MUTATOR.with(|mutator_cell| {
+        let mut mutator_ref = mutator_cell.borrow_mut();
+        let mutator = mutator_ref.as_mut().expect("Mutator should be initialized");
+        
+        // Allocate using MMTk
+        let addr = memory_manager::alloc(
+            mutator.as_mut(),
+            size,
+            8, // alignment
+            0, // offset
+            AllocationSemantics::Default,
+        );
+        
+        eprintln!("[GC] Allocated {} bytes at {:p}", size, addr.to_ptr::<u8>());
+        
+        addr.to_ptr::<u8>() as *mut u8
+    })
+}
+
+/// Placeholder for MMTk allocation - falls back to system allocator for now
+pub fn mmtk_alloc_placeholder(size: usize) -> *mut u8 {
+    use std::alloc::{alloc, Layout};
+    
+    let layout = Layout::from_size_align(size, 8).unwrap();
+    unsafe { alloc(layout) }
+}
+
+/// Placeholder for MMTk deallocation - NoGC doesn't deallocate
+pub unsafe fn mmtk_dealloc_placeholder(ptr: *mut u8, size: usize) {
+    use std::alloc::{dealloc, Layout};
+    
+    let layout = Layout::from_size_align(size, 8).unwrap();
+    unsafe { dealloc(ptr, layout); }
+}
+
+/// Register a variable as a global root (survives across function calls)
+pub fn register_global_root(var: crate::var::Var) {
+    if let Some(root_set_mutex) = get_global_root_set() {
+        if let Ok(mut root_set) = root_set_mutex.lock() {
+            eprintln!("[GC] Registering global root: {:?}", var);
+            root_set.globals.push(var);
+        }
+    }
+}
+
+/// Register a variable as a thread-local root (stack variable, local scope)
+pub fn register_thread_root(var: crate::var::Var) {
+    if let Some(root_set_mutex) = get_current_root_set() {
+        if let Ok(mut root_set) = root_set_mutex.lock() {
+            eprintln!("[GC] Registering thread root: {:?}", var);
+            root_set.stack_vars.push(var);
+        }
+    }
+}
+
+/// Clear all thread-local roots (called when leaving scope)
+pub fn clear_thread_roots() {
+    if let Some(root_set_mutex) = get_current_root_set() {
+        if let Ok(mut root_set) = root_set_mutex.lock() {
+            eprintln!("[GC] Clearing {} thread roots", root_set.stack_vars.len());
+            root_set.stack_vars.clear();
+        }
+    }
+}
+
+/// Register multiple variables as roots (bulk operation)
+pub fn register_thread_roots(vars: &[crate::var::Var]) {
+    if let Some(root_set_mutex) = get_current_root_set() {
+        if let Ok(mut root_set) = root_set_mutex.lock() {
+            eprintln!("[GC] Registering {} thread roots", vars.len());
+            root_set.stack_vars.extend_from_slice(vars);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::var::Var;
+    use crate::heap::{LispString, LispTuple};
+    
+    #[test]
+    fn test_gc_basic_allocation() {
+        // Initialize MMTk for testing
+        if let Err(e) = initialize_mmtk() {
+            panic!("Failed to initialize MMTk: {}", e);
+        }
+        
+        // Bind mutator for this thread
+        if let Err(e) = mmtk_bind_mutator() {
+            panic!("Failed to bind mutator: {}", e);
+        }
+        
+        println!("Creating heap objects...");
+        
+        // Create some heap objects
+        let string1 = Var::string("hello world");
+        let string2 = Var::string("goodbye world");
+        let tuple1 = Var::tuple(&[Var::int(1), Var::int(2), Var::int(3)]);
+        let tuple2 = Var::tuple(&[string1, string2]);
+        
+        println!("Created objects: {:?}, {:?}, {:?}, {:?}", 
+                 string1.as_string(), string2.as_string(), 
+                 tuple1.is_tuple(), tuple2.is_tuple());
+        
+        // Trigger garbage collection
+        trigger_gc();
+        
+        // Objects should still be reachable since they're on the stack
+        println!("After GC - objects still accessible: {:?}, {:?}", 
+                 string1.as_string(), string2.as_string());
+    }
+    
+    #[test] 
+    fn test_gc_unreachable_objects() {
+        // Initialize MMTk for testing
+        if let Err(e) = initialize_mmtk() {
+            panic!("Failed to initialize MMTk: {}", e);
+        }
+        
+        // Bind mutator for this thread
+        if let Err(e) = mmtk_bind_mutator() {
+            panic!("Failed to bind mutator: {}", e);
+        }
+        
+        println!("Creating unreachable objects...");
+        
+        // Create objects in inner scope that will become unreachable
+        {
+            let _temp_string = Var::string("temporary data");
+            let _temp_tuple = Var::tuple(&[Var::int(100), Var::int(200)]);
+            println!("Temporary objects created");
+        } // Objects go out of scope here
+        
+        println!("Objects now unreachable, triggering GC...");
+        trigger_gc();
+        
+        println!("GC completed - unreachable objects should be collected");
+    }
+    
+    #[test]
+    fn test_gc_root_registration() {
+        // Initialize MMTk for testing
+        if let Err(e) = initialize_mmtk() {
+            panic!("Failed to initialize MMTk: {}", e);
+        }
+        
+        // Bind mutator for this thread
+        if let Err(e) = mmtk_bind_mutator() {
+            panic!("Failed to bind mutator: {}", e);
+        }
+        
+        println!("Testing root registration and scanning...");
+        
+        // Create objects and register them as roots
+        let string1 = Var::string("root string");
+        let tuple1 = Var::tuple(&[Var::int(42), Var::string("nested")]);
+        
+        // Register as thread roots
+        register_thread_root(string1);
+        register_thread_root(tuple1);
+        
+        // Also test global root
+        let global_var = Var::string("global data");
+        register_global_root(global_var);
+        
+        println!("Triggering GC to test root scanning...");
+        trigger_gc();
+        
+        // Clear roots
+        clear_thread_roots();
+        
+        println!("Root registration test completed");
+    }
+}

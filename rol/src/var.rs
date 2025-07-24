@@ -44,6 +44,13 @@ pub const SYMBOL_TAG: u64 = 0x0009000000000000;
 #[derive(Clone, Copy)]
 pub struct Var(ValueUnion);
 
+// SAFETY: Var contains pointers that are managed by our GC system.
+// The GC ensures that these pointers remain valid during collection cycles.
+// Since all heap objects are immutable after creation (except for reference updates
+// during collection), it's safe to share Var values between threads.
+unsafe impl Send for Var {}
+unsafe impl Sync for Var {}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 union ValueUnion {
@@ -141,9 +148,8 @@ impl Var {
     }
 
     pub fn tuple(elements: &[Var]) -> Self {
-        let ptr = LispTuple::from_slice(elements) as u64;
-        let tagged_ptr = ptr | TUPLE_POINTER_TAG;
-        Self(ValueUnion { value: tagged_ptr })
+        let ptr = LispTuple::from_slice(elements);
+        unsafe { Self::mk_tagged_pointer(ptr, TUPLE_POINTER_TAG) }
     }
 
     pub fn empty_tuple() -> Self {
@@ -153,9 +159,8 @@ impl Var {
     }
 
     pub fn string(value: &str) -> Self {
-        let ptr = LispString::from_str(value) as u64;
-        let tagged_ptr = ptr | STRING_POINTER_TAG;
-        Self(ValueUnion { value: tagged_ptr })
+        let ptr = LispString::from_str(value);
+        unsafe { Self::mk_tagged_pointer(ptr, STRING_POINTER_TAG) }
     }
 
     pub fn environment(env: *mut Environment) -> Self {
@@ -275,6 +280,21 @@ impl Var {
         Self(ValueUnion {
             ptr: ptr as *const (),
         })
+    }
+
+    /// Create a tagged pointer with the specified tag
+    unsafe fn mk_tagged_pointer<T>(ptr: *const T, tag: u64) -> Self {
+        let addr = ptr as u64;
+        // Ensure pointer is properly aligned and >= MIN_POINTER
+        assert!(
+            addr >= MIN_POINTER,
+            "Pointer address too low: 0x{addr:016x}"
+        );
+        assert!(addr & 0x07 == 0, "Pointer not 8-byte aligned: 0x{addr:016x}");
+        assert!(addr & POINTER_TAG_MASK == 0, "Pointer conflicts with tag bits: 0x{addr:016x}");
+        
+        let tagged_addr = addr | tag;
+        Self(ValueUnion { value: tagged_addr })
     }
 
     pub fn as_bool(&self) -> Option<bool> {

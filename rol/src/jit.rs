@@ -5,7 +5,6 @@ use crate::var::{
     BOOLEAN_FALSE, BOOLEAN_TRUE, DOUBLE_ENCODE_OFFSET, HIGH16_TAG, MIN_NUMBER, MIN_POINTER, NULL,
     POINTER_TAG_MASK, STRING_POINTER_TAG, SYMBOL_TAG, TUPLE_POINTER_TAG, Var,
 };
-use cranelift::prelude::isa::CallConv;
 use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
@@ -117,6 +116,7 @@ pub struct VarJIT {
     builder_context: FunctionBuilderContext,
     ctx: codegen::Context,
     module: JITModule,
+    isa: cranelift::codegen::isa::OwnedTargetIsa,
 }
 
 impl VarJIT {
@@ -129,13 +129,14 @@ impl VarJIT {
             .finish(settings::Flags::new(settings::builder()))
             .unwrap();
 
-        let builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+        let builder = JITBuilder::with_isa(isa.clone(), cranelift_module::default_libcall_names());
         let module = JITModule::new(builder);
 
         Self {
             builder_context: FunctionBuilderContext::new(),
             ctx: module.make_context(),
             module,
+            isa,
         }
     }
 
@@ -799,7 +800,13 @@ impl VarBuilder {
             .load(types::I64, MemFlags::trusted(), closure_ptr, 12);
 
         // Create the function signature: fn(args: *const Var, arg_count: u32, captured_env: u64) -> u64
-        let mut sig = Signature::new(CallConv::SystemV);
+        // For now, use the native calling convention on this platform
+        let native_call_conv = cranelift_native::builder()
+            .unwrap()
+            .finish(cranelift::prelude::settings::Flags::new(cranelift::prelude::settings::builder()))
+            .unwrap()
+            .default_call_conv();
+        let mut sig = Signature::new(native_call_conv);
         sig.params.push(AbiParam::new(types::I64)); // args pointer
         sig.params.push(AbiParam::new(types::I32)); // arg count
         sig.params.push(AbiParam::new(types::I64)); // captured environment

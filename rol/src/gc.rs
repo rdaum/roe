@@ -2,7 +2,7 @@
 //! Provides root enumeration and child tracing for GC systems like mmtk.
 
 use crate::environment::Environment;
-use crate::heap::{LispString, LispTuple};
+use crate::heap::{LispString, LispTuple, LispClosure};
 use crate::var::Var;
 
 /// Trait for objects that can be traced by the garbage collector.
@@ -99,9 +99,30 @@ impl GcTrace for Environment {
     }
 }
 
+impl GcTrace for LispClosure {
+    fn trace_children<F>(&self, mut visitor: F)
+    where
+        F: FnMut(&Var),
+    {
+        // Trace the captured environment - it might contain heap references
+        let captured_env_var = Var::from_u64(self.captured_env);
+        if crate::gc::var_needs_tracing(&captured_env_var) {
+            visitor(&captured_env_var);
+        }
+    }
+
+    fn size_bytes(&self) -> usize {
+        std::mem::size_of::<LispClosure>()
+    }
+
+    fn type_name(&self) -> &'static str {
+        "LispClosure" 
+    }
+}
+
 /// Determine if a Var contains a heap reference that needs GC tracing.
 pub fn var_needs_tracing(var: &Var) -> bool {
-    var.is_tuple() || var.is_string() || var.is_environment()
+    var.is_tuple() || var.is_string() || var.is_environment() || var.is_closure()
 }
 
 /// Extract heap object from a Var for GC tracing.
@@ -119,6 +140,10 @@ pub unsafe fn var_as_gc_object(var: &Var) -> Option<GcObjectRef> {
         let ptr_bits = var.as_u64() & !crate::var::POINTER_TAG_MASK;
         let ptr = ptr_bits as *const Environment;
         Some(GcObjectRef::Environment(ptr))
+    } else if var.is_closure() {
+        let ptr_bits = var.as_u64() & !crate::var::POINTER_TAG_MASK;
+        let ptr = ptr_bits as *const LispClosure; 
+        Some(GcObjectRef::Closure(ptr))
     } else {
         None
     }
@@ -129,6 +154,7 @@ pub enum GcObjectRef {
     String(*const LispString),
     Vector(*const LispTuple),
     Environment(*const Environment),
+    Closure(*const LispClosure),
 }
 
 impl GcObjectRef {
@@ -143,6 +169,9 @@ impl GcObjectRef {
             GcObjectRef::Environment(ptr) => unsafe {
                 (*ptr).as_ref().unwrap().trace_children(visitor)
             },
+            GcObjectRef::Closure(ptr) => unsafe {
+                (*ptr).as_ref().unwrap().trace_children(visitor)
+            },
         }
     }
 
@@ -152,6 +181,7 @@ impl GcObjectRef {
             GcObjectRef::String(ptr) => unsafe { (*ptr).as_ref().unwrap().size_bytes() },
             GcObjectRef::Vector(ptr) => unsafe { (*ptr).as_ref().unwrap().size_bytes() },
             GcObjectRef::Environment(ptr) => unsafe { (*ptr).as_ref().unwrap().size_bytes() },
+            GcObjectRef::Closure(ptr) => unsafe { (*ptr).as_ref().unwrap().size_bytes() },
         }
     }
 
@@ -161,6 +191,7 @@ impl GcObjectRef {
             GcObjectRef::String(ptr) => unsafe { (*ptr).as_ref().unwrap().type_name() },
             GcObjectRef::Vector(ptr) => unsafe { (*ptr).as_ref().unwrap().type_name() },
             GcObjectRef::Environment(ptr) => unsafe { (*ptr).as_ref().unwrap().type_name() },
+            GcObjectRef::Closure(ptr) => unsafe { (*ptr).as_ref().unwrap().type_name() },
         }
     }
 }
@@ -217,6 +248,7 @@ pub unsafe fn trace_from_roots<R: GcRootSet>(roots: &R, mut mark_object: impl Fn
                 GcObjectRef::String(ptr) => ptr as *const u8,
                 GcObjectRef::Vector(ptr) => ptr as *const u8,
                 GcObjectRef::Environment(ptr) => ptr as *const u8,
+                GcObjectRef::Closure(ptr) => ptr as *const u8,
             };
             mark_object(ptr);
 
