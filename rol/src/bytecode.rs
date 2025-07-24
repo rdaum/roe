@@ -51,6 +51,40 @@ pub extern "C" fn jit_create_closure(_jit_ptr: *mut BytecodeJIT, arity: u32, _bo
     Var::closure(closure_ptr).as_u64()
 }
 
+/// Generate fast runtime helpers for closure calls with different argument counts
+macro_rules! generate_fast_call_helpers {
+    ($($n:expr => ($($arg:ident),*)),*) => {
+        $(
+            paste::paste! {
+                #[unsafe(no_mangle)]
+                pub extern "C" fn [<jit_call_closure_ $n>](
+                    jit_ptr: *mut BytecodeJIT, 
+                    closure: u64
+                    $(, $arg: u64)*
+                ) -> u64 {
+                    #[allow(unused_variables)]
+                    let args = [$($arg,)*];
+                    let args_ptr = if args.is_empty() { 
+                        std::ptr::null() 
+                    } else { 
+                        args.as_ptr() 
+                    };
+                    jit_call_closure(jit_ptr, closure, args_ptr, $n)
+                }
+            }
+        )*
+    };
+}
+
+// Generate fast call helpers for 0-4 arguments
+generate_fast_call_helpers! {
+    0 => (),
+    1 => (arg0),
+    2 => (arg0, arg1),
+    3 => (arg0, arg1, arg2),
+    4 => (arg0, arg1, arg2, arg3)
+}
+
 /// Runtime helper function for calling closures
 /// This is called from JIT-compiled code when a closure is invoked
 #[unsafe(no_mangle)]
@@ -67,6 +101,17 @@ pub extern "C" fn jit_call_closure(jit_ptr: *mut BytecodeJIT, closure: u64, args
                 // Need to compile the lambda on-demand
                 let function_id = closure_obj.captured_env as u32; // We stored function_id here
                 
+                // First check if we already compiled this function in our cache
+                if let Some(&cached_ptr) = jit.compiled_lambdas.get(&function_id) {
+                    // Function was compiled but closure wasn't updated - update it now
+                    // SAFETY: We're modifying the closure object to cache the compiled function pointer
+                    let mutable_closure = closure_ptr as *mut crate::heap::LispClosure;
+                    (*mutable_closure).func_ptr = cached_ptr;
+                    
+                    let func: extern "C" fn(*const u64, u32, u64) -> u64 = std::mem::transmute(cached_ptr);
+                    return func(args_ptr, arg_count, 0);
+                }
+                
                 // Clone the registry to avoid borrowing conflicts
                 let registry_clone = jit.lambda_registry.clone();
                 
@@ -77,6 +122,11 @@ pub extern "C" fn jit_call_closure(jit_ptr: *mut BytecodeJIT, closure: u64, args
                             Ok(compiled_ptr) => {
                                 // Cache the compiled function pointer
                                 jit.compiled_lambdas.insert(function_id, compiled_ptr);
+                                
+                                // Update the closure object with the compiled function pointer
+                                // SAFETY: We're modifying the closure object to cache the compiled function pointer
+                                let mutable_closure = closure_ptr as *mut crate::heap::LispClosure;
+                                (*mutable_closure).func_ptr = compiled_ptr;
                                 
                                 // Call the compiled function directly
                                 let func: extern "C" fn(*const u64, u32, u64) -> u64 = std::mem::transmute(compiled_ptr);
@@ -185,6 +235,9 @@ pub enum Opcode {
     // === Function Calls ===
     /// Call function: pop function and N arguments, push result
     Call(u8),
+    
+    /// Direct call to global function: call known function with N arguments (no function pop)
+    CallDirect(Symbol, u8),
     
     /// Tail call optimization: pop function and N arguments, return result
     TailCall(u8),
@@ -321,9 +374,22 @@ impl BytecodeCompiler {
                     if let Some(builtin) = BuiltinOp::from_symbol(*sym) {
                         return self.compile_builtin_op(builtin, args);
                     }
+                    
+                    // Check if this is a direct call to a global function
+                    // For now, assume any non-builtin symbol could be a direct call
+                    // The JIT will determine at runtime if it's available for direct calling
+                    
+                    // Compile all arguments (pushes them onto stack in order)
+                    for arg in args {
+                        self.compile_expr_recursive(arg)?;
+                    }
+                    
+                    // Emit direct call opcode
+                    self.function.emit(Opcode::CallDirect(*sym, args.len() as u8));
+                    return Ok(());
                 }
                 
-                // Regular function call
+                // Regular function call (indirect)
                 // Compile function expression (should push function onto stack)
                 self.compile_expr_recursive(func)?;
                 
@@ -597,6 +663,8 @@ pub struct BytecodeJIT {
     lambda_registry: Option<std::collections::HashMap<FunctionId, (Vec<Symbol>, Expr)>>,
     /// Cache of compiled lambda function pointers to avoid recompilation
     compiled_lambdas: std::collections::HashMap<FunctionId, *const u8>,
+    /// Cache of compiled global functions for direct calls (symbol -> function_pointer)
+    compiled_globals: std::collections::HashMap<Symbol, (*const u8, u32)>, // (func_ptr, arity)
 }
 
 impl BytecodeJIT {
@@ -615,6 +683,15 @@ impl BytecodeJIT {
         builder.symbol("jit_create_closure", jit_create_closure as *const u8);
         builder.symbol("jit_call_closure", jit_call_closure as *const u8);
         
+        // Register fast call helpers using paste to generate the function names
+        paste::paste! {
+            builder.symbol("jit_call_closure_0", [<jit_call_closure_0>] as *const u8);
+            builder.symbol("jit_call_closure_1", [<jit_call_closure_1>] as *const u8);
+            builder.symbol("jit_call_closure_2", [<jit_call_closure_2>] as *const u8);
+            builder.symbol("jit_call_closure_3", [<jit_call_closure_3>] as *const u8);
+            builder.symbol("jit_call_closure_4", [<jit_call_closure_4>] as *const u8);
+        }
+        
         let module = JITModule::new(builder);
         
         Self {
@@ -626,12 +703,18 @@ impl BytecodeJIT {
             global_variables: std::collections::HashMap::new(),
             lambda_registry: None,
             compiled_lambdas: std::collections::HashMap::new(),
+            compiled_globals: std::collections::HashMap::new(),
         }
     }
     
     /// Set a global variable value
     pub fn set_global(&mut self, symbol: Symbol, value: Var) {
         self.global_variables.insert(symbol, value);
+    }
+    
+    /// Register a compiled global function for direct calls
+    pub fn register_global_function(&mut self, symbol: Symbol, func_ptr: *const u8, arity: u32) {
+        self.compiled_globals.insert(symbol, (func_ptr, arity));
     }
     
     /// Get a global variable value
@@ -1500,50 +1583,86 @@ impl<'a> BytecodeAnalyzer<'a> {
                 // Call the jit_call_closure runtime helper
                 let jit_ptr = self.jit_ptr.ok_or("No JIT pointer available for closure calls")?;
                 
-                // Prepare arguments array on stack
-                let (args_ptr, arg_count_val) = if args.is_empty() {
-                    (builder.ins().iconst(types::I64, 0), builder.ins().iconst(types::I32, 0))
+                // Optimize for small argument counts - pass directly through registers
+                let result = if *arg_count <= 4 {
+                    // Fast path: pass arguments directly without memory allocation
+                    self.emit_fast_call(builder, jit_ptr, function, &args)?
                 } else {
-                    // Create stack slot for arguments
-                    let slot = builder.create_sized_stack_slot(StackSlotData::new(
-                        StackSlotKind::ExplicitSlot,
-                        (args.len() * 8) as u32,
-                    ));
-                    let args_addr = builder.ins().stack_addr(types::I64, slot, 0);
-                    
-                    // Store each argument
-                    for (i, &arg) in args.iter().enumerate() {
-                        builder.ins().store(MemFlags::trusted(), arg, args_addr, (i * 8) as i32);
-                    }
-                    
-                    (args_addr, builder.ins().iconst(types::I32, args.len() as i64))
+                    // Slow path: use memory for many arguments 
+                    self.emit_slow_call(builder, jit_ptr, function, &args)?
                 };
                 
-                // Import the signature first
-                let sig = builder.import_signature(Signature {
-                    params: vec![
-                        AbiParam::new(types::I64), // jit_ptr
-                        AbiParam::new(types::I64), // closure
-                        AbiParam::new(types::I64), // args_ptr
-                        AbiParam::new(types::I32), // arg_count
-                    ],
-                    returns: vec![AbiParam::new(types::I64)], // return value
-                    call_conv: CallConv::SystemV,
-                });
-                
-                // Get the function pointer as a constant
-                let func_ptr = builder.ins().iconst(types::I64, jit_call_closure as *const u8 as i64);
-                
-                // Create the call instruction
-                let call_inst = builder.ins().call_indirect(
-                    sig,
-                    func_ptr,
-                    &[jit_ptr, function, args_ptr, arg_count_val]
-                );
-                
-                let result = builder.inst_results(call_inst)[0];
-                
                 self.native_push(builder, result)?;
+            }
+            
+            // Direct function calls - optimized path for known global functions
+            Opcode::CallDirect(symbol, arg_count) => {
+                // Check if we have a compiled version of this global function
+                let jit_ptr = self.jit_ptr.ok_or("No JIT pointer available for direct calls")?;
+                
+                // Pop arguments from native stack
+                let mut args = Vec::with_capacity(*arg_count as usize);
+                for _ in 0..*arg_count {
+                    args.push(self.native_pop(builder)?);
+                }
+                args.reverse(); // Arguments were pushed in reverse order
+                
+                // Try to get the compiled global function
+                // We need to load this from the JIT's compiled_globals map
+                // For now, fall back to indirect call via global variable lookup
+                
+                // Load the global function variable
+                if let (Some(jit_ptr_val), Some(get_global_ref)) = (self.jit_ptr, self.get_global_ref) {
+                    let symbol_id = builder.ins().iconst(types::I64, symbol.id() as i64);
+                    let call_inst = builder.ins().call(get_global_ref, &[jit_ptr_val, symbol_id]);
+                    let function = builder.inst_results(call_inst)[0];
+                    
+                    // Prepare arguments array on stack (same as indirect call)
+                    let (args_ptr, arg_count_val) = if args.is_empty() {
+                        (builder.ins().iconst(types::I64, 0), builder.ins().iconst(types::I32, 0))
+                    } else {
+                        // Create stack slot for arguments
+                        let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                            StackSlotKind::ExplicitSlot,
+                            (args.len() * 8) as u32,
+                        ));
+                        let args_addr = builder.ins().stack_addr(types::I64, slot, 0);
+                        
+                        // Store each argument
+                        for (i, &arg) in args.iter().enumerate() {
+                            builder.ins().store(MemFlags::trusted(), arg, args_addr, (i * 8) as i32);
+                        }
+                        
+                        (args_addr, builder.ins().iconst(types::I32, args.len() as i64))
+                    };
+                    
+                    // Import the signature for jit_call_closure
+                    let sig = builder.import_signature(Signature {
+                        params: vec![
+                            AbiParam::new(types::I64), // jit_ptr
+                            AbiParam::new(types::I64), // closure
+                            AbiParam::new(types::I64), // args_ptr
+                            AbiParam::new(types::I32), // arg_count
+                        ],
+                        returns: vec![AbiParam::new(types::I64)], // return value
+                        call_conv: CallConv::SystemV,
+                    });
+                    
+                    // Get the function pointer as a constant
+                    let func_ptr = builder.ins().iconst(types::I64, jit_call_closure as *const u8 as i64);
+                    
+                    // Create the call instruction
+                    let call_inst = builder.ins().call_indirect(
+                        sig,
+                        func_ptr,
+                        &[jit_ptr, function, args_ptr, arg_count_val]
+                    );
+                    
+                    let result = builder.inst_results(call_inst)[0];
+                    self.native_push(builder, result)?;
+                } else {
+                    return Err(format!("Cannot resolve direct call to function: {symbol:?}"));
+                }
             }
             
             // Closure creation - native stack version
@@ -1589,6 +1708,127 @@ impl<'a> BytecodeAnalyzer<'a> {
         }
         
         Ok(())
+    }
+    
+    /// Emit a fast function call for small argument counts (≤4 args)
+    /// Passes arguments directly through registers to avoid memory allocation
+    fn emit_fast_call(&mut self, builder: &mut FunctionBuilder, jit_ptr: Value, function: Value, args: &[Value]) -> Result<Value, String> {
+        use cranelift::prelude::*;
+        
+        // Create specialized signatures for different argument counts
+        let sig = match args.len() {
+            0 => builder.import_signature(Signature {
+                params: vec![
+                    AbiParam::new(types::I64), // jit_ptr
+                    AbiParam::new(types::I64), // closure
+                ],
+                returns: vec![AbiParam::new(types::I64)],
+                call_conv: CallConv::SystemV,
+            }),
+            1 => builder.import_signature(Signature {
+                params: vec![
+                    AbiParam::new(types::I64), // jit_ptr
+                    AbiParam::new(types::I64), // closure
+                    AbiParam::new(types::I64), // arg0
+                ],
+                returns: vec![AbiParam::new(types::I64)],
+                call_conv: CallConv::SystemV,
+            }),
+            2 => builder.import_signature(Signature {
+                params: vec![
+                    AbiParam::new(types::I64), // jit_ptr
+                    AbiParam::new(types::I64), // closure
+                    AbiParam::new(types::I64), // arg0
+                    AbiParam::new(types::I64), // arg1
+                ],
+                returns: vec![AbiParam::new(types::I64)],
+                call_conv: CallConv::SystemV,
+            }),
+            3 => builder.import_signature(Signature {
+                params: vec![
+                    AbiParam::new(types::I64), // jit_ptr
+                    AbiParam::new(types::I64), // closure
+                    AbiParam::new(types::I64), // arg0
+                    AbiParam::new(types::I64), // arg1
+                    AbiParam::new(types::I64), // arg2
+                ],
+                returns: vec![AbiParam::new(types::I64)],
+                call_conv: CallConv::SystemV,
+            }),
+            4 => builder.import_signature(Signature {
+                params: vec![
+                    AbiParam::new(types::I64), // jit_ptr
+                    AbiParam::new(types::I64), // closure
+                    AbiParam::new(types::I64), // arg0
+                    AbiParam::new(types::I64), // arg1
+                    AbiParam::new(types::I64), // arg2
+                    AbiParam::new(types::I64), // arg3
+                ],
+                returns: vec![AbiParam::new(types::I64)],
+                call_conv: CallConv::SystemV,
+            }),
+            _ => return Err("Fast call only supports ≤4 arguments".to_string()),
+        };
+        
+        // Build call arguments: jit_ptr, closure, arg0, arg1, ...
+        let mut call_args = vec![jit_ptr, function];
+        call_args.extend_from_slice(args);
+        
+        // Use the appropriate fast call function based on argument count
+        let func_ptr = paste::paste! {
+            match args.len() {
+                0 => builder.ins().iconst(types::I64, [<jit_call_closure_0>] as *const u8 as i64),
+                1 => builder.ins().iconst(types::I64, [<jit_call_closure_1>] as *const u8 as i64),
+                2 => builder.ins().iconst(types::I64, [<jit_call_closure_2>] as *const u8 as i64),
+                3 => builder.ins().iconst(types::I64, [<jit_call_closure_3>] as *const u8 as i64),
+                4 => builder.ins().iconst(types::I64, [<jit_call_closure_4>] as *const u8 as i64),
+                _ => return Err("Fast call only supports ≤4 arguments".to_string()),
+            }
+        };
+        
+        let call_inst = builder.ins().call_indirect(sig, func_ptr, &call_args);
+        Ok(builder.inst_results(call_inst)[0])
+    }
+    
+    /// Emit a slow function call for large argument counts (>4 args)
+    /// Uses memory to pass arguments
+    fn emit_slow_call(&mut self, builder: &mut FunctionBuilder, jit_ptr: Value, function: Value, args: &[Value]) -> Result<Value, String> {
+        use cranelift::prelude::*;
+        
+        // Prepare arguments array on stack
+        let (args_ptr, arg_count_val) = if args.is_empty() {
+            (builder.ins().iconst(types::I64, 0), builder.ins().iconst(types::I32, 0))
+        } else {
+            // Create stack slot for arguments
+            let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                (args.len() * 8) as u32,
+            ));
+            let args_addr = builder.ins().stack_addr(types::I64, slot, 0);
+            
+            // Store each argument
+            for (i, &arg) in args.iter().enumerate() {
+                builder.ins().store(MemFlags::trusted(), arg, args_addr, (i * 8) as i32);
+            }
+            
+            (args_addr, builder.ins().iconst(types::I32, args.len() as i64))
+        };
+        
+        // Import the original signature
+        let sig = builder.import_signature(Signature {
+            params: vec![
+                AbiParam::new(types::I64), // jit_ptr
+                AbiParam::new(types::I64), // closure
+                AbiParam::new(types::I64), // args_ptr
+                AbiParam::new(types::I32), // arg_count
+            ],
+            returns: vec![AbiParam::new(types::I64)],
+            call_conv: CallConv::SystemV,
+        });
+        
+        let func_ptr = builder.ins().iconst(types::I64, jit_call_closure as *const u8 as i64);
+        let call_inst = builder.ins().call_indirect(sig, func_ptr, &[jit_ptr, function, args_ptr, arg_count_val]);
+        Ok(builder.inst_results(call_inst)[0])
     }
     
 }
