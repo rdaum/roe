@@ -254,6 +254,40 @@ impl Compiler {
                 }, all_closures))
             }
             
+            Expr::While { condition, body } => {
+                let (new_condition, mut condition_closures) = self.precompile_lambdas(condition, captured_env)?;
+                let (new_body, mut body_closures) = self.precompile_lambdas(body, captured_env)?;
+                
+                condition_closures.append(&mut body_closures);
+                Ok((Expr::While {
+                    condition: Box::new(new_condition),
+                    body: Box::new(new_body),
+                }, condition_closures))
+            }
+            
+            Expr::For { var, start, end, body } => {
+                let (new_start, mut start_closures) = self.precompile_lambdas(start, captured_env)?;
+                let (new_end, mut end_closures) = self.precompile_lambdas(end, captured_env)?;
+                let (new_body, mut body_closures) = self.precompile_lambdas(body, captured_env)?;
+                
+                start_closures.append(&mut end_closures);
+                start_closures.append(&mut body_closures);
+                Ok((Expr::For {
+                    var: *var,
+                    start: Box::new(new_start),
+                    end: Box::new(new_end),
+                    body: Box::new(new_body),
+                }, start_closures))
+            }
+            
+            Expr::Def { var, value } => {
+                let (new_value, closures) = self.precompile_lambdas(value, captured_env)?;
+                Ok((Expr::Def {
+                    var: *var,
+                    value: Box::new(new_value),
+                }, closures))
+            }
+            
             // Base cases - no lambdas to process
             Expr::Literal(_) | Expr::Variable(_) => {
                 Ok((expr.clone(), vec![]))
@@ -490,6 +524,21 @@ fn compile_expr_recursive(
             builder.seal_block(merge_block);
             
             Ok(builder.block_params(merge_block)[0])
+        }
+        
+        Expr::While { .. } => {
+            // While loops not implemented in recursive compiler
+            Err("While loops not supported in recursive compiler".to_string())
+        }
+        
+        Expr::For { .. } => {
+            // For loops not implemented in recursive compiler  
+            Err("For loops not supported in recursive compiler".to_string())
+        }
+        
+        Expr::Def { .. } => {
+            // Def not implemented in recursive compiler
+            Err("Def not supported in recursive compiler".to_string())
         }
     }
 }

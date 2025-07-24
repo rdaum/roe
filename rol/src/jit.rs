@@ -1,11 +1,110 @@
 //! Cranelift JIT integration for NaN-boxed Var operations.
 //! Provides helpers for emitting cranelift IR that manipulates our Var type efficiently.
 
-use crate::var::{Var, BOOLEAN_FALSE, BOOLEAN_TRUE, HIGH16_TAG, MIN_NUMBER, DOUBLE_ENCODE_OFFSET, NULL, SYMBOL_TAG, LIST_POINTER_TAG, STRING_POINTER_TAG, POINTER_TAG_MASK, MIN_POINTER};
+use crate::var::{Var, BOOLEAN_FALSE, BOOLEAN_TRUE, HIGH16_TAG, MIN_NUMBER, DOUBLE_ENCODE_OFFSET, NULL, SYMBOL_TAG, TUPLE_POINTER_TAG, STRING_POINTER_TAG, POINTER_TAG_MASK, MIN_POINTER};
 use cranelift::prelude::*;
 use cranelift::prelude::isa::CallConv;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
+
+// Generate arithmetic and comparison methods using macros
+macro_rules! impl_arithmetic_binop {
+    ($name:ident, $int_op:ident, $float_op:ident) => {
+        pub fn $name(&self, builder: &mut FunctionBuilder, lhs: Value, rhs: Value) -> Value {
+            // Check if both operands are integers
+            let lhs_is_int = self.is_int(builder, lhs);
+            let rhs_is_int = self.is_int(builder, rhs);
+            let both_ints = builder.ins().band(lhs_is_int, rhs_is_int);
+            
+            // Create blocks for int and float paths
+            let int_block = builder.create_block();
+            let float_block = builder.create_block();
+            let merge_block = builder.create_block();
+            
+            // Add block parameter for the result
+            builder.append_block_param(merge_block, types::I64);
+            
+            // Branch based on types
+            builder.ins().brif(both_ints, int_block, &[], float_block, &[]);
+            
+            // Integer path: both are ints, use int operation
+            builder.switch_to_block(int_block);
+            builder.seal_block(int_block);
+            let lhs_int = self.extract_int(builder, lhs);
+            let rhs_int = self.extract_int(builder, rhs);
+            let int_result = builder.ins().$int_op(lhs_int, rhs_int);
+            let int_var = self.make_int(builder, int_result);
+            builder.ins().jump(merge_block, &[int_var]);
+            
+            // Float path: at least one is a double, use float operation
+            builder.switch_to_block(float_block);
+            builder.seal_block(float_block);
+            let lhs_double = self.coerce_to_double(builder, lhs);
+            let rhs_double = self.coerce_to_double(builder, rhs);
+            let lhs_f64 = self.extract_double(builder, lhs_double);
+            let rhs_f64 = self.extract_double(builder, rhs_double);
+            let float_result = builder.ins().$float_op(lhs_f64, rhs_f64);
+            let float_var = self.make_double(builder, float_result);
+            builder.ins().jump(merge_block, &[float_var]);
+            
+            // Merge point
+            builder.switch_to_block(merge_block);
+            builder.seal_block(merge_block);
+            
+            builder.block_params(merge_block)[0]
+        }
+    };
+}
+
+macro_rules! impl_comparison_binop {
+    ($name:ident, $int_cond:ident, $float_cond:ident) => {
+        pub fn $name(&self, builder: &mut FunctionBuilder, lhs: Value, rhs: Value) -> Value {
+            // Check if both operands are integers
+            let lhs_is_int = self.is_int(builder, lhs);
+            let rhs_is_int = self.is_int(builder, rhs);
+            let both_ints = builder.ins().band(lhs_is_int, rhs_is_int);
+            
+            // Create blocks for int and float paths
+            let int_block = builder.create_block();
+            let float_block = builder.create_block();
+            let merge_block = builder.create_block();
+            
+            // Add block parameter for the result
+            builder.append_block_param(merge_block, types::I64);
+            
+            // Branch based on types
+            builder.ins().brif(both_ints, int_block, &[], float_block, &[]);
+            
+            // Integer path: both are ints, use int comparison
+            builder.switch_to_block(int_block);
+            builder.seal_block(int_block);
+            let lhs_int = self.extract_int(builder, lhs);
+            let rhs_int = self.extract_int(builder, rhs);
+            let int_cmp = builder.ins().icmp(IntCC::$int_cond, lhs_int, rhs_int);
+            let int_result = builder.ins().uextend(types::I64, int_cmp);
+            let int_var = self.make_bool(builder, int_result);
+            builder.ins().jump(merge_block, &[int_var]);
+            
+            // Float path: at least one is a double, use float comparison
+            builder.switch_to_block(float_block);
+            builder.seal_block(float_block);
+            let lhs_double = self.coerce_to_double(builder, lhs);
+            let rhs_double = self.coerce_to_double(builder, rhs);
+            let lhs_f64 = self.extract_double(builder, lhs_double);
+            let rhs_f64 = self.extract_double(builder, rhs_double);
+            let float_cmp = builder.ins().fcmp(FloatCC::$float_cond, lhs_f64, rhs_f64);
+            let float_result = builder.ins().uextend(types::I64, float_cmp);
+            let float_var = self.make_bool(builder, float_result);
+            builder.ins().jump(merge_block, &[float_var]);
+            
+            // Merge point
+            builder.switch_to_block(merge_block);
+            builder.seal_block(merge_block);
+            
+            builder.block_params(merge_block)[0]
+        }
+    };
+}
 
 pub struct VarJIT {
     builder_context: FunctionBuilderContext,
@@ -150,7 +249,7 @@ impl VarBuilder {
         // Check pointer tag mask == LIST_POINTER_TAG
         let tag_mask = builder.ins().iconst(types::I64, POINTER_TAG_MASK as i64);
         let tag_bits = builder.ins().band(var, tag_mask);
-        let list_tag = builder.ins().iconst(types::I64, LIST_POINTER_TAG as i64);
+        let list_tag = builder.ins().iconst(types::I64, TUPLE_POINTER_TAG as i64);
         let is_list_tag = builder.ins().icmp(IntCC::Equal, tag_bits, list_tag);
         
         // Combine all conditions
@@ -236,7 +335,7 @@ impl VarBuilder {
     
     pub fn make_list(&self, builder: &mut FunctionBuilder, ptr: Value) -> Value {
         // Tag the pointer with LIST_POINTER_TAG: ptr | LIST_POINTER_TAG
-        let list_tag = builder.ins().iconst(types::I64, LIST_POINTER_TAG as i64);
+        let list_tag = builder.ins().iconst(types::I64, TUPLE_POINTER_TAG as i64);
         builder.ins().bor(ptr, list_tag)
     }
     
@@ -416,6 +515,92 @@ impl VarBuilder {
         builder.block_params(merge_block)[0]
     }
     
+    // Generate the missing arithmetic methods using the macros defined above
+    impl_arithmetic_binop!(emit_arithmetic_mul, imul, fmul);
+    impl_arithmetic_binop!(emit_arithmetic_div, sdiv, fdiv);
+    // Manual implementation for modulo since floating-point remainder is special
+    pub fn emit_arithmetic_mod(&self, builder: &mut FunctionBuilder, lhs: Value, rhs: Value) -> Value {
+        // Check if both operands are integers
+        let lhs_is_int = self.is_int(builder, lhs);
+        let rhs_is_int = self.is_int(builder, rhs);
+        let both_ints = builder.ins().band(lhs_is_int, rhs_is_int);
+        
+        // Create blocks for int and float paths
+        let int_block = builder.create_block();
+        let float_block = builder.create_block();
+        let merge_block = builder.create_block();
+        
+        // Add block parameter for the result
+        builder.append_block_param(merge_block, types::I64);
+        
+        // Branch based on types
+        builder.ins().brif(both_ints, int_block, &[], float_block, &[]);
+        
+        // Integer path: both are ints, use integer remainder
+        builder.switch_to_block(int_block);
+        builder.seal_block(int_block);
+        let lhs_int = self.extract_int(builder, lhs);
+        let rhs_int = self.extract_int(builder, rhs);
+        let int_result = builder.ins().srem(lhs_int, rhs_int);
+        let int_var = self.make_int(builder, int_result);
+        builder.ins().jump(merge_block, &[int_var]);
+        
+        // Float path: for simplicity, convert to integers for modulo
+        // (In a real implementation, you might want floating-point modulo)
+        builder.switch_to_block(float_block);
+        builder.seal_block(float_block);
+        let lhs_double = self.coerce_to_double(builder, lhs);
+        let rhs_double = self.coerce_to_double(builder, rhs);
+        let lhs_f64 = self.extract_double(builder, lhs_double);
+        let rhs_f64 = self.extract_double(builder, rhs_double);
+        // Convert to integers for modulo operation
+        let lhs_int = builder.ins().fcvt_to_sint(types::I32, lhs_f64);
+        let rhs_int = builder.ins().fcvt_to_sint(types::I32, rhs_f64);
+        let float_result = builder.ins().srem(lhs_int, rhs_int);
+        let float_result_i64 = builder.ins().sextend(types::I64, float_result);
+        let float_var = self.make_int(builder, float_result_i64);
+        builder.ins().jump(merge_block, &[float_var]);
+        
+        // Merge point
+        builder.switch_to_block(merge_block);
+        builder.seal_block(merge_block);
+        
+        builder.block_params(merge_block)[0]
+    }
+    
+    // Generate the missing comparison methods
+    impl_comparison_binop!(emit_arithmetic_le, SignedLessThanOrEqual, LessThanOrEqual);
+    impl_comparison_binop!(emit_arithmetic_gt, SignedGreaterThan, GreaterThan);
+    impl_comparison_binop!(emit_arithmetic_ge, SignedGreaterThanOrEqual, GreaterThanOrEqual);
+    impl_comparison_binop!(emit_arithmetic_eq, Equal, Equal);
+    impl_comparison_binop!(emit_arithmetic_ne, NotEqual, NotEqual);
+    
+    /// Logical AND operation
+    pub fn emit_logical_and(&self, builder: &mut FunctionBuilder, lhs: Value, rhs: Value) -> Value {
+        let lhs_truthy = self.emit_is_truthy(builder, lhs);
+        let rhs_truthy = self.emit_is_truthy(builder, rhs);
+        let result = builder.ins().band(lhs_truthy, rhs_truthy);
+        let result_i64 = builder.ins().uextend(types::I64, result);
+        self.make_bool(builder, result_i64)
+    }
+    
+    /// Logical OR operation
+    pub fn emit_logical_or(&self, builder: &mut FunctionBuilder, lhs: Value, rhs: Value) -> Value {
+        let lhs_truthy = self.emit_is_truthy(builder, lhs);
+        let rhs_truthy = self.emit_is_truthy(builder, rhs);
+        let result = builder.ins().bor(lhs_truthy, rhs_truthy);
+        let result_i64 = builder.ins().uextend(types::I64, result);
+        self.make_bool(builder, result_i64)
+    }
+    
+    /// Logical NOT operation
+    pub fn emit_logical_not(&self, builder: &mut FunctionBuilder, value: Value) -> Value {
+        let is_truthy = self.emit_is_truthy(builder, value);
+        let result = builder.ins().bxor_imm(is_truthy, 1); // XOR with 1 to flip the bit
+        let result_i64 = builder.ins().uextend(types::I64, result);
+        self.make_bool(builder, result_i64)
+    }
+
     /// Coerce a Var to double - if it's an int, convert to double; if already double, pass through
     pub fn coerce_to_double(&self, builder: &mut FunctionBuilder, var: Value) -> Value {
         let is_int = self.is_int(builder, var);
@@ -545,6 +730,46 @@ impl VarBuilder {
         // Make the indirect call
         let call_inst = builder.ins().call_indirect(sig_ref, func_ptr, &[args_ptr, arg_count_val, captured_env]);
         builder.inst_results(call_inst)[0]
+    }
+
+    /// Convert a Var to a boolean value (0 = false, non-zero = true)
+    pub fn emit_is_truthy(&self, builder: &mut FunctionBuilder, var: Value) -> Value {
+        // For now, implement a simple truthiness check
+        // This is a simplified version - we need to check different Var types
+        
+        // Extract type tag from upper 8 bits
+        let tag = builder.ins().ushr_imm(var, 56);
+        
+        // Create blocks for different types
+        let int_block = builder.create_block();
+        let bool_block = builder.create_block();
+        let merge_block = builder.create_block();
+        builder.append_block_param(merge_block, types::I32);
+        
+        // Simple type dispatch (just for int and bool for now)
+        let is_int = builder.ins().icmp_imm(IntCC::Equal, tag, 0);
+        builder.ins().brif(is_int, int_block, &[], bool_block, &[]);
+        
+        // Int block: check if non-zero
+        builder.switch_to_block(int_block);
+        builder.seal_block(int_block);
+        let int_val = builder.ins().band_imm(var, 0xFFFFFFFF);
+        let int_nonzero = builder.ins().icmp_imm(IntCC::NotEqual, int_val, 0);
+        let int_result = builder.ins().uextend(types::I32, int_nonzero);
+        builder.ins().jump(merge_block, &[int_result]);
+        
+        // Bool/other block: assume truthy unless zero
+        builder.switch_to_block(bool_block);
+        builder.seal_block(bool_block);
+        let other_nonzero = builder.ins().icmp_imm(IntCC::NotEqual, var, 0);
+        let other_result = builder.ins().uextend(types::I32, other_nonzero);
+        builder.ins().jump(merge_block, &[other_result]);
+        
+        // Merge results
+        builder.switch_to_block(merge_block);
+        builder.seal_block(merge_block);
+        
+        builder.block_params(merge_block)[0]
     }
 }
 
@@ -1043,7 +1268,7 @@ mod tests {
         let func: unsafe extern "C" fn(u64, u64) -> u64 = unsafe { mem::transmute(code_ptr) };
         
         // Create a real list in Rust and extract its pointer
-        let rust_list = Var::empty_list();
+        let rust_list = Var::empty_tuple();
         let raw_ptr_value = rust_list.as_u64() & !POINTER_TAG_MASK;
         
         // Test with the raw pointer - should be recognized as list
@@ -1123,7 +1348,7 @@ mod tests {
         let func: unsafe extern "C" fn(u64, u64) -> u64 = unsafe { mem::transmute(code_ptr) };
         
         // Create a list and test pointer extraction
-        let rust_list = Var::empty_list();
+        let rust_list = Var::empty_tuple();
         let expected_ptr = rust_list.as_u64() & !POINTER_TAG_MASK;
         
         let result = unsafe { func(rust_list.as_u64(), 0) };
@@ -1247,7 +1472,7 @@ mod tests {
         let none_var = Var::none();
         let symbol_var = Var::symbol(12345);
         
-        let list_var = Var::empty_list();
+        let list_var = Var::empty_tuple();
         let string_var = Var::string("test");
         
         // Test int detection

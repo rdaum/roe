@@ -2,7 +2,7 @@
 //! Provides root enumeration and child tracing for GC systems like mmtk.
 
 use crate::var::Var;
-use crate::heap::{LispString, LispVector};
+use crate::heap::{LispString, LispTuple};
 use crate::environment::Environment;
 
 /// Trait for objects that can be traced by the garbage collector.
@@ -45,7 +45,7 @@ impl GcTrace for LispString {
     }
 }
 
-impl GcTrace for LispVector {
+impl GcTrace for LispTuple {
     fn trace_children<F>(&self, mut visitor: F) 
     where F: FnMut(&Var) 
     {
@@ -59,7 +59,7 @@ impl GcTrace for LispVector {
     }
     
     fn size_bytes(&self) -> usize {
-        std::mem::size_of::<LispVector>() + 
+        std::mem::size_of::<LispTuple>() + 
         (self.capacity as usize * std::mem::size_of::<Var>())
     }
     
@@ -98,15 +98,15 @@ impl GcTrace for Environment {
 
 /// Determine if a Var contains a heap reference that needs GC tracing.
 pub fn var_needs_tracing(var: &Var) -> bool {
-    var.is_list() || var.is_string() || var.is_environment()
+    var.is_tuple() || var.is_string() || var.is_environment()
 }
 
 /// Extract heap object from a Var for GC tracing.
 /// Returns None if the Var doesn't contain a traceable heap reference.
 pub unsafe fn var_as_gc_object(var: &Var) -> Option<GcObjectRef> {
-    if var.is_list() {
+    if var.is_tuple() {
         let ptr_bits = var.as_u64() & !crate::var::POINTER_TAG_MASK;
-        let ptr = ptr_bits as *const LispVector;
+        let ptr = ptr_bits as *const LispTuple;
         Some(GcObjectRef::Vector(ptr))
     } else if var.is_string() {
         let ptr_bits = var.as_u64() & !crate::var::POINTER_TAG_MASK;
@@ -124,7 +124,7 @@ pub unsafe fn var_as_gc_object(var: &Var) -> Option<GcObjectRef> {
 /// Type-erased reference to a GC-managed heap object.
 pub enum GcObjectRef {
     String(*const LispString),
-    Vector(*const LispVector),
+    Vector(*const LispTuple),
     Environment(*const Environment),
 }
 
@@ -253,7 +253,7 @@ mod tests {
             Var::string("nested"),
             Var::bool(true)
         ];
-        let list_var = Var::list(&elements);
+        let list_var = Var::tuple(&elements);
         
         // Vector should trace all its elements
         unsafe {
@@ -272,9 +272,9 @@ mod tests {
     #[test]
     fn test_nested_heap_objects() {
         // Create nested structure: list containing another list and string
-        let inner_list = Var::list(&[Var::int(1), Var::int(2)]);
+        let inner_list = Var::tuple(&[Var::int(1), Var::int(2)]);
         let string = Var::string("test");
-        let outer_list = Var::list(&[inner_list, string, Var::none()]);
+        let outer_list = Var::tuple(&[inner_list, string, Var::none()]);
         
         // Should trace all nested heap objects
         let root_set = SimpleRootSet {
@@ -299,7 +299,7 @@ mod tests {
         unsafe {
             // Create environment with heap-allocated values
             let string_var = Var::string("test");
-            let list_var = Var::list(&[Var::int(1), Var::int(2)]);
+            let list_var = Var::tuple(&[Var::int(1), Var::int(2)]);
             let env_values = [Var::int(42), string_var, list_var];
             let env_ptr = crate::environment::Environment::from_values(&env_values, None);
             let env_var = Var::environment(env_ptr);
@@ -313,7 +313,7 @@ mod tests {
                 assert_eq!(traced_vars.len(), 3);
                 assert_eq!(traced_vars[0].as_int(), Some(42));
                 assert_eq!(traced_vars[1].as_string(), Some("test"));
-                assert!(traced_vars[2].is_list());
+                assert!(traced_vars[2].is_tuple());
             }
             
             // Clean up
@@ -358,7 +358,7 @@ mod tests {
         unsafe {
             // Create complex environment chain with heap objects
             let parent_string = Var::string("parent_data");
-            let parent_list = Var::list(&[Var::int(1), Var::string("nested")]);
+            let parent_list = Var::tuple(&[Var::int(1), Var::string("nested")]);
             let parent_values = [parent_string, parent_list];
             let parent_ptr = crate::environment::Environment::from_values(&parent_values, None);
             let parent_var = Var::environment(parent_ptr);

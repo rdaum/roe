@@ -20,10 +20,10 @@ pub struct TypeProtocol {
     /// Compare two values of the same type (-1, 0, 1)
     pub compare: fn(*const (), *const ()) -> i32,
     
-    /// Get the length/size of the value (lists, strings, etc.)
+    /// Get the length/size of the value (tuples, strings, etc.)
     pub length: Option<fn(*const ()) -> i32>,
     
-    /// Get an item by index/key (lists[index], maps[key])
+    /// Get an item by index/key (tuples[index], maps[key])
     pub get: Option<fn(*const (), Var) -> Var>,
     
     /// Set an item by index/key (mutable operations)
@@ -53,7 +53,7 @@ pub fn get_protocol(var_type: VarType) -> &'static TypeProtocol {
         VarType::I32 => &I32_PROTOCOL,
         VarType::F64 => &F64_PROTOCOL,
         VarType::Symbol => &SYMBOL_PROTOCOL,
-        VarType::List => &LIST_PROTOCOL,
+        VarType::Tuple => &TUPLE_PROTOCOL,
         VarType::String => &STRING_PROTOCOL,
         VarType::Environment => &ENVIRONMENT_PROTOCOL,
         VarType::Pointer => &POINTER_PROTOCOL,
@@ -221,12 +221,12 @@ static SYMBOL_PROTOCOL: TypeProtocol = TypeProtocol {
     drop: |_| {},
 };
 
-static LIST_PROTOCOL: TypeProtocol = TypeProtocol {
+static TUPLE_PROTOCOL: TypeProtocol = TypeProtocol {
     to_string: |ptr| {
         let var = unsafe { &*(ptr as *const Var) };
-        let list = var.as_list().unwrap();
+        let tuple = var.as_tuple().unwrap();
         let mut result = String::from("[");
-        for (i, item) in list.iter().enumerate() {
+        for (i, item) in tuple.iter().enumerate() {
             if i > 0 { result.push_str(", "); }
             result.push_str(&format!("{item}"));
         }
@@ -235,10 +235,10 @@ static LIST_PROTOCOL: TypeProtocol = TypeProtocol {
     },
     hash: |ptr| {
         let var = unsafe { &*(ptr as *const Var) };
-        let list = var.as_list().unwrap();
-        // Simple hash combining list length and first few elements
-        let mut hash = list.len() as u64;
-        for (i, item) in list.iter().take(3).enumerate() {
+        let tuple = var.as_tuple().unwrap();
+        // Simple hash combining tuple length and first few elements
+        let mut hash = tuple.len() as u64;
+        for (i, item) in tuple.iter().take(3).enumerate() {
             hash ^= item.as_u64().wrapping_mul(i as u64 + 1);
         }
         hash
@@ -246,14 +246,14 @@ static LIST_PROTOCOL: TypeProtocol = TypeProtocol {
     equals: |lhs, rhs| {
         let lvar = unsafe { &*(lhs as *const Var) };
         let rvar = unsafe { &*(rhs as *const Var) };
-        lvar.as_list() == rvar.as_list()
+        lvar.as_tuple() == rvar.as_tuple()
     },
     compare: |lhs, rhs| {
         let lvar = unsafe { &*(lhs as *const Var) };
         let rvar = unsafe { &*(rhs as *const Var) };
-        let l_list = lvar.as_list().unwrap();
-        let r_list = rvar.as_list().unwrap();
-        match l_list.len().cmp(&r_list.len()) {
+        let l_tuple = lvar.as_tuple().unwrap();
+        let r_tuple = rvar.as_tuple().unwrap();
+        match l_tuple.len().cmp(&r_tuple.len()) {
             Ordering::Less => -1,
             Ordering::Greater => 1,
             Ordering::Equal => 0, // Could do lexicographic comparison here
@@ -261,26 +261,26 @@ static LIST_PROTOCOL: TypeProtocol = TypeProtocol {
     },
     length: Some(|ptr| {
         let var = unsafe { &*(ptr as *const Var) };
-        var.as_list().unwrap().len() as i32
+        var.as_tuple().unwrap().len() as i32
     }),
     get: Some(|ptr, index| {
         let var = unsafe { &*(ptr as *const Var) };
-        let list = var.as_list().unwrap();
+        let tuple = var.as_tuple().unwrap();
         if let Some(idx) = index.as_int() {
-            if idx >= 0 && (idx as usize) < list.len() {
-                return list[idx as usize];
+            if idx >= 0 && (idx as usize) < tuple.len() {
+                return tuple[idx as usize];
             }
         }
         Var::none()
     }),
-    put: None, // Lists are immutable in our implementation
+    put: None, // Tuples are immutable in our implementation
     next: None, // TODO: Implement iteration
-    call: None, // Lists are not callable
+    call: None, // Tuples are not callable
     is_truthy: |ptr| {
         let var = unsafe { &*(ptr as *const Var) };
-        !var.as_list().unwrap().is_empty()
+        !var.as_tuple().unwrap().is_empty()
     },
-    clone: |ptr| ptr as *mut (), // Lists are immutable, can share
+    clone: |ptr| ptr as *mut (), // Tuples are immutable, can share
     drop: |_| {}, // Memory management handled by Rust
 };
 

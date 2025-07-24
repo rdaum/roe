@@ -79,7 +79,7 @@ impl LispString {
 /// Layout: [length: u64][capacity: u64][elements: Var...]
 /// Vector data follows immediately after capacity field.
 #[repr(C)]
-pub struct LispVector {
+pub struct LispTuple {
     /// Number of elements currently in the vector
     pub length: u64,
     /// Number of elements that can fit without reallocation
@@ -87,20 +87,20 @@ pub struct LispVector {
     // Vector data follows immediately after capacity (flexible array member)
 }
 
-impl LispVector {
+impl LispTuple {
     /// Create a new empty LispVector with the given capacity
-    pub fn with_capacity(capacity: usize) -> *mut LispVector {
+    pub fn with_capacity(capacity: usize) -> *mut LispTuple {
         let capacity = capacity as u64;
         
         // Calculate total size: header + element storage
-        let header_size = std::mem::size_of::<LispVector>();
+        let header_size = std::mem::size_of::<LispTuple>();
         let elements_size = capacity as usize * std::mem::size_of::<Var>();
         let total_size = header_size + elements_size;
-        let align = std::mem::align_of::<LispVector>();
+        let align = std::mem::align_of::<LispTuple>();
         
         // Allocate memory
         let layout = Layout::from_size_align(total_size, align).unwrap();
-        let ptr = unsafe { alloc(layout) as *mut LispVector };
+        let ptr = unsafe { alloc(layout) as *mut LispTuple };
         
         if ptr.is_null() {
             panic!("Failed to allocate memory for LispVector");
@@ -120,7 +120,7 @@ impl LispVector {
     }
     
     /// Create a new LispVector from a slice of Vars
-    pub fn from_slice(elements: &[Var]) -> *mut LispVector {
+    pub fn from_slice(elements: &[Var]) -> *mut LispTuple {
         let ptr = Self::with_capacity(elements.len());
         
         unsafe {
@@ -135,31 +135,31 @@ impl LispVector {
     }
     
     /// Create a new empty LispVector
-    pub fn new() -> *mut LispVector {
+    pub fn new() -> *mut LispTuple {
         Self::with_capacity(0)
     }
     
     /// Get pointer to the element data
-    unsafe fn data_ptr(ptr: *mut LispVector) -> *mut Var {
-        unsafe { (ptr as *mut u8).add(std::mem::size_of::<LispVector>()) as *mut Var }
+    unsafe fn data_ptr(ptr: *mut LispTuple) -> *mut Var {
+        unsafe { (ptr as *mut u8).add(std::mem::size_of::<LispTuple>()) as *mut Var }
     }
     
     /// Get the elements as a slice
     pub unsafe fn as_slice(&self) -> &[Var] { unsafe {
-        let data_ptr = (self as *const LispVector as *mut u8)
-            .add(std::mem::size_of::<LispVector>()) as *const Var;
+        let data_ptr = (self as *const LispTuple as *mut u8)
+            .add(std::mem::size_of::<LispTuple>()) as *const Var;
         slice::from_raw_parts(data_ptr, self.length as usize)
     }}
     
     /// Get the elements as a mutable slice
     pub unsafe fn as_mut_slice(&mut self) -> &mut [Var] { unsafe {
-        let data_ptr = (self as *mut LispVector as *mut u8)
-            .add(std::mem::size_of::<LispVector>()) as *mut Var;
+        let data_ptr = (self as *mut LispTuple as *mut u8)
+            .add(std::mem::size_of::<LispTuple>()) as *mut Var;
         slice::from_raw_parts_mut(data_ptr, self.length as usize)
     }}
     
     /// Push an element to the vector (may reallocate)
-    pub unsafe fn push(ptr: *mut LispVector, element: Var) -> *mut LispVector { unsafe {
+    pub unsafe fn push(ptr: *mut LispTuple, element: Var) -> *mut LispTuple { unsafe {
         let length = (*ptr).length;
         let capacity = (*ptr).capacity;
         
@@ -194,15 +194,15 @@ impl LispVector {
     }}
     
     /// Free the memory for this LispVector
-    pub unsafe fn free(ptr: *mut LispVector) { unsafe {
+    pub unsafe fn free(ptr: *mut LispTuple) { unsafe {
         if ptr.is_null() {
             return;
         }
         
-        let header_size = std::mem::size_of::<LispVector>();
+        let header_size = std::mem::size_of::<LispTuple>();
         let elements_size = (*ptr).capacity as usize * std::mem::size_of::<Var>();
         let total_size = header_size + elements_size;
-        let align = std::mem::align_of::<LispVector>();
+        let align = std::mem::align_of::<LispTuple>();
         
         let layout = Layout::from_size_align_unchecked(total_size, align);
         dealloc(ptr as *mut u8, layout);
@@ -218,7 +218,7 @@ impl std::fmt::Debug for LispString {
     }
 }
 
-impl std::fmt::Debug for LispVector {
+impl std::fmt::Debug for LispTuple {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         unsafe {
             write!(f, "LispVector({:?})", self.as_slice())

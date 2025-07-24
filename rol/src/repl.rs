@@ -1,16 +1,17 @@
 //! Read-Eval-Print Loop for the Lisp interpreter.
 //! Provides an interactive shell with readline support, history, and error handling.
 
-use crate::compiler::Compiler;
+use crate::bytecode::{BytecodeCompiler, BytecodeJIT};
 use crate::environment::Environment;
 use crate::parser::parse_expr_string;
 use crate::var::Var;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
-/// REPL state that maintains the compiler and global environment
+/// REPL state that maintains the bytecode compiler and JIT
 pub struct Repl {
-    compiler: Compiler,
+    bytecode_compiler: BytecodeCompiler,
+    jit: BytecodeJIT,
     editor: DefaultEditor,
     global_env_ptr: *mut Environment,
     global_env_var: Var,
@@ -19,7 +20,8 @@ pub struct Repl {
 impl Repl {
     /// Create a new REPL instance
     pub fn new() -> std::result::Result<Self, ReadlineError> {
-        let compiler = Compiler::new();
+        let bytecode_compiler = BytecodeCompiler::new();
+        let jit = BytecodeJIT::new();
         let editor = DefaultEditor::new()?;
         
         // Create a global environment (empty for now)
@@ -27,7 +29,8 @@ impl Repl {
         let global_env_var = Var::environment(global_env_ptr);
         
         Ok(Self {
-            compiler,
+            bytecode_compiler,
+            jit,
             editor,
             global_env_ptr,
             global_env_var,
@@ -39,15 +42,17 @@ impl Repl {
         // Parse the expression
         let expr = parse_expr_string(input).map_err(|e| e as Box<dyn std::error::Error>)?;
         
-        // Compile to machine code
-        let func_ptr = self.compiler.compile_expr(&expr).map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)) as Box<dyn std::error::Error>)?;
+        // Compile to bytecode
+        let function = self.bytecode_compiler.compile_expr(&expr).map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)) as Box<dyn std::error::Error>)?;
         
-        // Execute with global environment
-        let func: fn(u64) -> u64 = unsafe { std::mem::transmute(func_ptr) };
-        let result_bits = func(self.global_env_var.as_u64());
+        // JIT compile bytecode to machine code
+        let func_ptr = self.jit.compile_function(&function).map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)) as Box<dyn std::error::Error>)?;
+        
+        // Execute the compiled function with JIT context
+        let result = self.jit.execute_function(func_ptr);
         
         // Return result
-        Ok(Var::from_u64(result_bits))
+        Ok(result)
     }
     
     /// Format a Var for display in the REPL
@@ -81,7 +86,7 @@ impl Repl {
                     format!("{:?}", var)
                 }
             }
-            crate::var::VarType::List => {
+            crate::var::VarType::Tuple => {
                 // TODO: Format lists nicely
                 format!("{:?}", var)
             }

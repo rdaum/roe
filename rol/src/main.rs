@@ -1,4 +1,5 @@
 mod ast;
+mod bytecode;
 mod compiler;
 mod environment;
 mod gc;

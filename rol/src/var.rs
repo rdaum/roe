@@ -10,7 +10,7 @@
 //! Based on https://github.com/zuiderkwast/Var/blob/master/Var.h
 
 use crate::environment::Environment;
-use crate::heap::{LispString, LispVector};
+use crate::heap::{LispString, LispTuple};
 use crate::protocol::{TypeProtocol, get_protocol};
 use crate::symbol::Symbol;
 use std::cmp::Ordering;
@@ -32,7 +32,7 @@ pub const MIN_POINTER: u64 = 0x04;
 
 // Pointer type tags (using high bits that are typically unused in user pointers)
 pub const GENERIC_POINTER_TAG: u64 = 0x0000000000000000;
-pub const LIST_POINTER_TAG: u64 = 0x1000000000000000;
+pub const TUPLE_POINTER_TAG: u64 = 0x1000000000000000;
 pub const STRING_POINTER_TAG: u64 = 0x2000000000000000;
 pub const CLOSURE_POINTER_TAG: u64 = 0x3000000000000000;
 pub const ENVIRONMENT_POINTER_TAG: u64 = 0x5000000000000000;
@@ -62,7 +62,7 @@ pub enum VarType {
     Bool,
     Pointer,
     Symbol,
-    List,
+    Tuple,
     String,
     Environment,
     Closure,
@@ -83,8 +83,8 @@ impl Var {
             VarType::None
         } else if self.is_symbol() {
             VarType::Symbol
-        } else if self.is_list() {
-            VarType::List
+        } else if self.is_tuple() {
+            VarType::Tuple
         } else if self.is_string() {
             VarType::String
         } else if self.is_environment() {
@@ -132,15 +132,15 @@ impl Var {
         Self::symbol(sym.id())
     }
 
-    pub fn list(elements: &[Var]) -> Self {
-        let ptr = LispVector::from_slice(elements) as u64;
-        let tagged_ptr = ptr | LIST_POINTER_TAG;
+    pub fn tuple(elements: &[Var]) -> Self {
+        let ptr = LispTuple::from_slice(elements) as u64;
+        let tagged_ptr = ptr | TUPLE_POINTER_TAG;
         Self(ValueUnion { value: tagged_ptr })
     }
     
-    pub fn empty_list() -> Self {
-        let ptr = LispVector::new() as u64;
-        let tagged_ptr = ptr | LIST_POINTER_TAG;
+    pub fn empty_tuple() -> Self {
+        let ptr = LispTuple::new() as u64;
+        let tagged_ptr = ptr | TUPLE_POINTER_TAG;
         Self(ValueUnion { value: tagged_ptr })
     }
 
@@ -174,7 +174,7 @@ impl Var {
 
     pub fn is_number(&self) -> bool {
         let v = unsafe { self.0.value };
-        v >= MIN_NUMBER && !self.is_symbol() && !self.is_list() && !self.is_string() && !self.is_environment()
+        v >= MIN_NUMBER && !self.is_symbol() && !self.is_tuple() && !self.is_string() && !self.is_environment()
     }
 
     pub fn is_int(&self) -> bool {
@@ -214,9 +214,9 @@ impl Var {
         (unsafe { self.0.value } & HIGH16_TAG) == SYMBOL_TAG
     }
 
-    pub fn is_list(&self) -> bool {
+    pub fn is_tuple(&self) -> bool {
         let v = unsafe { self.0.value };
-        (v & 0x03) == 0 && v >= MIN_POINTER && (v & POINTER_TAG_MASK) == LIST_POINTER_TAG
+        (v & 0x03) == 0 && v >= MIN_POINTER && (v & POINTER_TAG_MASK) == TUPLE_POINTER_TAG
     }
 
     pub fn is_string(&self) -> bool {
@@ -285,20 +285,20 @@ impl Var {
         self.as_symbol().map(Symbol::from_id)
     }
 
-    pub fn as_list(&self) -> Option<&[Var]> {
-        if self.is_list() {
+    pub fn as_tuple(&self) -> Option<&[Var]> {
+        if self.is_tuple() {
             let ptr_bits = unsafe { self.0.value } & !POINTER_TAG_MASK;
-            let ptr = ptr_bits as *const LispVector;
+            let ptr = ptr_bits as *const LispTuple;
             unsafe { Some((*ptr).as_slice()) }
         } else {
             None
         }
     }
     
-    pub fn as_list_mut(&mut self) -> Option<&mut [Var]> {
-        if self.is_list() {
+    pub fn as_tuple_mut(&mut self) -> Option<&mut [Var]> {
+        if self.is_tuple() {
             let ptr_bits = unsafe { self.0.value } & !POINTER_TAG_MASK;
-            let ptr = ptr_bits as *mut LispVector;
+            let ptr = ptr_bits as *mut LispTuple;
             unsafe { Some((*ptr).as_mut_slice()) }
         } else {
             None
@@ -375,8 +375,8 @@ impl Var {
     /// - none is falsy
     /// - symbols are truthy
     /// - pointers are truthy
-    /// - empty lists are falsy
-    /// - non-empty lists are truthy
+    /// - empty tuples are falsy
+    /// - non-empty tuples are truthy
     /// - empty strings are falsy
     /// - non-empty strings are truthy
     pub fn is_truthy(&self) -> bool {
@@ -390,7 +390,7 @@ impl Var {
             VarType::None => false,
             VarType::Symbol => true,
             VarType::Pointer => true,
-            VarType::List => !self.as_list().unwrap().is_empty(),
+            VarType::Tuple => !self.as_tuple().unwrap().is_empty(),
             VarType::String => !self.as_string().unwrap().is_empty(),
             VarType::Environment => true, // Environments are always truthy
             VarType::Closure => true, // Closures are always truthy
@@ -487,7 +487,7 @@ impl From<Symbol> for Var {
 
 impl From<&[Var]> for Var {
     fn from(value: &[Var]) -> Self {
-        Self::list(value)
+        Self::tuple(value)
     }
 }
 
@@ -512,7 +512,7 @@ impl fmt::Debug for Var {
             VarType::F64 => write!(f, "Var::F64({})", self.as_double().unwrap()),
             VarType::Pointer => write!(f, "Var::Pointer({:p})", unsafe { self.0.ptr }),
             VarType::Symbol => write!(f, "Var::Symbol({})", self.as_symbol().unwrap()),
-            VarType::List => write!(f, "Var::List({:?})", self.as_list().unwrap()),
+            VarType::Tuple => write!(f, "Var::Tuple({:?})", self.as_tuple().unwrap()),
             VarType::String => write!(f, "Var::String({:?})", self.as_string().unwrap()),
             VarType::Environment => {
                 if let Some(env_ptr) = self.as_environment() {
@@ -551,10 +551,10 @@ impl fmt::Display for Var {
                     write!(f, "sym({})", self.as_symbol().unwrap())
                 }
             }
-            VarType::List => {
-                let list = self.as_list().unwrap();
+            VarType::Tuple => {
+                let tuple = self.as_tuple().unwrap();
                 write!(f, "[")?;
-                for (i, item) in list.iter().enumerate() {
+                for (i, item) in tuple.iter().enumerate() {
                     if i > 0 { write!(f, ", ")?; }
                     write!(f, "{item}")?;
                 }
@@ -592,7 +592,7 @@ impl PartialEq for Var {
             (VarType::F64, VarType::F64) => self.as_double() == other.as_double(),
             (VarType::Pointer, VarType::Pointer) => unsafe { self.0.ptr == other.0.ptr },
             (VarType::Symbol, VarType::Symbol) => self.as_symbol() == other.as_symbol(),
-            (VarType::List, VarType::List) => self.as_list() == other.as_list(),
+            (VarType::Tuple, VarType::Tuple) => self.as_tuple() == other.as_tuple(),
             (VarType::String, VarType::String) => self.as_string() == other.as_string(),
             _ => false,
         }
@@ -1221,88 +1221,88 @@ mod tests {
     }
 
     #[test]
-    fn test_list_basic_creation() {
+    fn test_tuple_basic_creation() {
 
-        // Test simple list creation
-        let list_var = Var::empty_list();
-        assert_eq!(list_var.get_type(), VarType::List);
-        assert!(list_var.is_list());
+        // Test simple tuple creation
+        let tuple_var = Var::empty_tuple();
+        assert_eq!(tuple_var.get_type(), VarType::Tuple);
+        assert!(tuple_var.is_tuple());
         
-        // Test accessing the list (should not crash)
-        let retrieved_list = list_var.as_list();
-        assert!(retrieved_list.is_some());
+        // Test accessing the tuple (should not crash)
+        let retrieved_tuple = tuple_var.as_tuple();
+        assert!(retrieved_tuple.is_some());
         
         // Test length
-        let list_ref = retrieved_list.unwrap();
-        assert_eq!(list_ref.len(), 0);
+        let tuple_ref = retrieved_tuple.unwrap();
+        assert_eq!(tuple_ref.len(), 0);
     }
 
     #[test]
-    fn test_list_and_string_basic() {
+    fn test_tuple_and_string_basic() {
 
-        // Test list creation and access
+        // Test tuple creation and access
         let elements = [Var::int(1), Var::int(2), Var::int(3)];
-        let list_var = Var::list(&elements);
-        assert_eq!(list_var.get_type(), VarType::List);
-        assert!(list_var.is_list());
-        assert!(!list_var.is_string());
+        let tuple_var = Var::tuple(&elements);
+        assert_eq!(tuple_var.get_type(), VarType::Tuple);
+        assert!(tuple_var.is_tuple());
+        assert!(!tuple_var.is_string());
 
-        let retrieved_list = list_var.as_list().unwrap();
-        assert_eq!(retrieved_list.len(), 3);
-        assert_eq!(retrieved_list[0].as_int(), Some(1));
-        assert_eq!(retrieved_list[1].as_int(), Some(2));
-        assert_eq!(retrieved_list[2].as_int(), Some(3));
+        let retrieved_tuple = tuple_var.as_tuple().unwrap();
+        assert_eq!(retrieved_tuple.len(), 3);
+        assert_eq!(retrieved_tuple[0].as_int(), Some(1));
+        assert_eq!(retrieved_tuple[1].as_int(), Some(2));
+        assert_eq!(retrieved_tuple[2].as_int(), Some(3));
 
         // Test string creation and access  
         let string_var = Var::string("hello world");
         assert_eq!(string_var.get_type(), VarType::String);
         assert!(string_var.is_string());
-        assert!(!string_var.is_list());
+        assert!(!string_var.is_tuple());
 
         let retrieved_string = string_var.as_string().unwrap();
         assert_eq!(retrieved_string, "hello world");
 
         // Test From implementations
         let elements2 = [Var::bool(true)];
-        let list_var2: Var = (&elements2[..]).into();
-        assert_eq!(list_var2.get_type(), VarType::List);
+        let tuple_var2: Var = (&elements2[..]).into();
+        assert_eq!(tuple_var2.get_type(), VarType::Tuple);
 
         let string_var2: Var = "test".into();
         assert_eq!(string_var2.get_type(), VarType::String);
 
         // Test Display
-        assert_eq!(format!("{}", list_var), "[1, 2, 3]");
+        assert_eq!(format!("{}", tuple_var), "[1, 2, 3]");
         assert_eq!(format!("{}", string_var), "hello world");
 
         // Test truthy/falsy
-        assert!(list_var.is_truthy()); // Non-empty list is truthy
+        assert!(tuple_var.is_truthy()); // Non-empty tuple is truthy
         assert!(string_var.is_truthy()); // Non-empty string is truthy
 
-        let empty_list = Var::empty_list();
+        let empty_tuple = Var::empty_tuple();
         let empty_string = Var::string("");
-        assert!(empty_list.is_falsy()); // Empty list is falsy
+        assert!(empty_tuple.is_falsy()); // Empty tuple is falsy
         assert!(empty_string.is_falsy()); // Empty string is falsy
     }
 
     #[test]
     fn test_protocol_system() {
 
-        // Test list protocol
+        // Test tuple protocol
         let elements = [Var::int(1), Var::int(2), Var::int(3)];
-        let list = Var::list(&elements);
+        let tuple = Var::tuple(&elements);
 
-        assert_eq!(list.length(), Some(3));
-        assert_eq!(list.get(Var::int(0)).as_int(), Some(1));
-        assert_eq!(list.get(Var::int(1)).as_int(), Some(2));
-        assert_eq!(list.get(Var::int(2)).as_int(), Some(3));
-        assert_eq!(list.get(Var::int(10)), Var::none()); // Out of bounds
-        assert_eq!(list.protocol_to_string(), "[1, 2, 3]");
-        assert!(list.protocol_is_truthy());
+        assert_eq!(tuple.length(), Some(3));
+        assert_eq!(tuple.get(Var::int(0)).as_int(), Some(1));
+        assert_eq!(tuple.get(Var::int(1)).as_int(), Some(2));
+        assert_eq!(tuple.get(Var::int(2)).as_int(), Some(3));
+        assert_eq!(tuple.get(Var::int(10)), Var::none()); // Out of bounds
+        assert_eq!(tuple.protocol_to_string(), "[1, 2, 3]");
+        assert!(tuple.protocol_is_truthy());
 
-        // Test empty list
-        let empty_list = Var::empty_list();
-        assert_eq!(empty_list.length(), Some(0));
-        assert!(!empty_list.protocol_is_truthy());
+        // Test empty tuple
+        let empty_tuple = Var::empty_tuple();
+        assert_eq!(empty_tuple.length(), Some(0));
+        assert!(!empty_tuple.protocol_is_truthy());
 
         // Test string protocol
         let s = Var::string("hello");

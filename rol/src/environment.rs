@@ -463,7 +463,7 @@ mod tests {
             
             // Test type checking
             assert!(env_var.is_environment());
-            assert!(!env_var.is_list());
+            assert!(!env_var.is_tuple());
             assert!(!env_var.is_string());
             assert!(!env_var.is_number());
             assert_eq!(env_var.get_type(), crate::var::VarType::Environment);

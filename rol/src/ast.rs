@@ -37,6 +37,26 @@ pub enum Expr {
         then_expr: Box<Expr>,
         else_expr: Box<Expr>,
     },
+    
+    /// While loop: (while condition body)
+    While {
+        condition: Box<Expr>,
+        body: Box<Expr>,
+    },
+    
+    /// For loop: (for var start end body)
+    For {
+        var: Symbol,
+        start: Box<Expr>,
+        end: Box<Expr>, 
+        body: Box<Expr>,
+    },
+    
+    /// Global definition: (def var value)
+    Def {
+        var: Symbol,
+        value: Box<Expr>,
+    },
 }
 
 impl Expr {
@@ -111,6 +131,7 @@ pub enum BuiltinOp {
     
     // Comparison
     Eq,
+    Ne,
     Lt,
     Le,
     Gt,
@@ -133,6 +154,7 @@ impl BuiltinOp {
             "/" => Some(BuiltinOp::Div),
             "%" => Some(BuiltinOp::Mod),
             "=" => Some(BuiltinOp::Eq),
+            "!=" => Some(BuiltinOp::Ne),
             "<" => Some(BuiltinOp::Lt),
             "<=" => Some(BuiltinOp::Le),
             ">" => Some(BuiltinOp::Gt),
@@ -149,7 +171,7 @@ impl BuiltinOp {
         match self {
             BuiltinOp::Not => Some(1),
             BuiltinOp::Add | BuiltinOp::Sub | BuiltinOp::Mul | BuiltinOp::Div | BuiltinOp::Mod |
-            BuiltinOp::Eq | BuiltinOp::Lt | BuiltinOp::Le | BuiltinOp::Gt | BuiltinOp::Ge |
+            BuiltinOp::Eq | BuiltinOp::Ne | BuiltinOp::Lt | BuiltinOp::Le | BuiltinOp::Gt | BuiltinOp::Ge |
             BuiltinOp::And | BuiltinOp::Or => Some(2),
         }
     }

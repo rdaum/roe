@@ -10,6 +10,10 @@ pub enum Token {
     LeftParen,
     /// Right parenthesis: )
     RightParen,
+    /// Left bracket: [
+    LeftBracket,
+    /// Right bracket: ]
+    RightBracket,
     /// Integer number: 42, -17
     Integer(i32),
     /// Floating point number: 3.14, -2.5
@@ -29,6 +33,8 @@ impl fmt::Display for Token {
         match self {
             Token::LeftParen => write!(f, "("),
             Token::RightParen => write!(f, ")"),
+            Token::LeftBracket => write!(f, "["),
+            Token::RightBracket => write!(f, "]"),
             Token::Integer(n) => write!(f, "{}", n),
             Token::Float(n) => write!(f, "{}", n),
             Token::Symbol(s) => write!(f, "{}", s),
@@ -223,6 +229,16 @@ impl Lexer {
                     return Ok(Token::RightParen);
                 }
                 
+                Some('[') => {
+                    self.advance();
+                    return Ok(Token::LeftBracket);
+                }
+                
+                Some(']') => {
+                    self.advance();
+                    return Ok(Token::RightBracket);
+                }
+                
                 Some('"') => {
                     return self.read_string();
                 }
@@ -282,12 +298,14 @@ mod tests {
     
     #[test]
     fn test_basic_tokens() {
-        let mut lexer = Lexer::new("( ) 42 3.14");
+        let mut lexer = Lexer::new("( ) [ ] 42 3.14");
         let tokens = lexer.tokenize().unwrap();
         
         assert_eq!(tokens, vec![
             Token::LeftParen,
             Token::RightParen,
+            Token::LeftBracket,
+            Token::RightBracket,
             Token::Integer(42),
             Token::Float(3.14),
             Token::Eof,
@@ -383,6 +401,30 @@ mod tests {
             Token::Symbol("+".to_string()),
             Token::Symbol("x".to_string()),
             Token::Keyword("value".to_string()),
+            Token::RightParen,
+            Token::RightParen,
+            Token::Eof,
+        ]);
+    }
+    
+    #[test]
+    fn test_janet_style_let_expression() {
+        let mut lexer = Lexer::new("(let [x 5 y 3] (+ x y))");
+        let tokens = lexer.tokenize().unwrap();
+        
+        assert_eq!(tokens, vec![
+            Token::LeftParen,
+            Token::Symbol("let".to_string()),
+            Token::LeftBracket,
+            Token::Symbol("x".to_string()),
+            Token::Integer(5),
+            Token::Symbol("y".to_string()),
+            Token::Integer(3),
+            Token::RightBracket,
+            Token::LeftParen,
+            Token::Symbol("+".to_string()),
+            Token::Symbol("x".to_string()),
+            Token::Symbol("y".to_string()),
             Token::RightParen,
             Token::RightParen,
             Token::Eof,

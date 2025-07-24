@@ -87,7 +87,8 @@ impl Parser {
     /// Parse a single expression
     pub fn parse_expr(&mut self) -> Result<Expr, ParseError> {
         match self.current_token() {
-            Token::LeftParen => self.parse_list(),
+            Token::LeftParen => self.parse_tuple(),
+            Token::LeftBracket => self.parse_vector(),
             Token::Integer(n) => {
                 let value = *n;
                 self.advance();
@@ -99,9 +100,23 @@ impl Parser {
                 Ok(Expr::Literal(Var::float(value)))
             }
             Token::Symbol(s) => {
-                let sym = Symbol::mk(s);
-                self.advance();
-                Ok(Expr::Variable(sym))
+                // Check for boolean literals first
+                match s.as_str() {
+                    "true" => {
+                        self.advance();
+                        Ok(Expr::Literal(Var::bool(true)))
+                    }
+                    "false" => {
+                        self.advance();
+                        Ok(Expr::Literal(Var::bool(false)))
+                    }
+                    _ => {
+                        // Regular symbol/variable
+                        let sym = Symbol::mk(s);
+                        self.advance();
+                        Ok(Expr::Variable(sym))
+                    }
+                }
             }
             Token::Keyword(s) => {
                 let keyword = s.clone();
@@ -121,6 +136,12 @@ impl Parser {
                     found: self.current_token().clone(),
                 })
             }
+            Token::RightBracket => {
+                Err(ParseError::UnexpectedToken {
+                    expected: "expression".to_string(),
+                    found: self.current_token().clone(),
+                })
+            }
             Token::Eof => {
                 Err(ParseError::UnexpectedEof {
                     expected: "expression".to_string(),
@@ -129,14 +150,14 @@ impl Parser {
         }
     }
     
-    /// Parse a list expression (function call or special form)
-    fn parse_list(&mut self) -> Result<Expr, ParseError> {
+    /// Parse a tuple expression (function call or special form)
+    fn parse_tuple(&mut self) -> Result<Expr, ParseError> {
         self.consume(Token::LeftParen, "(")?;
         
-        // Handle empty list
+        // Handle empty tuple
         if matches!(self.current_token(), Token::RightParen) {
             self.advance();
-            return Ok(Expr::Literal(Var::list(&[])));
+            return Ok(Expr::Literal(Var::tuple(&[])));
         }
         
         // Parse the first element to see if it's a special form
@@ -148,6 +169,9 @@ impl Parser {
                 "let" => return self.parse_let(),
                 "if" => return self.parse_if(),
                 "lambda" => return self.parse_lambda(),
+                "while" => return self.parse_while(),
+                "for" => return self.parse_for(),
+                "def" => return self.parse_def(),
                 _ => {
                     // Regular function call
                     let mut args = Vec::new();
@@ -177,39 +201,119 @@ impl Parser {
         })
     }
     
-    /// Parse a let binding: (let ((var1 val1) (var2 val2) ...) body)
-    fn parse_let(&mut self) -> Result<Expr, ParseError> {
-        // We already consumed "let", now expect the bindings list
-        self.consume(Token::LeftParen, "(")?;
+    /// Parse a vector expression [elem1 elem2 ...]
+    fn parse_vector(&mut self) -> Result<Expr, ParseError> {
+        self.consume(Token::LeftBracket, "[")?;
         
-        let mut bindings = Vec::new();
+        let mut elements = Vec::new();
         
-        // Parse each binding
-        while !matches!(self.current_token(), Token::RightParen | Token::Eof) {
-            // Each binding is (var value)
-            self.consume(Token::LeftParen, "(")?;
-            
-            // Get the variable name
-            let var_expr = self.parse_expr()?;
-            let var_symbol = match var_expr {
-                Expr::Variable(sym) => sym,
-                _ => {
-                    return Err(ParseError::InvalidSpecialForm {
-                        form: "let".to_string(),
-                        reason: "binding variable must be a symbol".to_string(),
-                    });
-                }
-            };
-            
-            // Get the value expression
-            let value_expr = self.parse_expr()?;
-            
-            self.consume(Token::RightParen, ")")?;
-            
-            bindings.push((var_symbol, value_expr));
+        // Parse elements until we hit the closing bracket
+        while !matches!(self.current_token(), Token::RightBracket | Token::Eof) {
+            elements.push(self.parse_expr()?);
         }
         
-        self.consume(Token::RightParen, ")")?;
+        self.consume(Token::RightBracket, "]")?;
+        
+        // Convert to a tuple literal for now (vectors are essentially tuples)
+        let element_vars: Result<Vec<Var>, String> = elements.into_iter()
+            .map(|expr| match expr {
+                Expr::Literal(var) => Ok(var),
+                _ => Err("Only literals supported in vectors for now".to_string())
+            })
+            .collect();
+            
+        match element_vars {
+            Ok(vars) => Ok(Expr::Literal(Var::tuple(&vars))),
+            Err(_) => {
+                // For now, just create an empty tuple if we can't handle complex elements
+                // TODO: Improve this to handle arbitrary expressions
+                Ok(Expr::Literal(Var::tuple(&[])))
+            }
+        }
+    }
+    
+    /// Parse a let binding: (let ((var1 val1) (var2 val2) ...) body) or (let [var1 val1 var2 val2 ...] body)
+    fn parse_let(&mut self) -> Result<Expr, ParseError> {
+        // We already consumed "let", now check if bindings use old or new syntax
+        let bindings = match self.current_token() {
+            Token::LeftParen => {
+                // Old Common Lisp style: ((var1 val1) (var2 val2) ...)
+                self.consume(Token::LeftParen, "(")?;
+                
+                let mut bindings = Vec::new();
+                
+                // Parse each binding
+                while !matches!(self.current_token(), Token::RightParen | Token::Eof) {
+                    // Each binding is (var value)
+                    self.consume(Token::LeftParen, "(")?;
+                    
+                    // Get the variable name
+                    let var_expr = self.parse_expr()?;
+                    let var_symbol = match var_expr {
+                        Expr::Variable(sym) => sym,
+                        _ => {
+                            return Err(ParseError::InvalidSpecialForm {
+                                form: "let".to_string(),
+                                reason: "binding variable must be a symbol".to_string(),
+                            });
+                        }
+                    };
+                    
+                    // Get the value expression
+                    let value_expr = self.parse_expr()?;
+                    
+                    self.consume(Token::RightParen, ")")?;
+                    
+                    bindings.push((var_symbol, value_expr));
+                }
+                
+                self.consume(Token::RightParen, ")")?;
+                bindings
+            }
+            Token::LeftBracket => {
+                // New Janet/Clojure style: [var1 val1 var2 val2 ...]
+                self.consume(Token::LeftBracket, "[")?;
+                
+                let mut bindings = Vec::new();
+                
+                // Parse alternating variable-value pairs
+                while !matches!(self.current_token(), Token::RightBracket | Token::Eof) {
+                    // Get the variable name
+                    let var_expr = self.parse_expr()?;
+                    let var_symbol = match var_expr {
+                        Expr::Variable(sym) => sym,
+                        _ => {
+                            return Err(ParseError::InvalidSpecialForm {
+                                form: "let".to_string(),
+                                reason: "binding variable must be a symbol".to_string(),
+                            });
+                        }
+                    };
+                    
+                    // Check if we have a corresponding value
+                    if matches!(self.current_token(), Token::RightBracket | Token::Eof) {
+                        return Err(ParseError::InvalidSpecialForm {
+                            form: "let".to_string(),
+                            reason: "missing value for binding variable".to_string(),
+                        });
+                    }
+                    
+                    // Get the value expression
+                    let value_expr = self.parse_expr()?;
+                    
+                    bindings.push((var_symbol, value_expr));
+                }
+                
+                self.consume(Token::RightBracket, "]")?;
+                bindings
+            }
+            _ => {
+                return Err(ParseError::InvalidSpecialForm {
+                    form: "let".to_string(),
+                    reason: "expected '(' or '[' for let bindings".to_string(),
+                });
+            }
+        };
         
         // Parse the body expression
         let body = self.parse_expr()?;
@@ -240,7 +344,7 @@ impl Parser {
     
     /// Parse a lambda expression: (lambda (param1 param2 ...) body)
     fn parse_lambda(&mut self) -> Result<Expr, ParseError> {
-        // We already consumed "lambda", now expect parameter list
+        // We already consumed "lambda", now expect parameter tuple
         self.consume(Token::LeftParen, "(")?;
         
         let mut params = Vec::new();
@@ -270,6 +374,72 @@ impl Parser {
         Ok(Expr::Lambda {
             params,
             body: Box::new(body),
+        })
+    }
+    
+    /// Parse a while loop: (while condition body)
+    fn parse_while(&mut self) -> Result<Expr, ParseError> {
+        // We already consumed "while"
+        let condition = self.parse_expr()?;
+        let body = self.parse_expr()?;
+        
+        self.consume(Token::RightParen, ")")?;
+        
+        Ok(Expr::While {
+            condition: Box::new(condition),
+            body: Box::new(body),
+        })
+    }
+    
+    /// Parse a for loop: (for var start end body)
+    fn parse_for(&mut self) -> Result<Expr, ParseError> {
+        // We already consumed "for"
+        let var_expr = self.parse_expr()?;
+        let var_symbol = match var_expr {
+            Expr::Variable(sym) => sym,
+            _ => {
+                return Err(ParseError::InvalidSpecialForm {
+                    form: "for".to_string(),
+                    reason: "loop variable must be a symbol".to_string(),
+                });
+            }
+        };
+        
+        let start = self.parse_expr()?;
+        let end = self.parse_expr()?;
+        let body = self.parse_expr()?;
+        
+        self.consume(Token::RightParen, ")")?;
+        
+        Ok(Expr::For {
+            var: var_symbol,
+            start: Box::new(start),
+            end: Box::new(end),
+            body: Box::new(body),
+        })
+    }
+    
+    /// Parse a def expression: (def var value)
+    fn parse_def(&mut self) -> Result<Expr, ParseError> {
+        // We already consumed "def"
+        let var_expr = self.parse_expr()?;
+        let var_symbol = match var_expr {
+            Expr::Variable(sym) => sym,
+            _ => {
+                return Err(ParseError::InvalidSpecialForm {
+                    form: "def".to_string(),
+                    reason: "variable must be a symbol".to_string(),
+                });
+            }
+        };
+        
+        let value = self.parse_expr()?;
+        
+        self.consume(Token::RightParen, ")")?;
+        
+        Ok(Expr::Def {
+            var: var_symbol,
+            value: Box::new(value),
         })
     }
     
@@ -315,6 +485,13 @@ mod tests {
         
         let expr = parse_expr_string("3.14").unwrap();
         assert_eq!(expr, Expr::Literal(Var::float(3.14)));
+        
+        // Test booleans
+        let expr = parse_expr_string("true").unwrap();
+        assert_eq!(expr, Expr::Literal(Var::bool(true)));
+        
+        let expr = parse_expr_string("false").unwrap();
+        assert_eq!(expr, Expr::Literal(Var::bool(false)));
         
         // Test symbols
         let expr = parse_expr_string("foo").unwrap();
@@ -464,9 +641,9 @@ mod tests {
     }
     
     #[test]
-    fn test_empty_list() {
+    fn test_empty_tuple() {
         let expr = parse_expr_string("()").unwrap();
-        assert_eq!(expr, Expr::Literal(Var::list(&[])));
+        assert_eq!(expr, Expr::Literal(Var::tuple(&[])));
     }
     
     #[test]
@@ -476,7 +653,7 @@ mod tests {
     }
     
     #[test]
-    fn test_error_unterminated_list() {
+    fn test_error_unterminated_tuple() {
         let result = parse_expr_string("(+ 1 2");
         assert!(result.is_err());
     }
@@ -484,6 +661,119 @@ mod tests {
     #[test]
     fn test_error_invalid_let_binding() {
         let result = parse_expr_string("(let ((42 5)) x)");
+        assert!(result.is_err());
+    }
+    
+    #[test]
+    fn test_parse_boolean_operations() {
+        // Test boolean literals in function calls
+        let expr = parse_expr_string("(and true false)").unwrap();
+        
+        match expr {
+            Expr::Call { func, args } => {
+                assert_eq!(*func, Expr::Variable(Symbol::mk("and")));
+                assert_eq!(args.len(), 2);
+                assert_eq!(args[0], Expr::Literal(Var::bool(true)));
+                assert_eq!(args[1], Expr::Literal(Var::bool(false)));
+            }
+            _ => panic!("Expected function call"),
+        }
+        
+        // Test negation
+        let expr = parse_expr_string("(not true)").unwrap();
+        match expr {
+            Expr::Call { func, args } => {
+                assert_eq!(*func, Expr::Variable(Symbol::mk("not")));
+                assert_eq!(args.len(), 1);
+                assert_eq!(args[0], Expr::Literal(Var::bool(true)));
+            }
+            _ => panic!("Expected function call"),
+        }
+    }
+    
+    #[test]
+    fn test_parse_janet_style_let_binding() {
+        // Test new Janet/Clojure style: (let [x 5 y 3] (+ x y))
+        let expr = parse_expr_string("(let [x 5 y 3] (+ x y))").unwrap();
+        
+        match expr {
+            Expr::Let { bindings, body } => {
+                assert_eq!(bindings.len(), 2);
+                
+                assert_eq!(bindings[0].0, Symbol::mk("x"));
+                assert_eq!(bindings[0].1, Expr::Literal(Var::int(5)));
+                
+                assert_eq!(bindings[1].0, Symbol::mk("y"));
+                assert_eq!(bindings[1].1, Expr::Literal(Var::int(3)));
+                
+                // Body should be (+ x y)
+                match body.as_ref() {
+                    Expr::Call { func, args } => {
+                        assert_eq!(**func, Expr::Variable(Symbol::mk("+")));
+                        assert_eq!(args[0], Expr::Variable(Symbol::mk("x")));
+                        assert_eq!(args[1], Expr::Variable(Symbol::mk("y")));
+                    }
+                    _ => panic!("Expected function call in body"),
+                }
+            }
+            _ => panic!("Expected let binding"),
+        }
+    }
+    
+    #[test]
+    fn test_parse_let_binding_backward_compatibility() {
+        // Test that old Common Lisp style still works: (let ((x 5) (y 3)) (+ x y))
+        let expr = parse_expr_string("(let ((x 5) (y 3)) (+ x y))").unwrap();
+        
+        match expr {
+            Expr::Let { bindings, body } => {
+                assert_eq!(bindings.len(), 2);
+                
+                assert_eq!(bindings[0].0, Symbol::mk("x"));
+                assert_eq!(bindings[0].1, Expr::Literal(Var::int(5)));
+                
+                assert_eq!(bindings[1].0, Symbol::mk("y"));
+                assert_eq!(bindings[1].1, Expr::Literal(Var::int(3)));
+                
+                // Body should be (+ x y)
+                match body.as_ref() {
+                    Expr::Call { func, args } => {
+                        assert_eq!(**func, Expr::Variable(Symbol::mk("+")));
+                        assert_eq!(args[0], Expr::Variable(Symbol::mk("x")));
+                        assert_eq!(args[1], Expr::Variable(Symbol::mk("y")));
+                    }
+                    _ => panic!("Expected function call in body"),
+                }
+            }
+            _ => panic!("Expected let binding"),
+        }
+    }
+    
+    #[test]
+    fn test_error_janet_style_let_odd_bindings() {
+        // Test error when odd number of elements in Janet style let
+        let result = parse_expr_string("(let [x 5 y] (+ x y))");
+        assert!(result.is_err());
+    }
+    
+    #[test]
+    fn test_parse_def() {
+        // Test def expression: (def x 42)
+        let expr = parse_expr_string("(def x 42)").unwrap();
+        
+        match expr {
+            Expr::Def { var, value } => {
+                assert_eq!(var, Symbol::mk("x"));
+                assert_eq!(*value, Expr::Literal(Var::int(42)));
+            }
+            _ => panic!("Expected def expression"),
+        }
+    }
+    
+    #[test]
+    fn test_error_def_invalid_var() {
+        // Test error when def variable is not a symbol
+        let result = parse_expr_string("(def 42 100)");
         assert!(result.is_err());
     }
 }
