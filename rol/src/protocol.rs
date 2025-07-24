@@ -10,37 +10,37 @@ use std::hash::{Hash, Hasher};
 pub struct TypeProtocol {
     /// Convert value to string representation
     pub to_string: fn(*const ()) -> String,
-    
+
     /// Hash the value for use in hash tables
     pub hash: fn(*const ()) -> u64,
-    
+
     /// Check equality between two values of the same type
     pub equals: fn(*const (), *const ()) -> bool,
-    
+
     /// Compare two values of the same type (-1, 0, 1)
     pub compare: fn(*const (), *const ()) -> i32,
-    
+
     /// Get the length/size of the value (tuples, strings, etc.)
     pub length: Option<fn(*const ()) -> i32>,
-    
+
     /// Get an item by index/key (tuples[index], maps[key])
     pub get: Option<fn(*const (), Var) -> Var>,
-    
+
     /// Set an item by index/key (mutable operations)
     pub put: Option<fn(*mut (), Var, Var)>,
-    
+
     /// Get next item for iteration
     pub next: Option<fn(*const (), Var) -> Var>,
-    
+
     /// Call the value as a function
     pub call: Option<fn(*const (), &[Var]) -> Var>,
-    
+
     /// Check if the value is truthy
     pub is_truthy: fn(*const ()) -> bool,
-    
+
     /// Clone/copy the value
     pub clone: fn(*const ()) -> *mut (),
-    
+
     /// Drop/free the value
     pub drop: fn(*mut ()),
 }
@@ -64,17 +64,17 @@ pub fn get_protocol(var_type: VarType) -> &'static TypeProtocol {
 // Protocol implementations for each type
 static NONE_PROTOCOL: TypeProtocol = TypeProtocol {
     to_string: |_| "none".to_string(),
-    hash: |_| 0, // None always hashes to 0
-    equals: |_, _| true, // All None values are equal
-    compare: |_, _| 0, // All None values are equal
-    length: None, // None has no length
-    get: None, // None is not indexable
-    put: None, // None is not mutable
-    next: None, // None is not iterable
-    call: None, // None is not callable
-    is_truthy: |_| false, // None is always falsy
+    hash: |_| 0,                     // None always hashes to 0
+    equals: |_, _| true,             // All None values are equal
+    compare: |_, _| 0,               // All None values are equal
+    length: None,                    // None has no length
+    get: None,                       // None is not indexable
+    put: None,                       // None is not mutable
+    next: None,                      // None is not iterable
+    call: None,                      // None is not callable
+    is_truthy: |_| false,            // None is always falsy
     clone: |_| std::ptr::null_mut(), // None doesn't need cloning
-    drop: |_| {}, // None doesn't need dropping
+    drop: |_| {},                    // None doesn't need dropping
 };
 
 static BOOL_PROTOCOL: TypeProtocol = TypeProtocol {
@@ -132,7 +132,13 @@ static I32_PROTOCOL: TypeProtocol = TypeProtocol {
         let rvar = unsafe { &*(rhs as *const Var) };
         let l = lvar.as_int().unwrap();
         let r = rvar.as_int().unwrap();
-        if l < r { -1 } else if l > r { 1 } else { 0 }
+        if l < r {
+            -1
+        } else if l > r {
+            1
+        } else {
+            0
+        }
     },
     length: None,
     get: None,
@@ -209,11 +215,17 @@ static SYMBOL_PROTOCOL: TypeProtocol = TypeProtocol {
         let rvar = unsafe { &*(rhs as *const Var) };
         let l = lvar.as_symbol().unwrap();
         let r = rvar.as_symbol().unwrap();
-        if l < r { -1 } else if l > r { 1 } else { 0 }
+        if l < r {
+            -1
+        } else if l > r {
+            1
+        } else {
+            0
+        }
     },
     length: None,
     get: None,
-    put: None, 
+    put: None,
     next: None,
     call: None,
     is_truthy: |_| true, // Symbols are always truthy
@@ -227,7 +239,9 @@ static TUPLE_PROTOCOL: TypeProtocol = TypeProtocol {
         let tuple = var.as_tuple().unwrap();
         let mut result = String::from("[");
         for (i, item) in tuple.iter().enumerate() {
-            if i > 0 { result.push_str(", "); }
+            if i > 0 {
+                result.push_str(", ");
+            }
             result.push_str(&format!("{item}"));
         }
         result.push(']');
@@ -273,7 +287,7 @@ static TUPLE_PROTOCOL: TypeProtocol = TypeProtocol {
         }
         Var::none()
     }),
-    put: None, // Tuples are immutable in our implementation
+    put: None,  // Tuples are immutable in our implementation
     next: None, // TODO: Implement iteration
     call: None, // Tuples are not callable
     is_truthy: |ptr| {
@@ -281,7 +295,7 @@ static TUPLE_PROTOCOL: TypeProtocol = TypeProtocol {
         !var.as_tuple().unwrap().is_empty()
     },
     clone: |ptr| ptr as *mut (), // Tuples are immutable, can share
-    drop: |_| {}, // Memory management handled by Rust
+    drop: |_| {},                // Memory management handled by Rust
 };
 
 static STRING_PROTOCOL: TypeProtocol = TypeProtocol {
@@ -328,7 +342,7 @@ static STRING_PROTOCOL: TypeProtocol = TypeProtocol {
         }
         Var::none()
     }),
-    put: None, // Strings are immutable
+    put: None,  // Strings are immutable
     next: None, // TODO: Implement iteration
     call: None, // Strings are not callable
     is_truthy: |ptr| {
@@ -336,16 +350,14 @@ static STRING_PROTOCOL: TypeProtocol = TypeProtocol {
         !var.as_string().unwrap().is_empty()
     },
     clone: |ptr| ptr as *mut (), // Strings are immutable, can share
-    drop: |_| {}, // Memory management handled by Rust
+    drop: |_| {},                // Memory management handled by Rust
 };
 
 static ENVIRONMENT_PROTOCOL: TypeProtocol = TypeProtocol {
     to_string: |ptr| {
         let var = unsafe { &*(ptr as *const Var) };
         if let Some(env_ptr) = var.as_environment() {
-            unsafe {
-                format!("env(size={})", (*env_ptr).size)
-            }
+            unsafe { format!("env(size={})", (*env_ptr).size) }
         } else {
             "env(invalid)".to_string()
         }
@@ -368,7 +380,13 @@ static ENVIRONMENT_PROTOCOL: TypeProtocol = TypeProtocol {
         let rvar = unsafe { &*(rhs as *const Var) };
         let l_ptr = lvar.as_environment().unwrap_or(std::ptr::null_mut()) as u64;
         let r_ptr = rvar.as_environment().unwrap_or(std::ptr::null_mut()) as u64;
-        if l_ptr < r_ptr { -1 } else if l_ptr > r_ptr { 1 } else { 0 }
+        if l_ptr < r_ptr {
+            -1
+        } else if l_ptr > r_ptr {
+            1
+        } else {
+            0
+        }
     },
     length: Some(|ptr| {
         let var = unsafe { &*(ptr as *const Var) };
@@ -378,23 +396,27 @@ static ENVIRONMENT_PROTOCOL: TypeProtocol = TypeProtocol {
             0
         }
     }),
-    get: None, // Environments are not directly indexed by external code
-    put: None, // Environments are not directly modified by external code
-    next: None, // Environments are not iterable
-    call: None, // Environments are not callable
-    is_truthy: |_| true, // Environments are always truthy
+    get: None,                   // Environments are not directly indexed by external code
+    put: None,                   // Environments are not directly modified by external code
+    next: None,                  // Environments are not iterable
+    call: None,                  // Environments are not callable
+    is_truthy: |_| true,         // Environments are always truthy
     clone: |ptr| ptr as *mut (), // Environments can be shared
-    drop: |_| {}, // Memory management handled by Rust
+    drop: |_| {},                // Memory management handled by Rust
 };
 
 static POINTER_PROTOCOL: TypeProtocol = TypeProtocol {
-    to_string: |ptr| {
-        format!("ptr({ptr:p})")
-    },
+    to_string: |ptr| format!("ptr({ptr:p})"),
     hash: |ptr| ptr as u64,
     equals: |lhs, rhs| lhs == rhs,
     compare: |lhs, rhs| {
-        if lhs < rhs { -1 } else if lhs > rhs { 1 } else { 0 }
+        if lhs < rhs {
+            -1
+        } else if lhs > rhs {
+            1
+        } else {
+            0
+        }
     },
     length: None,
     get: None,
@@ -407,20 +429,24 @@ static POINTER_PROTOCOL: TypeProtocol = TypeProtocol {
 };
 
 static CLOSURE_PROTOCOL: TypeProtocol = TypeProtocol {
-    to_string: |ptr| {
-        unsafe {
-            let closure = ptr as *const crate::heap::LispClosure;
-            format!("closure(arity={})", (*closure).arity)
-        }
+    to_string: |ptr| unsafe {
+        let closure = ptr as *const crate::heap::LispClosure;
+        format!("closure(arity={})", (*closure).arity)
     },
-    
+
     // Basic hashing and comparison for closures
     hash: |ptr| ptr as u64,
     equals: |a, b| a == b,
     compare: |a, b| {
-        if a < b { -1 } else if a > b { 1 } else { 0 }
+        if a < b {
+            -1
+        } else if a > b {
+            1
+        } else {
+            0
+        }
     },
-    
+
     // Closure-specific operations - return arity as length
     length: Some(|ptr| unsafe {
         let closure = ptr as *const crate::heap::LispClosure;
@@ -429,27 +455,23 @@ static CLOSURE_PROTOCOL: TypeProtocol = TypeProtocol {
     get: Some(|_, _| Var::none()),
     put: None,
     next: None,
-    
+
     // Closures are callable
-    call: Some(|ptr, args| {
-        unsafe {
-            let closure = ptr as *const crate::heap::LispClosure;
-            let result_bits = (*closure).call(args);
-            Var::from_u64(result_bits)
-        }
+    call: Some(|ptr, args| unsafe {
+        let closure = ptr as *const crate::heap::LispClosure;
+        let result_bits = (*closure).call(args);
+        Var::from_u64(result_bits)
     }),
-    
+
     is_truthy: |_| true, // Closures are always truthy
-    
+
     // Memory management for closures
     clone: |ptr| {
         // For now, just return the same pointer (shared ownership)
         // In a real implementation, we'd properly clone the closure
         ptr as *mut ()
     },
-    drop: |ptr| {
-        unsafe {
-            crate::heap::LispClosure::free(ptr as *mut crate::heap::LispClosure);
-        }
+    drop: |ptr| unsafe {
+        crate::heap::LispClosure::free(ptr as *mut crate::heap::LispClosure);
     },
 };

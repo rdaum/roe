@@ -40,7 +40,6 @@ pub const POINTER_TAG_MASK: u64 = 0xF000000000000000;
 
 pub const SYMBOL_TAG: u64 = 0x0009000000000000;
 
-
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Var(ValueUnion);
@@ -76,30 +75,39 @@ impl Default for Var {
 
 impl Var {
     pub fn get_type(&self) -> VarType {
-        // Check in order of value ranges for efficiency
+        // Check in order of value ranges for efficiency - use early returns
         if self.is_boolean() {
-            VarType::Bool
-        } else if self.is_none() {
-            VarType::None
-        } else if self.is_symbol() {
-            VarType::Symbol
-        } else if self.is_tuple() {
-            VarType::Tuple
-        } else if self.is_string() {
-            VarType::String
-        } else if self.is_environment() {
-            VarType::Environment
-        } else if self.is_closure() {
-            VarType::Closure
-        } else if self.is_int() {
-            VarType::I32
-        } else if self.is_double() {
-            VarType::F64
-        } else if self.is_pointer() {
-            VarType::Pointer
-        } else {
-            panic!("Unknown Var type: 0x{:016x}", unsafe { self.0.value });
+            return VarType::Bool;
         }
+        if self.is_none() {
+            return VarType::None;
+        }
+        if self.is_symbol() {
+            return VarType::Symbol;
+        }
+        if self.is_tuple() {
+            return VarType::Tuple;
+        }
+        if self.is_string() {
+            return VarType::String;
+        }
+        if self.is_environment() {
+            return VarType::Environment;
+        }
+        if self.is_closure() {
+            return VarType::Closure;
+        }
+        if self.is_int() {
+            return VarType::I32;
+        }
+        if self.is_double() {
+            return VarType::F64;
+        }
+        if self.is_pointer() {
+            return VarType::Pointer;
+        }
+
+        panic!("Unknown Var type: 0x{:016x}", unsafe { self.0.value });
     }
 
     pub fn new() -> Self {
@@ -137,7 +145,7 @@ impl Var {
         let tagged_ptr = ptr | TUPLE_POINTER_TAG;
         Self(ValueUnion { value: tagged_ptr })
     }
-    
+
     pub fn empty_tuple() -> Self {
         let ptr = LispTuple::new() as u64;
         let tagged_ptr = ptr | TUPLE_POINTER_TAG;
@@ -146,7 +154,7 @@ impl Var {
 
     pub fn string(value: &str) -> Self {
         let ptr = LispString::from_str(value) as u64;
-        let tagged_ptr = ptr | STRING_POINTER_TAG; 
+        let tagged_ptr = ptr | STRING_POINTER_TAG;
         Self(ValueUnion { value: tagged_ptr })
     }
 
@@ -155,7 +163,7 @@ impl Var {
         let tagged_ptr = ptr | ENVIRONMENT_POINTER_TAG;
         Self(ValueUnion { value: tagged_ptr })
     }
-    
+
     /// Create a Var from a closure pointer
     pub fn closure(ptr: *mut crate::heap::LispClosure) -> Self {
         let ptr_bits = ptr as u64;
@@ -174,7 +182,11 @@ impl Var {
 
     pub fn is_number(&self) -> bool {
         let v = unsafe { self.0.value };
-        v >= MIN_NUMBER && !self.is_symbol() && !self.is_tuple() && !self.is_string() && !self.is_environment()
+        v >= MIN_NUMBER
+            && !self.is_symbol()
+            && !self.is_tuple()
+            && !self.is_string()
+            && !self.is_environment()
     }
 
     pub fn is_int(&self) -> bool {
@@ -228,7 +240,7 @@ impl Var {
         let v = unsafe { self.0.value };
         (v & 0x03) == 0 && v >= MIN_POINTER && (v & POINTER_TAG_MASK) == ENVIRONMENT_POINTER_TAG
     }
-    
+
     pub fn is_closure(&self) -> bool {
         let v = unsafe { self.0.value };
         (v & 0x03) == 0 && v >= MIN_POINTER && (v & POINTER_TAG_MASK) == CLOSURE_POINTER_TAG
@@ -294,7 +306,7 @@ impl Var {
             None
         }
     }
-    
+
     pub fn as_tuple_mut(&mut self) -> Option<&mut [Var]> {
         if self.is_tuple() {
             let ptr_bits = unsafe { self.0.value } & !POINTER_TAG_MASK;
@@ -323,7 +335,7 @@ impl Var {
             None
         }
     }
-    
+
     pub fn as_closure(&self) -> Option<*mut crate::heap::LispClosure> {
         if self.is_closure() {
             let ptr_bits = unsafe { self.0.value } & !POINTER_TAG_MASK;
@@ -393,7 +405,7 @@ impl Var {
             VarType::Tuple => !self.as_tuple().unwrap().is_empty(),
             VarType::String => !self.as_string().unwrap().is_empty(),
             VarType::Environment => true, // Environments are always truthy
-            VarType::Closure => true, // Closures are always truthy
+            VarType::Closure => true,     // Closures are always truthy
         }
     }
 
@@ -516,18 +528,14 @@ impl fmt::Debug for Var {
             VarType::String => write!(f, "Var::String({:?})", self.as_string().unwrap()),
             VarType::Environment => {
                 if let Some(env_ptr) = self.as_environment() {
-                    unsafe {
-                        write!(f, "Var::Environment(size={})", (*env_ptr).size)
-                    }
+                    unsafe { write!(f, "Var::Environment(size={})", (*env_ptr).size) }
                 } else {
                     write!(f, "Var::Environment(invalid)")
                 }
-            },
+            }
             VarType::Closure => {
                 if let Some(closure_ptr) = self.as_closure() {
-                    unsafe {
-                        write!(f, "Var::Closure(arity={})", (*closure_ptr).arity)
-                    }
+                    unsafe { write!(f, "Var::Closure(arity={})", (*closure_ptr).arity) }
                 } else {
                     write!(f, "Var::Closure(invalid)")
                 }
@@ -555,7 +563,9 @@ impl fmt::Display for Var {
                 let tuple = self.as_tuple().unwrap();
                 write!(f, "[")?;
                 for (i, item) in tuple.iter().enumerate() {
-                    if i > 0 { write!(f, ", ")?; }
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
                     write!(f, "{item}")?;
                 }
                 write!(f, "]")
@@ -563,18 +573,14 @@ impl fmt::Display for Var {
             VarType::String => write!(f, "{}", self.as_string().unwrap()),
             VarType::Environment => {
                 if let Some(env_ptr) = self.as_environment() {
-                    unsafe {
-                        write!(f, "env(size={})", (*env_ptr).size)
-                    }
+                    unsafe { write!(f, "env(size={})", (*env_ptr).size) }
                 } else {
                     write!(f, "env(invalid)")
                 }
-            },
+            }
             VarType::Closure => {
                 if let Some(closure_ptr) = self.as_closure() {
-                    unsafe {
-                        write!(f, "closure(arity={})", (*closure_ptr).arity)
-                    }
+                    unsafe { write!(f, "closure(arity={})", (*closure_ptr).arity) }
                 } else {
                     write!(f, "closure(invalid)")
                 }
@@ -609,8 +615,8 @@ impl Hash for Var {
 }
 
 impl PartialOrd for Var {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> { 
-        Some(self.cmp(other)) 
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -620,17 +626,25 @@ impl Ord for Var {
             // Same types - compare values
             (VarType::Bool, VarType::Bool) => self.as_bool().cmp(&other.as_bool()),
             (VarType::I32, VarType::I32) => self.as_int().cmp(&other.as_int()),
-            (VarType::F64, VarType::F64) => self.as_double().partial_cmp(&other.as_double()).unwrap_or(Ordering::Equal),
+            (VarType::F64, VarType::F64) => self
+                .as_double()
+                .partial_cmp(&other.as_double())
+                .unwrap_or(Ordering::Equal),
             (VarType::Symbol, VarType::Symbol) => self.as_symbol().cmp(&other.as_symbol()),
 
             // Cross-type numeric comparisons
             (VarType::I32, VarType::F64) => {
                 let int_val = self.as_int().unwrap() as f64;
-                int_val.partial_cmp(&other.as_double().unwrap()).unwrap_or(Ordering::Equal)
+                int_val
+                    .partial_cmp(&other.as_double().unwrap())
+                    .unwrap_or(Ordering::Equal)
             }
             (VarType::F64, VarType::I32) => {
                 let int_val = other.as_int().unwrap() as f64;
-                self.as_double().unwrap().partial_cmp(&int_val).unwrap_or(Ordering::Equal)
+                self.as_double()
+                    .unwrap()
+                    .partial_cmp(&int_val)
+                    .unwrap_or(Ordering::Equal)
             }
 
             // None is less than everything except None
@@ -783,7 +797,6 @@ impl Rem for Var {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -970,12 +983,6 @@ mod tests {
         // Test equality
         assert_eq!(sym1, sym2);
         assert_ne!(sym1, sym3);
-
-        // Debug the type detection issue
-        println!("sym1 raw value: 0x{:016x}", sym1.as_u64());
-        println!("sym1.is_symbol(): {}", sym1.is_symbol());
-        println!("sym1.is_pointer(): {}", sym1.is_pointer());
-        println!("sym1.get_type(): {:?}", sym1.get_type());
 
         // Test Symbol integration
         let test_sym = Symbol::mk("hello");
@@ -1222,16 +1229,15 @@ mod tests {
 
     #[test]
     fn test_tuple_basic_creation() {
-
         // Test simple tuple creation
         let tuple_var = Var::empty_tuple();
         assert_eq!(tuple_var.get_type(), VarType::Tuple);
         assert!(tuple_var.is_tuple());
-        
+
         // Test accessing the tuple (should not crash)
         let retrieved_tuple = tuple_var.as_tuple();
         assert!(retrieved_tuple.is_some());
-        
+
         // Test length
         let tuple_ref = retrieved_tuple.unwrap();
         assert_eq!(tuple_ref.len(), 0);
@@ -1239,7 +1245,6 @@ mod tests {
 
     #[test]
     fn test_tuple_and_string_basic() {
-
         // Test tuple creation and access
         let elements = [Var::int(1), Var::int(2), Var::int(3)];
         let tuple_var = Var::tuple(&elements);
@@ -1253,7 +1258,7 @@ mod tests {
         assert_eq!(retrieved_tuple[1].as_int(), Some(2));
         assert_eq!(retrieved_tuple[2].as_int(), Some(3));
 
-        // Test string creation and access  
+        // Test string creation and access
         let string_var = Var::string("hello world");
         assert_eq!(string_var.get_type(), VarType::String);
         assert!(string_var.is_string());
@@ -1286,7 +1291,6 @@ mod tests {
 
     #[test]
     fn test_protocol_system() {
-
         // Test tuple protocol
         let elements = [Var::int(1), Var::int(2), Var::int(3)];
         let tuple = Var::tuple(&elements);
@@ -1331,15 +1335,14 @@ mod tests {
         let a = Var::int(5);
         let b = Var::int(10);
         let c = Var::int(5);
-        
+
         assert_eq!(a.protocol_compare(&b), Some(-1)); // 5 < 10
-        assert_eq!(b.protocol_compare(&a), Some(1));  // 10 > 5
-        assert_eq!(a.protocol_compare(&c), Some(0));  // 5 == 5
-        
+        assert_eq!(b.protocol_compare(&a), Some(1)); // 10 > 5
+        assert_eq!(a.protocol_compare(&c), Some(0)); // 5 == 5
+
         // Different types can't be compared
         assert_eq!(a.protocol_compare(&s), None);
     }
-
 
     #[test]
     fn test_comprehensive_arithmetic_matrix() {

@@ -365,7 +365,7 @@ mod tests {
         assert_eq!(map.get(&sym3), None);
     }
 
-     #[test]
+    #[test]
     fn test_many_symbols() {
         let mut symbols = Vec::new();
         let mut strings = HashSet::new();

@@ -57,20 +57,20 @@ impl Lexer {
     pub fn new(input: &str) -> Self {
         let chars: Vec<char> = input.chars().collect();
         let current_char = chars.first().copied();
-        
+
         Self {
             input: chars,
             position: 0,
             current_char,
         }
     }
-    
+
     /// Advance to the next character
     fn advance(&mut self) {
         self.position += 1;
         self.current_char = self.input.get(self.position).copied();
     }
-    
+
     /// Skip whitespace characters
     fn skip_whitespace(&mut self) {
         while let Some(ch) = self.current_char {
@@ -81,7 +81,7 @@ impl Lexer {
             }
         }
     }
-    
+
     /// Skip a comment (from ; to end of line)
     fn skip_comment(&mut self) {
         while let Some(ch) = self.current_char {
@@ -92,18 +92,18 @@ impl Lexer {
             self.advance();
         }
     }
-    
+
     /// Read a number (integer or float)
     fn read_number(&mut self) -> Result<Token, String> {
         let mut number_str = String::new();
         let mut is_float = false;
-        
+
         // Handle negative sign
         if self.current_char == Some('-') {
             number_str.push('-');
             self.advance();
         }
-        
+
         // Read digits and possibly a decimal point
         while let Some(ch) = self.current_char {
             if ch.is_ascii_digit() {
@@ -117,23 +117,25 @@ impl Lexer {
                 break;
             }
         }
-        
+
         // Parse the number
         if is_float {
-            number_str.parse::<f64>()
+            number_str
+                .parse::<f64>()
                 .map(Token::Float)
                 .map_err(|_| format!("Invalid float: {number_str}"))
         } else {
-            number_str.parse::<i32>()
+            number_str
+                .parse::<i32>()
                 .map(Token::Integer)
                 .map_err(|_| format!("Invalid integer: {number_str}"))
         }
     }
-    
+
     /// Read a symbol or keyword
     fn read_symbol(&mut self) -> Token {
         let mut symbol_str = String::new();
-        
+
         while let Some(ch) = self.current_char {
             if ch.is_alphanumeric() || "+-*/%=<>!?_-".contains(ch) {
                 symbol_str.push(ch);
@@ -142,17 +144,17 @@ impl Lexer {
                 break;
             }
         }
-        
+
         Token::Symbol(symbol_str)
     }
-    
+
     /// Read a keyword (starting with :)
     fn read_keyword(&mut self) -> Token {
         // Skip the : character
         self.advance();
-        
+
         let mut keyword_str = String::new();
-        
+
         while let Some(ch) = self.current_char {
             if ch.is_alphanumeric() || "-_".contains(ch) {
                 keyword_str.push(ch);
@@ -161,17 +163,17 @@ impl Lexer {
                 break;
             }
         }
-        
+
         Token::Keyword(keyword_str)
     }
-    
+
     /// Read a string literal
     fn read_string(&mut self) -> Result<Token, String> {
         // Skip opening quote
         self.advance();
-        
+
         let mut string_content = String::new();
-        
+
         while let Some(ch) = self.current_char {
             if ch == '"' {
                 // End of string
@@ -199,58 +201,58 @@ impl Lexer {
                 self.advance();
             }
         }
-        
+
         Err("Unterminated string literal".to_string())
     }
-    
+
     /// Get the next token from the input
     pub fn next_token(&mut self) -> Result<Token, String> {
         loop {
             match self.current_char {
                 None => return Ok(Token::Eof),
-                
+
                 Some(ch) if ch.is_whitespace() => {
                     self.skip_whitespace();
                     continue;
                 }
-                
+
                 Some(';') => {
                     self.skip_comment();
                     continue;
                 }
-                
+
                 Some('(') => {
                     self.advance();
                     return Ok(Token::LeftParen);
                 }
-                
+
                 Some(')') => {
                     self.advance();
                     return Ok(Token::RightParen);
                 }
-                
+
                 Some('[') => {
                     self.advance();
                     return Ok(Token::LeftBracket);
                 }
-                
+
                 Some(']') => {
                     self.advance();
                     return Ok(Token::RightBracket);
                 }
-                
+
                 Some('"') => {
                     return self.read_string();
                 }
-                
+
                 Some(':') => {
                     return Ok(self.read_keyword());
                 }
-                
+
                 Some(ch) if ch.is_ascii_digit() => {
                     return self.read_number();
                 }
-                
+
                 Some('-') => {
                     // Could be negative number or minus symbol
                     // Peek ahead to see if next char is a digit
@@ -262,32 +264,32 @@ impl Lexer {
                     // Otherwise treat as symbol
                     return Ok(self.read_symbol());
                 }
-                
+
                 Some(ch) if ch.is_alphabetic() || "+-*/%=<>!?_".contains(ch) => {
                     return Ok(self.read_symbol());
                 }
-                
+
                 Some(ch) => {
                     return Err(format!("Unexpected character: '{ch}'"));
                 }
             }
         }
     }
-    
+
     /// Tokenize the entire input into a vector of tokens
     pub fn tokenize(&mut self) -> Result<Vec<Token>, String> {
         let mut tokens = Vec::new();
-        
+
         loop {
             let token = self.next_token()?;
             let is_eof = matches!(token, Token::Eof);
             tokens.push(token);
-            
+
             if is_eof {
                 break;
             }
         }
-        
+
         Ok(tokens)
     }
 }
@@ -295,156 +297,176 @@ impl Lexer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_basic_tokens() {
         let mut lexer = Lexer::new("( ) [ ] 42 3.14");
         let tokens = lexer.tokenize().unwrap();
-        
-        assert_eq!(tokens, vec![
-            Token::LeftParen,
-            Token::RightParen,
-            Token::LeftBracket,
-            Token::RightBracket,
-            Token::Integer(42),
-            Token::Float(3.14),
-            Token::Eof,
-        ]);
+
+        assert_eq!(
+            tokens,
+            vec![
+                Token::LeftParen,
+                Token::RightParen,
+                Token::LeftBracket,
+                Token::RightBracket,
+                Token::Integer(42),
+                Token::Float(3.14),
+                Token::Eof,
+            ]
+        );
     }
-    
+
     #[test]
     fn test_symbols_and_keywords() {
         let mut lexer = Lexer::new("+ foo-bar :keyword :my-key");
         let tokens = lexer.tokenize().unwrap();
-        
-        assert_eq!(tokens, vec![
-            Token::Symbol("+".to_string()),
-            Token::Symbol("foo-bar".to_string()),
-            Token::Keyword("keyword".to_string()),
-            Token::Keyword("my-key".to_string()),
-            Token::Eof,
-        ]);
+
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Symbol("+".to_string()),
+                Token::Symbol("foo-bar".to_string()),
+                Token::Keyword("keyword".to_string()),
+                Token::Keyword("my-key".to_string()),
+                Token::Eof,
+            ]
+        );
     }
-    
+
     #[test]
     fn test_strings() {
         let mut lexer = Lexer::new(r#""hello world" "with\nescapes""#);
         let tokens = lexer.tokenize().unwrap();
-        
-        assert_eq!(tokens, vec![
-            Token::String("hello world".to_string()),
-            Token::String("with\nescapes".to_string()),
-            Token::Eof,
-        ]);
+
+        assert_eq!(
+            tokens,
+            vec![
+                Token::String("hello world".to_string()),
+                Token::String("with\nescapes".to_string()),
+                Token::Eof,
+            ]
+        );
     }
-    
+
     #[test]
     fn test_negative_numbers() {
         let mut lexer = Lexer::new("-42 -3.14 - minus");
         let tokens = lexer.tokenize().unwrap();
-        
-        assert_eq!(tokens, vec![
-            Token::Integer(-42),
-            Token::Float(-3.14),
-            Token::Symbol("-".to_string()),
-            Token::Symbol("minus".to_string()),
-            Token::Eof,
-        ]);
+
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Integer(-42),
+                Token::Float(-3.14),
+                Token::Symbol("-".to_string()),
+                Token::Symbol("minus".to_string()),
+                Token::Eof,
+            ]
+        );
     }
-    
+
     #[test]
     fn test_comments() {
         let mut lexer = Lexer::new("42 ; this is a comment\n3.14");
         let tokens = lexer.tokenize().unwrap();
-        
-        assert_eq!(tokens, vec![
-            Token::Integer(42),
-            Token::Float(3.14),
-            Token::Eof,
-        ]);
+
+        assert_eq!(
+            tokens,
+            vec![Token::Integer(42), Token::Float(3.14), Token::Eof,]
+        );
     }
-    
+
     #[test]
     fn test_lisp_expression() {
         let mut lexer = Lexer::new("(+ (* 2 3) 4)");
         let tokens = lexer.tokenize().unwrap();
-        
-        assert_eq!(tokens, vec![
-            Token::LeftParen,
-            Token::Symbol("+".to_string()),
-            Token::LeftParen,
-            Token::Symbol("*".to_string()),
-            Token::Integer(2),
-            Token::Integer(3),
-            Token::RightParen,
-            Token::Integer(4),
-            Token::RightParen,
-            Token::Eof,
-        ]);
+
+        assert_eq!(
+            tokens,
+            vec![
+                Token::LeftParen,
+                Token::Symbol("+".to_string()),
+                Token::LeftParen,
+                Token::Symbol("*".to_string()),
+                Token::Integer(2),
+                Token::Integer(3),
+                Token::RightParen,
+                Token::Integer(4),
+                Token::RightParen,
+                Token::Eof,
+            ]
+        );
     }
-    
+
     #[test]
     fn test_let_expression() {
         let mut lexer = Lexer::new("(let ((x 5)) (+ x :value))");
         let tokens = lexer.tokenize().unwrap();
-        
-        assert_eq!(tokens, vec![
-            Token::LeftParen,
-            Token::Symbol("let".to_string()),
-            Token::LeftParen,
-            Token::LeftParen,
-            Token::Symbol("x".to_string()),
-            Token::Integer(5),
-            Token::RightParen,
-            Token::RightParen,
-            Token::LeftParen,
-            Token::Symbol("+".to_string()),
-            Token::Symbol("x".to_string()),
-            Token::Keyword("value".to_string()),
-            Token::RightParen,
-            Token::RightParen,
-            Token::Eof,
-        ]);
+
+        assert_eq!(
+            tokens,
+            vec![
+                Token::LeftParen,
+                Token::Symbol("let".to_string()),
+                Token::LeftParen,
+                Token::LeftParen,
+                Token::Symbol("x".to_string()),
+                Token::Integer(5),
+                Token::RightParen,
+                Token::RightParen,
+                Token::LeftParen,
+                Token::Symbol("+".to_string()),
+                Token::Symbol("x".to_string()),
+                Token::Keyword("value".to_string()),
+                Token::RightParen,
+                Token::RightParen,
+                Token::Eof,
+            ]
+        );
     }
-    
+
     #[test]
     fn test_janet_style_let_expression() {
         let mut lexer = Lexer::new("(let [x 5 y 3] (+ x y))");
         let tokens = lexer.tokenize().unwrap();
-        
-        assert_eq!(tokens, vec![
-            Token::LeftParen,
-            Token::Symbol("let".to_string()),
-            Token::LeftBracket,
-            Token::Symbol("x".to_string()),
-            Token::Integer(5),
-            Token::Symbol("y".to_string()),
-            Token::Integer(3),
-            Token::RightBracket,
-            Token::LeftParen,
-            Token::Symbol("+".to_string()),
-            Token::Symbol("x".to_string()),
-            Token::Symbol("y".to_string()),
-            Token::RightParen,
-            Token::RightParen,
-            Token::Eof,
-        ]);
+
+        assert_eq!(
+            tokens,
+            vec![
+                Token::LeftParen,
+                Token::Symbol("let".to_string()),
+                Token::LeftBracket,
+                Token::Symbol("x".to_string()),
+                Token::Integer(5),
+                Token::Symbol("y".to_string()),
+                Token::Integer(3),
+                Token::RightBracket,
+                Token::LeftParen,
+                Token::Symbol("+".to_string()),
+                Token::Symbol("x".to_string()),
+                Token::Symbol("y".to_string()),
+                Token::RightParen,
+                Token::RightParen,
+                Token::Eof,
+            ]
+        );
     }
-    
+
     #[test]
     fn test_error_unterminated_string() {
         let mut lexer = Lexer::new(r#""unterminated"#);
         let result = lexer.tokenize();
-        
+
         assert!(result.is_err());
         assert!(result.err().unwrap().contains("Unterminated string"));
     }
-    
+
     #[test]
     fn test_error_invalid_escape() {
         let mut lexer = Lexer::new(r#""\x""#);
         let result = lexer.tokenize();
-        
+
         assert!(result.is_err());
         assert!(result.err().unwrap().contains("Invalid escape sequence"));
     }
