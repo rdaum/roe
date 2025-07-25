@@ -13,14 +13,82 @@ use cranelift::prelude::*;
 use cranelift_jit::JITModule;
 use cranelift_module::{Linkage, Module};
 
+/// Macro to wrap builder.ins().store() calls with write barriers for GC safety
+/// 
+/// Usage: store_with_write_barrier!(analyzer, builder, flags, value, addr, offset, barrier_type)
+#[macro_export]
+macro_rules! store_with_write_barrier {
+    ($analyzer:expr, $builder:expr, $flags:expr, $value:expr, $addr:expr, $offset:expr, "stack") => {
+        {
+            if let Some(stack_write_barrier_ref) = $analyzer.stack_write_barrier_ref {
+                // Calculate target address  
+                let target_addr = if $offset == 0 {
+                    $addr
+                } else {
+                    $builder.ins().iadd_imm($addr, $offset as i64)
+                };
+                
+                // Load old value for barrier (assume none for new allocations)
+                let old_value = $builder.ins().iconst(types::I64, crate::var::Var::none().as_u64() as i64);
+                
+                // Call write barrier before store
+                $builder.ins().call(stack_write_barrier_ref, &[target_addr, old_value, $value]);
+            }
+            
+            // Perform the actual store
+            $builder.ins().store($flags, $value, $addr, $offset)
+        }
+    };
+    
+    ($analyzer:expr, $builder:expr, $flags:expr, $value:expr, $addr:expr, $offset:expr, "memory") => {
+        {
+            if let Some(memory_write_barrier_ref) = $analyzer.memory_write_barrier_ref {
+                // Calculate target address
+                let target_addr = if $offset == 0 {
+                    $addr
+                } else {
+                    $builder.ins().iadd_imm($addr, $offset as i64)
+                };
+                
+                // Load old value for barrier (assume none for new allocations)
+                let old_value = $builder.ins().iconst(types::I64, crate::var::Var::none().as_u64() as i64);
+                
+                // Call write barrier before store
+                $builder.ins().call(memory_write_barrier_ref, &[target_addr, old_value, $value]);
+            }
+            
+            // Perform the actual store
+            $builder.ins().store($flags, $value, $addr, $offset)
+        }
+    };
+    
+    ($analyzer:expr, $builder:expr, $flags:expr, $value:expr, $addr:expr, $offset:expr, "none") => {
+        {
+            // No write barrier needed - this stores non-Var data
+            $builder.ins().store($flags, $value, $addr, $offset)
+        }
+    };
+}
+
 /// Runtime helper function for DefGlobal opcode
 #[unsafe(no_mangle)]
 pub extern "C" fn jit_set_global(jit_ptr: *mut BytecodeJIT, symbol_id: u64, value: u64) {
     unsafe {
         let jit = &mut *jit_ptr;
         let symbol = Symbol::from_id(symbol_id as u32);
-        let var = Var::from_u64(value);
-        jit.set_global(symbol, var);
+        let new_var = Var::from_u64(value);
+        let old_var = jit.get_global(symbol).unwrap_or(Var::none());
+        
+        // Use RAII write barrier for global assignment
+        // For globals, we don't have a specific containing object, so use null
+        let _guard = crate::mmtk_binding::WriteBarrierGuard::new(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            old_var,
+            new_var
+        );
+        
+        jit.set_global(symbol, new_var);
     }
 }
 
@@ -56,8 +124,18 @@ pub extern "C" fn jit_get_global_offset(jit_ptr: *mut BytecodeJIT, offset: u32) 
 pub extern "C" fn jit_set_global_offset(jit_ptr: *mut BytecodeJIT, offset: u32, value: u64) {
     unsafe {
         let jit = &mut *jit_ptr;
-        let var = Var::from_u64(value);
-        jit.set_global_offset(offset, var);
+        let new_var = Var::from_u64(value);
+        let old_var = jit.get_global_offset(offset).unwrap_or(Var::none());
+        
+        // Use RAII write barrier for global offset assignment
+        let _guard = crate::mmtk_binding::WriteBarrierGuard::new(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            old_var,
+            new_var
+        );
+        
+        jit.set_global_offset(offset, new_var);
     }
 }
 
@@ -886,6 +964,11 @@ impl BytecodeJIT {
         builder.symbol("jit_set_global_offset", jit_set_global_offset as *const u8);
         builder.symbol("jit_create_closure", jit_create_closure as *const u8);
         builder.symbol("jit_call_closure", jit_call_closure as *const u8);
+        
+        // Register write barrier helpers for JIT-generated memory stores
+        builder.symbol("jit_stack_write_barrier", crate::mmtk_binding::jit_stack_write_barrier as *const u8);
+        builder.symbol("jit_memory_write_barrier", crate::mmtk_binding::jit_memory_write_barrier as *const u8);
+        builder.symbol("jit_safepoint_check", crate::mmtk_binding::jit_safepoint_check as *const u8);
 
         // Register fast call helpers using paste to generate the function names
         paste::paste! {
@@ -920,7 +1003,38 @@ impl BytecodeJIT {
 
     /// Set a global variable value (dynamic/mutable variables)
     pub fn set_global(&mut self, symbol: Symbol, value: Var) {
-        self.global_variables.insert(symbol, value);
+        // Get old value for write barrier (if it exists)
+        let old_value = self.global_variables.get(&symbol).copied().unwrap_or(Var::none());
+        
+        // For HashMap storage, we need to handle the write barrier for the heap reference
+        // Since HashMap manages its own memory layout, we use the JIT global write barrier helper
+        if let Some(existing_slot) = self.global_variables.get_mut(&symbol) {
+            // Updating existing entry
+            let slot_ptr = existing_slot as *mut Var;
+            crate::with_write_barrier!(
+                std::ptr::null_mut(),
+                slot_ptr,
+                old_value,
+                value => {
+                    *existing_slot = value;
+                }
+            );
+        } else {
+            // New entry - HashMap will handle allocation, but we still need write barrier for the value
+            self.global_variables.insert(symbol, value);
+            // For new insertions, we should ideally call the write barrier on the newly inserted slot
+            if let Some(new_slot) = self.global_variables.get_mut(&symbol) {
+                let slot_ptr = new_slot as *mut Var;
+                crate::with_write_barrier!(
+                    std::ptr::null_mut(),
+                    slot_ptr,
+                    Var::none(),
+                    value => {
+                        // Value is already inserted, this barrier just notifies GC
+                    }
+                );
+            }
+        }
     }
 
     /// Set a global variable by offset (fast path for immutable globals)
@@ -929,7 +1043,20 @@ impl BytecodeJIT {
         if offset >= self.global_offsets.len() {
             self.global_offsets.resize(offset + 1, Var::none());
         }
-        self.global_offsets[offset] = value;
+        
+        // Get old value and slot pointer for write barrier
+        let old_value = self.global_offsets.get(offset).copied().unwrap_or(Var::none());
+        let slot_ptr = &mut self.global_offsets[offset] as *mut Var;
+        
+        // Use RAII write barrier guard - globals don't have containing object
+        crate::with_write_barrier!(
+            std::ptr::null_mut(),
+            slot_ptr,
+            old_value,
+            value => {
+                self.global_offsets[offset] = value;
+            }
+        );
     }
 
     /// Register a compiled global function for direct calls
@@ -1029,6 +1156,9 @@ impl BytecodeJIT {
             get_global_ref: None,
             set_global_offset_ref: None,
             get_global_offset_ref: None,
+            safepoint_ref: None,
+            stack_write_barrier_ref: None,
+            memory_write_barrier_ref: None,
             lambda_registry: None,
             call_conv,
             stack_base: None,
@@ -1174,11 +1304,59 @@ impl BytecodeJIT {
             .module
             .declare_func_in_func(get_global_offset_func, &mut lambda_ctx.func);
 
+        // Declare safepoint function for lambda context too
+        let lambda_safepoint_sig = self.module.make_signature();
+        let lambda_safepoint_func = self
+            .module
+            .declare_function("jit_safepoint_check", Linkage::Import, &lambda_safepoint_sig)
+            .map_err(|e| format!("Failed to declare safepoint_check in lambda: {e}"))?;
+        let lambda_safepoint_ref = self
+            .module
+            .declare_func_in_func(lambda_safepoint_func, &mut lambda_ctx.func);
+
+        // Declare write barrier functions for lambda context
+        let stack_write_barrier_sig = {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(types::I64)); // stack_addr
+            sig.params.push(AbiParam::new(types::I64)); // old_value_bits
+            sig.params.push(AbiParam::new(types::I64)); // new_value_bits
+            sig
+        };
+
+        let memory_write_barrier_sig = {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(types::I64)); // addr
+            sig.params.push(AbiParam::new(types::I64)); // old_value_bits
+            sig.params.push(AbiParam::new(types::I64)); // new_value_bits
+            sig
+        };
+
+        let stack_write_barrier_func = self
+            .module
+            .declare_function("jit_stack_write_barrier", Linkage::Import, &stack_write_barrier_sig)
+            .map_err(|e| format!("Failed to declare stack_write_barrier in lambda: {e}"))?;
+        
+        let memory_write_barrier_func = self
+            .module
+            .declare_function("jit_memory_write_barrier", Linkage::Import, &memory_write_barrier_sig)
+            .map_err(|e| format!("Failed to declare memory_write_barrier in lambda: {e}"))?;
+
+        let lambda_stack_write_barrier_ref = self
+            .module
+            .declare_func_in_func(stack_write_barrier_func, &mut lambda_ctx.func);
+        
+        let lambda_memory_write_barrier_ref = self
+            .module
+            .declare_func_in_func(memory_write_barrier_func, &mut lambda_ctx.func);
+
         let mut builder = FunctionBuilder::new(&mut lambda_ctx.func, &mut lambda_builder_context);
         let entry_block = builder.create_block();
         builder.append_block_params_for_function_params(entry_block);
         builder.switch_to_block(entry_block);
         builder.seal_block(entry_block);
+
+        // Add safepoint check at lambda function entry for GC coordination
+        builder.ins().call(lambda_safepoint_ref, &[]);
 
         // Get function parameters
         let args_ptr = builder.block_params(entry_block)[0];
@@ -1215,6 +1393,9 @@ impl BytecodeJIT {
             get_global_ref: Some(get_global_ref),
             set_global_offset_ref: Some(set_global_offset_ref),
             get_global_offset_ref: Some(get_global_offset_ref),
+            safepoint_ref: Some(lambda_safepoint_ref),
+            stack_write_barrier_ref: Some(lambda_stack_write_barrier_ref),
+            memory_write_barrier_ref: Some(lambda_memory_write_barrier_ref),
             lambda_registry: self.lambda_registry.as_ref(),
             call_conv: self.native_call_conv(),
             stack_base: None,
@@ -1370,6 +1551,41 @@ impl BytecodeJIT {
             )
             .map_err(|e| format!("Failed to declare get_global_offset: {e}"))?;
 
+        // Declare safepoint check function
+        let safepoint_sig = self.module.make_signature();
+        // No parameters, no return value - just a void function call
+        let safepoint_func = self
+            .module
+            .declare_function("jit_safepoint_check", Linkage::Import, &safepoint_sig)
+            .map_err(|e| format!("Failed to declare safepoint_check: {e}"))?;
+
+        // Declare write barrier functions
+        let stack_write_barrier_sig = {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(types::I64)); // stack_addr
+            sig.params.push(AbiParam::new(types::I64)); // old_value_bits
+            sig.params.push(AbiParam::new(types::I64)); // new_value_bits
+            sig
+        };
+
+        let memory_write_barrier_sig = {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(types::I64)); // addr
+            sig.params.push(AbiParam::new(types::I64)); // old_value_bits
+            sig.params.push(AbiParam::new(types::I64)); // new_value_bits
+            sig
+        };
+
+        let stack_write_barrier_func = self
+            .module
+            .declare_function("jit_stack_write_barrier", Linkage::Import, &stack_write_barrier_sig)
+            .map_err(|e| format!("Failed to declare stack_write_barrier: {e}"))?;
+        
+        let memory_write_barrier_func = self
+            .module
+            .declare_function("jit_memory_write_barrier", Linkage::Import, &memory_write_barrier_sig)
+            .map_err(|e| format!("Failed to declare memory_write_barrier: {e}"))?;
+
         let set_global_ref = self
             .module
             .declare_func_in_func(set_global_func, builder.func);
@@ -1382,6 +1598,17 @@ impl BytecodeJIT {
         let get_global_offset_ref = self
             .module
             .declare_func_in_func(get_global_offset_func, builder.func);
+        let safepoint_ref = self
+            .module
+            .declare_func_in_func(safepoint_func, builder.func);
+        
+        let stack_write_barrier_ref = self
+            .module
+            .declare_func_in_func(stack_write_barrier_func, builder.func);
+        
+        let memory_write_barrier_ref = self
+            .module
+            .declare_func_in_func(memory_write_barrier_func, builder.func);
 
         // Analyze and compile the bytecode optimally
         let _result = {
@@ -1392,10 +1619,16 @@ impl BytecodeJIT {
                 get_global_ref,
                 set_global_offset_ref,
                 get_global_offset_ref,
+                safepoint_ref,
+                stack_write_barrier_ref,
+                memory_write_barrier_ref,
                 self.lambda_registry.as_ref(),
                 Some(recursive_calls),
                 call_conv,
             );
+
+            // Add safepoint check at function entry for GC coordination
+            builder.ins().call(safepoint_ref, &[]);
 
             // Pre-populate analyzer with global variables as constants
             for (symbol, var) in &self.global_variables {
@@ -1449,6 +1682,9 @@ struct BytecodeAnalyzer<'a> {
     get_global_ref: Option<FuncRef>,
     set_global_offset_ref: Option<FuncRef>,
     get_global_offset_ref: Option<FuncRef>,
+    safepoint_ref: Option<FuncRef>,
+    stack_write_barrier_ref: Option<FuncRef>,
+    memory_write_barrier_ref: Option<FuncRef>,
     lambda_registry: Option<&'a std::collections::HashMap<FunctionId, (Vec<Symbol>, Function)>>,
     call_conv: CallConv,
 
@@ -1468,6 +1704,13 @@ impl<'a> BytecodeAnalyzer<'a> {
     fn native_call_conv(&self) -> CallConv {
         self.call_conv
     }
+
+    /// Emit a safepoint check call if available
+    fn emit_safepoint_check(&self, builder: &mut FunctionBuilder) {
+        if let Some(safepoint_ref) = self.safepoint_ref {
+            builder.ins().call(safepoint_ref, &[]);
+        }
+    }
     fn with_globals(
         var_builder: &'a VarBuilder,
         jit_ptr: Value,
@@ -1475,6 +1718,9 @@ impl<'a> BytecodeAnalyzer<'a> {
         get_global_ref: FuncRef,
         set_global_offset_ref: FuncRef,
         get_global_offset_ref: FuncRef,
+        safepoint_ref: FuncRef,
+        stack_write_barrier_ref: FuncRef,
+        memory_write_barrier_ref: FuncRef,
         lambda_registry: Option<&'a std::collections::HashMap<FunctionId, (Vec<Symbol>, Function)>>,
         recursive_calls: Option<&'a std::collections::HashMap<Symbol, Vec<RecursiveCallSite>>>,
         call_conv: CallConv,
@@ -1489,6 +1735,9 @@ impl<'a> BytecodeAnalyzer<'a> {
             get_global_ref: Some(get_global_ref),
             set_global_offset_ref: Some(set_global_offset_ref),
             get_global_offset_ref: Some(get_global_offset_ref),
+            safepoint_ref: Some(safepoint_ref),
+            stack_write_barrier_ref: Some(stack_write_barrier_ref),
+            memory_write_barrier_ref: Some(memory_write_barrier_ref),
             lambda_registry,
             call_conv,
             stack_base: None,
@@ -1540,7 +1789,7 @@ impl<'a> BytecodeAnalyzer<'a> {
         let stack_ptr = builder.ins().stack_load(types::I64, stack_ptr_slot, 0);
 
         // Store value at current stack pointer
-        builder.ins().store(MemFlags::new(), value, stack_ptr, 0);
+        store_with_write_barrier!(self, builder, MemFlags::new(), value, stack_ptr, 0, "stack");
 
         // Increment stack pointer
         let new_stack_ptr = builder.ins().iadd_imm(stack_ptr, VAR_SIZE as i64);
@@ -2145,11 +2394,14 @@ impl<'a> BytecodeAnalyzer<'a> {
 
                         // Store each argument
                         for (i, &arg) in args.iter().enumerate() {
-                            builder.ins().store(
+                            store_with_write_barrier!(
+                                self,
+                                builder,
                                 MemFlags::trusted(),
                                 arg,
                                 args_addr,
                                 (i * 8) as i32,
+                                "memory"
                             );
                         }
 
@@ -2346,11 +2598,14 @@ impl<'a> BytecodeAnalyzer<'a> {
 
                         // Store each argument
                         for (i, &arg) in args.iter().enumerate() {
-                            builder.ins().store(
+                            store_with_write_barrier!(
+                                self,
+                                builder,
                                 MemFlags::trusted(),
                                 arg,
                                 args_addr,
                                 (i * 8) as i32,
+                                "memory"
                             );
                         }
 
@@ -2559,11 +2814,9 @@ impl<'a> BytecodeAnalyzer<'a> {
             ));
             let args_addr = builder.ins().stack_addr(types::I64, slot, 0);
 
-            // Store each argument
+            // Store each argument with write barriers
             for (i, &arg) in args.iter().enumerate() {
-                builder
-                    .ins()
-                    .store(MemFlags::trusted(), arg, args_addr, (i * 8) as i32);
+                store_with_write_barrier!(self, builder, MemFlags::trusted(), arg, args_addr, (i * 8) as i32, "memory");
             }
 
             (

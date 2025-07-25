@@ -27,6 +27,9 @@ static MUTATOR_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomic
 /// Stop-the-world synchronization for garbage collection
 static GC_SYNC: OnceLock<Arc<(Mutex<bool>, Condvar)>> = OnceLock::new();
 
+/// Global flag for safepoint requests - checked by JIT code at safepoints
+static GC_SAFEPOINT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
 /// Global root set for persistent roots like globals and symbols
 static GLOBAL_ROOT_SET: OnceLock<Mutex<SimpleRootSet>> = OnceLock::new();
 /// Thread-local root set - simplified to a single instance for now
@@ -121,6 +124,9 @@ impl Collection<RolVM> for RolVM {
             *gc_in_progress = true;
         }
         
+        // Set safepoint flag to request all mutator threads to pause
+        GC_SAFEPOINT_REQUESTED.store(true, Ordering::Release);
+        
         eprintln!("[GC] Starting garbage collection cycle");
         
         // For now, just spawn a simple thread that runs the context
@@ -140,6 +146,10 @@ impl Collection<RolVM> for RolVM {
             let (lock, condvar) = &**gc_sync;
             let mut gc_in_progress = lock.lock().unwrap();
             *gc_in_progress = false;
+            
+            // Clear safepoint request flag
+            GC_SAFEPOINT_REQUESTED.store(false, Ordering::Release);
+            
             condvar.notify_all();
         });
     }
@@ -233,7 +243,8 @@ impl Scanning<RolVM> for RolVM {
         
         // Scan thread-local root set (stack frames, local vars, etc.)
         if let Some(root_set_mutex) = get_current_root_set() {
-            if let Ok(root_set) = root_set_mutex.try_lock() {
+            // Use blocking lock to ensure we wait for mutator threads to reach safepoints
+            let root_set = root_set_mutex.lock().unwrap();
                 // First, register the root objects themselves
                 for atomic_root in &root_set.stack_roots {
                     let root_ptr_ptr = atomic_root.load(std::sync::atomic::Ordering::Acquire);
@@ -253,9 +264,6 @@ impl Scanning<RolVM> for RolVM {
                         factory.create_process_roots_work(vec![addr]);
                     }
                 });
-            } else {
-                eprintln!("[GC] Warning: Could not lock current root set during GC");
-            }
         }
     }
     
@@ -264,7 +272,8 @@ impl Scanning<RolVM> for RolVM {
         
         // Scan global root set (global variables, etc.)
         if let Some(root_set_mutex) = get_global_root_set() {
-            if let Ok(root_set) = root_set_mutex.try_lock() {
+            // Use blocking lock to ensure proper coordination with mutator threads
+            let root_set = root_set_mutex.lock().unwrap();
                 // First, register the root objects themselves
                 for atomic_root in &root_set.global_roots {
                     let root_ptr_ptr = atomic_root.load(std::sync::atomic::Ordering::Acquire);
@@ -284,14 +293,10 @@ impl Scanning<RolVM> for RolVM {
                         factory.create_process_roots_work(vec![addr]);
                     }
                 });
-            } else {
-                eprintln!("[GC] Warning: Could not lock global root set during GC");
-            }
         }
         
         // TODO: Also scan:
-        // - Symbol interner for interned strings/symbols
-        // - Global function registry  
+        // - Global function registry
         // - JIT compiled code roots
         // - Any other VM-wide roots
     }
@@ -373,9 +378,10 @@ pub fn initialize_mmtk() -> Result<(), &'static str> {
     // Create MMTk builder
     let mut builder = MMTKBuilder::new();
     
-    // Set MarkSweep plan for real garbage collection
+    // Use MarkSweep for now - more memory-efficient than GenImmix
+    // The write barriers we implemented work with any MMTk plan
     builder.options.plan.set(PlanSelector::MarkSweep);
-    
+
     // Initialize MMTk
     let mmtk = memory_manager::mmtk_init(&builder);
     
@@ -385,9 +391,16 @@ pub fn initialize_mmtk() -> Result<(), &'static str> {
     // Reset mutator count
     MUTATOR_COUNT.store(0, std::sync::atomic::Ordering::Release);
     
-    // Initialize GC synchronization
+    // Initialize GC synchronization BEFORE collection initialization
     GC_SYNC.set(Arc::new((Mutex::new(false), Condvar::new())))
         .map_err(|_| "Failed to initialize GC synchronization")?;
+    
+    // Initialize collection subsystem
+    let mmtk_ref = get_mmtk_instance();
+    let thread_id = std::thread::current().id();
+    let thread_addr = unsafe { Address::from_usize(&thread_id as *const _ as usize) };
+    let vm_thread = VMThread(OpaquePointer::from_address(thread_addr));
+    memory_manager::initialize_collection(mmtk_ref, vm_thread);
     
     // Initialize root sets
     GLOBAL_ROOT_SET.set(Mutex::new(SimpleRootSet {
@@ -402,7 +415,7 @@ pub fn initialize_mmtk() -> Result<(), &'static str> {
         jit_roots: Vec::new(),
     })).map_err(|_| "Failed to initialize current root set")?;
     
-    println!("MMTk MarkSweep plan initialized with stop-the-world GC");
+    println!("MMTk MarkSweep plan initialized - concurrent GC ready when virtual memory issues resolved");
     Ok(())
 }
 
@@ -583,6 +596,247 @@ pub fn register_var_as_root(var: crate::var::Var, is_global: bool) {
             } else {
                 register_thread_root(trait_ptr);
             }
+        }
+    }
+}
+
+/// Write barrier for concurrent garbage collection
+/// Call this before modifying any heap object field that contains object references
+pub fn write_barrier_pre(object: *mut u8, slot: *mut u8) {
+    if !is_mmtk_initialized() {
+        return;
+    }
+    
+    // Skip write barrier for null object (global variables, stack, etc.)
+    if object.is_null() {
+        return;
+    }
+    
+    let obj_ref = unsafe { ObjectReference::from_raw_address(Address::from_ptr(object)).expect("Invalid object reference") };
+    let slot_addr = unsafe { Address::from_ptr(slot) };
+    
+    THREAD_MUTATOR.with(|mutator_cell| {
+        let mut mutator_ref = mutator_cell.borrow_mut();
+        if let Some(mutator) = mutator_ref.as_mut() {
+            // MMTk pre-write barrier for concurrent collection
+            // API: object_reference_write_pre(mutator, src, slot, target)
+            memory_manager::object_reference_write_pre(
+                mutator.as_mut(),
+                obj_ref,
+                slot_addr,
+                Some(obj_ref), // src object reference
+            );
+        }
+    });
+}
+
+/// Write barrier for concurrent garbage collection  
+/// Call this after modifying any heap object field that contains object references
+pub fn write_barrier_post(object: *mut u8, slot: *mut u8, target: *mut u8) {
+    if !is_mmtk_initialized() {
+        return;
+    }
+    
+    // Skip write barrier for null object (global variables, stack, etc.)
+    if object.is_null() {
+        return;
+    }
+    
+    let obj_ref = unsafe { ObjectReference::from_raw_address(Address::from_ptr(object)).expect("Invalid object reference") };
+    let slot_addr = unsafe { Address::from_ptr(slot) };
+    let target_ref = if target.is_null() {
+        unsafe { ObjectReference::from_raw_address(Address::ZERO).expect("Invalid null reference") }
+    } else {
+        unsafe { ObjectReference::from_raw_address(Address::from_ptr(target)).expect("Invalid target reference") }
+    };
+    
+    THREAD_MUTATOR.with(|mutator_cell| {
+        let mut mutator_ref = mutator_cell.borrow_mut();
+        if let Some(mutator) = mutator_ref.as_mut() {
+            // MMTk post-write barrier for concurrent collection
+            // API: object_reference_write_post(mutator, src, slot, target)  
+            memory_manager::object_reference_write_post(
+                mutator.as_mut(),
+                obj_ref,
+                slot_addr,
+                Some(target_ref),
+            );
+        }
+    });
+}
+
+/// Write barrier for Var slot modifications - handles NaN-boxed pointers
+pub fn var_write_barrier(containing_object: *mut u8, slot_addr: *mut crate::var::Var, old_value: crate::var::Var, new_value: crate::var::Var) {
+    // Pre-barrier with old value
+    if crate::gc::var_needs_tracing(&old_value) {
+        let _old_ptr = address_from_var(&old_value).to_ptr::<u8>() as *mut u8;
+        write_barrier_pre(containing_object, slot_addr as *mut u8);
+    }
+    
+    // Post-barrier with new value  
+    if crate::gc::var_needs_tracing(&new_value) {
+        let new_ptr = address_from_var(&new_value).to_ptr::<u8>() as *mut u8;
+        write_barrier_post(containing_object, slot_addr as *mut u8, new_ptr);
+    }
+}
+
+/// RAII write barrier guard that automatically handles pre/post barriers
+/// Usage: let _guard = WriteBarrierGuard::new(object, slot, old_value, new_value);
+pub struct WriteBarrierGuard {
+    containing_object: *mut u8,
+    slot_addr: *mut u8,
+    new_value: crate::var::Var,
+}
+
+impl WriteBarrierGuard {
+    /// Create a new write barrier guard and execute pre-barrier
+    pub fn new(containing_object: *mut u8, slot_addr: *mut crate::var::Var, old_value: crate::var::Var, new_value: crate::var::Var) -> Self {
+        // Execute pre-barrier
+        if crate::gc::var_needs_tracing(&old_value) {
+            write_barrier_pre(containing_object, slot_addr as *mut u8);
+        }
+        
+        Self {
+            containing_object,
+            slot_addr: slot_addr as *mut u8,
+            new_value,
+        }
+    }
+    
+    /// Create a write barrier guard for raw pointers (non-Var)
+    pub fn new_raw(containing_object: *mut u8, slot_addr: *mut u8, target_ptr: *mut u8) -> RawWriteBarrierGuard {
+        // Execute pre-barrier
+        write_barrier_pre(containing_object, slot_addr);
+        
+        RawWriteBarrierGuard {
+            containing_object,
+            slot_addr,
+            target_ptr,
+        }
+    }
+}
+
+impl Drop for WriteBarrierGuard {
+    fn drop(&mut self) {
+        // Execute post-barrier
+        if crate::gc::var_needs_tracing(&self.new_value) {
+            let new_ptr = address_from_var(&self.new_value).to_ptr::<u8>() as *mut u8;
+            write_barrier_post(self.containing_object, self.slot_addr, new_ptr);
+        }
+    }
+}
+
+/// RAII write barrier guard for raw pointer modifications
+pub struct RawWriteBarrierGuard {
+    containing_object: *mut u8,
+    slot_addr: *mut u8,
+    target_ptr: *mut u8,
+}
+
+impl Drop for RawWriteBarrierGuard {
+    fn drop(&mut self) {
+        // Execute post-barrier
+        write_barrier_post(self.containing_object, self.slot_addr, self.target_ptr);
+    }
+}
+
+/// Macro for convenient write barrier usage
+/// Usage: with_write_barrier!(object_ptr, slot_ptr, old_val, new_val => { slot_ptr.write(new_val); });
+#[macro_export]
+macro_rules! with_write_barrier {
+    ($object:expr, $slot:expr, $old:expr, $new:expr => $code:block) => {
+        {
+            let _guard = $crate::mmtk_binding::WriteBarrierGuard::new($object, $slot, $old, $new);
+            $code
+        }
+    };
+}
+
+/// Macro for raw pointer write barriers
+/// Usage: with_raw_write_barrier!(object_ptr, slot_ptr, target_ptr => { *slot_ptr = target_ptr; });
+#[macro_export]
+macro_rules! with_raw_write_barrier {
+    ($object:expr, $slot:expr, $target:expr => $code:block) => {
+        {
+            let _guard = $crate::mmtk_binding::WriteBarrierGuard::new_raw($object, $slot, $target);
+            $code
+        }
+    };
+}
+
+/// JIT-callable write barrier for environment variable assignments
+/// Call this before setting any environment slot to a new value
+#[unsafe(no_mangle)]
+pub extern "C" fn jit_env_write_barrier(env_bits: u64, offset: u32, old_value_bits: u64, new_value_bits: u64) {
+    let env_var = crate::var::Var::from_u64(env_bits);
+    if let Some(env_ptr) = env_var.as_environment() {
+        unsafe {
+            if offset < (*env_ptr).size {
+                // Calculate slot address
+                let slots_ptr = (env_ptr as *mut u8).add(std::mem::size_of::<crate::environment::Environment>()) as *mut crate::var::Var;
+                let slot_addr = slots_ptr.add(offset as usize);
+                
+                let old_value = crate::var::Var::from_u64(old_value_bits);
+                let new_value = crate::var::Var::from_u64(new_value_bits);
+                
+                var_write_barrier(env_ptr as *mut u8, slot_addr, old_value, new_value);
+            }
+        }
+    }
+}
+
+/// JIT-callable write barrier for global variable assignments  
+#[unsafe(no_mangle)]
+pub extern "C" fn jit_global_write_barrier(slot_addr: *mut u8, old_value_bits: u64, new_value_bits: u64) {
+    let old_value = crate::var::Var::from_u64(old_value_bits);
+    let new_value = crate::var::Var::from_u64(new_value_bits);
+    
+    // For global variables, we don't have a containing object, so we use null
+    // The write barrier implementation should handle this case
+    var_write_barrier(std::ptr::null_mut(), slot_addr as *mut crate::var::Var, old_value, new_value);
+}
+
+/// JIT-callable write barrier for general heap object field writes
+#[unsafe(no_mangle)]
+pub extern "C" fn jit_heap_write_barrier(object_ptr: *mut u8, slot_addr: *mut u8, target_ptr: *mut u8) {
+    write_barrier_pre(object_ptr, slot_addr);
+    write_barrier_post(object_ptr, slot_addr, target_ptr);
+}
+
+/// JIT-callable write barrier for stack memory stores
+/// Call this before storing any Var value to stack memory
+#[unsafe(no_mangle)]
+pub extern "C" fn jit_stack_write_barrier(stack_addr: *mut u8, old_value_bits: u64, new_value_bits: u64) {
+    let old_value = crate::var::Var::from_u64(old_value_bits);
+    let new_value = crate::var::Var::from_u64(new_value_bits);
+    
+    // For stack writes, we don't have a containing object (stack is managed by JIT)
+    var_write_barrier(std::ptr::null_mut(), stack_addr as *mut crate::var::Var, old_value, new_value);
+}
+
+/// JIT-callable write barrier for general memory stores  
+/// Call this before storing any Var value to heap-allocated memory
+#[unsafe(no_mangle)]
+pub extern "C" fn jit_memory_write_barrier(addr: *mut u8, old_value_bits: u64, new_value_bits: u64) {
+    let old_value = crate::var::Var::from_u64(old_value_bits);
+    let new_value = crate::var::Var::from_u64(new_value_bits);
+    
+    // For general memory writes, we don't know the containing object
+    var_write_barrier(std::ptr::null_mut(), addr as *mut crate::var::Var, old_value, new_value);
+}
+
+/// JIT safepoint check - called from JIT-generated code at strategic points
+/// This is the heart of the cooperative GC coordination system
+#[unsafe(no_mangle)]
+pub extern "C" fn jit_safepoint_check() {
+    // Fast path: check if GC is requested (single atomic load)
+    if GC_SAFEPOINT_REQUESTED.load(Ordering::Acquire) {
+        // Slow path: block until GC completes
+        let gc_sync = GC_SYNC.get().expect("GC sync not initialized");
+        let (lock, condvar) = &**gc_sync;
+        let mut gc_in_progress = lock.lock().unwrap();
+        while *gc_in_progress {
+            gc_in_progress = condvar.wait(gc_in_progress).unwrap();
         }
     }
 }

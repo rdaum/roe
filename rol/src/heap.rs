@@ -184,7 +184,18 @@ impl LispTuple {
             if length < capacity {
                 // Space available, just add element
                 let data_ptr = Self::data_ptr(ptr);
-                *data_ptr.add(length as usize) = element;
+                let slot_ptr = data_ptr.add(length as usize);
+                
+                // Use RAII write barrier for new element
+                crate::with_write_barrier!(
+                    ptr as *mut u8,
+                    slot_ptr,
+                    crate::var::Var::none(), // old value is none/uninitialized
+                    element => {
+                        *slot_ptr = element;
+                    }
+                );
+                
                 (*ptr).length = length + 1;
                 ptr
             } else {
@@ -192,17 +203,40 @@ impl LispTuple {
                 let new_capacity = if capacity == 0 { 4 } else { capacity * 2 };
                 let new_ptr = Self::with_capacity(new_capacity as usize);
 
-                // Copy existing elements
+                // Copy existing elements with write barriers
                 if length > 0 {
                     let old_data = Self::data_ptr(ptr);
                     let new_data = Self::data_ptr(new_ptr);
-                    ptr::copy_nonoverlapping(old_data, new_data, length as usize);
+                    
+                    // Copy existing elements with RAII write barriers
+                    for i in 0..length as usize {
+                        let old_element = *old_data.add(i);
+                        let new_slot_ptr = new_data.add(i);
+                        
+                        crate::with_write_barrier!(
+                            new_ptr as *mut u8,
+                            new_slot_ptr,
+                            crate::var::Var::none(), // new tuple slot starts as none
+                            crate::var::Var::from_u64(old_element.as_u64()) => {
+                                *new_slot_ptr = old_element;
+                            }
+                        );
+                    }
                 }
 
-                // Add new element
+                // Add new element with RAII write barrier
                 (*new_ptr).length = length + 1;
                 let new_data = Self::data_ptr(new_ptr);
-                *new_data.add(length as usize) = element;
+                let new_slot_ptr = new_data.add(length as usize);
+                
+                crate::with_write_barrier!(
+                    new_ptr as *mut u8,
+                    new_slot_ptr,
+                    crate::var::Var::none(),
+                    element => {
+                        *new_slot_ptr = element;
+                    }
+                );
 
                 // Free old vector
                 Self::free(ptr);

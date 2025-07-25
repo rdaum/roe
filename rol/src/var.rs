@@ -149,31 +149,71 @@ impl Var {
 
     pub fn tuple(elements: &[Var]) -> Self {
         let ptr = LispTuple::from_slice(elements);
-        unsafe { Self::mk_tagged_pointer(ptr, TUPLE_POINTER_TAG) }
+        let var = unsafe { Self::mk_tagged_pointer(ptr, TUPLE_POINTER_TAG) };
+        
+        // Register the newly allocated tuple as a thread root immediately
+        // This prevents GC from collecting it if a collection happens during evaluation
+        if crate::mmtk_binding::is_mmtk_initialized() {
+            crate::mmtk_binding::register_var_as_root(var, false); // false = thread root
+        }
+        
+        var
     }
 
     pub fn empty_tuple() -> Self {
         let ptr = LispTuple::new() as u64;
         let tagged_ptr = ptr | TUPLE_POINTER_TAG;
-        Self(ValueUnion { value: tagged_ptr })
+        let var = Self(ValueUnion { value: tagged_ptr });
+        
+        // Register the newly allocated empty tuple as a thread root immediately
+        // This prevents GC from collecting it if a collection happens during evaluation
+        if crate::mmtk_binding::is_mmtk_initialized() {
+            crate::mmtk_binding::register_var_as_root(var, false); // false = thread root
+        }
+        
+        var
     }
 
     pub fn string(value: &str) -> Self {
         let ptr = LispString::from_str(value);
-        unsafe { Self::mk_tagged_pointer(ptr, STRING_POINTER_TAG) }
+        let var = unsafe { Self::mk_tagged_pointer(ptr, STRING_POINTER_TAG) };
+        
+        // Register the newly allocated string as a thread root immediately
+        // This prevents GC from collecting it if a collection happens during evaluation
+        if crate::mmtk_binding::is_mmtk_initialized() {
+            crate::mmtk_binding::register_var_as_root(var, false); // false = thread root
+        }
+        
+        var
     }
 
     pub fn environment(env: *mut Environment) -> Self {
         let ptr = env as u64;
         let tagged_ptr = ptr | ENVIRONMENT_POINTER_TAG;
-        Self(ValueUnion { value: tagged_ptr })
+        let var = Self(ValueUnion { value: tagged_ptr });
+        
+        // Register the environment as a thread root if it contains heap objects
+        // This prevents GC from collecting the environment during evaluation
+        if crate::mmtk_binding::is_mmtk_initialized() {
+            crate::mmtk_binding::register_var_as_root(var, false); // false = thread root
+        }
+        
+        var
     }
 
     /// Create a Var from a closure pointer
     pub fn closure(ptr: *mut crate::heap::LispClosure) -> Self {
         let ptr_bits = ptr as u64;
         let tagged_ptr = ptr_bits | CLOSURE_POINTER_TAG;
-        Self(ValueUnion { value: tagged_ptr })
+        let var = Self(ValueUnion { value: tagged_ptr });
+        
+        // Register the closure as a thread root immediately
+        // This prevents GC from collecting it during evaluation
+        if crate::mmtk_binding::is_mmtk_initialized() {
+            crate::mmtk_binding::register_var_as_root(var, false); // false = thread root
+        }
+        
+        var
     }
 
     pub fn is_none(&self) -> bool {

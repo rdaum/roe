@@ -942,6 +942,9 @@ fn compile_function_call_recursive(
         let arg_array_addr = builder.ins().stack_addr(types::I64, arg_array_ptr, 0);
 
         // Store each argument in the array
+        // TODO: Add write barriers here for concurrent GC safety
+        // This stores Var values to stack memory and should call jit_stack_write_barrier
+        // Currently skipped because this is a standalone compiler without access to write barrier function refs
         for (i, &arg_value) in arg_values.iter().enumerate() {
             let offset = (i * 8) as i32;
             builder

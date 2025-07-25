@@ -97,7 +97,19 @@ impl Environment {
                 as *mut u64
         };
         unsafe {
-            *slots_ptr.add(offset as usize) = value.as_u64();
+            // Get old value and slot pointer for write barrier
+            let slot_var_ptr = slots_ptr.add(offset as usize) as *mut crate::var::Var;
+            let old_value = crate::var::Var::from_u64(*slots_ptr.add(offset as usize));
+            
+            // Use RAII write barrier guard
+            crate::with_write_barrier!(
+                self as *mut Environment as *mut u8,
+                slot_var_ptr,
+                old_value,
+                value => {
+                    *slots_ptr.add(offset as usize) = value.as_u64();
+                }
+            );
         }
     }
 

@@ -79,11 +79,9 @@ impl Repl {
         // Execute the compiled function with JIT context
         let result = self.jit.execute_function(func_ptr);
 
-        // Register the result as a thread root if it's a heap object
-        // This ensures the GC doesn't collect the result while it's being used
-        if crate::gc::var_needs_tracing(&result) {
-            register_var_as_root(result, false); // false = thread root (temporary)
-        }
+        // NOTE: We don't need to register the result here anymore because
+        // heap objects are now registered immediately when they're allocated
+        // in Var::string(), Var::tuple(), etc. This prevents double registration.
 
         // Return result
         Ok(result)
