@@ -3,6 +3,7 @@
 
 use crate::mmtk_binding::{mmtk_alloc, mmtk_alloc_placeholder, mmtk_dealloc_placeholder};
 use crate::var::Var;
+use crate::heap_ptr::HeapPtr;
 use std::ptr;
 use std::slice;
 use std::str;
@@ -18,7 +19,43 @@ pub struct LispString {
 }
 
 impl LispString {
-    /// Create a new LispString from a Rust string slice
+    /// Create a new LispString from a Rust string slice with RAII ownership
+    pub fn new_owned(s: &str) -> Option<HeapPtr<LispString>> {
+        let bytes = s.as_bytes();
+        let length = bytes.len() as u64;
+
+        // Calculate total size: header + string data
+        let header_size = std::mem::size_of::<LispString>();
+        let data_size = bytes.len();
+        let total_size = header_size + data_size;
+        
+        // Round up to 8-byte alignment as required by MMTk
+        let aligned_size = (total_size + 7) & !7;
+
+        // Allocate memory using MMTk
+        let ptr = if crate::mmtk_binding::is_mmtk_initialized() {
+            mmtk_alloc(aligned_size) as *mut LispString
+        } else {
+            mmtk_alloc_placeholder(aligned_size) as *mut LispString
+        };
+
+        if ptr.is_null() {
+            return None;
+        }
+
+        unsafe {
+            // Initialize header
+            (*ptr).length = length;
+
+            // Copy string data immediately after header
+            let data_ptr = (ptr as *mut u8).add(header_size);
+            ptr::copy_nonoverlapping(bytes.as_ptr(), data_ptr, bytes.len());
+            
+            HeapPtr::from_raw(ptr, aligned_size)
+        }
+    }
+
+    /// Create a new LispString from a Rust string slice (raw pointer version)
     pub fn from_str(s: &str) -> *mut LispString {
         let bytes = s.as_bytes();
         let length = bytes.len() as u64;
@@ -96,7 +133,39 @@ pub struct LispTuple {
 }
 
 impl LispTuple {
-    /// Create a new empty LispVector with the given capacity
+    /// Create a new empty LispVector with the given capacity (RAII version)
+    pub fn new_with_capacity(capacity: usize) -> Option<HeapPtr<LispTuple>> {
+        let capacity = capacity as u64;
+
+        // Calculate total size: header + element storage
+        let header_size = std::mem::size_of::<LispTuple>();
+        let elements_size = capacity as usize * std::mem::size_of::<Var>();
+        let total_size = header_size + elements_size;
+        
+        // Round up to 8-byte alignment as required by MMTk
+        let aligned_size = (total_size + 7) & !7;
+
+        // Allocate memory using MMTk
+        let ptr = if crate::mmtk_binding::is_mmtk_initialized() {
+            mmtk_alloc(aligned_size) as *mut LispTuple
+        } else {
+            mmtk_alloc_placeholder(aligned_size) as *mut LispTuple
+        };
+
+        if ptr.is_null() {
+            return None;
+        }
+
+        unsafe {
+            // Initialize header
+            (*ptr).length = 0; // Start empty
+            (*ptr).capacity = capacity;
+            
+            HeapPtr::from_raw(ptr, aligned_size)
+        }
+    }
+
+    /// Create a new empty LispVector with the given capacity (raw pointer version)
     pub fn with_capacity(capacity: usize) -> *mut LispTuple {
         let capacity = capacity as u64;
 
@@ -290,7 +359,31 @@ pub struct LispClosure {
 }
 
 impl LispClosure {
-    /// Create a new closure with the given function pointer, arity, and captured environment
+    /// Create a new closure with the given function pointer, arity, and captured environment (RAII version)
+    pub fn new_owned(func_ptr: *const u8, arity: u32, captured_env: u64) -> Option<HeapPtr<LispClosure>> {
+        let size = std::mem::size_of::<LispClosure>();
+        // Round up to 8-byte alignment as required by MMTk
+        let aligned_size = (size + 7) & !7;
+        let ptr = if crate::mmtk_binding::is_mmtk_initialized() {
+            mmtk_alloc(aligned_size) as *mut LispClosure
+        } else {
+            mmtk_alloc_placeholder(aligned_size) as *mut LispClosure
+        };
+
+        if ptr.is_null() {
+            return None;
+        }
+
+        unsafe {
+            (*ptr).func_ptr = func_ptr;
+            (*ptr).arity = arity;
+            (*ptr).captured_env = captured_env;
+            
+            HeapPtr::from_raw(ptr, aligned_size)
+        }
+    }
+
+    /// Create a new closure with the given function pointer, arity, and captured environment (raw pointer version)
     pub fn new(func_ptr: *const u8, arity: u32, captured_env: u64) -> *mut LispClosure {
         let size = std::mem::size_of::<LispClosure>();
         // Round up to 8-byte alignment as required by MMTk

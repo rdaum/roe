@@ -369,7 +369,7 @@ fn address_from_var(var: &crate::var::Var) -> Address {
     unsafe { Address::from_usize(ptr_bits as usize) }
 }
 
-/// Initialize MMTk with NoGC plan
+/// Initialize MMTk with MarkSweep plan
 pub fn initialize_mmtk() -> Result<(), &'static str> {
     if MMTK_INITIALIZED.swap(true, Ordering::AcqRel) {
         return Ok(()); // Already initialized
@@ -378,8 +378,7 @@ pub fn initialize_mmtk() -> Result<(), &'static str> {
     // Create MMTk builder
     let mut builder = MMTKBuilder::new();
     
-    // Use MarkSweep for now - more memory-efficient than GenImmix
-    // The write barriers we implemented work with any MMTk plan
+    // Use MarkSweep for now - GenImmix requires more complex VM space setup
     builder.options.plan.set(PlanSelector::MarkSweep);
 
     // Initialize MMTk

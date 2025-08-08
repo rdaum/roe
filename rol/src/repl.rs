@@ -5,86 +5,97 @@ use crate::bytecode::{BytecodeCompiler, BytecodeJIT};
 use crate::environment::Environment;
 use crate::mmtk_binding::{initialize_mmtk, mmtk_bind_mutator, register_var_as_root, clear_thread_roots};
 use crate::parser::parse_expr_string;
+use crate::scheduler::{RolScheduler, BufferId};
 use crate::var::Var;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
+use std::sync::Arc;
+use tokio::runtime::Runtime;
 
-/// REPL state that maintains the bytecode compiler and JIT
+/// REPL state using the new scheduler-based execution
 pub struct Repl {
-    bytecode_compiler: BytecodeCompiler,
-    jit: BytecodeJIT,
+    scheduler: Arc<RolScheduler>,
     editor: DefaultEditor,
+    runtime: Runtime,
+    buffer_id: BufferId,
     global_env_ptr: *mut Environment,
 }
 
 impl Repl {
-    /// Create a new REPL instance
-    pub fn new() -> std::result::Result<Self, ReadlineError> {
-        // Initialize MMTk garbage collector
-        if let Err(e) = initialize_mmtk() {
-            eprintln!("Warning: Failed to initialize MMTk GC: {}", e);
-        }
+    /// Create a new REPL instance with scheduler
+    pub fn new() -> std::result::Result<Self, Box<dyn std::error::Error>> {
+        // Create tokio runtime for async operations
+        let runtime = Runtime::new()?;
         
-        // Bind mutator for this thread
-        if let Err(e) = mmtk_bind_mutator() {
-            eprintln!("Warning: Failed to bind MMTk mutator: {}", e);
-        }
+        // Create the scheduler within the runtime context
+        let scheduler = runtime.block_on(async {
+            // Create scheduler
+            let scheduler = Arc::new(RolScheduler::new(None)?);
+            
+            // Start the scheduler
+            scheduler.start().await?;
+            
+            Ok::<Arc<RolScheduler>, String>(scheduler)
+        })?;
 
-        let bytecode_compiler = BytecodeCompiler::new();
-        let jit = BytecodeJIT::new();
-        let editor = DefaultEditor::new()?;
+        let editor = DefaultEditor::new()
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
 
-        // Create a global environment (empty for now)
+        // Create a global environment (empty for now) 
+        // Note: This will be handled by individual tasks now
         let global_env_ptr = Environment::from_values(&[], None);
         
         // Register the global environment as a global root
         let global_env_var = Var::environment(global_env_ptr);
         register_var_as_root(global_env_var, true); // true = global root
 
+        // Use a dummy buffer ID for REPL
+        let buffer_id = BufferId::new(0);
+
         Ok(Self {
-            bytecode_compiler,
-            jit,
+            scheduler,
             editor,
+            runtime,
+            buffer_id,
             global_env_ptr,
         })
     }
 
-    /// Evaluate a Lisp expression string and return the result
+    /// Evaluate a Lisp expression string using the scheduler
     pub fn eval(&mut self, input: &str) -> std::result::Result<Var, Box<dyn std::error::Error>> {
-        // Parse the expression
-        let expr = parse_expr_string(input).map_err(|e| e as Box<dyn std::error::Error>)?;
-
-        // Compile to bytecode
-        let function = self.bytecode_compiler.compile_expr(&expr).map_err(|e| {
-            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-                as Box<dyn std::error::Error>
-        })?;
-
-        // JIT compile bytecode to machine code with lambda registry and recursive call info
-        let recursive_calls = self.bytecode_compiler.get_recursive_calls();
-        let global_symbol_table = self.bytecode_compiler.get_global_symbol_table();
-        let func_ptr = self
-            .jit
-            .compile_function(
-                &function,
-                &self.bytecode_compiler.lambda_registry,
-                recursive_calls,
-                global_symbol_table,
-            )
-            .map_err(|e| {
-                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-                    as Box<dyn std::error::Error>
-            })?;
-
-        // Execute the compiled function with JIT context
-        let result = self.jit.execute_function(func_ptr);
-
-        // NOTE: We don't need to register the result here anymore because
-        // heap objects are now registered immediately when they're allocated
-        // in Var::string(), Var::tuple(), etc. This prevents double registration.
-
-        // Return result
-        Ok(result)
+        // Use the scheduler to evaluate the code asynchronously
+        let scheduler = self.scheduler.clone();
+        let buffer_id = self.buffer_id;
+        let code = input.to_string();
+        
+        // Block on the async evaluation
+        self.runtime.block_on(async move {
+            scheduler.eval_async(buffer_id, code).await
+                .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)) as Box<dyn std::error::Error>)
+        })
+    }
+    
+    /// Evaluate with timeout support (useful for preventing infinite loops)
+    pub fn eval_with_timeout(&mut self, input: &str, timeout_secs: u64) -> std::result::Result<Var, Box<dyn std::error::Error>> {
+        let scheduler = self.scheduler.clone();
+        let buffer_id = self.buffer_id;
+        let code = input.to_string();
+        
+        // Block on the async evaluation with timeout
+        self.runtime.block_on(async move {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(timeout_secs),
+                scheduler.eval_async(buffer_id, code)
+            ).await {
+                Ok(result) => result.map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)) as Box<dyn std::error::Error>),
+                Err(_) => Err(Box::new(std::io::Error::new(std::io::ErrorKind::TimedOut, "Evaluation timed out")) as Box<dyn std::error::Error>),
+            }
+        })
+    }
+    
+    /// Shutdown the scheduler and runtime
+    pub async fn shutdown(&self) -> Result<(), String> {
+        self.scheduler.shutdown().await
     }
 
     /// Format a Var for display in the REPL
@@ -179,6 +190,26 @@ impl Repl {
                         continue;
                     }
 
+                    if line == ":timeout" {
+                        println!("Testing timeout support (will timeout in 5 seconds)...");
+                        println!("Evaluating: (loop)  ; This should timeout");
+                        match self.eval_with_timeout("(loop)", 5) {
+                            Ok(result) => println!("Result: {}", self.format_result(&result)),
+                            Err(e) => println!("Error (expected): {}", e),
+                        }
+                        continue;
+                    }
+
+                    if line == ":scheduler" {
+                        println!("ROL Scheduler Status:");
+                        println!("  - Running with {} worker threads", 
+                                std::thread::available_parallelism().unwrap_or(std::num::NonZeroUsize::new(2).unwrap()).get().min(4));
+                        println!("  - Each evaluation runs as an isolated green thread");
+                        println!("  - Automatic timeout protection enabled");
+                        println!("  - Ready for async external calls");
+                        continue;
+                    }
+
                     // Add to history
                     self.editor.add_history_entry(line)?;
 
@@ -248,11 +279,15 @@ impl Repl {
         println!("Commands:");
         println!("  help, :help           ; show this help");
         println!("  quit, exit, :q        ; exit the REPL");
+        println!("  :scheduler            ; show scheduler status");
+        println!("  :timeout              ; test timeout protection");
         println!("  Ctrl+C                ; interrupt current input");
         println!("  Ctrl+D                ; exit the REPL");
         println!();
         println!("Features:");
         println!("  • JIT compilation to native machine code");
+        println!("  • Green thread scheduler with cooperative multitasking");
+        println!("  • Automatic timeout protection (30s default)");
         println!("  • Smart type coercion (int + int = int, mixed → float)");
         println!("  • Lexical scoping with environment chains");
         println!("  • Proper Lisp truthiness (0, 0.0, false are falsy)");
@@ -271,9 +306,18 @@ impl Drop for Repl {
 }
 
 /// Create and run a REPL
-pub fn start_repl() -> std::result::Result<(), ReadlineError> {
+pub fn start_repl() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut repl = Repl::new()?;
-    repl.run()
+    let result = repl.run();
+    
+    // Shutdown the scheduler when REPL exits
+    repl.runtime.block_on(async {
+        if let Err(e) = repl.shutdown().await {
+            eprintln!("Warning: Failed to shutdown scheduler: {}", e);
+        }
+    });
+    
+    result.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
 }
 
 #[cfg(test)]

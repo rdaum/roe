@@ -40,6 +40,10 @@ pub const POINTER_TAG_MASK: u64 = 0xF000000000000000;
 
 pub const SYMBOL_TAG: u64 = 0x0009000000000000;
 
+// Special signal values for scheduler integration
+pub const YIELD_SIGNAL: u64 = 0xFFFFFFFFFFFFFFFA; // Special value indicating task should yield
+pub const EXTERNAL_CALL_SIGNAL: u64 = 0xFFFFFFFFFFFFFFFB; // Special value indicating external call
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Var(ValueUnion);

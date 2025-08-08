@@ -5,6 +5,7 @@ mod compiler;
 mod environment;
 mod gc;
 mod heap;
+mod heap_ptr;
 mod integration_tests;
 mod jit;
 mod lexer;
@@ -12,6 +13,7 @@ mod mmtk_binding;
 mod parser;
 mod protocol;
 mod repl;
+mod scheduler;
 mod symbol;
 mod var;
 
