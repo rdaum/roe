@@ -29,6 +29,7 @@ use roe_core::Editor;
 use std::sync::Arc;
 use text::TextRenderer;
 use vello::kurbo::{Affine, Rect};
+use vello::peniko::Color;
 use vello::util::{RenderContext, RenderSurface};
 use vello::wgpu;
 use vello::{AaConfig, RenderParams, RendererOptions, Scene};
@@ -37,11 +38,14 @@ use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::ModifiersState;
-use winit::window::{Window, WindowId};
+use winit::window::{CursorIcon, Window, WindowId};
 
 /// Default window dimensions
 const DEFAULT_WIDTH: u32 = 1200;
 const DEFAULT_HEIGHT: u32 = 800;
+
+/// Scrollbar width in logical pixels
+const SCROLLBAR_WIDTH: f64 = 14.0;
 
 /// Application state for the Vello renderer
 pub struct RoeVelloApp<'a> {
@@ -67,6 +71,12 @@ pub struct RoeVelloApp<'a> {
     cursor_position: Option<(f64, f64)>,
     /// Whether mouse is being dragged for selection
     mouse_dragging: bool,
+    /// Position where mouse drag started (to set mark on first movement)
+    drag_start_cursor: Option<usize>,
+    /// Whether vertical scrollbar is being dragged
+    scrollbar_dragging: Option<roe_core::WindowId>,
+    /// Whether horizontal scrollbar is being dragged
+    hscrollbar_dragging: Option<roe_core::WindowId>,
 }
 
 struct RenderState<'s> {
@@ -95,6 +105,9 @@ impl<'a> RoeVelloApp<'a> {
             modifiers: ModifiersState::empty(),
             cursor_position: None,
             mouse_dragging: false,
+            drag_start_cursor: None,
+            scrollbar_dragging: None,
+            hscrollbar_dragging: None,
         }
     }
 
@@ -108,7 +121,7 @@ impl<'a> RoeVelloApp<'a> {
 
     fn render(&mut self) {
         // Extract surface info first to avoid borrow conflicts
-        let (width, height, dev_id, format) = {
+        let (width, height, dev_id, format, scale_factor) = {
             let Some(ref state) = self.state else {
                 return;
             };
@@ -117,21 +130,33 @@ impl<'a> RoeVelloApp<'a> {
                 state.surface.config.height,
                 state.surface.dev_id,
                 state.surface.format,
+                state.window.scale_factor(),
             )
         };
+
+        // Convert to logical dimensions for layout calculations
+        let logical_width = (width as f64 / scale_factor) as u32;
+        let logical_height = (height as f64 / scale_factor) as u32;
 
         // Get dimensions from text renderer
         let char_width = self.text_renderer.char_width();
         let line_height = self.text_renderer.line_height();
 
-        // Update editor frame dimensions
-        let cols = (width as f32 / char_width).floor() as u16;
-        let lines = (height as f32 / line_height).floor() as u16;
+        // Update editor frame dimensions (using logical dimensions)
+        let cols = (logical_width as f32 / char_width).floor() as u16;
+        let lines = (logical_height as f32 / line_height).floor() as u16;
         self.editor.handle_resize(cols.max(1), lines.saturating_sub(1).max(1)); // -1 for echo area
 
-        // Build the scene
+        // Build the scene in logical coordinates, then scale for physical rendering
         self.scene.reset();
-        self.build_scene(width, height);
+        self.build_scene(logical_width, logical_height);
+
+        // Apply scale factor transform to the scene
+        if scale_factor != 1.0 {
+            let mut scaled_scene = Scene::new();
+            scaled_scene.append(&self.scene, Some(Affine::scale(scale_factor)));
+            self.scene = scaled_scene;
+        }
 
         // Now get the surface texture
         let Some(ref mut state) = self.state else {
@@ -283,9 +308,28 @@ impl<'a> RoeVelloApp<'a> {
         let buffer = &self.editor.buffers[window.active_buffer];
         let content_x = x + char_width;
         let content_y = y + line_height;
-        let content_height = window.height_chars.saturating_sub(2) as usize;
+        // Reserve space for horizontal scrollbar at bottom
+        let content_height = window.height_chars.saturating_sub(3) as usize; // -3 for top border, modeline, h-scrollbar
         let start_line = window.start_line as usize;
-        let content_width = (window.width_chars.saturating_sub(2) as f64 * char_width) as f32;
+        let start_column = window.start_column as usize;
+        // Account for scrollbar width in content area
+        let content_width_px = w - (2.0 * char_width) - SCROLLBAR_WIDTH - 4.0;
+        let content_width = content_width_px as f32;
+        let content_width_chars = (content_width_px / char_width) as usize;
+
+        // Set up clipping region for content area (prevents text overflow)
+        let clip_rect = Rect::new(
+            content_x,
+            content_y,
+            content_x + content_width_px,
+            content_y + (content_height as f64 * line_height),
+        );
+        self.scene.push_layer(
+            vello::peniko::BlendMode::default(),
+            1.0,
+            Affine::IDENTITY,
+            &clip_rect,
+        );
 
         // Get selection region (only for active window)
         let region_bounds = if is_active {
@@ -294,11 +338,18 @@ impl<'a> RoeVelloApp<'a> {
             None
         };
 
-        // Collect lines to render with their buffer positions
+        // Collect lines to render with their buffer positions, track max width
+        let mut max_line_len: usize = 0;
         let lines_to_render: Vec<(usize, usize, String)> = buffer
             .buffer_lines()
             .into_iter()
             .enumerate()
+            .inspect(|(_, text)| {
+                let len = text.trim_end_matches('\n').len();
+                if len > max_line_len {
+                    max_line_len = len;
+                }
+            })
             .filter(|(idx, _)| *idx >= start_line && (*idx - start_line) < content_height)
             .map(|(idx, text)| {
                 let line_start_pos = buffer.to_char_index(0, idx as u16);
@@ -306,7 +357,7 @@ impl<'a> RoeVelloApp<'a> {
             })
             .collect();
 
-        // Draw selection highlights first (behind text)
+        // Draw selection highlights first (behind text), accounting for horizontal scroll
         if let Some((region_start, region_end)) = region_bounds {
             let selection_color = self.theme.selection_color;
             for (visual_line, line_start_pos, line_text) in &lines_to_render {
@@ -326,40 +377,43 @@ impl<'a> RoeVelloApp<'a> {
                         line_text.len()
                     };
 
-                    // Draw selection rectangle
-                    let sel_x = content_x + (sel_start_in_line as f64 * char_width);
-                    let sel_y = content_y + (*visual_line as f64 * line_height);
-                    let sel_width = (sel_end_in_line - sel_start_in_line) as f64 * char_width;
+                    // Adjust for horizontal scroll
+                    let visible_sel_start = sel_start_in_line.saturating_sub(start_column);
+                    let visible_sel_end = sel_end_in_line.saturating_sub(start_column);
 
-                    // Extend selection to end of line if region extends past line content
-                    let sel_width = if region_end > line_end_pos && sel_end_in_line == line_text.len() {
-                        // Extend to fill remaining visible width
-                        (content_width as f64) - (sel_start_in_line as f64 * char_width)
-                    } else {
-                        sel_width
-                    };
+                    if visible_sel_end > 0 && visible_sel_start < content_width_chars {
+                        let sel_x = content_x + (visible_sel_start as f64 * char_width);
+                        let sel_y = content_y + (*visual_line as f64 * line_height);
+                        let sel_width = (visible_sel_end - visible_sel_start) as f64 * char_width;
 
-                    let sel_rect = Rect::new(sel_x, sel_y, sel_x + sel_width, sel_y + line_height);
-                    self.scene.fill(
-                        vello::peniko::Fill::NonZero,
-                        Affine::IDENTITY,
-                        selection_color,
-                        None,
-                        &sel_rect,
-                    );
+                        let sel_rect = Rect::new(sel_x, sel_y, sel_x + sel_width, sel_y + line_height);
+                        self.scene.fill(
+                            vello::peniko::Fill::NonZero,
+                            Affine::IDENTITY,
+                            selection_color,
+                            None,
+                            &sel_rect,
+                        );
+                    }
                 }
             }
         }
 
-        // Render each line of text
+        // Render each line of text with horizontal scroll offset
         let fg_color = self.theme.fg_color;
         for (visual_line, _line_start_pos, line_text) in lines_to_render {
+            // Apply horizontal scroll - skip start_column characters
+            let visible_text: String = line_text.chars().skip(start_column).collect();
+            if visible_text.is_empty() {
+                continue;
+            }
+
             let text_x = content_x as f32;
             let text_y = content_y as f32 + (visual_line as f32) * line_height as f32;
 
             self.text_renderer.render_line(
                 &mut self.scene,
-                &line_text,
+                &visible_text,
                 text_x,
                 text_y,
                 fg_color,
@@ -367,7 +421,35 @@ impl<'a> RoeVelloApp<'a> {
             );
         }
 
-        // Draw modeline text
+        // Draw cursor (inside clipping region), accounting for horizontal scroll
+        if is_active {
+            let (col, line) = buffer.to_column_line(window.cursor);
+            let line = line as usize;
+            let col = col as usize;
+            if line >= start_line {
+                let cursor_visual_line = line - start_line;
+                // Check if cursor is horizontally visible
+                if cursor_visual_line < content_height && col >= start_column && col < start_column + content_width_chars {
+                    let visual_col = col - start_column;
+                    let cursor_x = content_x + (visual_col as f64 * char_width);
+                    let cursor_y = content_y + (cursor_visual_line as f64) * line_height;
+
+                    let cursor_rect = Rect::new(cursor_x, cursor_y, cursor_x + 2.0, cursor_y + line_height);
+                    self.scene.fill(
+                        vello::peniko::Fill::NonZero,
+                        Affine::IDENTITY,
+                        self.theme.cursor_color,
+                        None,
+                        &cursor_rect,
+                    );
+                }
+            }
+        }
+
+        // Pop the clipping layer (content area done)
+        self.scene.pop_layer();
+
+        // Draw modeline text (outside clip)
         let buffer_name = buffer.object();
         let (col, line) = buffer.to_column_line(window.cursor);
         let modeline_text = if is_active {
@@ -385,27 +467,102 @@ impl<'a> RoeVelloApp<'a> {
             Some(content_width),
         );
 
-        // Draw cursor
-        if is_active {
-            let (col, line) = buffer.to_column_line(window.cursor);
-            let line = line as usize;
-            let col = col as usize;
-            if line >= start_line {
-                let cursor_visual_line = line - start_line;
-                if cursor_visual_line < content_height {
-                    let cursor_x = content_x + (col as f64 * char_width);
-                    let cursor_y = content_y + (cursor_visual_line as f64) * line_height;
+        // Draw scrollbar
+        let total_lines = buffer.buffer_len_lines().max(1);
+        let scrollbar_x = x + w - SCROLLBAR_WIDTH - 2.0; // Inside right border
+        let scrollbar_top = y + 2.0; // Below top border
+        let scrollbar_height = h - line_height - 4.0; // Above modeline
 
-                    let cursor_rect = Rect::new(cursor_x, cursor_y, cursor_x + 2.0, cursor_y + line_height);
-                    self.scene.fill(
-                        vello::peniko::Fill::NonZero,
-                        Affine::IDENTITY,
-                        self.theme.cursor_color,
-                        None,
-                        &cursor_rect,
-                    );
-                }
-            }
+        // Draw scrollbar track (subtle background)
+        let track_rect = Rect::new(
+            scrollbar_x,
+            scrollbar_top,
+            scrollbar_x + SCROLLBAR_WIDTH,
+            scrollbar_top + scrollbar_height,
+        );
+        self.scene.fill(
+            vello::peniko::Fill::NonZero,
+            Affine::IDENTITY,
+            Color::rgba8(0x40, 0x40, 0x40, 0x80),
+            None,
+            &track_rect,
+        );
+
+        // Calculate thumb position and size
+        let visible_ratio = (content_height as f64 / total_lines as f64).min(1.0);
+        let thumb_height = (scrollbar_height * visible_ratio).max(20.0); // Minimum thumb size
+        let scroll_ratio = if total_lines > content_height {
+            start_line as f64 / (total_lines - content_height) as f64
+        } else {
+            0.0
+        };
+        let thumb_y = scrollbar_top + scroll_ratio * (scrollbar_height - thumb_height);
+
+        // Draw thumb
+        let thumb_rect = Rect::new(
+            scrollbar_x + 2.0,
+            thumb_y,
+            scrollbar_x + SCROLLBAR_WIDTH - 2.0,
+            thumb_y + thumb_height,
+        );
+        let thumb_color = if is_active {
+            Color::rgba8(0x80, 0x80, 0x80, 0xC0)
+        } else {
+            Color::rgba8(0x60, 0x60, 0x60, 0xA0)
+        };
+        self.scene.fill(
+            vello::peniko::Fill::NonZero,
+            Affine::IDENTITY,
+            thumb_color,
+            None,
+            &thumb_rect,
+        );
+
+        // Draw horizontal scrollbar (only if content exceeds visible width)
+        if max_line_len > content_width_chars {
+            let hscroll_y = y + h - line_height - SCROLLBAR_WIDTH - 2.0; // Above modeline
+            let hscroll_x = x + 2.0; // After left border
+            let hscroll_width = w - SCROLLBAR_WIDTH - 6.0; // Before vertical scrollbar
+
+            // Draw horizontal scrollbar track
+            let htrack_rect = Rect::new(
+                hscroll_x,
+                hscroll_y,
+                hscroll_x + hscroll_width,
+                hscroll_y + SCROLLBAR_WIDTH,
+            );
+            self.scene.fill(
+                vello::peniko::Fill::NonZero,
+                Affine::IDENTITY,
+                Color::rgba8(0x40, 0x40, 0x40, 0x80),
+                None,
+                &htrack_rect,
+            );
+
+            // Calculate horizontal thumb position and size
+            let h_visible_ratio = (content_width_chars as f64 / max_line_len as f64).min(1.0);
+            let hthumb_width = (hscroll_width * h_visible_ratio).max(20.0);
+            let h_scroll_ratio = if max_line_len > content_width_chars {
+                start_column as f64 / (max_line_len - content_width_chars) as f64
+            } else {
+                0.0
+            };
+            let hthumb_x = hscroll_x + h_scroll_ratio * (hscroll_width - hthumb_width);
+
+            // Draw horizontal thumb
+            let hthumb_rect = Rect::new(
+                hthumb_x,
+                hscroll_y + 2.0,
+                hthumb_x + hthumb_width,
+                hscroll_y + SCROLLBAR_WIDTH - 2.0,
+            );
+            self.scene.fill(
+                vello::peniko::Fill::NonZero,
+                Affine::IDENTITY,
+                thumb_color,
+                None,
+                &hthumb_rect,
+            );
         }
     }
 
@@ -484,9 +641,9 @@ impl<'a> RoeVelloApp<'a> {
         let relative_x = grid_x.saturating_sub(window.x + 1);
         let relative_y = grid_y.saturating_sub(window.y + 1);
 
-        // Convert to buffer position
+        // Convert to buffer position (account for scroll offsets)
         let buffer_line = relative_y as usize + window.start_line as usize;
-        let buffer_col = relative_x as usize;
+        let buffer_col = relative_x as usize + window.start_column as usize;
 
         // Clamp line to valid range
         let total_lines = buffer.buffer_len_lines();
@@ -514,8 +671,8 @@ impl<'a> RoeVelloApp<'a> {
         let window = self.editor.windows.get_mut(window_id).unwrap();
         window.cursor = clamped_cursor;
 
-        // Set mark at cursor position for potential drag selection
-        buffer.set_mark(clamped_cursor);
+        // Clear any existing mark (simple click shouldn't start selection)
+        buffer.clear_mark();
     }
 
     /// Handle mouse drag to update selection
@@ -536,9 +693,9 @@ impl<'a> RoeVelloApp<'a> {
         let relative_x = grid_x.saturating_sub(window.x + 1);
         let relative_y = grid_y.saturating_sub(window.y + 1);
 
-        // Convert to buffer position
+        // Convert to buffer position (account for scroll offsets)
         let buffer_line = relative_y as usize + window.start_line as usize;
-        let buffer_col = relative_x as usize;
+        let buffer_col = relative_x as usize + window.start_column as usize;
 
         // Clamp line to valid range
         let total_lines = buffer.buffer_len_lines();
@@ -567,7 +724,12 @@ impl<'a> RoeVelloApp<'a> {
             new_cursor.min(buffer_len - 1)
         };
 
-        // Update cursor in window (mark stays where it was set on mouse down)
+        // On first drag movement, set the mark at the starting position
+        if let Some(start_cursor) = self.drag_start_cursor.take() {
+            buffer.set_mark(start_cursor);
+        }
+
+        // Update cursor in window
         let window = self.editor.windows.get_mut(window_id).unwrap();
         window.cursor = clamped_cursor;
     }
@@ -586,6 +748,179 @@ impl<'a> RoeVelloApp<'a> {
             }
         }
         None
+    }
+
+    /// Check if a pixel position is in a window's scrollbar, returns (window_id, relative_y_ratio)
+    fn check_scrollbar_hit(&self, px: f64, py: f64) -> Option<(roe_core::WindowId, f64)> {
+        let char_width = self.text_renderer.char_width() as f64;
+        let line_height = self.text_renderer.line_height() as f64;
+
+        for (window_id, window) in &self.editor.windows {
+            let x = window.x as f64 * char_width;
+            let y = window.y as f64 * line_height;
+            let w = window.width_chars as f64 * char_width;
+            let h = window.height_chars as f64 * line_height;
+
+            let scrollbar_x = x + w - SCROLLBAR_WIDTH - 2.0;
+            let scrollbar_top = y + 2.0;
+            let scrollbar_height = h - line_height - 4.0;
+
+            // Check if position is in scrollbar area
+            if px >= scrollbar_x
+                && px <= scrollbar_x + SCROLLBAR_WIDTH
+                && py >= scrollbar_top
+                && py <= scrollbar_top + scrollbar_height
+            {
+                // Return ratio of position within scrollbar
+                let ratio = (py - scrollbar_top) / scrollbar_height;
+                return Some((window_id, ratio.clamp(0.0, 1.0)));
+            }
+        }
+        None
+    }
+
+    /// Handle scrollbar click - scroll to position
+    fn handle_scrollbar_click(&mut self, window_id: roe_core::WindowId, ratio: f64) {
+        let window = &self.editor.windows[window_id];
+        let buffer = &self.editor.buffers[window.active_buffer];
+        let total_lines = buffer.buffer_len_lines();
+        let content_height = window.height_chars.saturating_sub(2) as usize;
+
+        if total_lines <= content_height {
+            return; // No scrolling needed
+        }
+
+        // Calculate new start line based on click ratio
+        let max_start = total_lines.saturating_sub(content_height);
+        let new_start = ((max_start as f64) * ratio).round() as usize;
+
+        let window = self.editor.windows.get_mut(window_id).unwrap();
+        window.start_line = new_start as u16;
+    }
+
+    /// Handle scrollbar drag
+    fn handle_scrollbar_drag(&mut self, py: f64) {
+        let Some(window_id) = self.scrollbar_dragging else {
+            return;
+        };
+
+        let line_height = self.text_renderer.line_height() as f64;
+
+        let window = &self.editor.windows[window_id];
+        let y = window.y as f64 * line_height;
+        let h = window.height_chars as f64 * line_height;
+
+        let scrollbar_top = y + 2.0;
+        let scrollbar_height = h - line_height - 4.0;
+
+        // Calculate ratio from pixel position
+        let ratio = ((py - scrollbar_top) / scrollbar_height).clamp(0.0, 1.0);
+
+        // Scroll to that position
+        let buffer = &self.editor.buffers[window.active_buffer];
+        let total_lines = buffer.buffer_len_lines();
+        let content_height = window.height_chars.saturating_sub(2) as usize;
+
+        if total_lines <= content_height {
+            return;
+        }
+
+        let max_start = total_lines.saturating_sub(content_height);
+        let new_start = ((max_start as f64) * ratio).round() as usize;
+
+        let window = self.editor.windows.get_mut(window_id).unwrap();
+        window.start_line = new_start as u16;
+    }
+
+    /// Check if a pixel position is in a window's horizontal scrollbar
+    fn check_hscrollbar_hit(&self, px: f64, py: f64) -> Option<(roe_core::WindowId, f64)> {
+        let char_width = self.text_renderer.char_width() as f64;
+        let line_height = self.text_renderer.line_height() as f64;
+
+        for (window_id, window) in &self.editor.windows {
+            let x = window.x as f64 * char_width;
+            let y = window.y as f64 * line_height;
+            let w = window.width_chars as f64 * char_width;
+            let h = window.height_chars as f64 * line_height;
+
+            let hscroll_y = y + h - line_height - SCROLLBAR_WIDTH - 2.0;
+            let hscroll_x = x + 2.0;
+            let hscroll_width = w - SCROLLBAR_WIDTH - 6.0;
+
+            // Check if position is in horizontal scrollbar area
+            if px >= hscroll_x
+                && px <= hscroll_x + hscroll_width
+                && py >= hscroll_y
+                && py <= hscroll_y + SCROLLBAR_WIDTH
+            {
+                let ratio = (px - hscroll_x) / hscroll_width;
+                return Some((window_id, ratio.clamp(0.0, 1.0)));
+            }
+        }
+        None
+    }
+
+    /// Get max line length for a buffer
+    fn get_max_line_len(&self, window_id: roe_core::WindowId) -> usize {
+        let window = &self.editor.windows[window_id];
+        let buffer = &self.editor.buffers[window.active_buffer];
+        buffer
+            .buffer_lines()
+            .into_iter()
+            .map(|line| line.trim_end_matches('\n').len())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Handle horizontal scrollbar click
+    fn handle_hscrollbar_click(&mut self, window_id: roe_core::WindowId, ratio: f64) {
+        let char_width = self.text_renderer.char_width() as f64;
+        let window = &self.editor.windows[window_id];
+        let w = window.width_chars as f64 * char_width;
+        let content_width_px = w - (2.0 * char_width) - SCROLLBAR_WIDTH - 4.0;
+        let content_width_chars = (content_width_px / char_width) as usize;
+
+        let max_line_len = self.get_max_line_len(window_id);
+        if max_line_len <= content_width_chars {
+            return; // No horizontal scrolling needed
+        }
+
+        let max_start = max_line_len.saturating_sub(content_width_chars);
+        let new_start = ((max_start as f64) * ratio).round() as usize;
+
+        let window = self.editor.windows.get_mut(window_id).unwrap();
+        window.start_column = new_start as u16;
+    }
+
+    /// Handle horizontal scrollbar drag
+    fn handle_hscrollbar_drag(&mut self, px: f64) {
+        let Some(window_id) = self.hscrollbar_dragging else {
+            return;
+        };
+
+        let char_width = self.text_renderer.char_width() as f64;
+        let window = &self.editor.windows[window_id];
+        let x = window.x as f64 * char_width;
+        let w = window.width_chars as f64 * char_width;
+
+        let hscroll_x = x + 2.0;
+        let hscroll_width = w - SCROLLBAR_WIDTH - 6.0;
+
+        let ratio = ((px - hscroll_x) / hscroll_width).clamp(0.0, 1.0);
+
+        let content_width_px = w - (2.0 * char_width) - SCROLLBAR_WIDTH - 4.0;
+        let content_width_chars = (content_width_px / char_width) as usize;
+
+        let max_line_len = self.get_max_line_len(window_id);
+        if max_line_len <= content_width_chars {
+            return;
+        }
+
+        let max_start = max_line_len.saturating_sub(content_width_chars);
+        let new_start = ((max_start as f64) * ratio).round() as usize;
+
+        let window = self.editor.windows.get_mut(window_id).unwrap();
+        window.start_column = new_start as u16;
     }
 }
 
@@ -698,13 +1033,51 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.cursor_position = Some((position.x, position.y));
-                // Handle drag selection
-                if self.mouse_dragging {
-                    self.handle_mouse_drag(position.x, position.y);
+                // Convert physical to logical coordinates
+                let scale_factor = self
+                    .state
+                    .as_ref()
+                    .map(|s| s.window.scale_factor())
+                    .unwrap_or(1.0);
+                let logical_x = position.x / scale_factor;
+                let logical_y = position.y / scale_factor;
+
+                self.cursor_position = Some((logical_x, logical_y));
+
+                // Handle vertical scrollbar dragging
+                if self.scrollbar_dragging.is_some() {
+                    self.handle_scrollbar_drag(logical_y);
                     if let Some(ref render_state) = self.state {
                         render_state.window.request_redraw();
                     }
+                }
+                // Handle horizontal scrollbar dragging
+                else if self.hscrollbar_dragging.is_some() {
+                    self.handle_hscrollbar_drag(logical_x);
+                    if let Some(ref render_state) = self.state {
+                        render_state.window.request_redraw();
+                    }
+                }
+                // Handle text selection drag
+                else if self.mouse_dragging {
+                    self.handle_mouse_drag(logical_x, logical_y);
+                    if let Some(ref render_state) = self.state {
+                        render_state.window.request_redraw();
+                    }
+                }
+
+                // Update cursor icon based on hover state
+                if let Some(ref state) = self.state {
+                    let cursor = if self.scrollbar_dragging.is_some() || self.hscrollbar_dragging.is_some() {
+                        CursorIcon::Grabbing
+                    } else if self.check_scrollbar_hit(logical_x, logical_y).is_some()
+                        || self.check_hscrollbar_hit(logical_x, logical_y).is_some()
+                    {
+                        CursorIcon::Grab
+                    } else {
+                        CursorIcon::Text
+                    };
+                    state.window.set_cursor(cursor);
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
@@ -712,8 +1085,29 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
                     match state {
                         ElementState::Pressed => {
                             if let Some((x, y)) = self.cursor_position {
-                                pollster::block_on(self.handle_mouse_click(x, y));
-                                self.mouse_dragging = true;
+                                // Check if click is on vertical scrollbar first
+                                if let Some((window_id, ratio)) = self.check_scrollbar_hit(x, y) {
+                                    self.handle_scrollbar_click(window_id, ratio);
+                                    self.scrollbar_dragging = Some(window_id);
+                                    if let Some(ref state) = self.state {
+                                        state.window.set_cursor(CursorIcon::Grabbing);
+                                    }
+                                }
+                                // Check horizontal scrollbar
+                                else if let Some((window_id, ratio)) = self.check_hscrollbar_hit(x, y) {
+                                    self.handle_hscrollbar_click(window_id, ratio);
+                                    self.hscrollbar_dragging = Some(window_id);
+                                    if let Some(ref state) = self.state {
+                                        state.window.set_cursor(CursorIcon::Grabbing);
+                                    }
+                                } else {
+                                    // Normal text click
+                                    pollster::block_on(self.handle_mouse_click(x, y));
+                                    // Save cursor position for potential drag selection
+                                    let cursor = self.editor.windows[self.editor.active_window].cursor;
+                                    self.drag_start_cursor = Some(cursor);
+                                    self.mouse_dragging = true;
+                                }
                                 if let Some(ref render_state) = self.state {
                                     render_state.window.request_redraw();
                                 }
@@ -721,6 +1115,9 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
                         }
                         ElementState::Released => {
                             self.mouse_dragging = false;
+                            self.drag_start_cursor = None;
+                            self.scrollbar_dragging = None;
+                            self.hscrollbar_dragging = None;
                         }
                     }
                 }

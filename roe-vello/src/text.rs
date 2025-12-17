@@ -136,7 +136,7 @@ impl TextRenderer {
         x: f32,
         y: f32,
         color: Color,
-        max_width: Option<f32>,
+        _max_width: Option<f32>, // Reserved for future wrapping support
     ) {
         if text.is_empty() {
             return;
@@ -165,10 +165,10 @@ impl TextRenderer {
 
         let mut layout: Layout<Color> = builder.build(text);
 
-        // Break lines and align
-        let width = max_width.unwrap_or(f32::MAX);
-        layout.break_all_lines(Some(width));
-        layout.align(Some(width), Alignment::Start);
+        // Don't wrap lines - let clipping handle overflow
+        // For proper wrapping we'd need to pre-calculate visual line counts
+        layout.break_all_lines(None);
+        layout.align(None, Alignment::Start);
 
         // Render glyphs
         self.render_layout(scene, &layout, x, y);

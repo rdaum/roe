@@ -87,6 +87,8 @@ pub struct Window {
     pub active_buffer: BufferId,
     /// What line is the top left corner of the window in the buffer at?
     pub start_line: u16,
+    /// What column is the left edge of the window at? (for horizontal scrolling)
+    pub start_column: u16,
     /// Cursor offset
     /// The position of the cursor inside the buffer for this window.
     /// The actual physical cursor position on the screen is calculated from this and the window's
@@ -615,6 +617,7 @@ impl Editor {
             height_chars: height,
             active_buffer: command_buffer_id,
             start_line: 0,
+            start_column: 0,
             cursor: 0, // Start at beginning
             window_type: WindowType::Command {
                 position,
@@ -1463,8 +1466,9 @@ impl Editor {
 
                     // Auto-scroll to keep cursor visible
                     let content_height = window.height_chars.saturating_sub(3); // Account for border + modeline
+                    let content_width = window.width_chars.saturating_sub(4); // Account for borders + scrollbar
                     let needs_redraw =
-                        Self::ensure_cursor_visible_static(window, line, content_height);
+                        Self::ensure_cursor_visible_static(window, col, line, content_width, content_height);
 
                     let mut actions = vec![ChromeAction::CursorMove(
                         window.absolute_cursor_position(col, line),
@@ -2351,11 +2355,15 @@ impl Editor {
     /// Returns true if scrolling occurred (requiring a redraw).
     fn ensure_cursor_visible_static(
         window: &mut Window,
+        cursor_col: u16,
         cursor_line: u16,
+        content_width: u16,
         content_height: u16,
     ) -> bool {
         let old_start_line = window.start_line;
+        let old_start_column = window.start_column;
 
+        // Vertical scrolling
         // Check if cursor is below the visible area
         if cursor_line >= window.start_line + content_height {
             // Cursor is below visible area - scroll down
@@ -2367,8 +2375,20 @@ impl Editor {
             window.start_line = cursor_line;
         }
 
-        // Return true if we scrolled (start_line changed)
-        old_start_line != window.start_line
+        // Horizontal scrolling
+        // Check if cursor is past the right edge of visible area
+        if cursor_col >= window.start_column + content_width {
+            // Cursor is past right edge - scroll right
+            window.start_column = cursor_col.saturating_sub(content_width.saturating_sub(1));
+        }
+        // Check if cursor is before the left edge of visible area
+        else if cursor_col < window.start_column {
+            // Cursor is before left edge - scroll left
+            window.start_column = cursor_col;
+        }
+
+        // Return true if we scrolled (either axis changed)
+        old_start_line != window.start_line || old_start_column != window.start_column
     }
 
     /// Yank (paste) from kill-ring
@@ -2684,6 +2704,7 @@ mod tests {
             height_chars: 22,
             active_buffer: scratch_buffer_id,
             start_line: 0,
+            start_column: 0,
             cursor: 0,
             window_type: WindowType::Normal,
         };

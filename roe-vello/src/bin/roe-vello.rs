@@ -245,6 +245,7 @@ async fn create_editor(config: EditorConfig) -> Editor {
         height_chars: DEFAULT_LINES,
         active_buffer,
         start_line: 0,
+        start_column: 0,
         cursor: 0,
         window_type: editor::WindowType::Normal,
     };

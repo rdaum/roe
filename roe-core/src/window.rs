@@ -47,6 +47,7 @@ mod tests {
             height_chars: 22,
             active_buffer: BufferId::default(),
             start_line: 0,
+            start_column: 0,
             cursor: 0,
             window_type: WindowType::Normal,
         }
