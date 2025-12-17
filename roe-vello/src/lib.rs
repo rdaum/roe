@@ -65,6 +65,8 @@ pub struct RoeVelloApp<'a> {
     modifiers: ModifiersState,
     /// Current cursor position in pixels
     cursor_position: Option<(f64, f64)>,
+    /// Whether mouse is being dragged for selection
+    mouse_dragging: bool,
 }
 
 struct RenderState<'s> {
@@ -92,6 +94,7 @@ impl<'a> RoeVelloApp<'a> {
             quit_requested: false,
             modifiers: ModifiersState::empty(),
             cursor_position: None,
+            mouse_dragging: false,
         }
     }
 
@@ -510,6 +513,63 @@ impl<'a> RoeVelloApp<'a> {
         // Update cursor in window
         let window = self.editor.windows.get_mut(window_id).unwrap();
         window.cursor = clamped_cursor;
+
+        // Set mark at cursor position for potential drag selection
+        buffer.set_mark(clamped_cursor);
+    }
+
+    /// Handle mouse drag to update selection
+    fn handle_mouse_drag(&mut self, x: f64, y: f64) {
+        let char_width = self.text_renderer.char_width() as f64;
+        let line_height = self.text_renderer.line_height() as f64;
+
+        // Convert pixel position to character grid position
+        let grid_x = (x / char_width) as u16;
+        let grid_y = (y / line_height) as u16;
+
+        // Only update cursor in the active window during drag
+        let window_id = self.editor.active_window;
+        let window = &self.editor.windows[window_id];
+        let buffer = &self.editor.buffers[window.active_buffer];
+
+        // Position relative to window content area (+1 for border)
+        let relative_x = grid_x.saturating_sub(window.x + 1);
+        let relative_y = grid_y.saturating_sub(window.y + 1);
+
+        // Convert to buffer position
+        let buffer_line = relative_y as usize + window.start_line as usize;
+        let buffer_col = relative_x as usize;
+
+        // Clamp line to valid range
+        let total_lines = buffer.buffer_len_lines();
+        if total_lines == 0 {
+            return;
+        }
+        let clamped_line = buffer_line.min(total_lines - 1);
+
+        // Get line length to clamp column
+        let line_text = buffer
+            .buffer_lines()
+            .into_iter()
+            .nth(clamped_line)
+            .unwrap_or_default();
+        let line_len = line_text.trim_end_matches('\n').len();
+        let clamped_col = buffer_col.min(line_len);
+
+        // Get the new cursor position using clamped values
+        let new_cursor = buffer.to_char_index(clamped_col as u16, clamped_line as u16);
+
+        // Final safety clamp to buffer length
+        let buffer_len = buffer.buffer_len_chars();
+        let clamped_cursor = if buffer_len == 0 {
+            0
+        } else {
+            new_cursor.min(buffer_len - 1)
+        };
+
+        // Update cursor in window (mark stays where it was set on mouse down)
+        let window = self.editor.windows.get_mut(window_id).unwrap();
+        window.cursor = clamped_cursor;
     }
 
     /// Find which window contains the given grid position
@@ -639,14 +699,28 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_position = Some((position.x, position.y));
+                // Handle drag selection
+                if self.mouse_dragging {
+                    self.handle_mouse_drag(position.x, position.y);
+                    if let Some(ref render_state) = self.state {
+                        render_state.window.request_redraw();
+                    }
+                }
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                if state == ElementState::Pressed && button == MouseButton::Left {
-                    if let Some((x, y)) = self.cursor_position {
-                        pollster::block_on(self.handle_mouse_click(x, y));
-                        // Request redraw after mouse click
-                        if let Some(ref render_state) = self.state {
-                            render_state.window.request_redraw();
+                if button == MouseButton::Left {
+                    match state {
+                        ElementState::Pressed => {
+                            if let Some((x, y)) = self.cursor_position {
+                                pollster::block_on(self.handle_mouse_click(x, y));
+                                self.mouse_dragging = true;
+                                if let Some(ref render_state) = self.state {
+                                    render_state.window.request_redraw();
+                                }
+                            }
+                        }
+                        ElementState::Released => {
+                            self.mouse_dragging = false;
                         }
                     }
                 }
