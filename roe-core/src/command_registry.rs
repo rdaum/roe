@@ -11,8 +11,10 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
-use crate::editor::{ChromeAction, OpenType};
+use crate::editor::{BufferOperation, ChromeAction, OpenType};
 use crate::{Buffer, BufferId, WindowId};
+use std::future::Future;
+use std::pin::Pin;
 
 // Command name constants
 pub const CMD_COMMAND_MODE: &str = "command-mode";
@@ -36,6 +38,7 @@ pub const CMD_MESSAGES: &str = "messages";
 pub const CMD_SHOW_MESSAGES: &str = "show-messages";
 pub const CMD_KEYBOARD_QUIT: &str = "keyboard-quit";
 pub const CMD_JULIA_REPL: &str = "julia-repl";
+pub const CMD_DUMP_MESSAGES: &str = "dump-messages";
 
 /// Context information passed to commands when they execute
 #[derive(Clone)]
@@ -69,9 +72,11 @@ pub enum CommandCategory {
     Script(String),
 }
 
-/// Handler function type for commands
-pub type CommandHandler =
-    Box<dyn Fn(CommandContext) -> Result<Vec<ChromeAction>, String> + Send + Sync>;
+/// Result type for async command handlers
+pub type CommandResult = Pin<Box<dyn Future<Output = Result<Vec<ChromeAction>, String>> + Send>>;
+
+/// Handler function type for commands (async)
+pub type CommandHandler = Box<dyn Fn(CommandContext) -> CommandResult + Send + Sync>;
 
 /// A single command that can be executed
 pub struct Command {
@@ -102,9 +107,20 @@ impl Command {
     }
 
     /// Execute this command with the given context
-    pub fn execute(&self, context: CommandContext) -> Result<Vec<ChromeAction>, String> {
-        (self.handler)(context)
+    pub async fn execute(&self, context: CommandContext) -> Result<Vec<ChromeAction>, String> {
+        (self.handler)(context).await
     }
+}
+
+/// Helper to create a sync command handler (wraps sync code in async)
+pub fn sync_handler<F>(f: F) -> CommandHandler
+where
+    F: Fn(CommandContext) -> Result<Vec<ChromeAction>, String> + Send + Sync + 'static,
+{
+    Box::new(move |ctx| {
+        let result = f(ctx);
+        Box::pin(async move { result })
+    })
 }
 
 /// Registry of all available commands
@@ -180,21 +196,21 @@ pub fn create_default_registry() -> CommandRegistry {
         CMD_FIND_FILE,
         "Open a file",
         CommandCategory::Global,
-        Box::new(|_context| Ok(vec![ChromeAction::OpenFile(OpenType::New)])),
+        sync_handler(|_context| Ok(vec![ChromeAction::OpenFile(OpenType::New)])),
     ));
 
     registry.register_command(Command::new(
         CMD_SAVE_BUFFER,
         "Save current buffer to file",
         CommandCategory::Global,
-        Box::new(|_context| Ok(vec![ChromeAction::Save])),
+        sync_handler(|_context| Ok(vec![ChromeAction::Save])),
     ));
 
     registry.register_command(Command::new(
         CMD_VISIT_FILE,
         "Visit file, replacing current buffer",
         CommandCategory::Global,
-        Box::new(|_context| Ok(vec![ChromeAction::OpenFile(OpenType::Visit)])),
+        sync_handler(|_context| Ok(vec![ChromeAction::OpenFile(OpenType::Visit)])),
     ));
 
     // Editor lifecycle
@@ -202,21 +218,21 @@ pub fn create_default_registry() -> CommandRegistry {
         CMD_COMMAND_MODE,
         "Open command palette (M-x)",
         CommandCategory::Global,
-        Box::new(|_context| Ok(vec![ChromeAction::CommandMode])),
+        sync_handler(|_context| Ok(vec![ChromeAction::CommandMode])),
     ));
 
     registry.register_command(Command::new(
         CMD_QUIT,
         "Quit the editor",
         CommandCategory::Global,
-        Box::new(|_context| Ok(vec![ChromeAction::Quit])),
+        sync_handler(|_context| Ok(vec![ChromeAction::Quit])),
     ));
 
     registry.register_command(Command::new(
         CMD_EXIT,
         "Exit the editor (alias for quit)",
         CommandCategory::Global,
-        Box::new(|_context| Ok(vec![ChromeAction::Quit])),
+        sync_handler(|_context| Ok(vec![ChromeAction::Quit])),
     ));
 
     // Window management
@@ -224,35 +240,35 @@ pub fn create_default_registry() -> CommandRegistry {
         CMD_SPLIT_HORIZONTAL,
         "Split current window horizontally",
         CommandCategory::Global,
-        Box::new(|_context| Ok(vec![ChromeAction::SplitHorizontal])),
+        sync_handler(|_context| Ok(vec![ChromeAction::SplitHorizontal])),
     ));
 
     registry.register_command(Command::new(
         CMD_SPLIT_VERTICAL,
         "Split current window vertically",
         CommandCategory::Global,
-        Box::new(|_context| Ok(vec![ChromeAction::SplitVertical])),
+        sync_handler(|_context| Ok(vec![ChromeAction::SplitVertical])),
     ));
 
     registry.register_command(Command::new(
         CMD_DELETE_WINDOW,
         "Delete current window",
         CommandCategory::Global,
-        Box::new(|_context| Ok(vec![ChromeAction::DeleteWindow])),
+        sync_handler(|_context| Ok(vec![ChromeAction::DeleteWindow])),
     ));
 
     registry.register_command(Command::new(
         CMD_DELETE_OTHER_WINDOWS,
         "Delete all windows except current",
         CommandCategory::Global,
-        Box::new(|_context| Ok(vec![ChromeAction::DeleteOtherWindows])),
+        sync_handler(|_context| Ok(vec![ChromeAction::DeleteOtherWindows])),
     ));
 
     registry.register_command(Command::new(
         CMD_OTHER_WINDOW,
         "Switch to next window",
         CommandCategory::Global,
-        Box::new(|_context| Ok(vec![ChromeAction::SwitchWindow])),
+        sync_handler(|_context| Ok(vec![ChromeAction::SwitchWindow])),
     ));
 
     // Alternative command names (common aliases)
@@ -260,14 +276,14 @@ pub fn create_default_registry() -> CommandRegistry {
         CMD_SPLIT_BELOW,
         "Split current window horizontally (alias)",
         CommandCategory::Global,
-        Box::new(|_context| Ok(vec![ChromeAction::SplitHorizontal])),
+        sync_handler(|_context| Ok(vec![ChromeAction::SplitHorizontal])),
     ));
 
     registry.register_command(Command::new(
         CMD_SPLIT_RIGHT,
         "Split current window vertically (alias)",
         CommandCategory::Global,
-        Box::new(|_context| Ok(vec![ChromeAction::SplitVertical])),
+        sync_handler(|_context| Ok(vec![ChromeAction::SplitVertical])),
     ));
 
     // Information commands
@@ -275,7 +291,7 @@ pub fn create_default_registry() -> CommandRegistry {
         CMD_DESCRIBE_BUFFER,
         "Show information about current buffer",
         CommandCategory::Global,
-        Box::new(|context| {
+        sync_handler(|context| {
             let buffer_len = context.buffer.buffer_len_chars();
             Ok(vec![ChromeAction::Echo(format!(
                 "Buffer: {} ({}:{}) {} chars",
@@ -288,7 +304,7 @@ pub fn create_default_registry() -> CommandRegistry {
         CMD_DESCRIBE_MODE,
         "Show information about current major mode",
         CommandCategory::Global,
-        Box::new(|_context| {
+        sync_handler(|_context| {
             Ok(vec![ChromeAction::Echo(
                 "Current mode: file-mode".to_string(),
             )])
@@ -300,28 +316,37 @@ pub fn create_default_registry() -> CommandRegistry {
         CMD_SWITCH_BUFFER,
         "Switch to a buffer",
         CommandCategory::Global,
-        Box::new(|_context| Ok(vec![ChromeAction::SwitchBuffer])),
+        sync_handler(|_context| Ok(vec![ChromeAction::SwitchBuffer])),
     ));
 
     registry.register_command(Command::new(
         CMD_KILL_BUFFER,
         "Kill a buffer",
         CommandCategory::Global,
-        Box::new(|_context| Ok(vec![ChromeAction::KillBuffer])),
+        sync_handler(|_context| Ok(vec![ChromeAction::KillBuffer])),
     ));
 
     registry.register_command(Command::new(
         CMD_MESSAGES,
         "Switch to Messages buffer",
         CommandCategory::Global,
-        Box::new(|_context| Ok(vec![ChromeAction::ShowMessages])),
+        sync_handler(|_context| Ok(vec![ChromeAction::ShowMessages])),
     ));
 
     registry.register_command(Command::new(
         CMD_SHOW_MESSAGES,
         "Switch to Messages buffer (alias)",
         CommandCategory::Global,
-        Box::new(|_context| Ok(vec![ChromeAction::ShowMessages])),
+        sync_handler(|_context| Ok(vec![ChromeAction::ShowMessages])),
+    ));
+
+    registry.register_command(Command::new(
+        CMD_DUMP_MESSAGES,
+        "Write Messages buffer to /tmp/roe-messages.txt",
+        CommandCategory::Global,
+        sync_handler(|_context| {
+            Ok(vec![ChromeAction::DumpMessages("/tmp/roe-messages.txt".to_string())])
+        }),
     ));
 
     // Utility commands
@@ -329,7 +354,7 @@ pub fn create_default_registry() -> CommandRegistry {
         CMD_KEYBOARD_QUIT,
         "Cancel current operation",
         CommandCategory::Global,
-        Box::new(|_context| Ok(vec![ChromeAction::Echo("Quit".to_string())])),
+        sync_handler(|_context| Ok(vec![ChromeAction::Echo("Quit".to_string())])),
     ));
 
     // Julia commands
@@ -337,7 +362,7 @@ pub fn create_default_registry() -> CommandRegistry {
         CMD_JULIA_REPL,
         "Open Julia REPL buffer",
         CommandCategory::Global,
-        Box::new(|_context| {
+        sync_handler(|_context| {
             Ok(vec![ChromeAction::NewBufferWithMode {
                 buffer_name: "*Julia REPL*".to_string(),
                 mode_name: "julia-repl".to_string(),
@@ -347,6 +372,107 @@ pub fn create_default_registry() -> CommandRegistry {
     ));
 
     registry
+}
+
+/// Create an async command handler that calls a Julia command
+pub fn julia_handler(
+    runtime: crate::julia_runtime::SharedJuliaRuntime,
+    command_name: String,
+) -> CommandHandler {
+    Box::new(move |context: CommandContext| {
+        let runtime = runtime.clone();
+        let name = command_name.clone();
+        Box::pin(async move {
+            // Get mark position (-1 if not set)
+            let mark_pos = context.buffer.get_mark().map(|m| m as i64).unwrap_or(-1);
+
+            // Convert CommandContext to JuliaCommandContext
+            let julia_context = crate::julia_runtime::JuliaCommandContext {
+                buffer_name: context.buffer_name.clone(),
+                buffer_modified: context.buffer_modified,
+                cursor_pos: context.cursor_pos,
+                current_line: context.current_line,
+                current_column: context.current_column,
+                line_count: context.buffer.buffer_len_lines(),
+                char_count: context.buffer.buffer_len_chars(),
+                mark_pos,
+            };
+
+            // Call the Julia command (pass buffer for direct access)
+            let runtime_guard = runtime.lock().await;
+            match runtime_guard
+                .call_command(&name, julia_context, context.buffer.clone())
+                .await
+            {
+                Ok(result) => convert_julia_result(result),
+                Err(e) => Err(format!("Julia command error: {:?}", e)),
+            }
+        })
+    })
+}
+
+/// Convert JuliaCommandResult to ChromeActions
+fn convert_julia_result(
+    result: crate::julia_runtime::JuliaCommandResult,
+) -> Result<Vec<ChromeAction>, String> {
+    use crate::julia_runtime::{JuliaBufferOp, JuliaCommandResult};
+
+    match result {
+        JuliaCommandResult::Echo(msg) => Ok(vec![ChromeAction::Echo(msg)]),
+        JuliaCommandResult::Error(msg) => Err(msg),
+        JuliaCommandResult::None => Ok(vec![]),
+        JuliaCommandResult::BufferOps(ops) => {
+            let buffer_ops: Vec<BufferOperation> = ops
+                .into_iter()
+                .map(|op| match op {
+                    JuliaBufferOp::Insert { pos, text } => BufferOperation::Insert { pos, text },
+                    JuliaBufferOp::Delete { start, end } => BufferOperation::Delete { start, end },
+                    JuliaBufferOp::Replace { start, end, text } => {
+                        BufferOperation::Replace { start, end, text }
+                    }
+                    JuliaBufferOp::SetCursor(pos) => BufferOperation::SetCursor(pos),
+                    JuliaBufferOp::SetMark(pos) => BufferOperation::SetMark(pos),
+                    JuliaBufferOp::ClearMark => BufferOperation::ClearMark,
+                    JuliaBufferOp::SetContent(content) => BufferOperation::SetContent(content),
+                })
+                .collect();
+            Ok(vec![ChromeAction::BufferOps(buffer_ops)])
+        }
+        JuliaCommandResult::Multi(results) => {
+            let mut actions = Vec::new();
+            for r in results {
+                match convert_julia_result(r) {
+                    Ok(mut a) => actions.append(&mut a),
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(actions)
+        }
+    }
+}
+
+/// Register all Julia commands from the runtime into the registry
+pub async fn register_julia_commands(
+    registry: &mut CommandRegistry,
+    runtime: &crate::julia_runtime::SharedJuliaRuntime,
+) {
+    let runtime_guard = runtime.lock().await;
+    match runtime_guard.list_commands().await {
+        Ok(commands) => {
+            drop(runtime_guard); // Release the lock before registering
+            for (name, description) in commands {
+                registry.register_command(Command::new(
+                    name.clone(),
+                    description,
+                    CommandCategory::Script("julia".to_string()),
+                    julia_handler(runtime.clone(), name),
+                ));
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to list Julia commands: {:?}", e);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -361,7 +487,7 @@ mod tests {
             "test-command",
             "A test command",
             CommandCategory::Global,
-            Box::new(|_| Ok(vec![])),
+            sync_handler(|_| Ok(vec![])),
         ));
 
         assert_eq!(registry.all_commands().len(), 1);
@@ -377,21 +503,21 @@ mod tests {
             "save-buffer",
             "Save buffer",
             CommandCategory::Global,
-            Box::new(|_| Ok(vec![])),
+            sync_handler(|_| Ok(vec![])),
         ));
 
         registry.register_command(Command::new(
             "save-all",
             "Save all",
             CommandCategory::Global,
-            Box::new(|_| Ok(vec![])),
+            sync_handler(|_| Ok(vec![])),
         ));
 
         registry.register_command(Command::new(
             "quit",
             "Quit",
             CommandCategory::Global,
-            Box::new(|_| Ok(vec![])),
+            sync_handler(|_| Ok(vec![])),
         ));
 
         let save_matches = registry.find_commands("save");

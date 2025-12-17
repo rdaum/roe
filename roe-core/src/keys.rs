@@ -113,7 +113,7 @@ pub enum CursorDirection {
     ParagraphBackward,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum Side {
     Left,
     Right,
@@ -121,7 +121,7 @@ pub enum Side {
 
 /// The set of emacs-ish keys we care about, that we map the physical system keycodes to.
 /// Series of these then get mapped to actions.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum LogicalKey {
     Left,
     Right,
@@ -180,7 +180,7 @@ impl LogicalKey {
         s.to_string()
     }
 }
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum KeyModifier {
     Hyper(Side),
     Super(Side),
@@ -248,6 +248,312 @@ impl KeyState {
 }
 
 pub struct DefaultBindings {}
+
+/// Configurable keybindings loaded from Julia
+/// All bindings are defined in Julia - no hardcoded defaults in Rust
+pub struct ConfigurableBindings {
+    /// Map from key sequences to actions
+    bindings: std::collections::HashMap<Vec<LogicalKey>, KeyAction>,
+}
+
+impl ConfigurableBindings {
+    pub fn new() -> Self {
+        Self {
+            bindings: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Load bindings from Julia key sequence strings and action strings
+    /// key_sequence: "C-x C-c", "M-x", "C-p", etc.
+    /// action: "quit" (command name) or ":cursor-up" (direct action)
+    pub fn add_binding(&mut self, key_sequence: &str, action: &str) {
+        if let Some(keys) = Self::parse_key_sequence(key_sequence) {
+            if let Some(key_action) = Self::parse_action(action) {
+                self.bindings.insert(keys, key_action);
+            }
+        }
+    }
+
+    /// Parse a key sequence string like "C-x C-c" into Vec<LogicalKey>
+    /// For chords like "C-x C-c", the result is [Control, 'x', 'c'] (not [Control, 'x', Control, 'c'])
+    /// This matches how the key state machine accumulates chord keys.
+    fn parse_key_sequence(seq: &str) -> Option<Vec<LogicalKey>> {
+        let parts: Vec<&str> = seq.split_whitespace().collect();
+        let mut keys = Vec::new();
+        let mut chord_modifier: Option<LogicalKey> = None;
+
+        for (i, part) in parts.iter().enumerate() {
+            if let Some(parsed_keys) = Self::parse_single_key(part) {
+                if i == 0 {
+                    // First part: include all keys (modifier + base key)
+                    keys.extend(parsed_keys.clone());
+                    // If this part has a modifier, remember it for chord continuation
+                    if parsed_keys.len() > 1 {
+                        if let LogicalKey::Modifier(_) = &parsed_keys[0] {
+                            chord_modifier = Some(parsed_keys[0]);
+                        }
+                    }
+                } else {
+                    // Subsequent parts in a chord
+                    if parsed_keys.len() > 1 {
+                        // This part has a modifier (like C-c in "C-x C-c")
+                        // Check if it's the same modifier as the chord started with
+                        if let LogicalKey::Modifier(_) = &parsed_keys[0] {
+                            if chord_modifier.is_some() {
+                                // Same modifier continuation - only add the base key
+                                keys.extend(parsed_keys.into_iter().skip(1));
+                            } else {
+                                // Different or no chord modifier - add all keys
+                                keys.extend(parsed_keys);
+                            }
+                        } else {
+                            keys.extend(parsed_keys);
+                        }
+                    } else {
+                        // Single key (like 'b' in "C-x b")
+                        keys.extend(parsed_keys);
+                    }
+                }
+            } else {
+                return None; // Invalid key in sequence
+            }
+        }
+
+        if keys.is_empty() {
+            None
+        } else {
+            Some(keys)
+        }
+    }
+
+    /// Parse a single key like "C-x", "M-f", "a", "F5", "Left", "C-S-/"
+    fn parse_single_key(key_str: &str) -> Option<Vec<LogicalKey>> {
+        let mut modifiers = Vec::new();
+        let mut rest = key_str;
+
+        // Parse modifier prefixes (can be combined: C-S-/)
+        loop {
+            if rest.starts_with("C-") {
+                modifiers.push(LogicalKey::Modifier(KeyModifier::Control(Side::Left)));
+                rest = &rest[2..];
+            } else if rest.starts_with("M-") {
+                modifiers.push(LogicalKey::Modifier(KeyModifier::Meta(Side::Left)));
+                rest = &rest[2..];
+            } else if rest.starts_with("S-") {
+                modifiers.push(LogicalKey::Modifier(KeyModifier::Shift(Side::Left)));
+                rest = &rest[2..];
+            } else if rest.starts_with("A-") {
+                modifiers.push(LogicalKey::Modifier(KeyModifier::Alt(Side::Left)));
+                rest = &rest[2..];
+            } else {
+                break;
+            }
+        }
+
+        // Parse the base key
+        let base_key = Self::parse_base_key(rest)?;
+
+        if modifiers.is_empty() {
+            Some(vec![base_key])
+        } else {
+            modifiers.push(base_key);
+            Some(modifiers)
+        }
+    }
+
+    /// Parse a base key like "x", "F5", "Left", "Enter"
+    fn parse_base_key(s: &str) -> Option<LogicalKey> {
+        // Single character
+        if s.len() == 1 {
+            let c = s.chars().next()?;
+            return Some(LogicalKey::AlphaNumeric(c));
+        }
+
+        // Special keys
+        match s.to_lowercase().as_str() {
+            "left" => Some(LogicalKey::Left),
+            "right" => Some(LogicalKey::Right),
+            "up" => Some(LogicalKey::Up),
+            "down" => Some(LogicalKey::Down),
+            "pageup" | "pgup" => Some(LogicalKey::PageUp),
+            "pagedown" | "pgdn" => Some(LogicalKey::PageDown),
+            "home" => Some(LogicalKey::Home),
+            "end" => Some(LogicalKey::End),
+            "enter" | "return" | "ret" => Some(LogicalKey::Enter),
+            "tab" => Some(LogicalKey::Tab),
+            "backspace" | "bs" => Some(LogicalKey::Backspace),
+            "delete" | "del" => Some(LogicalKey::Delete),
+            "escape" | "esc" => Some(LogicalKey::Esc),
+            "insert" | "ins" => Some(LogicalKey::Insert),
+            "space" | "spc" => Some(LogicalKey::AlphaNumeric(' ')),
+            _ => {
+                // Try function keys F1-F12
+                if s.to_lowercase().starts_with('f') {
+                    if let Ok(n) = s[1..].parse::<u8>() {
+                        if (1..=12).contains(&n) {
+                            return Some(LogicalKey::Function(n));
+                        }
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    /// Parse an action string like "quit" (command) or ":cursor-up" (direct action)
+    fn parse_action(action: &str) -> Option<KeyAction> {
+        if let Some(action_name) = action.strip_prefix(':') {
+            // Direct action
+            match action_name {
+                // Cursor movement
+                "cursor-up" => Some(KeyAction::Cursor(CursorDirection::Up)),
+                "cursor-down" => Some(KeyAction::Cursor(CursorDirection::Down)),
+                "cursor-left" => Some(KeyAction::Cursor(CursorDirection::Left)),
+                "cursor-right" => Some(KeyAction::Cursor(CursorDirection::Right)),
+                "cursor-line-start" => Some(KeyAction::Cursor(CursorDirection::LineStart)),
+                "cursor-line-end" => Some(KeyAction::Cursor(CursorDirection::LineEnd)),
+                "cursor-buffer-start" => Some(KeyAction::Cursor(CursorDirection::BufferStart)),
+                "cursor-buffer-end" => Some(KeyAction::Cursor(CursorDirection::BufferEnd)),
+                "cursor-word-forward" => Some(KeyAction::Cursor(CursorDirection::WordForward)),
+                "cursor-word-backward" => Some(KeyAction::Cursor(CursorDirection::WordBackward)),
+                "cursor-page-up" => Some(KeyAction::Cursor(CursorDirection::PageUp)),
+                "cursor-page-down" => Some(KeyAction::Cursor(CursorDirection::PageDown)),
+                "cursor-paragraph-forward" => {
+                    Some(KeyAction::Cursor(CursorDirection::ParagraphForward))
+                }
+                "cursor-paragraph-backward" => {
+                    Some(KeyAction::Cursor(CursorDirection::ParagraphBackward))
+                }
+
+                // Text manipulation
+                "delete" => Some(KeyAction::Delete),
+                "backspace" => Some(KeyAction::Backspace),
+                "enter" => Some(KeyAction::Enter),
+                "tab" => Some(KeyAction::Tab),
+
+                // Kill/yank
+                "kill-line" => Some(KeyAction::KillLine(false)),
+                "kill-whole-line" => Some(KeyAction::KillLine(true)),
+                "kill-region" => Some(KeyAction::KillRegion(true)),
+                "copy-region" => Some(KeyAction::KillRegion(false)),
+                "yank" => Some(KeyAction::Yank(None)),
+
+                // Mark
+                "mark-start" | "set-mark" => Some(KeyAction::MarkStart),
+
+                // Misc
+                "cancel" => Some(KeyAction::Cancel),
+                "escape" => Some(KeyAction::Escape),
+                "undo" => Some(KeyAction::Undo),
+                "redo" => Some(KeyAction::Redo),
+
+                // Chord continuation
+                "chord-next" => Some(KeyAction::ChordNext),
+
+                _ => None,
+            }
+        } else {
+            // Command name
+            Some(KeyAction::Command(action.to_string()))
+        }
+    }
+
+    /// Check if a key sequence is a prefix of any binding (for chord detection)
+    /// Note: keys should already be normalized before calling this
+    pub fn is_prefix(&self, keys: &[LogicalKey]) -> bool {
+        for bound_keys in self.bindings.keys() {
+            if bound_keys.len() > keys.len() && bound_keys.starts_with(keys) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Get the number of bindings (for debugging)
+    pub fn len(&self) -> usize {
+        self.bindings.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bindings.is_empty()
+    }
+}
+
+impl Default for ConfigurableBindings {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ConfigurableBindings {
+    /// Normalize a key to ignore Side differences in modifiers
+    /// This ensures Control(Left) matches Control(Right), etc.
+    fn normalize_key(key: &LogicalKey) -> LogicalKey {
+        match key {
+            LogicalKey::Modifier(KeyModifier::Control(_)) => {
+                LogicalKey::Modifier(KeyModifier::Control(Side::Left))
+            }
+            LogicalKey::Modifier(KeyModifier::Meta(_)) => {
+                LogicalKey::Modifier(KeyModifier::Meta(Side::Left))
+            }
+            LogicalKey::Modifier(KeyModifier::Shift(_)) => {
+                LogicalKey::Modifier(KeyModifier::Shift(Side::Left))
+            }
+            LogicalKey::Modifier(KeyModifier::Alt(_)) => {
+                LogicalKey::Modifier(KeyModifier::Alt(Side::Left))
+            }
+            LogicalKey::Modifier(KeyModifier::Super(_)) => {
+                LogicalKey::Modifier(KeyModifier::Super(Side::Left))
+            }
+            LogicalKey::Modifier(KeyModifier::Hyper(_)) => {
+                LogicalKey::Modifier(KeyModifier::Hyper(Side::Left))
+            }
+            other => *other,
+        }
+    }
+
+    /// Normalize a key sequence for lookup
+    fn normalize_keys(keys: &[LogicalKey]) -> Vec<LogicalKey> {
+        keys.iter().map(Self::normalize_key).collect()
+    }
+}
+
+impl Bindings for ConfigurableBindings {
+    fn keystroke(&self, keys: Vec<LogicalKey>) -> KeyAction {
+        // Normalize keys to ignore Side differences in modifiers
+        let normalized = Self::normalize_keys(&keys);
+
+        // Direct lookup with normalized keys
+        if let Some(action) = self.bindings.get(&normalized) {
+            return action.clone();
+        }
+
+        // Check if this is a prefix of a longer binding (chord in progress)
+        if self.is_prefix(&normalized) {
+            return KeyAction::ChordNext;
+        }
+
+        // Handle single alphanumeric keys as self-insert
+        if keys.len() == 1 {
+            if let LogicalKey::AlphaNumeric(c) = keys[0] {
+                return KeyAction::AlphaNumeric(c);
+            }
+        }
+
+        // Handle Shift+alpha for uppercase
+        if keys.len() == 2 {
+            if let (
+                LogicalKey::Modifier(KeyModifier::Shift(_)),
+                LogicalKey::AlphaNumeric(c),
+            ) = (&keys[0], &keys[1])
+            {
+                return KeyAction::AlphaNumeric(c.to_ascii_uppercase());
+            }
+        }
+
+        KeyAction::Unbound
+    }
+}
 
 impl Bindings for DefaultBindings {
     fn keystroke(&self, keys: Vec<LogicalKey>) -> KeyAction {

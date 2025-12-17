@@ -25,6 +25,7 @@ pub mod keys;
 pub mod kill_ring;
 pub mod mode;
 pub mod renderer;
+pub mod scripted_mode;
 pub mod selection_menu;
 pub mod window;
 
@@ -42,6 +43,6 @@ new_key_type! {
 
 pub use buffer::Buffer;
 pub use editor::{Editor, Frame, Window};
-pub use keys::KeyState;
+pub use keys::{Bindings, ConfigurableBindings, KeyState};
 pub use mode::{FileMode, Mode};
 pub use renderer::Renderer;

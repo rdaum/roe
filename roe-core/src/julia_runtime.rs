@@ -11,14 +11,165 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
-use async_trait::async_trait;
+// jlrs AsyncTask trait requires this specific fn signature, not async fn
+#![allow(clippy::manual_async_fn)]
+
+use crate::buffer::Buffer;
 use jlrs::memory::target::frame::GcFrame;
 use jlrs::prelude::*;
+use jlrs::runtime::handle::async_handle::AsyncHandle;
 use std::collections::HashMap;
+use std::ffi::{c_char, c_longlong, CStr, CString};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use tokio::sync::{mpsc, Mutex};
+
+/// Type alias for a shared Julia runtime
+pub type SharedJuliaRuntime = Arc<Mutex<RoeJuliaRuntime>>;
+
+// ============================================
+// Buffer context for Julia command execution
+// ============================================
+
+/// Storage for the current buffer during Julia command execution
+/// This is set before calling a Julia command and cleared after
+static CURRENT_BUFFER: std::sync::Mutex<Option<Buffer>> = std::sync::Mutex::new(None);
+
+/// Set the current buffer for Julia command execution
+pub fn set_current_buffer(buffer: Buffer) {
+    let mut guard = CURRENT_BUFFER.lock().expect("Buffer lock poisoned");
+    *guard = Some(buffer);
+}
+
+/// Clear the current buffer after Julia command execution
+pub fn clear_current_buffer() {
+    let mut guard = CURRENT_BUFFER.lock().expect("Buffer lock poisoned");
+    *guard = None;
+}
+
+/// Get a clone of the current buffer (for use in extern functions)
+fn get_current_buffer() -> Option<Buffer> {
+    let guard = CURRENT_BUFFER.lock().expect("Buffer lock poisoned");
+    guard.clone()
+}
+
+// ============================================
+// Extern "C" functions callable from Julia
+// ============================================
+
+/// Get the entire buffer content as a string
+/// Returns a C string that Julia must free
+#[no_mangle]
+pub extern "C" fn roe_buffer_content() -> *mut c_char {
+    let Some(buffer) = get_current_buffer() else {
+        return std::ptr::null_mut();
+    };
+    let content = buffer.content();
+    match CString::new(content) {
+        Ok(cstr) => cstr.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Free a string returned by roe_buffer_content
+/// # Safety
+/// The pointer must have been returned by a previous call to a roe_buffer_* function.
+#[no_mangle]
+pub unsafe extern "C" fn roe_free_string(s: *mut c_char) {
+    if !s.is_null() {
+        drop(CString::from_raw(s));
+    }
+}
+
+/// Get a single line from the buffer (0-indexed)
+/// Returns a C string that Julia must free
+#[no_mangle]
+pub extern "C" fn roe_buffer_line(line_idx: c_longlong) -> *mut c_char {
+    let Some(buffer) = get_current_buffer() else {
+        return std::ptr::null_mut();
+    };
+    if line_idx < 0 {
+        return std::ptr::null_mut();
+    }
+    let line = buffer.buffer_line(line_idx as usize);
+    match CString::new(line) {
+        Ok(cstr) => cstr.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Get the number of lines in the buffer
+#[no_mangle]
+pub extern "C" fn roe_buffer_line_count() -> c_longlong {
+    let Some(buffer) = get_current_buffer() else {
+        return 0;
+    };
+    buffer.buffer_len_lines() as c_longlong
+}
+
+/// Get the number of characters in the buffer
+#[no_mangle]
+pub extern "C" fn roe_buffer_char_count() -> c_longlong {
+    let Some(buffer) = get_current_buffer() else {
+        return 0;
+    };
+    buffer.buffer_len_chars() as c_longlong
+}
+
+/// Get a substring from the buffer (start inclusive, end exclusive)
+/// Returns a C string that Julia must free
+#[no_mangle]
+pub extern "C" fn roe_buffer_substring(start: c_longlong, end: c_longlong) -> *mut c_char {
+    let Some(buffer) = get_current_buffer() else {
+        return std::ptr::null_mut();
+    };
+    if start < 0 || end < start {
+        return std::ptr::null_mut();
+    }
+
+    // Get the substring via the rope
+    let content = buffer.content();
+    let start_idx = (start as usize).min(content.len());
+    let end_idx = (end as usize).min(content.len());
+    let substring = &content[start_idx..end_idx];
+
+    match CString::new(substring) {
+        Ok(cstr) => cstr.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Insert text at a position in the buffer
+/// # Safety
+/// The text pointer must be a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn roe_buffer_insert(pos: c_longlong, text: *const c_char) {
+    let Some(buffer) = get_current_buffer() else {
+        return;
+    };
+    if pos < 0 || text.is_null() {
+        return;
+    }
+    let text_str = match CStr::from_ptr(text).to_str() {
+        Ok(s) => s.to_string(),
+        Err(_) => return,
+    };
+    buffer.insert_pos(text_str, pos as usize);
+}
+
+/// Delete text from the buffer (start inclusive, end exclusive)
+#[no_mangle]
+pub extern "C" fn roe_buffer_delete(start: c_longlong, end: c_longlong) {
+    let Some(buffer) = get_current_buffer() else {
+        return;
+    };
+    if start < 0 || end <= start {
+        return;
+    }
+    let count = end - start;
+    buffer.delete_pos(start as usize, count as isize);
+}
 
 /// Error types for Julia runtime operations
 #[derive(Debug)]
@@ -110,19 +261,21 @@ impl AdditionTask {
     }
 }
 
-#[async_trait(?Send)]
 impl AsyncTask for AdditionTask {
     type Output = JlrsResult<u64>;
 
-    async fn run<'frame>(&mut self, mut frame: AsyncGcFrame<'frame>) -> Self::Output {
-        let a = Value::new(&mut frame, self.a);
-        let b = Value::new(&mut frame, self.b);
-        let func = Module::base(&frame).global(&mut frame, "+")?;
+    fn run(self, mut frame: AsyncGcFrame<'_>) -> impl std::future::Future<Output = Self::Output> {
+        async move {
+            let a = Value::new(&mut frame, self.a);
+            let b = Value::new(&mut frame, self.b);
+            let func = Module::base(&frame).global(&mut frame, "+")?;
 
-        unsafe { func.call_async(&mut frame, [a, b]) }
-            .await
-            .into_jlrs_result()?
-            .unbox::<u64>()
+            let result = unsafe { func.call_async(&mut frame, [a, b]) }.await;
+            match result {
+                Ok(val) => val.unbox::<u64>(),
+                Err(e) => Err(e.as_value().into()),
+            }
+        }
     }
 }
 
@@ -137,33 +290,34 @@ impl ConfigLoadTask {
     }
 }
 
-#[async_trait(?Send)]
 impl AsyncTask for ConfigLoadTask {
     type Output = JlrsResult<HashMap<String, ConfigValue>>;
 
-    async fn run<'frame>(&mut self, mut frame: AsyncGcFrame<'frame>) -> Self::Output {
-        frame.scope(|mut frame| {
-            // Read the Julia file content
-            let content = std::fs::read_to_string(&self.config_path).unwrap_or_default();
-            if content.is_empty() {
-                return Ok(HashMap::new());
-            }
+    fn run(self, mut frame: AsyncGcFrame<'_>) -> impl std::future::Future<Output = Self::Output> {
+        async move {
+            frame.scope(|mut frame| {
+                // Read the Julia file content
+                let content = std::fs::read_to_string(&self.config_path).unwrap_or_default();
+                if content.is_empty() {
+                    return Ok(HashMap::new());
+                }
 
-            // Execute the Julia code to define roe_config
-            let Ok(_) = (unsafe { Value::eval_string(&mut frame, &content) }) else {
-                return Ok(HashMap::new());
-            };
+                // Execute the Julia code to define roe_config
+                let Ok(_) = (unsafe { Value::eval_string(&mut frame, &content) }) else {
+                    return Ok(HashMap::new());
+                };
 
-            // Try to get roe_config from Main
-            let Ok(_) = Module::main(&frame).global(&mut frame, "roe_config") else {
-                return Ok(HashMap::new());
-            };
+                // Try to get roe_config from Main
+                let Ok(_) = Module::main(&frame).global(&mut frame, "roe_config") else {
+                    return Ok(HashMap::new());
+                };
 
-            // Return a test value to show it worked
-            let mut config_map = HashMap::new();
-            config_map.insert("_loaded".to_string(), ConfigValue::Boolean(true));
-            Ok(config_map)
-        })
+                // Return a test value to show it worked
+                let mut config_map = HashMap::new();
+                config_map.insert("_loaded".to_string(), ConfigValue::Boolean(true));
+                Ok(config_map)
+            })
+        }
     }
 }
 
@@ -178,40 +332,44 @@ impl JuliaReplTask {
     }
 }
 
-#[async_trait(?Send)]
 impl AsyncTask for JuliaReplTask {
     type Output = JlrsResult<String>;
 
-    async fn run<'frame>(&mut self, mut frame: AsyncGcFrame<'frame>) -> Self::Output {
-        frame.scope(|mut frame| {
-            // Execute the Julia expression
-            let result = unsafe { Value::eval_string(&mut frame, &self.expression) };
+    fn run(self, mut frame: AsyncGcFrame<'_>) -> impl std::future::Future<Output = Self::Output> {
+        async move {
+            frame.scope(|mut frame| {
+                // Execute the Julia expression
+                let result = unsafe { Value::eval_string(&mut frame, &self.expression) };
 
-            match result {
-                Ok(value) => {
-                    // Convert result to string representation
-                    let string_func = Module::base(&frame).global(&mut frame, "string")?;
-                    let string_result = match unsafe { string_func.call1(&mut frame, value) } {
-                        Ok(result) => result,
-                        Err(_) => {
-                            return Ok("(result could not be converted to string)".to_string())
-                        }
-                    };
+                match result {
+                    Ok(value) => {
+                        // Convert result to string representation
+                        let string_func = Module::base(&frame).global(&mut frame, "string")?;
+                        let string_result =
+                            match unsafe { string_func.call(&mut frame, [value]) } {
+                                Ok(result) => result,
+                                Err(_) => {
+                                    return Ok(
+                                        "(result could not be converted to string)".to_string()
+                                    )
+                                }
+                            };
 
-                    if let Ok(julia_string) = string_result.cast::<JuliaString>() {
-                        if let Ok(rust_string) = julia_string.as_str() {
-                            return Ok(rust_string.to_string());
+                        if let Ok(julia_string) = string_result.cast::<JuliaString>() {
+                            if let Ok(rust_string) = julia_string.as_str() {
+                                return Ok(rust_string.to_string());
+                            }
                         }
+
+                        Ok("(result could not be converted to string)".to_string())
                     }
-
-                    Ok("(result could not be converted to string)".to_string())
+                    Err(e) => {
+                        // Return error message as string
+                        Ok(format!("Error: {e:?}"))
+                    }
                 }
-                Err(e) => {
-                    // Return error message as string
-                    Ok(format!("Error: {e:?}"))
-                }
-            }
-        })
+            })
+        }
     }
 }
 
@@ -240,7 +398,7 @@ impl ConfigQueryTask {
         // Get first level: getindex(config_dict, "colors")
         let first_key = JuliaString::new(&mut *frame, parts[0]);
         let Ok(first_value) =
-            (unsafe { getindex.call2(&mut *frame, config_dict, first_key.as_value()) })
+            (unsafe { getindex.call(&mut *frame, [config_dict, first_key.as_value()]) })
         else {
             return Ok(None);
         };
@@ -248,7 +406,7 @@ impl ConfigQueryTask {
         // Get second level: getindex(colors_dict, "background")
         let second_key = JuliaString::new(&mut *frame, parts[1]);
         let Ok(final_value) =
-            (unsafe { getindex.call2(&mut *frame, first_value, second_key.as_value()) })
+            (unsafe { getindex.call(&mut *frame, [first_value, second_key.as_value()]) })
         else {
             return Ok(None);
         };
@@ -271,7 +429,7 @@ impl ConfigQueryTask {
         let getindex = Module::base(frame).global(&mut *frame, "getindex")?;
         let key_str = JuliaString::new(&mut *frame, &self.key);
 
-        let Ok(value) = (unsafe { getindex.call2(&mut *frame, config_dict, key_str.as_value()) })
+        let Ok(value) = (unsafe { getindex.call(&mut *frame, [config_dict, key_str.as_value()]) })
         else {
             return Ok(None);
         };
@@ -297,35 +455,686 @@ impl ConfigQueryTask {
     }
 }
 
-#[async_trait(?Send)]
 impl AsyncTask for ConfigQueryTask {
     type Output = JlrsResult<Option<ConfigValue>>;
 
-    async fn run<'frame>(&mut self, mut frame: AsyncGcFrame<'frame>) -> Self::Output {
-        frame.scope(|mut frame| {
-            let main_module = Module::main(&frame);
+    fn run(self, mut frame: AsyncGcFrame<'_>) -> impl std::future::Future<Output = Self::Output> {
+        async move {
+            frame.scope(|mut frame| {
+                let main_module = Module::main(&frame);
 
-            // Get roe_config global or return None
-            let Ok(config_dict) = main_module.global(&mut frame, "roe_config") else {
-                return Ok(None);
-            };
+                // Get roe_config global or return None
+                let Ok(config_dict) = main_module.global(&mut frame, "roe_config") else {
+                    return Ok(None);
+                };
 
-            if self.key.contains('.') {
-                self.handle_nested_key(&mut frame, config_dict)
-            } else {
-                self.handle_top_level_key(&mut frame, config_dict)
-            }
-        })
+                if self.key.contains('.') {
+                    self.handle_nested_key(&mut frame, config_dict)
+                } else {
+                    self.handle_top_level_key(&mut frame, config_dict)
+                }
+            })
+        }
     }
+}
+
+/// Task for loading the Roe Julia module
+pub struct LoadRoeModuleTask {
+    module_path: PathBuf,
+}
+
+impl LoadRoeModuleTask {
+    pub fn new(module_path: PathBuf) -> Self {
+        Self { module_path }
+    }
+}
+
+impl AsyncTask for LoadRoeModuleTask {
+    type Output = JlrsResult<Result<(), String>>;
+
+    fn run(self, mut frame: AsyncGcFrame<'_>) -> impl std::future::Future<Output = Self::Output> {
+        async move {
+            frame.scope(|mut frame| {
+                // Make path absolute if it isn't already
+                let abs_path = if self.module_path.is_absolute() {
+                    self.module_path.clone()
+                } else {
+                    std::env::current_dir()
+                        .map(|cwd| cwd.join(&self.module_path))
+                        .unwrap_or(self.module_path.clone())
+                };
+
+                // Include the Roe module
+                let include_code = format!("include({:?})", abs_path.to_string_lossy());
+                let result = unsafe { Value::eval_string(&mut frame, &include_code) };
+
+                match result {
+                    Ok(_) => {
+                        // Bring Roe module into scope
+                        let using_result = unsafe { Value::eval_string(&mut frame, "using .Roe") };
+                        match using_result {
+                            Ok(_) => Ok(Ok(())),
+                            Err(e) => Ok(Err(format!("Failed 'using .Roe': {:?}", e))),
+                        }
+                    }
+                    Err(e) => Ok(Err(format!(
+                        "Failed to include {:?}: {:?}",
+                        abs_path, e
+                    ))),
+                }
+            })
+        }
+    }
+}
+
+/// Task for calling a Julia command
+pub struct CallCommandTask {
+    command_name: String,
+    context: JuliaCommandContext,
+}
+
+impl CallCommandTask {
+    pub fn new(command_name: String, context: JuliaCommandContext) -> Self {
+        Self {
+            command_name,
+            context,
+        }
+    }
+
+    /// Helper to extract a string field from a Julia Dict
+    fn get_string_field<'target>(
+        frame: &mut GcFrame<'target>,
+        getindex: &Value,
+        dict: Value,
+        key: &str,
+    ) -> Option<String> {
+        let key_val = JuliaString::new(&mut *frame, key);
+        let result = unsafe { getindex.call(&mut *frame, [dict, key_val.as_value()]) };
+        if let Ok(val) = result {
+            if let Ok(js) = val.cast::<JuliaString>() {
+                return Some(js.as_str().unwrap_or("").to_string());
+            }
+        }
+        None
+    }
+
+    /// Helper to extract an integer field from a Julia Dict
+    fn get_int_field<'target>(
+        frame: &mut GcFrame<'target>,
+        getindex: &Value,
+        dict: Value,
+        key: &str,
+    ) -> Option<i64> {
+        let key_val = JuliaString::new(&mut *frame, key);
+        let result = unsafe { getindex.call(&mut *frame, [dict, key_val.as_value()]) };
+        if let Ok(val) = result {
+            if let Ok(n) = val.unbox::<i64>() {
+                return Some(n);
+            }
+        }
+        None
+    }
+}
+
+impl AsyncTask for CallCommandTask {
+    type Output = JlrsResult<JuliaCommandResult>;
+
+    fn run(self, mut frame: AsyncGcFrame<'_>) -> impl std::future::Future<Output = Self::Output> {
+        async move {
+            frame.scope(|mut frame| {
+                // Get the Roe module and call_command function
+                let main_module = Module::main(&frame);
+
+                // Get the Roe module
+                let Ok(roe_module) = main_module.global(&mut frame, "Roe") else {
+                    return Ok(JuliaCommandResult::Error(
+                        "Roe module not loaded".to_string(),
+                    ));
+                };
+
+                // Get call_command function
+                let Ok(call_command_fn) = roe_module
+                    .cast::<Module>()
+                    .unwrap()
+                    .global(&mut frame, "call_command")
+                else {
+                    return Ok(JuliaCommandResult::Error(
+                        "call_command function not found".to_string(),
+                    ));
+                };
+
+                // Build Dict using comprehension-style eval
+                let dict_code = format!(
+                    r#"Dict(
+                        "buffer_name" => {:?},
+                        "buffer_modified" => {},
+                        "cursor_pos" => {},
+                        "current_line" => {},
+                        "current_column" => {},
+                        "line_count" => {},
+                        "char_count" => {},
+                        "mark_pos" => {}
+                    )"#,
+                    self.context.buffer_name,
+                    self.context.buffer_modified,
+                    self.context.cursor_pos,
+                    self.context.current_line,
+                    self.context.current_column,
+                    self.context.line_count,
+                    self.context.char_count,
+                    self.context.mark_pos
+                );
+
+                let Ok(context_dict) = (unsafe { Value::eval_string(&mut frame, &dict_code) })
+                else {
+                    return Ok(JuliaCommandResult::Error(
+                        "Failed to create context Dict".to_string(),
+                    ));
+                };
+
+                // Call Roe.call_command(name, context)
+                let command_name_val = JuliaString::new(&mut frame, &self.command_name);
+
+                let result = unsafe {
+                    call_command_fn.call(&mut frame, [command_name_val.as_value(), context_dict])
+                };
+
+                match result {
+                    Ok(result_dict) => {
+                        // Extract the result type and message
+                        let getindex = Module::base(&frame).global(&mut frame, "getindex")?;
+                        let type_key = JuliaString::new(&mut frame, "type");
+
+                        let Ok(type_val) =
+                            (unsafe { getindex.call(&mut frame, [result_dict, type_key.as_value()]) })
+                        else {
+                            return Ok(JuliaCommandResult::Error(
+                                "Missing 'type' in result".to_string(),
+                            ));
+                        };
+
+                        let type_str = if let Ok(js) = type_val.cast::<JuliaString>() {
+                            js.as_str().unwrap_or("unknown").to_string()
+                        } else {
+                            "unknown".to_string()
+                        };
+
+                        match type_str.as_str() {
+                            "echo" => {
+                                let message_key = JuliaString::new(&mut frame, "message");
+                                if let Ok(msg_val) = unsafe {
+                                    getindex.call(&mut frame, [result_dict, message_key.as_value()])
+                                } {
+                                    if let Ok(js) = msg_val.cast::<JuliaString>() {
+                                        let msg = js.as_str().unwrap_or("").to_string();
+                                        return Ok(JuliaCommandResult::Echo(msg));
+                                    }
+                                }
+                                Ok(JuliaCommandResult::Echo("".to_string()))
+                            }
+                            "error" => {
+                                let message_key = JuliaString::new(&mut frame, "message");
+                                if let Ok(msg_val) = unsafe {
+                                    getindex.call(&mut frame, [result_dict, message_key.as_value()])
+                                } {
+                                    if let Ok(js) = msg_val.cast::<JuliaString>() {
+                                        let msg = js.as_str().unwrap_or("Unknown error").to_string();
+                                        return Ok(JuliaCommandResult::Error(msg));
+                                    }
+                                }
+                                Ok(JuliaCommandResult::Error("Unknown error".to_string()))
+                            }
+                            "none" => Ok(JuliaCommandResult::None),
+                            // Buffer operations
+                            "insert" => {
+                                let pos = Self::get_int_field(&mut frame, &getindex, result_dict, "pos").unwrap_or(0) as usize;
+                                let text = Self::get_string_field(&mut frame, &getindex, result_dict, "text").unwrap_or_default();
+                                Ok(JuliaCommandResult::BufferOps(vec![JuliaBufferOp::Insert { pos, text }]))
+                            }
+                            "delete" => {
+                                let start = Self::get_int_field(&mut frame, &getindex, result_dict, "start").unwrap_or(0) as usize;
+                                let end = Self::get_int_field(&mut frame, &getindex, result_dict, "end").unwrap_or(0) as usize;
+                                Ok(JuliaCommandResult::BufferOps(vec![JuliaBufferOp::Delete { start, end }]))
+                            }
+                            "replace" => {
+                                let start = Self::get_int_field(&mut frame, &getindex, result_dict, "start").unwrap_or(0) as usize;
+                                let end = Self::get_int_field(&mut frame, &getindex, result_dict, "end").unwrap_or(0) as usize;
+                                let text = Self::get_string_field(&mut frame, &getindex, result_dict, "text").unwrap_or_default();
+                                Ok(JuliaCommandResult::BufferOps(vec![JuliaBufferOp::Replace { start, end, text }]))
+                            }
+                            "set_cursor" => {
+                                let pos = Self::get_int_field(&mut frame, &getindex, result_dict, "pos").unwrap_or(0) as usize;
+                                Ok(JuliaCommandResult::BufferOps(vec![JuliaBufferOp::SetCursor(pos)]))
+                            }
+                            "set_mark" => {
+                                let pos = Self::get_int_field(&mut frame, &getindex, result_dict, "pos").unwrap_or(0) as usize;
+                                Ok(JuliaCommandResult::BufferOps(vec![JuliaBufferOp::SetMark(pos)]))
+                            }
+                            "clear_mark" => {
+                                Ok(JuliaCommandResult::BufferOps(vec![JuliaBufferOp::ClearMark]))
+                            }
+                            "set_content" => {
+                                let content = Self::get_string_field(&mut frame, &getindex, result_dict, "content").unwrap_or_default();
+                                Ok(JuliaCommandResult::BufferOps(vec![JuliaBufferOp::SetContent(content)]))
+                            }
+                            "multi" => {
+                                // Parse array of actions - for now just return None
+                                // TODO: implement multi-action parsing
+                                Ok(JuliaCommandResult::None)
+                            }
+                            _ => Ok(JuliaCommandResult::None),
+                        }
+                    }
+                    Err(_) => Ok(JuliaCommandResult::Error(
+                        "Failed to call Julia command".to_string(),
+                    )),
+                }
+            })
+        }
+    }
+}
+
+/// Task for listing available Julia commands
+pub struct ListCommandsTask;
+
+impl AsyncTask for ListCommandsTask {
+    type Output = JlrsResult<Vec<(String, String)>>;
+
+    fn run(self, mut frame: AsyncGcFrame<'_>) -> impl std::future::Future<Output = Self::Output> {
+        async move {
+            frame.scope(|mut frame| {
+                let main_module = Module::main(&frame);
+
+                // Get the Roe module
+                let Ok(roe_module) = main_module.global(&mut frame, "Roe") else {
+                    return Ok(Vec::new());
+                };
+
+                // Get list_commands function
+                let Ok(list_commands_fn) = roe_module
+                    .cast::<Module>()
+                    .unwrap()
+                    .global(&mut frame, "list_commands")
+                else {
+                    return Ok(Vec::new());
+                };
+
+                // Call Roe.list_commands()
+                let Ok(result) = (unsafe { list_commands_fn.call(&mut frame, []) }) else {
+                    return Ok(Vec::new());
+                };
+
+                // Parse the result - it's a Vector of Tuples
+                let length_fn = Module::base(&frame).global(&mut frame, "length")?;
+                let getindex = Module::base(&frame).global(&mut frame, "getindex")?;
+
+                let Ok(length_val) = (unsafe { length_fn.call(&mut frame, [result]) }) else {
+                    return Ok(Vec::new());
+                };
+
+                let length: i64 = length_val.unbox::<i64>().unwrap_or(0);
+                let mut commands = Vec::new();
+
+                for i in 1..=length {
+                    let idx = Value::new(&mut frame, i);
+                    let Ok(tuple) = (unsafe { getindex.call(&mut frame, [result, idx]) }) else {
+                        continue;
+                    };
+
+                    // Get first and second elements of tuple
+                    let idx1 = Value::new(&mut frame, 1i64);
+                    let idx2 = Value::new(&mut frame, 2i64);
+
+                    let Ok(name_val) = (unsafe { getindex.call(&mut frame, [tuple, idx1]) }) else {
+                        continue;
+                    };
+                    let Ok(desc_val) = (unsafe { getindex.call(&mut frame, [tuple, idx2]) }) else {
+                        continue;
+                    };
+
+                    if let (Ok(name_js), Ok(desc_js)) = (
+                        name_val.cast::<JuliaString>(),
+                        desc_val.cast::<JuliaString>(),
+                    ) {
+                        if let (Ok(name), Ok(desc)) = (name_js.as_str(), desc_js.as_str()) {
+                            commands.push((name.to_string(), desc.to_string()));
+                        }
+                    }
+                }
+
+                Ok(commands)
+            })
+        }
+    }
+}
+
+/// Task for listing user-defined keybindings from Julia
+pub struct ListKeybindingsTask;
+
+impl AsyncTask for ListKeybindingsTask {
+    type Output = JlrsResult<Vec<(String, String)>>;
+
+    fn run(self, mut frame: AsyncGcFrame<'_>) -> impl std::future::Future<Output = Self::Output> {
+        async move {
+            frame.scope(|mut frame| {
+                let main_module = Module::main(&frame);
+
+                // Get the Roe module
+                let Ok(roe_module) = main_module.global(&mut frame, "Roe") else {
+                    return Ok(Vec::new());
+                };
+
+                // Get list_keybindings function
+                let Ok(list_keybindings_fn) = roe_module
+                    .cast::<Module>()
+                    .unwrap()
+                    .global(&mut frame, "list_keybindings")
+                else {
+                    return Ok(Vec::new());
+                };
+
+                // Call Roe.list_keybindings()
+                let Ok(result) = (unsafe { list_keybindings_fn.call(&mut frame, []) }) else {
+                    return Ok(Vec::new());
+                };
+
+                // Parse the result - it's a Vector of Tuples (key_sequence, action)
+                let length_fn = Module::base(&frame).global(&mut frame, "length")?;
+                let getindex = Module::base(&frame).global(&mut frame, "getindex")?;
+
+                let Ok(length_val) = (unsafe { length_fn.call(&mut frame, [result]) }) else {
+                    return Ok(Vec::new());
+                };
+
+                let length: i64 = length_val.unbox::<i64>().unwrap_or(0);
+                let mut bindings = Vec::new();
+
+                for i in 1..=length {
+                    let idx = Value::new(&mut frame, i);
+                    let Ok(tuple) = (unsafe { getindex.call(&mut frame, [result, idx]) }) else {
+                        continue;
+                    };
+
+                    // Get first and second elements of tuple
+                    let idx1 = Value::new(&mut frame, 1i64);
+                    let idx2 = Value::new(&mut frame, 2i64);
+
+                    let Ok(key_seq_val) = (unsafe { getindex.call(&mut frame, [tuple, idx1]) })
+                    else {
+                        continue;
+                    };
+                    let Ok(action_val) = (unsafe { getindex.call(&mut frame, [tuple, idx2]) })
+                    else {
+                        continue;
+                    };
+
+                    if let (Ok(key_seq_js), Ok(action_js)) = (
+                        key_seq_val.cast::<JuliaString>(),
+                        action_val.cast::<JuliaString>(),
+                    ) {
+                        if let (Ok(key_seq), Ok(action)) = (key_seq_js.as_str(), action_js.as_str())
+                        {
+                            bindings.push((key_seq.to_string(), action.to_string()));
+                        }
+                    }
+                }
+
+                Ok(bindings)
+            })
+        }
+    }
+}
+
+/// Task to call a Julia mode's perform handler
+pub struct ModePerformTask {
+    pub mode_name: String,
+    pub action_dict: std::collections::HashMap<String, String>,
+}
+
+impl AsyncTask for ModePerformTask {
+    type Output = JlrsResult<Option<JuliaModeResult>>;
+
+    fn run(self, mut frame: AsyncGcFrame<'_>) -> impl std::future::Future<Output = Self::Output> {
+        async move {
+            frame.scope(|mut frame| {
+                let main_module = Module::main(&frame);
+
+                // Get the Roe module
+                let Ok(roe_module) = main_module.global(&mut frame, "Roe") else {
+                    return Ok(None);
+                };
+                let roe_module = roe_module.cast::<Module>().unwrap();
+
+                // Get mode_perform function
+                let Ok(mode_perform_fn) = roe_module.global(&mut frame, "mode_perform") else {
+                    return Ok(None);
+                };
+
+                // Create Julia Dict for the action
+                let dict_type = Module::base(&frame).global(&mut frame, "Dict")?;
+                let action_jl = unsafe { dict_type.call(&mut frame, [])? };
+
+                // Populate the action dict
+                let setindex_fn = Module::base(&frame).global(&mut frame, "setindex!")?;
+                for (key, value) in &self.action_dict {
+                    let key_jl = JuliaString::new(&mut frame, key);
+                    let value_jl = JuliaString::new(&mut frame, value);
+                    unsafe {
+                        setindex_fn.call(&mut frame, [action_jl, value_jl.as_value(), key_jl.as_value()])?;
+                    };
+                }
+
+                // Call Roe.mode_perform(mode_name, action_dict)
+                let mode_name_jl = JuliaString::new(&mut frame, &self.mode_name);
+                let Ok(result) = (unsafe {
+                    mode_perform_fn.call(&mut frame, [mode_name_jl.as_value(), action_jl])
+                }) else {
+                    return Ok(None);
+                };
+
+                // Parse the result Dict
+                let getindex = Module::base(&frame).global(&mut frame, "getindex")?;
+                let haskey = Module::base(&frame).global(&mut frame, "haskey")?;
+                let length_fn = Module::base(&frame).global(&mut frame, "length")?;
+
+                // Get result type
+                let result_key = JuliaString::new(&mut frame, "result");
+                let Ok(result_type_val) = (unsafe {
+                    getindex.call(&mut frame, [result, result_key.as_value()])
+                }) else {
+                    return Ok(None);
+                };
+                let result_type = result_type_val
+                    .cast::<JuliaString>()
+                    .ok()
+                    .and_then(|s| s.as_str().ok())
+                    .unwrap_or("ignored")
+                    .to_string();
+
+                // Get actions array
+                let actions_key = JuliaString::new(&mut frame, "actions");
+                let has_actions = unsafe {
+                    haskey.call(&mut frame, [result, actions_key.as_value()])
+                        .ok()
+                        .and_then(|v| v.unbox::<Bool>().ok())
+                        .map(|b| b.as_bool())
+                        .unwrap_or(false)
+                };
+
+                let mut actions = Vec::new();
+                if has_actions {
+                    let Ok(actions_arr) = (unsafe {
+                        getindex.call(&mut frame, [result, actions_key.as_value()])
+                    }) else {
+                        return Ok(Some(JuliaModeResult { result_type, actions }));
+                    };
+
+                    let actions_len: i64 = unsafe {
+                        length_fn.call(&mut frame, [actions_arr])
+                            .ok()
+                            .and_then(|v| v.unbox::<i64>().ok())
+                            .unwrap_or(0)
+                    };
+
+                    for i in 1..=actions_len {
+                        let idx = Value::new(&mut frame, i);
+                        let Ok(action_dict) = (unsafe { getindex.call(&mut frame, [actions_arr, idx]) }) else {
+                            continue;
+                        };
+
+                        // Parse individual action
+                        let type_key = JuliaString::new(&mut frame, "type");
+                        let action_type = unsafe {
+                            getindex.call(&mut frame, [action_dict, type_key.as_value()])
+                                .ok()
+                                .and_then(|v| v.cast::<JuliaString>().ok())
+                                .and_then(|s| s.as_str().ok().map(|s| s.to_string()))
+                                .unwrap_or_default()
+                        };
+
+                        let mut mode_action = JuliaModeAction {
+                            action_type,
+                            ..Default::default()
+                        };
+
+                        // Get optional fields
+                        let get_str_field = |field: &str, frame: &mut GcFrame, dict: Value| -> Option<String> {
+                            let key = JuliaString::new(&mut *frame, field);
+                            let has = unsafe {
+                                haskey.call(&mut *frame, [dict, key.as_value()])
+                                    .ok()
+                                    .and_then(|v| v.unbox::<Bool>().ok())
+                                    .map(|b| b.as_bool())
+                                    .unwrap_or(false)
+                            };
+                            if has {
+                                unsafe {
+                                    getindex.call(&mut *frame, [dict, key.as_value()])
+                                        .ok()
+                                        .and_then(|v| v.cast::<JuliaString>().ok())
+                                        .and_then(|s| s.as_str().ok().map(|s| s.to_string()))
+                                }
+                            } else {
+                                None
+                            }
+                        };
+
+                        mode_action.text = get_str_field("text", &mut frame, action_dict);
+                        mode_action.position = get_str_field("position", &mut frame, action_dict);
+                        mode_action.path = get_str_field("path", &mut frame, action_dict);
+                        mode_action.open_type = get_str_field("open_type", &mut frame, action_dict);
+                        mode_action.command = get_str_field("command", &mut frame, action_dict);
+
+                        // Get buffer_index as integer
+                        mode_action.buffer_index = {
+                            let key = JuliaString::new(&mut frame, "buffer_index");
+                            let has = unsafe {
+                                haskey.call(&mut frame, [action_dict, key.as_value()])
+                                    .ok()
+                                    .and_then(|v| v.unbox::<Bool>().ok())
+                                    .map(|b| b.as_bool())
+                                    .unwrap_or(false)
+                            };
+                            if has {
+                                unsafe {
+                                    getindex.call(&mut frame, [action_dict, key.as_value()])
+                                        .ok()
+                                        .and_then(|v| v.unbox::<i64>().ok())
+                                }
+                            } else {
+                                None
+                            }
+                        };
+
+                        actions.push(mode_action);
+                    }
+                }
+
+                Ok(Some(JuliaModeResult { result_type, actions }))
+            })
+        }
+    }
+}
+
+/// Context passed to Julia commands (mirrors CommandContext)
+#[derive(Debug, Clone)]
+pub struct JuliaCommandContext {
+    pub buffer_name: String,
+    pub buffer_modified: bool,
+    pub cursor_pos: usize,
+    pub current_line: u16,
+    pub current_column: u16,
+    pub line_count: usize,
+    pub char_count: usize,
+    /// Mark position (-1 if not set)
+    pub mark_pos: i64,
+}
+
+/// Buffer operation from Julia (mirrors editor::BufferOperation)
+#[derive(Debug, Clone)]
+pub enum JuliaBufferOp {
+    Insert { pos: usize, text: String },
+    Delete { start: usize, end: usize },
+    Replace { start: usize, end: usize, text: String },
+    SetCursor(usize),
+    SetMark(usize),
+    ClearMark,
+    SetContent(String),
+}
+
+/// Result from a Julia command
+#[derive(Debug, Clone)]
+pub enum JuliaCommandResult {
+    Echo(String),
+    Error(String),
+    None,
+    /// Buffer manipulation operations
+    BufferOps(Vec<JuliaBufferOp>),
+    /// Multiple actions combined (echo + buffer ops, etc.)
+    Multi(Vec<JuliaCommandResult>),
+}
+
+/// A single action returned from a Julia mode handler
+#[derive(Debug, Clone, Default)]
+pub struct JuliaModeAction {
+    pub action_type: String,
+    pub text: Option<String>,
+    pub position: Option<String>,
+    pub path: Option<String>,
+    pub open_type: Option<String>,
+    pub command: Option<String>,
+    pub buffer_index: Option<i64>,
+}
+
+/// Result from a Julia mode perform call
+#[derive(Debug, Clone)]
+pub struct JuliaModeResult {
+    pub result_type: String, // "consumed", "annotated", "ignored"
+    pub actions: Vec<JuliaModeAction>,
 }
 
 /// Command to send to the persistent Julia runtime
 #[derive(Debug)]
 pub enum JuliaCommand {
     LoadConfig(PathBuf),
+    LoadRoeModule(PathBuf, tokio::sync::oneshot::Sender<Result<(), String>>),
     QueryConfig(String, tokio::sync::oneshot::Sender<Option<ConfigValue>>),
     TestAddition(u64, u64, tokio::sync::oneshot::Sender<u64>),
     EvalExpression(String, tokio::sync::oneshot::Sender<String>),
+    CallCommand(
+        String,
+        JuliaCommandContext,
+        Buffer,  // The buffer for this command's context
+        tokio::sync::oneshot::Sender<JuliaCommandResult>,
+    ),
+    ListCommands(tokio::sync::oneshot::Sender<Vec<(String, String)>>),
+    ListKeybindings(tokio::sync::oneshot::Sender<Vec<(String, String)>>),
+    /// Call a Julia mode's perform handler
+    ModePerform(
+        String,                                              // mode name
+        std::collections::HashMap<String, String>,           // key action as dict
+        tokio::sync::oneshot::Sender<JuliaModeResult>,
+    ),
     Shutdown,
 }
 
@@ -436,6 +1245,110 @@ impl RoeJuliaRuntime {
                     let output =
                         result.unwrap_or_else(|_| "Error: Result processing failed".to_string());
                     let _ = response_tx.send(output);
+                }
+                JuliaCommand::LoadRoeModule(path, response_tx) => {
+                    let task = LoadRoeModuleTask::new(path);
+                    let Ok(async_task) = julia.task(task).try_dispatch() else {
+                        let _ = response_tx.send(Err("Failed to dispatch task".to_string()));
+                        continue;
+                    };
+
+                    let Ok(result) = async_task.await else {
+                        let _ = response_tx.send(Err("Task execution failed".to_string()));
+                        continue;
+                    };
+
+                    let output = result.unwrap_or_else(|e| Err(format!("Julia error: {:?}", e)));
+                    let _ = response_tx.send(output);
+                }
+                JuliaCommand::CallCommand(name, context, buffer, response_tx) => {
+                    // Set the buffer for this command's execution
+                    set_current_buffer(buffer);
+
+                    let task = CallCommandTask::new(name, context);
+                    let Ok(async_task) = julia.task(task).try_dispatch() else {
+                        clear_current_buffer();
+                        let _ = response_tx.send(JuliaCommandResult::Error(
+                            "Failed to dispatch task".to_string(),
+                        ));
+                        continue;
+                    };
+
+                    let Ok(result) = async_task.await else {
+                        clear_current_buffer();
+                        let _ = response_tx.send(JuliaCommandResult::Error(
+                            "Task execution failed".to_string(),
+                        ));
+                        continue;
+                    };
+
+                    // Clear the buffer after command execution
+                    clear_current_buffer();
+
+                    let output = result.unwrap_or(JuliaCommandResult::Error(
+                        "Result processing failed".to_string(),
+                    ));
+                    let _ = response_tx.send(output);
+                }
+                JuliaCommand::ListCommands(response_tx) => {
+                    let task = ListCommandsTask;
+                    let Ok(async_task) = julia.task(task).try_dispatch() else {
+                        let _ = response_tx.send(Vec::new());
+                        continue;
+                    };
+
+                    let Ok(result) = async_task.await else {
+                        let _ = response_tx.send(Vec::new());
+                        continue;
+                    };
+
+                    let commands = result.unwrap_or_default();
+                    let _ = response_tx.send(commands);
+                }
+                JuliaCommand::ListKeybindings(response_tx) => {
+                    let task = ListKeybindingsTask;
+                    let Ok(async_task) = julia.task(task).try_dispatch() else {
+                        let _ = response_tx.send(Vec::new());
+                        continue;
+                    };
+
+                    let Ok(result) = async_task.await else {
+                        let _ = response_tx.send(Vec::new());
+                        continue;
+                    };
+
+                    let bindings = result.unwrap_or_default();
+                    let _ = response_tx.send(bindings);
+                }
+                JuliaCommand::ModePerform(mode_name, action_dict, response_tx) => {
+                    let task = ModePerformTask {
+                        mode_name,
+                        action_dict,
+                    };
+                    let Ok(async_task) = julia.task(task).try_dispatch() else {
+                        let _ = response_tx.send(JuliaModeResult {
+                            result_type: "ignored".to_string(),
+                            actions: vec![],
+                        });
+                        continue;
+                    };
+
+                    let Ok(result) = async_task.await else {
+                        let _ = response_tx.send(JuliaModeResult {
+                            result_type: "ignored".to_string(),
+                            actions: vec![],
+                        });
+                        continue;
+                    };
+
+                    let mode_result = result
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| JuliaModeResult {
+                            result_type: "ignored".to_string(),
+                            actions: vec![],
+                        });
+                    let _ = response_tx.send(mode_result);
                 }
                 JuliaCommand::Shutdown => {
                     break;
@@ -614,6 +1527,152 @@ impl RoeJuliaRuntime {
     pub fn test_julia_basic(&self) -> Result<(), JuliaRuntimeError> {
         Self::test_jlrs_basic()
             .map_err(|e| JuliaRuntimeError::TaskExecutionFailed(format!("Julia test failed: {e}")))
+    }
+
+    /// Load the Roe Julia module for command definitions
+    pub async fn load_roe_module(
+        &self,
+        module_path: PathBuf,
+    ) -> Result<(), JuliaRuntimeError> {
+        let Some(ref command_tx) = self.command_tx else {
+            return Err(JuliaRuntimeError::ScriptLoadFailed(
+                "Runtime not initialized".to_string(),
+            ));
+        };
+
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+        command_tx
+            .send(JuliaCommand::LoadRoeModule(module_path, response_tx))
+            .map_err(|_| {
+                JuliaRuntimeError::ScriptLoadFailed("Command channel closed".to_string())
+            })?;
+
+        let result = response_rx.await.map_err(|_| {
+            JuliaRuntimeError::ScriptLoadFailed("Response channel closed".to_string())
+        })?;
+
+        result.map_err(JuliaRuntimeError::ScriptLoadFailed)
+    }
+
+    /// Call a Julia-defined command
+    pub async fn call_command(
+        &self,
+        name: &str,
+        context: JuliaCommandContext,
+        buffer: Buffer,
+    ) -> Result<JuliaCommandResult, JuliaRuntimeError> {
+        let Some(ref command_tx) = self.command_tx else {
+            return Err(JuliaRuntimeError::TaskExecutionFailed(
+                "Runtime not initialized".to_string(),
+            ));
+        };
+
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+        command_tx
+            .send(JuliaCommand::CallCommand(
+                name.to_string(),
+                context,
+                buffer,
+                response_tx,
+            ))
+            .map_err(|_| {
+                JuliaRuntimeError::TaskExecutionFailed("Command channel closed".to_string())
+            })?;
+
+        response_rx.await.map_err(|_| {
+            JuliaRuntimeError::TaskExecutionFailed("Response channel closed".to_string())
+        })
+    }
+
+    /// List all available Julia commands
+    pub async fn list_commands(&self) -> Result<Vec<(String, String)>, JuliaRuntimeError> {
+        let Some(ref command_tx) = self.command_tx else {
+            return Err(JuliaRuntimeError::TaskExecutionFailed(
+                "Runtime not initialized".to_string(),
+            ));
+        };
+
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+        command_tx
+            .send(JuliaCommand::ListCommands(response_tx))
+            .map_err(|_| {
+                JuliaRuntimeError::TaskExecutionFailed("Command channel closed".to_string())
+            })?;
+
+        response_rx.await.map_err(|_| {
+            JuliaRuntimeError::TaskExecutionFailed("Response channel closed".to_string())
+        })
+    }
+
+    /// List all user-defined keybindings from Julia
+    pub async fn list_keybindings(&self) -> Result<Vec<(String, String)>, JuliaRuntimeError> {
+        let Some(ref command_tx) = self.command_tx else {
+            return Err(JuliaRuntimeError::TaskExecutionFailed(
+                "Runtime not initialized".to_string(),
+            ));
+        };
+
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+        command_tx
+            .send(JuliaCommand::ListKeybindings(response_tx))
+            .map_err(|_| {
+                JuliaRuntimeError::TaskExecutionFailed("Command channel closed".to_string())
+            })?;
+
+        response_rx.await.map_err(|_| {
+            JuliaRuntimeError::TaskExecutionFailed("Response channel closed".to_string())
+        })
+    }
+
+    /// Call a Julia mode's perform handler (synchronous version for Mode trait)
+    pub fn call_mode_perform(
+        &self,
+        mode_name: &str,
+        action: std::collections::HashMap<String, String>,
+    ) -> Result<JuliaModeResult, JuliaRuntimeError> {
+        let Some(ref command_tx) = self.command_tx else {
+            return Err(JuliaRuntimeError::TaskExecutionFailed(
+                "Runtime not initialized".to_string(),
+            ));
+        };
+
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+        command_tx
+            .send(JuliaCommand::ModePerform(
+                mode_name.to_string(),
+                action,
+                response_tx,
+            ))
+            .map_err(|_| {
+                JuliaRuntimeError::TaskExecutionFailed("Command channel closed".to_string())
+            })?;
+
+        // Block waiting for response - this is called from Mode::perform which is sync
+        response_rx.blocking_recv().map_err(|_| {
+            JuliaRuntimeError::TaskExecutionFailed("Response channel closed".to_string())
+        })
+    }
+
+    /// Get path to the bundled roe.jl module
+    pub fn bundled_roe_module_path() -> Option<PathBuf> {
+        // Look for roe.jl in the jl/ directory
+        let exe_path = std::env::current_exe().ok()?;
+        let exe_dir = exe_path.parent()?;
+
+        // Try several locations
+        let candidates = [
+            exe_dir.join("jl/roe.jl"),
+            exe_dir.join("../jl/roe.jl"),
+            PathBuf::from("jl/roe.jl"),
+            std::env::current_dir().ok()?.join("jl/roe.jl"),
+        ];
+
+        candidates.into_iter().find(|candidate| candidate.exists())
     }
 }
 

@@ -308,13 +308,13 @@ impl CommandMode {
     }
 
     /// Execute the given command with context
-    pub fn execute_command(
+    pub async fn execute_command(
         command_name: &str,
         registry: &CommandRegistry,
         context: CommandContext,
     ) -> Result<Vec<ChromeAction>, String> {
         if let Some(command) = registry.get_command(command_name) {
-            command.execute(context)
+            command.execute(context).await
         } else {
             Err(format!("Command not found: {command_name}"))
         }

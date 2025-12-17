@@ -98,9 +98,9 @@ impl LineSpan {
 /// Scanline-based dirty tracking for terminal rendering
 #[derive(Debug, Clone)]
 pub struct DirtyTracker {
-    /// Dirty spans per line, indexed by line number
+    /// Dirty spans per line, indexed by (buffer_id, line number)
     /// None means line is clean, Some(span) means that span needs redrawing
-    dirty_lines: Vec<Option<LineSpan>>,
+    dirty_lines: HashMap<BufferId, Vec<Option<LineSpan>>>,
     /// Buffers that need full redraw
     dirty_buffers: HashSet<BufferId>,
     /// Windows whose chrome needs redraw
@@ -120,7 +120,7 @@ impl Default for DirtyTracker {
 impl DirtyTracker {
     pub fn new() -> Self {
         Self {
-            dirty_lines: Vec::new(),
+            dirty_lines: HashMap::new(),
             dirty_buffers: HashSet::new(),
             dirty_window_chrome: HashSet::new(),
             dirty_modeline_components: HashMap::new(),
@@ -131,18 +131,19 @@ impl DirtyTracker {
     /// Mark a region as dirty
     pub fn mark_dirty(&mut self, region: DirtyRegion) {
         match region {
-            DirtyRegion::Line { buffer_id: _, line } => {
-                self.ensure_line_capacity(line + 1);
-                self.dirty_lines[line] = Some(LineSpan::full_line());
+            DirtyRegion::Line { buffer_id, line } => {
+                self.ensure_line_capacity(buffer_id, line + 1);
+                self.dirty_lines.get_mut(&buffer_id).unwrap()[line] = Some(LineSpan::full_line());
             }
             DirtyRegion::LineRange {
-                buffer_id: _,
+                buffer_id,
                 start_line,
                 end_line,
             } => {
-                self.ensure_line_capacity(end_line + 1);
-                for line in start_line..=end_line {
-                    self.dirty_lines[line] = Some(LineSpan::full_line());
+                self.ensure_line_capacity(buffer_id, end_line + 1);
+                let lines = self.dirty_lines.get_mut(&buffer_id).unwrap();
+                for line in lines.iter_mut().take(end_line + 1).skip(start_line) {
+                    *line = Some(LineSpan::full_line());
                 }
             }
             DirtyRegion::CharRange {
@@ -176,41 +177,44 @@ impl DirtyTracker {
     }
 
     /// Mark a specific span within a line as dirty
-    pub fn mark_line_span_dirty(&mut self, line: usize, span: LineSpan) {
-        self.ensure_line_capacity(line + 1);
+    pub fn mark_line_span_dirty(&mut self, buffer_id: BufferId, line: usize, span: LineSpan) {
+        self.ensure_line_capacity(buffer_id, line + 1);
 
-        match &self.dirty_lines[line] {
+        let lines = self.dirty_lines.get_mut(&buffer_id).unwrap();
+        match &lines[line] {
             None => {
                 // Line is clean, mark this span as dirty
-                self.dirty_lines[line] = Some(span);
+                lines[line] = Some(span);
             }
             Some(existing_span) => {
                 // Line already has dirty span, merge them
-                self.dirty_lines[line] = Some(existing_span.merge(&span));
+                lines[line] = Some(existing_span.merge(&span));
             }
         }
     }
 
-    /// Check if a line is dirty
-    pub fn is_line_dirty(&self, line: usize) -> bool {
+    /// Check if a line is dirty for a specific buffer
+    pub fn is_line_dirty(&self, buffer_id: BufferId, line: usize) -> bool {
         if self.full_screen_dirty {
             return true;
         }
 
-        if line < self.dirty_lines.len() {
-            self.dirty_lines[line].is_some()
-        } else {
-            false
+        if let Some(lines) = self.dirty_lines.get(&buffer_id) {
+            if line < lines.len() {
+                return lines[line].is_some();
+            }
         }
+        false
     }
 
     /// Get the dirty span for a line, if any
-    pub fn get_line_dirty_span(&self, line: usize) -> Option<&LineSpan> {
-        if line < self.dirty_lines.len() {
-            self.dirty_lines[line].as_ref()
-        } else {
-            None
+    pub fn get_line_dirty_span(&self, buffer_id: BufferId, line: usize) -> Option<&LineSpan> {
+        if let Some(lines) = self.dirty_lines.get(&buffer_id) {
+            if line < lines.len() {
+                return lines[line].as_ref();
+            }
         }
+        None
     }
 
     /// Check if a buffer is completely dirty
@@ -263,17 +267,26 @@ impl DirtyTracker {
         self.full_screen_dirty = false;
     }
 
-    /// Get all dirty lines as an iterator
-    pub fn dirty_lines_iter(&self) -> impl Iterator<Item = (usize, &LineSpan)> {
+    /// Get all dirty lines for a specific buffer as an iterator
+    pub fn dirty_lines_iter(
+        &self,
+        buffer_id: BufferId,
+    ) -> impl Iterator<Item = (usize, &LineSpan)> {
         self.dirty_lines
-            .iter()
-            .enumerate()
-            .filter_map(|(line_num, span)| span.as_ref().map(|s| (line_num, s)))
+            .get(&buffer_id)
+            .into_iter()
+            .flat_map(|lines| {
+                lines
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(line_num, span)| span.as_ref().map(|s| (line_num, s)))
+            })
     }
 
-    fn ensure_line_capacity(&mut self, needed_lines: usize) {
-        if self.dirty_lines.len() < needed_lines {
-            self.dirty_lines.resize(needed_lines, None);
+    fn ensure_line_capacity(&mut self, buffer_id: BufferId, needed_lines: usize) {
+        let lines = self.dirty_lines.entry(buffer_id).or_default();
+        if lines.len() < needed_lines {
+            lines.resize(needed_lines, None);
         }
     }
 }
@@ -302,12 +315,12 @@ mod tests {
     use slotmap::SlotMap;
 
     fn test_buffer_id() -> BufferId {
-        let mut buffers = SlotMap::with_key();
+        let mut buffers: SlotMap<BufferId, ()> = SlotMap::with_key();
         buffers.insert(())
     }
 
     fn _test_window_id() -> WindowId {
-        let mut windows = SlotMap::with_key();
+        let mut windows: SlotMap<WindowId, ()> = SlotMap::with_key();
         windows.insert(())
     }
 
@@ -334,63 +347,67 @@ mod tests {
     #[test]
     fn test_dirty_tracker_line_marking() {
         let mut tracker = DirtyTracker::new();
+        let buffer_id = test_buffer_id();
 
         // Initially clean
-        assert!(!tracker.is_line_dirty(0));
-        assert!(!tracker.is_line_dirty(5));
+        assert!(!tracker.is_line_dirty(buffer_id, 0));
+        assert!(!tracker.is_line_dirty(buffer_id, 5));
 
         // Mark line 5 dirty
         tracker.mark_dirty(DirtyRegion::Line {
-            buffer_id: test_buffer_id(),
+            buffer_id,
             line: 5,
         });
-        assert!(tracker.is_line_dirty(5));
-        assert!(!tracker.is_line_dirty(4));
-        assert!(!tracker.is_line_dirty(6));
+        assert!(tracker.is_line_dirty(buffer_id, 5));
+        assert!(!tracker.is_line_dirty(buffer_id, 4));
+        assert!(!tracker.is_line_dirty(buffer_id, 6));
 
         // Clear and check
         tracker.clear();
-        assert!(!tracker.is_line_dirty(5));
+        assert!(!tracker.is_line_dirty(buffer_id, 5));
     }
 
     #[test]
     fn test_dirty_tracker_line_range() {
         let mut tracker = DirtyTracker::new();
+        let buffer_id = test_buffer_id();
 
         tracker.mark_dirty(DirtyRegion::LineRange {
-            buffer_id: test_buffer_id(),
+            buffer_id,
             start_line: 2,
             end_line: 5,
         });
 
-        assert!(!tracker.is_line_dirty(1));
-        assert!(tracker.is_line_dirty(2));
-        assert!(tracker.is_line_dirty(3));
-        assert!(tracker.is_line_dirty(4));
-        assert!(tracker.is_line_dirty(5));
-        assert!(!tracker.is_line_dirty(6));
+        assert!(!tracker.is_line_dirty(buffer_id, 1));
+        assert!(tracker.is_line_dirty(buffer_id, 2));
+        assert!(tracker.is_line_dirty(buffer_id, 3));
+        assert!(tracker.is_line_dirty(buffer_id, 4));
+        assert!(tracker.is_line_dirty(buffer_id, 5));
+        assert!(!tracker.is_line_dirty(buffer_id, 6));
     }
 
     #[test]
     fn test_dirty_tracker_full_screen() {
         let mut tracker = DirtyTracker::new();
+        let buffer_id = test_buffer_id();
 
         tracker.mark_dirty(DirtyRegion::FullScreen);
         assert!(tracker.is_full_screen_dirty());
-        assert!(tracker.is_line_dirty(0));
-        assert!(tracker.is_line_dirty(100));
-        assert!(tracker.is_buffer_dirty(test_buffer_id()));
+        assert!(tracker.is_line_dirty(buffer_id, 0));
+        assert!(tracker.is_line_dirty(buffer_id, 100));
+        assert!(tracker.is_buffer_dirty(buffer_id));
     }
 
     #[test]
     fn test_line_span_merging_in_tracker() {
         let mut tracker = DirtyTracker::new();
+        let buffer_id = test_buffer_id();
 
         // Mark two overlapping spans on same line
-        tracker.mark_line_span_dirty(3, LineSpan::new(5, 10));
-        tracker.mark_line_span_dirty(3, LineSpan::new(8, 15));
+        tracker.mark_line_span_dirty(buffer_id, 3, LineSpan::new(5, 10));
+        tracker.mark_line_span_dirty(buffer_id, 3, LineSpan::new(8, 15));
 
-        let span = tracker.get_line_dirty_span(3).unwrap();
+        let span = tracker.get_line_dirty_span(buffer_id, 3).unwrap();
         assert_eq!(span, &LineSpan::new(5, 15));
     }
 }

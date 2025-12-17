@@ -527,7 +527,14 @@ impl BufferHost {
                                     });
                                 } else {
                                     // Simple text deletion, only current line affected
-                                    let line = self.buffer.to_column_line(cursor_pos).1 as usize;
+                                    // For backspace (count < 0), deletion happened BEFORE cursor_pos
+                                    // So use the position where deletion occurred
+                                    let delete_pos = if count < 0 {
+                                        cursor_pos.saturating_sub(1)
+                                    } else {
+                                        cursor_pos
+                                    };
+                                    let line = self.buffer.to_column_line(delete_pos).1 as usize;
                                     dirty_regions.push(DirtyRegion::Line {
                                         buffer_id: self.buffer_id,
                                         line,
@@ -592,7 +599,9 @@ impl BufferHost {
                         dirty_regions.push(DirtyRegion::Buffer {
                             buffer_id: self.buffer_id,
                         });
-                        new_cursor_pos = Some(0); // Move cursor to start
+                        // Move cursor to start - update both so subsequent actions use correct pos
+                        cursor_pos = 0;
+                        new_cursor_pos = Some(0);
                     }
                 }
                 ModeAction::SetMark => {

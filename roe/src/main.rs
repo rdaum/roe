@@ -18,8 +18,8 @@ use crossterm::event::{
 use crossterm::execute;
 use crossterm::terminal::disable_raw_mode;
 use roe_core::{
-    buffer_host, command_registry, editor, keys, kill_ring, mode, Buffer, BufferId, Editor, Frame,
-    KeyState, Mode, ModeId, Renderer, Window, WindowId,
+    buffer_host, command_registry, editor, kill_ring, mode, Buffer, BufferId, ConfigurableBindings,
+    Editor, Frame, KeyState, Mode, ModeId, Renderer, Window, WindowId,
 };
 use roe_terminal::{TerminalRenderer, ECHO_AREA_HEIGHT};
 use slotmap::SlotMap;
@@ -138,6 +138,40 @@ async fn terminal_main<W: Write>(stdout: W, config: EditorConfig) -> Result<(), 
 
     // Initialize Julia runtime with Arc for sharing
     let julia_runtime = roe_core::julia_runtime::create_shared_runtime().ok();
+
+    // Load Julia configuration and keybindings early, before creating Editor
+    let mut bindings = ConfigurableBindings::new();
+    if let Some(ref julia_runtime) = julia_runtime {
+        let config_path = if let Some(init_file) = &config.init_file {
+            std::path::PathBuf::from(init_file)
+        } else {
+            roe_core::julia_runtime::RoeJuliaRuntime::default_config_path()
+        };
+
+        let runtime = julia_runtime.lock().await;
+
+        // Load the Roe module first (provides command infrastructure and default keybindings)
+        if let Some(roe_module_path) =
+            roe_core::julia_runtime::RoeJuliaRuntime::bundled_roe_module_path()
+        {
+            let _ = runtime.load_roe_module(roe_module_path.clone()).await;
+        }
+        drop(runtime);
+
+        // Load user config (may override default keybindings)
+        let mut runtime = julia_runtime.lock().await;
+        let _ = runtime.load_config(Some(config_path)).await;
+        drop(runtime);
+
+        // Query keybindings from Julia and populate ConfigurableBindings
+        let runtime = julia_runtime.lock().await;
+        if let Ok(julia_bindings) = runtime.list_keybindings().await {
+            for (key_seq, action) in julia_bindings {
+                bindings.add_binding(&key_seq, &action);
+            }
+        }
+        drop(runtime);
+    }
 
     let mut buffers: SlotMap<BufferId, Buffer> = SlotMap::default();
     let mut buffer_hosts: HashMap<BufferId, buffer_host::BufferHostClient> = HashMap::new();
@@ -283,7 +317,7 @@ async fn terminal_main<W: Write>(stdout: W, config: EditorConfig) -> Result<(), 
         active_window: active_window_id,
         previous_active_window: None,
         key_state: KeyState::new(),
-        bindings: Box::new(keys::DefaultBindings {}),
+        bindings: Box::new(bindings),
         window_tree,
         kill_ring: kill_ring::KillRing::new(),
         command_registry: command_registry::create_default_registry(),
@@ -300,16 +334,11 @@ async fn terminal_main<W: Write>(stdout: W, config: EditorConfig) -> Result<(), 
     let initial_buffer_id = editor.windows[active_window_id].active_buffer;
     editor.record_buffer_access(initial_buffer_id);
 
-    // Try to load Julia configuration
+    // Register Julia commands into the command registry
+    // (Julia runtime and config were already loaded earlier for keybindings)
     if let Some(ref julia_runtime) = editor.julia_runtime {
-        let config_path = if let Some(init_file) = &config.init_file {
-            std::path::PathBuf::from(init_file)
-        } else {
-            roe_core::julia_runtime::RoeJuliaRuntime::default_config_path()
-        };
-
-        let mut runtime = julia_runtime.lock().await;
-        let _ = runtime.load_config(Some(config_path)).await;
+        command_registry::register_julia_commands(&mut editor.command_registry, julia_runtime)
+            .await;
     }
 
     // Load Julia theme and create terminal renderer with it

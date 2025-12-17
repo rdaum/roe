@@ -475,6 +475,12 @@ pub struct Buffer {
     inner: Arc<RwLock<BufferInner>>,
 }
 
+impl std::fmt::Debug for Buffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Buffer").finish_non_exhaustive()
+    }
+}
+
 impl Buffer {
     /// Create a new buffer
     pub fn new(modes: &[ModeId]) -> Self {

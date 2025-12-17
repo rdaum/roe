@@ -11,7 +11,7 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
-use crate::command_registry::{Command, CommandCategory};
+use crate::command_registry::{sync_handler, Command, CommandCategory};
 use crate::keys::KeyAction;
 
 /// Mouse event information for modes
@@ -325,13 +325,13 @@ impl Mode for FileMode {
                 "save-buffer",
                 "Save current buffer to file",
                 CommandCategory::Mode("file".to_string()),
-                Box::new(|_context| Ok(vec![ChromeAction::Echo("Saving file...".to_string())])),
+                sync_handler(|_context| Ok(vec![ChromeAction::Echo("Saving file...".to_string())])),
             ),
             Command::new(
                 "revert-buffer",
                 "Reload buffer from file, discarding changes",
                 CommandCategory::Mode("file".to_string()),
-                Box::new(|_context| {
+                sync_handler(|_context| {
                     Ok(vec![ChromeAction::Echo("Reverting buffer...".to_string())])
                 }),
             ),
@@ -339,7 +339,7 @@ impl Mode for FileMode {
                 "write-file",
                 "Write buffer to a new file",
                 CommandCategory::Mode("file".to_string()),
-                Box::new(|_context| {
+                sync_handler(|_context| {
                     Ok(vec![ChromeAction::Echo(
                         "Write file not implemented yet".to_string(),
                     )])
@@ -476,13 +476,13 @@ impl Mode for JuliaReplMode {
                 "julia-clear-repl",
                 "Clear the Julia REPL buffer",
                 CommandCategory::Mode("julia-repl".to_string()),
-                Box::new(|_context| Ok(vec![ChromeAction::Echo("REPL cleared".to_string())])),
+                sync_handler(|_context| Ok(vec![ChromeAction::Echo("REPL cleared".to_string())])),
             ),
             Command::new(
                 "julia-restart",
                 "Restart the Julia runtime",
                 CommandCategory::Mode("julia-repl".to_string()),
-                Box::new(|_context| {
+                sync_handler(|_context| {
                     Ok(vec![ChromeAction::Echo(
                         "Julia runtime restarted".to_string(),
                     )])
@@ -555,7 +555,7 @@ impl Mode for MessagesMode {
             "clear-messages",
             "Clear all messages from the messages buffer",
             CommandCategory::Mode("messages".to_string()),
-            Box::new(|_context| Ok(vec![ChromeAction::Echo("Messages cleared".to_string())])),
+            sync_handler(|_context| Ok(vec![ChromeAction::Echo("Messages cleared".to_string())])),
         )]
     }
 

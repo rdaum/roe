@@ -182,6 +182,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "find-julia"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0b7637b6810d79bcb59eaed16cb37aa7f282e0615383af596b412472f1806f5"
+
+[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -295,55 +301,80 @@ dependencies = [
 
 [[package]]
 name = "itertools"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
+checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
 dependencies = [
  "either",
 ]
 
 [[package]]
 name = "jl-sys"
-version = "0.25.1"
+version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83688564035db670526c850be629cc0410a1545db53c3e4442575a7e38ad7673"
+checksum = "04b66d5bfd693fa3c742931f03070525d608339358f6086b9366964a46069946"
 dependencies = [
  "cc",
  "cfg-if",
- "jlrs-macros",
+ "find-julia",
+ "jlrs-compat",
 ]
 
 [[package]]
 name = "jlrs"
-version = "0.21.1"
+version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2216d5c20d3bd801584e2cda12898b4da04eb7820ef5d4f7a354c6127d1ae92"
+checksum = "15fc651e917de6292e8dc9b6e6bbefde4ae9855fe2f11b5749020f2ba3d3f727"
 dependencies = [
  "async-channel",
- "async-trait",
  "atomic",
- "cfg-if",
+ "find-julia",
  "fnv",
  "jl-sys",
+ "jlrs-compat",
  "jlrs-macros",
+ "jlrs-sys",
  "lock_api",
  "once_cell",
  "parking_lot",
  "rustc-hash",
+ "semver",
  "smallvec",
  "thiserror",
  "tokio",
 ]
 
 [[package]]
-name = "jlrs-macros"
-version = "0.4.0"
+name = "jlrs-compat"
+version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d07da8f375531b12385d2b4d847db80c83390a045d35f47c1bdb8cffcec26825"
+checksum = "c9f0d7f776f25bc50b9a0990b3103f798c3661e83d0f93a98e2a28dbd48728cc"
+
+[[package]]
+name = "jlrs-macros"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1600ff763a733a1840c9195940579bfbe99bbc2efaaeb3034b4a84f450e6d8dc"
 dependencies = [
+ "find-julia",
  "itertools",
+ "jl-sys",
+ "jlrs-compat",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "jlrs-sys"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6bb174eb94e5640f218263c98b212ec0730aab3e448df4d8e8d4cb3304aad5b0"
+dependencies = [
+ "cc",
+ "cfg-if",
+ "find-julia",
+ "jl-sys",
+ "jlrs-compat",
 ]
 
 [[package]]
@@ -562,6 +593,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "semver"
+version = "1.0.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d767eb0aabc880b29956c35734170f26ed551a859dbd361d140cdbeca61ab1e2"
+
+[[package]]
 name = "shlex"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -647,18 +684,18 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "1.0.69"
+version = "2.0.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
+checksum = "f63587ca0f12b72a0600bcba1d40081f830876000bb46dd2337a3051618f4fc8"
 dependencies = [
  "thiserror-impl",
 ]
 
 [[package]]
 name = "thiserror-impl"
-version = "1.0.69"
+version = "2.0.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
+checksum = "3ff15c8ecd7de3849db632e14d18d2571fa09dfc5ed93479bc4485c7a517c913"
 dependencies = [
  "proc-macro2",
  "quote",

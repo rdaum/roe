@@ -3,15 +3,13 @@
 A minimalistic console text editor in the spirit of the Emacs family of editors, built in Rust.
 
 This editor follows the Emacs tradition in three key ways: (a) it's buffer-oriented rather than
-file-oriented, (b) it uses the default GNU Emacs keybinding set, and (c) it's being architected with
-full programmability in mind (though not yet implemented). Unlike the current trend toward "modal"
-editors, this is a direct manipulation editor and proud of it.
+file-oriented, (b) it uses the default GNU Emacs keybinding set, and (c) it's fully programmable
+via an embedded scripting language. Unlike the current trend toward "modal" editors, this is a
+direct manipulation editor and proud of it.
 
-Currently, all behavior is hard-wired in Rust rather than implemented in a high-level language like
-Lisp. However, the architecture has been designed from the ground up to delegate the bulk of editor
-logic to an embedded language system. We are integrating Julia as our implementation language,
-where most modes, commands, and editing behaviors will be implemented - similar to how elisp
-functions in Emacs.
+Roe uses Julia as its extension language (where Emacs uses Elisp). Keybindings, commands, and
+interactive modes can all be defined in Julia. The core editor is implemented in Rust for
+performance, while Julia provides the high-level customization layer.
 
 ## Screenshot
 
@@ -19,7 +17,8 @@ functions in Emacs.
 
 ## Features
 
-- **Emacs-style keybindings**: Familiar keyboard shortcuts for Emacs users
+- **Emacs-style keybindings**: Familiar keyboard shortcuts for Emacs users, fully customizable
+- **Julia scripting**: Define commands, keybindings, and interactive modes in Julia
 - **Buffer-oriented editing**: Work with buffers as the primary unit, not just files like other
   editors. Just like GNU emacs.
   - Even the command entry window is a buffer.
@@ -28,13 +27,13 @@ functions in Emacs.
   windows
 - **Modular architecture**: Extensible mode system for different editing behaviors
 - **Terminal-based**: Lightweight, runs in your terminal
-- **Fast rendering**: Uses crossterm for efficient terminal manipulation
+- **Fast rendering**: Uses crossterm for efficient terminal manipulation with incremental updates
 
 ## Key Bindings
 
-_Note: The keybindings are currently hard-coded and cannot be redefined. There are also no macros
-yet (so how can you call it an Emacs!). However, the architecture has been designed to support both
-customizable keybindings and macro recording/playback in the future._
+Keybindings are defined in Julia and can be customized in your `.roe.jl` configuration file.
+The defaults follow GNU Emacs conventions. Use `define_key("C-x C-s", "save-buffer")` syntax
+to add or override bindings.
 
 ### Cursor Movement
 
@@ -123,12 +122,35 @@ customizable keybindings and macro recording/playback in the future._
 ## Building and Running
 
 ```bash
+# Set up Julia (downloads and configures Julia distribution)
+./scripts/setup-julia.sh
+
 # Build the project
 cargo build --release
 
 # Run the editor
-cargo run
+./scripts/run.sh
 ```
+
+## Configuration
+
+Roe loads configuration from `~/.roe.jl` on startup. Example configuration:
+
+```julia
+using Roe
+
+# Custom keybindings
+define_key("C-s", "save-buffer")      # Quick save
+define_key("C-q", "quit")             # Quick quit
+define_key("F5", "my-build-command")  # Custom command
+
+# Define a custom command
+define_command("insert-date", "Insert current date") do ctx
+    InsertAction(ctx.cursor_pos, string(Dates.today()))
+end
+```
+
+See `jl/keybindings.jl` for the full list of default keybindings.
 
 ## Architecture
 
@@ -151,21 +173,23 @@ This is a work-in-progress editor. Currently implemented:
 - **Region selection**: Mark system with visual highlighting
 - **Kill ring**: Cut, copy, paste with kill ring history
 - **Command mode**: Interactive command execution (M-x) with completion
-- **File operations**: Open and save files
+- **File operations**: Open and save files with interactive file selector
 - **Mouse integration**: Click-to-position cursor, window switching, border dragging for resizing
-- **Terminal UI**: Efficient rendering with borders, modelines, and echo area
-- **Auto-clearing messages**: Timed echo message clearing for better UX
-- **Julia integration**: Configuration loading from .roe.jl files and interactive Julia REPL mode
+- **Terminal UI**: Efficient incremental rendering with borders, modelines, and echo area
+- **Julia scripting**: Full integration with Julia for customization:
+  - Customizable keybindings via `define_key()`
+  - User-defined commands via `define_command()`
+  - Interactive modes written in Julia (file selector, buffer switcher)
+  - FFI access to buffer contents from Julia
 
 ## Next steps / not yet implemented
 
-- **Customizable keybindings**: Allow users to redefine key mappings
 - **Macro system**: Record and playback keystroke sequences
 - **Search and replace**: Interactive search, query-replace functionality
-- **Extended Julia integration**: Expand Julia's role as the primary implementation language for modes, commands, and editing behaviors, moving more functionality from hard-coded Rust to Julia
 - **Syntax highlighting**: TreeSitter integration for language-aware editing
 - **LSP integration**: Language server protocol support for modern development features
 - **Advanced editing**: Multiple cursors, rectangular selections, etc.
+- **Undo/redo**: Currently partially implemented
 
 ## Contributing & Feedback
 

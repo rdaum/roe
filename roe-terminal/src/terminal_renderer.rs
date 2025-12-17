@@ -213,6 +213,7 @@ impl<W: Write> TerminalRenderer<W> {
         let line_text = buffer.buffer_line(buffer_line);
         // Remove trailing newline if present
         let line_text = line_text.trim_end_matches('\n');
+
         let line_start_pos = buffer.buffer_line_to_char(buffer_line);
 
         let content_x = window.x + 1;
@@ -471,10 +472,10 @@ impl<W: Write> Renderer for TerminalRenderer<W> {
                     dirty_lines.push((global_line, (0, usize::MAX)));
                 }
             } else {
-                // Only collect specific dirty lines if buffer is not entirely dirty
+                // Only collect specific dirty lines for this buffer
                 dirty_lines = self
                     .dirty_tracker
-                    .dirty_lines_iter()
+                    .dirty_lines_iter(buffer_id)
                     .map(|(line, span)| (line, (span.start_col, span.end_col)))
                     .collect();
             }
@@ -507,13 +508,19 @@ impl<W: Write> Renderer for TerminalRenderer<W> {
         // Flush all queued drawing commands first
         self.device.flush()?;
 
-        // Move cursor to correct position and show it
+        // Move cursor to correct position and show it (unless in command window)
         let active_window = &editor.windows[editor.active_window];
         let (col, line) =
             editor.buffers[active_window.active_buffer].to_column_line(active_window.cursor);
         let (x, y) = active_window.absolute_cursor_position(col, line);
         queue!(&mut self.device, cursor::MoveTo(x, y))?;
-        queue!(&mut self.device, cursor::Show)?;
+
+        // Hide cursor in command windows (they use visual indicators like ">")
+        if matches!(active_window.window_type, roe_core::editor::WindowType::Command { .. }) {
+            queue!(&mut self.device, cursor::Hide)?;
+        } else {
+            queue!(&mut self.device, cursor::Show)?;
+        }
 
         // Flush cursor positioning commands
         self.device.flush()?;
@@ -576,13 +583,19 @@ impl<W: Write> Renderer for TerminalRenderer<W> {
         // Flush all drawing commands first
         self.device.flush()?;
 
-        // Position cursor and show it
+        // Position cursor and show it (unless in command window)
         let active_window = &editor.windows[editor.active_window];
         let (col, line) =
             editor.buffers[active_window.active_buffer].to_column_line(active_window.cursor);
         let (x, y) = active_window.absolute_cursor_position(col, line);
         queue!(&mut self.device, cursor::MoveTo(x, y))?;
-        queue!(&mut self.device, cursor::Show)?;
+
+        // Hide cursor in command windows (they use visual indicators like ">")
+        if matches!(active_window.window_type, roe_core::editor::WindowType::Command { .. }) {
+            queue!(&mut self.device, cursor::Hide)?;
+        } else {
+            queue!(&mut self.device, cursor::Show)?;
+        }
 
         // Flush cursor positioning commands
         self.device.flush()?;
@@ -1136,7 +1149,7 @@ pub async fn event_loop_with_renderer<W: Write>(
             // No keys to process (e.g., mouse events, resize events)
             vec![]
         } else {
-            editor.key_event(keys)?
+            editor.key_event(keys).await?
         };
 
         for action in actions {
@@ -1208,6 +1221,13 @@ pub async fn event_loop_with_renderer<W: Write>(
                         }
                         renderer.mark_dirty(DirtyRegion::FullScreen);
                     }
+                }
+                ChromeAction::BufferOps(_) => {
+                    // Buffer operations are handled in Editor::process_chrome_actions
+                    // This case should not be reached, but we handle it for completeness
+                }
+                ChromeAction::DumpMessages(_) => {
+                    // Handled in Editor::process_chrome_actions
                 }
             }
         }
@@ -1544,10 +1564,10 @@ mod tests {
         let buffer_id = slotmap::SlotMap::with_key().insert(());
 
         renderer.mark_dirty(DirtyRegion::Line { buffer_id, line: 5 });
-        assert!(renderer.dirty_tracker.is_line_dirty(5));
-        assert!(!renderer.dirty_tracker.is_line_dirty(4));
+        assert!(renderer.dirty_tracker.is_line_dirty(buffer_id, 5));
+        assert!(!renderer.dirty_tracker.is_line_dirty(buffer_id, 4));
 
         renderer.clear_dirty();
-        assert!(!renderer.dirty_tracker.is_line_dirty(5));
+        assert!(!renderer.dirty_tracker.is_line_dirty(buffer_id, 5));
     }
 }
