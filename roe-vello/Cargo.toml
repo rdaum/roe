@@ -1,0 +1,31 @@
+[package]
+name = "roe-vello"
+version = "0.1.0"
+edition = "2021"
+description = "Vello/GPU rendering for Roe (Ryan's Own Emacs)"
+
+[[bin]]
+name = "roe-vello"
+path = "src/bin/roe-vello.rs"
+
+[dependencies]
+# Core roe
+roe-core = { path = "../roe-core" }
+
+# Rendering
+vello = "0.3"
+# Note: wgpu version must match what vello uses (0.3 uses wgpu 22)
+
+# Windowing
+winit = "0.30"
+
+# Text
+parley = "0.2"
+
+# Async
+tokio = { workspace = true }
+pollster = "0.4"
+
+# Utilities
+slotmap = { workspace = true }
+jlrs = { workspace = true }

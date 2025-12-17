@@ -3,6 +3,7 @@ members = [
     "roe",
     "roe-core",
     "roe-terminal",
+    "roe-vello",
 ]
 resolver = "2"
 

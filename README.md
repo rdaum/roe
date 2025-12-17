@@ -1,6 +1,6 @@
 # Roe / ᚱᛟ / Ryan's Own Emacs
 
-A minimalistic console text editor in the spirit of the Emacs family of editors, built in Rust.
+A minimalistic text editor in the spirit of the Emacs family of editors, built in Rust.
 
 This editor follows the Emacs tradition in three key ways: (a) it's buffer-oriented rather than
 file-oriented, (b) it uses the default GNU Emacs keybinding set, and (c) it's fully programmable
@@ -15,6 +15,15 @@ performance, while Julia provides the high-level customization layer.
 
 ![Screenshot of Roe editor](screenshot.png)
 
+## Renderers
+
+Roe supports two rendering backends:
+
+- **Terminal** (`roe`): Lightweight, runs in your terminal using crossterm with efficient incremental updates
+- **Vello/GPU** (`roe-vello`): Native window with GPU-accelerated rendering via Vello/wgpu
+
+Both renderers share the same core editor, keybindings, and Julia integration.
+
 ## Features
 
 - **Emacs-style keybindings**: Familiar keyboard shortcuts for Emacs users, fully customizable
@@ -26,8 +35,7 @@ performance, while Julia provides the high-level customization layer.
 - **Mouse support**: Click to position cursor, drag window borders to resize, click to switch
   windows
 - **Modular architecture**: Extensible mode system for different editing behaviors
-- **Terminal-based**: Lightweight, runs in your terminal
-- **Fast rendering**: Uses crossterm for efficient terminal manipulation with incremental updates
+- **Dual rendering**: Terminal or GPU-accelerated native window
 
 ## Key Bindings
 
@@ -128,13 +136,40 @@ to add or override bindings.
 # Build the project
 cargo build --release
 
-# Run the editor
-./scripts/run.sh
+# Run terminal version
+./scripts/run.sh [files...]
+
+# Run Vello/GPU version
+./scripts/run-vello.sh [files...]
 ```
 
 ## Configuration
 
-Roe loads configuration from `~/.roe.jl` on startup. Example configuration:
+Roe loads configuration from `.roe.jl` in the current directory on startup. Example configuration:
+
+```julia
+# Configuration is defined as a Dict named roe_config
+roe_config = Dict(
+    # Font settings (Vello renderer only)
+    "font" => Dict(
+        "family" => "JetBrains Mono",  # Any installed font
+        "size" => 14
+    ),
+
+    # Color scheme (optional - defaults are used if not specified)
+    # "colors" => Dict(
+    #     "background" => "#1e1e1e",
+    #     "foreground" => "#d4d4d4",
+    #     "selection" => "#264f78",
+    #     "modeline" => "#007acc",
+    #     "cursor" => "#aeafad"
+    # )
+)
+```
+
+### Keybindings
+
+Custom keybindings can also be defined in Julia:
 
 ```julia
 using Roe
@@ -156,11 +191,17 @@ See `jl/keybindings.jl` for the full list of default keybindings.
 
 Roe is built with a clean separation of concerns:
 
+- **roe-core**: Core editor logic, buffer management, window system, Julia integration
+- **roe-terminal**: Terminal renderer using crossterm
+- **roe-vello**: GPU renderer using Vello/wgpu with Parley for text layout
+
+Key concepts:
+
 - **Buffer**: Text storage using `ropey` for efficient editing
 - **Window**: View into a buffer with cursor and scroll position
 - **Mode**: Defines behavior and keybindings for different editing contexts
 - **Editor**: Coordinates buffers, windows, and modes
-- **Frame**: Represents the terminal screen real estate
+- **Frame**: Represents available screen real estate
 
 ## Current Status
 
@@ -175,12 +216,15 @@ This is a work-in-progress editor. Currently implemented:
 - **Command mode**: Interactive command execution (M-x) with completion
 - **File operations**: Open and save files with interactive file selector
 - **Mouse integration**: Click-to-position cursor, window switching, border dragging for resizing
-- **Terminal UI**: Efficient incremental rendering with borders, modelines, and echo area
+- **Dual rendering**:
+  - Terminal UI with efficient incremental rendering via crossterm
+  - GPU-accelerated native window via Vello/wgpu with configurable fonts
 - **Julia scripting**: Full integration with Julia for customization:
   - Customizable keybindings via `define_key()`
   - User-defined commands via `define_command()`
-  - Interactive modes written in Julia (file selector, buffer switcher)
+  - Interactive modes written in Julia (file selector, buffer switcher, Julia REPL)
   - FFI access to buffer contents from Julia
+  - Theme/font configuration via Julia config file
 
 ## Next steps / not yet implemented
 

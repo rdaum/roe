@@ -411,11 +411,21 @@ impl ConfigQueryTask {
             return Ok(None);
         };
 
-        // Try to convert to string
+        // Try to convert based on Julia type - string first
         if let Ok(julia_string) = final_value.cast::<JuliaString>() {
             if let Ok(rust_string) = julia_string.as_str() {
                 return Ok(Some(ConfigValue::String(rust_string.to_string())));
             }
+        }
+
+        // Try integer
+        if let Ok(int_val) = final_value.unbox::<i64>() {
+            return Ok(Some(ConfigValue::Integer(int_val)));
+        }
+
+        // Try boolean - Julia Bool to Rust bool
+        if let Ok(bool_val) = final_value.unbox::<Bool>() {
+            return Ok(Some(ConfigValue::Boolean(bool_val.as_bool())));
         }
 
         Ok(None)
