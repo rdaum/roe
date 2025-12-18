@@ -436,6 +436,9 @@ fn convert_julia_result(
                     JuliaBufferOp::SetMark(pos) => BufferOperation::SetMark(pos),
                     JuliaBufferOp::ClearMark => BufferOperation::ClearMark,
                     JuliaBufferOp::SetContent(content) => BufferOperation::SetContent(content),
+                    JuliaBufferOp::IndentLine { line, indent } => {
+                        BufferOperation::IndentLine { line, indent }
+                    }
                 })
                 .collect();
             Ok(vec![ChromeAction::BufferOps(buffer_ops)])
@@ -449,6 +452,9 @@ fn convert_julia_result(
                 }
             }
             Ok(actions)
+        }
+        JuliaCommandResult::ExecuteCommand(command) => {
+            Ok(vec![ChromeAction::ExecuteCommand(command)])
         }
     }
 }

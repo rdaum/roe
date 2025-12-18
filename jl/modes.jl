@@ -57,6 +57,11 @@ function mode_action_to_dict(a::ExecuteCommandAction)
     Dict("type" => "execute_command", "command" => a.command)
 end
 
+# Also define action_to_dict for use by regular commands
+function action_to_dict(a::ExecuteCommandAction)
+    Dict("type" => "execute_command", "command" => a.command)
+end
+
 function mode_action_to_dict(::CursorUpAction)
     Dict("type" => "cursor_up")
 end

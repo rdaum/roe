@@ -268,7 +268,7 @@ impl TextRenderer {
                 text[..start]
                     .char_indices()
                     .map(|(i, _)| i)
-                    .last()
+                    .next_back()
                     .unwrap_or(0)
             };
             // Find the nearest char boundary at or after end

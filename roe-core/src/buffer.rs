@@ -131,6 +131,8 @@ impl BufferInner {
     }
 
     pub fn to_column_line(&self, char_index: usize) -> (u16, u16) {
+        // Clamp to valid range to prevent panic from stale cursor positions
+        let char_index = self.clamp_position(char_index);
         let line = self.buffer.char_to_line(char_index);
         let col = char_index - self.buffer.line_to_char(line);
         (col as u16, line as u16)

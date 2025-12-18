@@ -10,6 +10,7 @@
 #
 set -euo pipefail
 
+export RUST_BACKTRACE=full
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 JULIA_DIR="$PROJECT_ROOT/julia"
 

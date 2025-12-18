@@ -1072,9 +1072,10 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
                 self.render();
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                let actions = pollster::block_on(self.handle_key_event(event));
+                let mut actions: std::collections::VecDeque<_> =
+                    pollster::block_on(self.handle_key_event(event)).into();
 
-                for action in actions {
+                while let Some(action) = actions.pop_front() {
                     match action {
                         ChromeAction::Quit => {
                             self.quit_requested = true;
@@ -1155,6 +1156,32 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
                                 new_end as i64,
                             ));
                             roe_core::julia_runtime::clear_current_buffer();
+                        }
+                        ChromeAction::ExecuteCommand(command_name) => {
+                            // Execute another command via the command registry
+                            let context = self.editor.create_command_context();
+                            if self.editor.julia_runtime.is_some() {
+                                match pollster::block_on(
+                                    roe_core::command_mode::CommandMode::execute_command(
+                                        &command_name,
+                                        &self.editor.command_registry,
+                                        context,
+                                    ),
+                                ) {
+                                    Ok(command_actions) => {
+                                        // Process through editor to handle BufferOps etc.
+                                        let processed =
+                                            self.editor.process_chrome_actions(command_actions);
+                                        for a in processed {
+                                            actions.push_back(a);
+                                        }
+                                    }
+                                    Err(error_msg) => {
+                                        self.editor
+                                            .set_echo_message(format!("Command error: {error_msg}"));
+                                    }
+                                }
+                            }
                         }
                         _ => {}
                     }

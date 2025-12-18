@@ -547,6 +547,10 @@ function _julia_mode_init()
         define_julia_faces()
     end
 
+    # Register mode-specific indent commands
+    register_indent_command("julia-mode", "julia-indent-line")
+    register_newline_indent_command("julia-mode", "julia-newline-and-indent")
+
     # Apply initial highlighting
     highlight_julia_buffer()
 end
@@ -564,6 +568,237 @@ function _julia_mode_after_change(start::Int, old_end::Int, new_end::Int)
     # re-highlight affected regions
     highlight_julia_buffer()
 end
+
+# ============================================
+# Indentation Support
+# ============================================
+
+# Keywords that should dedent (line starts with these = one less indent level)
+const JULIA_DEDENT_KEYWORDS = Set(["else", "elseif", "catch", "finally", "end"])
+
+# Indent size in spaces
+const JULIA_INDENT_SIZE = 4
+
+"""
+Get byte positions where each line starts in the code.
+"""
+function _line_byte_positions(code::String)
+    positions = [1]
+    for (i, c) in enumerate(code)
+        if c == '\n'
+            push!(positions, i + 1)
+        end
+    end
+    return positions
+end
+
+"""
+Count indent level at a byte position by walking the parse tree.
+Handles both block constructs (function, if, for) and continuations (unclosed parens).
+"""
+function _indent_at_byte(tree, byte_pos::Int, code::String)
+    if !_try_load_julia_highlighting()
+        return 0
+    end
+
+    JS = Main.JuliaSyntax
+    indent = 0
+
+    # Node kinds that introduce block indentation (cumulative)
+    # Note: K"block" is NOT here - it's a generic container, the actual constructs provide indent
+    # Note: elseif/else/catch/finally are NOT here - they continue existing blocks, not new indent
+    block_kinds = Set([
+        (@eval Main JuliaSyntax.K"function"),
+        (@eval Main JuliaSyntax.K"macro"),
+        (@eval Main JuliaSyntax.K"for"),
+        (@eval Main JuliaSyntax.K"while"),
+        (@eval Main JuliaSyntax.K"if"),
+        (@eval Main JuliaSyntax.K"let"),
+        (@eval Main JuliaSyntax.K"try"),
+        (@eval Main JuliaSyntax.K"struct"),
+        (@eval Main JuliaSyntax.K"module"),
+        (@eval Main JuliaSyntax.K"begin"),
+        (@eval Main JuliaSyntax.K"do"),
+        (@eval Main JuliaSyntax.K"quote"),
+    ])
+
+    # Node kinds that introduce continuation indentation (cumulative for nested structures)
+    continuation_kinds = Set([
+        (@eval Main JuliaSyntax.K"call"),
+        (@eval Main JuliaSyntax.K"tuple"),
+        (@eval Main JuliaSyntax.K"vect"),
+        (@eval Main JuliaSyntax.K"braces"),
+        (@eval Main JuliaSyntax.K"parens"),
+    ])
+
+    # Get line number for a byte position
+    function line_for_byte(pos)
+        line = 1
+        for (i, c) in enumerate(code)
+            if i >= pos
+                break
+            end
+            if c == '\n'
+                line += 1
+            end
+        end
+        return line
+    end
+
+    target_line = line_for_byte(byte_pos)
+    block_lines_seen = Set{Int}()  # Track which lines we've already counted for blocks
+    continuation_lines_seen = Set{Int}()  # Track which lines we've already counted for continuations
+
+    function walk(node)
+        fb = Base.invokelatest(JS.first_byte, node)
+        lb = Base.invokelatest(JS.last_byte, node)
+        k = Base.invokelatest(JS.kind, node)
+
+        if fb <= byte_pos <= lb
+            # Block constructs: only indent if we're INSIDE the block (started on earlier line)
+            # AND we haven't already counted a block from that line
+            if k in block_kinds
+                block_start_line = line_for_byte(fb)
+                if block_start_line < target_line && !(block_start_line in block_lines_seen)
+                    push!(block_lines_seen, block_start_line)
+                    indent += 1
+                end
+            # Continuation constructs: add indent if construct spans multiple lines
+            # AND started on an earlier line than target
+            # AND we haven't already counted a continuation from that line
+            elseif k in continuation_kinds
+                # Skip leading whitespace to find actual content start
+                content_start = fb
+                while content_start <= lb && content_start <= length(code) && code[content_start] in " \t\n\r"
+                    content_start += 1
+                end
+
+                # Skip if content starts with a comment
+                starts_with_comment = content_start <= length(code) && code[content_start] == '#'
+
+                construct_start_line = line_for_byte(content_start)
+                construct_end_line = line_for_byte(lb)
+                spans_multiple_lines = construct_end_line > construct_start_line
+
+                if !starts_with_comment && construct_start_line < target_line && spans_multiple_lines && !(construct_start_line in continuation_lines_seen)
+                    push!(continuation_lines_seen, construct_start_line)
+                    indent += 1
+                end
+            end
+
+            if Base.invokelatest(JS.haschildren, node)
+                for child in Base.invokelatest(JS.children, node)
+                    walk(child)
+                end
+            end
+        end
+    end
+
+    walk(tree)
+    return indent
+end
+
+"""
+Get the first word on a line (for detecting dedent keywords).
+"""
+function _get_first_word(line::AbstractString)
+    m = match(r"^\s*(\w+)", line)
+    return m === nothing ? "" : m.captures[1]
+end
+
+"""
+    calculate_julia_indent(code::String, line_num::Int) -> Int
+
+Calculate the correct indentation level (in spaces) for a given line number.
+Uses JuliaSyntax parse tree for accurate block detection.
+"""
+function calculate_julia_indent(code::String, line_num::Int)
+    if !_try_load_julia_highlighting()
+        return 0
+    end
+
+    JS = Main.JuliaSyntax
+
+    lines = split(code, '\n')
+    if line_num < 1 || line_num > length(lines)
+        return 0
+    end
+
+    # Parse the code
+    local tree
+    try
+        tree = Base.invokelatest(JS.parseall, JS.SyntaxNode, code)
+    catch e
+        # Parse error - fall back to simple indent
+        return 0
+    end
+
+    line_starts = _line_byte_positions(code)
+    if line_num > length(line_starts)
+        return 0
+    end
+
+    byte_pos = line_starts[line_num]
+
+    # Get base indent from tree
+    indent = _indent_at_byte(tree, byte_pos, code)
+
+    # Check if line starts with dedenting keyword
+    first_word = _get_first_word(lines[line_num])
+    if first_word in JULIA_DEDENT_KEYWORDS
+        indent = max(0, indent - 1)
+    end
+
+    # Check if line starts with closing bracket (dedent for continuation)
+    line_trimmed = lstrip(lines[line_num])
+    if !isempty(line_trimmed) && line_trimmed[1] in ")]}"
+        indent = max(0, indent - 1)
+    end
+
+    return indent * JULIA_INDENT_SIZE
+end
+
+# Register indent commands
+function _register_julia_indent_commands()
+    define_command(
+        "julia-indent-line",
+        "Re-indent the current line (Tab behavior)"
+    ) do ctx
+        code = buffer_content()
+        line_num = ctx.current_line  # 1-indexed from Rust
+
+        # Calculate correct indent using parse tree
+        target_indent = calculate_julia_indent(code, line_num)
+
+        # Return IndentLineAction with 0-indexed line for Rust
+        return IndentLineAction(ctx.current_line - 1, target_indent)
+    end
+
+    define_command(
+        "julia-newline-and-indent",
+        "Insert newline and indent (Enter behavior)"
+    ) do ctx
+        code = buffer_content()
+        cursor = ctx.cursor_pos  # 0-indexed from Rust
+        line_num = ctx.current_line  # Already 1-indexed from Rust
+
+        # Simulate what the buffer will look like after newline insertion
+        # to calculate the correct indent for the new line
+        # Convert 0-indexed cursor to 1-indexed Julia string position
+        before = cursor > 0 ? code[1:cursor] : ""
+        after = cursor < length(code) ? code[cursor+1:end] : ""
+        new_code = before * "\n" * after
+        new_line_num = line_num + 1
+
+        target_indent = calculate_julia_indent(new_code, new_line_num)
+
+        # Insert newline + indentation as a single insert
+        indent_str = " " ^ target_indent
+        return InsertAction(cursor, "\n" * indent_str)
+    end
+end
+
+_register_julia_indent_commands()
 
 # Register julia-mode as a major mode
 define_major_mode("julia-mode",

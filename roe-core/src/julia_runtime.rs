@@ -190,6 +190,22 @@ pub extern "C" fn roe_buffer_delete(start: c_longlong, end: c_longlong) {
     buffer.delete_pos(start as usize, count as isize);
 }
 
+/// Get the major mode of the current buffer
+/// Returns a C string that Julia must free, or null if no major mode is set
+#[no_mangle]
+pub extern "C" fn roe_buffer_major_mode() -> *mut c_char {
+    let Some(buffer) = get_current_buffer() else {
+        return std::ptr::null_mut();
+    };
+    let Some(mode) = buffer.major_mode() else {
+        return std::ptr::null_mut();
+    };
+    match CString::new(mode) {
+        Ok(cstr) => cstr.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 // ============================================
 // Face and syntax highlighting FFI
 // ============================================
@@ -1018,6 +1034,35 @@ impl AsyncTask for CallCommandTask {
                                     JuliaBufferOp::SetContent(content),
                                 ]))
                             }
+                            "indent_line" => {
+                                let line = Self::get_int_field(
+                                    &mut frame,
+                                    &getindex,
+                                    result_dict,
+                                    "line",
+                                )
+                                .unwrap_or(0) as usize;
+                                let indent = Self::get_int_field(
+                                    &mut frame,
+                                    &getindex,
+                                    result_dict,
+                                    "indent",
+                                )
+                                .unwrap_or(0) as usize;
+                                Ok(JuliaCommandResult::BufferOps(vec![
+                                    JuliaBufferOp::IndentLine { line, indent },
+                                ]))
+                            }
+                            "execute_command" => {
+                                let command = Self::get_string_field(
+                                    &mut frame,
+                                    &getindex,
+                                    result_dict,
+                                    "command",
+                                )
+                                .unwrap_or_default();
+                                Ok(JuliaCommandResult::ExecuteCommand(command))
+                            }
                             "multi" => {
                                 // Parse array of actions - for now just return None
                                 // TODO: implement multi-action parsing
@@ -1558,6 +1603,10 @@ pub enum JuliaBufferOp {
     SetMark(usize),
     ClearMark,
     SetContent(String),
+    IndentLine {
+        line: usize,
+        indent: usize,
+    },
 }
 
 /// Result from a Julia command
@@ -1570,6 +1619,8 @@ pub enum JuliaCommandResult {
     BufferOps(Vec<JuliaBufferOp>),
     /// Multiple actions combined (echo + buffer ops, etc.)
     Multi(Vec<JuliaCommandResult>),
+    /// Execute another command by name
+    ExecuteCommand(String),
 }
 
 /// A single action returned from a Julia mode handler

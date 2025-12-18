@@ -1211,14 +1211,14 @@ pub async fn event_loop_with_renderer<W: Write>(
 
         // Display the keys pressed in echo with - between, using as_display_string, but only if there's
         // modifiers in play
-        let actions = if keys.is_empty() {
+        let mut actions: std::collections::VecDeque<_> = if keys.is_empty() {
             // No keys to process (e.g., mouse events, resize events)
-            vec![]
+            std::collections::VecDeque::new()
         } else {
-            editor.key_event(keys).await?
+            editor.key_event(keys).await?.into()
         };
 
-        for action in actions {
+        while let Some(action) = actions.pop_front() {
             match action {
                 ChromeAction::Echo(message) => {
                     // Set the echo message in the editor and render it
@@ -1323,6 +1323,30 @@ pub async fn event_loop_with_renderer<W: Write>(
                         )
                         .await;
                     roe_core::julia_runtime::clear_current_buffer();
+                }
+                ChromeAction::ExecuteCommand(command_name) => {
+                    // Execute another command via the command registry
+                    let context = editor.create_command_context();
+                    if editor.julia_runtime.is_some() {
+                        match roe_core::command_mode::CommandMode::execute_command(
+                            &command_name,
+                            &editor.command_registry,
+                            context,
+                        )
+                        .await
+                        {
+                            Ok(command_actions) => {
+                                // Process through editor to handle BufferOps etc.
+                                let processed = editor.process_chrome_actions(command_actions);
+                                for a in processed {
+                                    actions.push_back(a);
+                                }
+                            }
+                            Err(error_msg) => {
+                                editor.set_echo_message(format!("Command error: {error_msg}"));
+                            }
+                        }
+                    }
                 }
             }
         }

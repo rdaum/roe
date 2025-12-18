@@ -113,3 +113,19 @@ function buffer_delete!(start::Int, stop::Int)
     ccall(Libdl.dlsym(handle, :roe_buffer_delete), Cvoid, (Clonglong, Clonglong), start, stop)
     return nothing
 end
+
+"""
+    buffer_major_mode() -> Union{String, Nothing}
+
+Get the major mode of the current buffer, or nothing if no mode is set.
+"""
+function buffer_major_mode()
+    handle = _get_roe_handle()
+    ptr = ccall(Libdl.dlsym(handle, :roe_buffer_major_mode), Ptr{Cchar}, ())
+    if ptr == C_NULL
+        return nothing
+    end
+    result = unsafe_string(ptr)
+    ccall(Libdl.dlsym(handle, :roe_free_string), Cvoid, (Ptr{Cchar},), ptr)
+    return result
+end

@@ -257,6 +257,11 @@ pub enum BufferOperation {
     ClearMark,
     /// Set the entire buffer content
     SetContent(String),
+    /// Indent a line to a specific level (handles cursor positioning)
+    IndentLine {
+        line: usize,
+        indent: usize,
+    },
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -310,6 +315,8 @@ pub enum ChromeAction {
         old_end: usize,
         new_end: usize,
     },
+    /// Execute a command by name
+    ExecuteCommand(String),
 }
 
 impl Editor {
@@ -2619,7 +2626,7 @@ impl Editor {
 
     /// Create a CommandContext from the current editor state
     /// Process ChromeActions and handle those that need editor state changes
-    fn process_chrome_actions(&mut self, actions: Vec<ChromeAction>) -> Vec<ChromeAction> {
+    pub fn process_chrome_actions(&mut self, actions: Vec<ChromeAction>) -> Vec<ChromeAction> {
         let mut result_actions = Vec::new();
 
         for action in actions {
@@ -2777,6 +2784,50 @@ impl Editor {
                                     ));
                                     result_actions.push(ChromeAction::CursorMove((0, 0)));
                                 }
+                                BufferOperation::IndentLine { line, indent } => {
+                                    // Find line start position
+                                    let line_start = buffer.to_char_index(0, line as u16);
+
+                                    // Get the line content to find current indentation
+                                    let line_text = buffer.buffer_line(line);
+                                    let current_indent = line_text
+                                        .chars()
+                                        .take_while(|c| *c == ' ' || *c == '\t')
+                                        .count();
+
+                                    // Calculate cursor behavior (Emacs-style)
+                                    let window = &mut self.windows[self.active_window];
+                                    let cursor_in_indent = window.cursor >= line_start
+                                        && window.cursor <= line_start + current_indent;
+
+                                    // Delete old indentation
+                                    if current_indent > 0 {
+                                        buffer.delete_pos(line_start, current_indent as isize);
+                                    }
+
+                                    // Insert new indentation
+                                    if indent > 0 {
+                                        let indent_str = " ".repeat(indent);
+                                        buffer.insert_pos(indent_str, line_start);
+                                    }
+
+                                    // Update cursor position
+                                    if cursor_in_indent {
+                                        // Move to end of new indent
+                                        window.cursor = line_start + indent;
+                                    } else if window.cursor > line_start + current_indent {
+                                        // Adjust cursor by indent difference
+                                        let diff = indent as isize - current_indent as isize;
+                                        window.cursor =
+                                            (window.cursor as isize + diff).max(0) as usize;
+                                    }
+
+                                    let (col, ln) = buffer.to_column_line(window.cursor);
+                                    result_actions.push(ChromeAction::CursorMove((col, ln)));
+                                    result_actions.push(ChromeAction::MarkDirty(
+                                        DirtyRegion::Buffer { buffer_id },
+                                    ));
+                                }
                             }
                         }
                     } else {
@@ -2808,7 +2859,7 @@ impl Editor {
         result_actions
     }
 
-    fn create_command_context(&self) -> crate::command_registry::CommandContext {
+    pub fn create_command_context(&self) -> crate::command_registry::CommandContext {
         let window = &self.windows[self.active_window];
         let buffer = &self.buffers[window.active_buffer];
         let (current_column, current_line) = buffer.to_column_line(window.cursor);

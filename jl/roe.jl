@@ -20,10 +20,13 @@ module Roe
 export define_command, call_command, CommandContext, define_key, define_keys, undefine_key,
        # Action types
        EchoAction, NoAction, InsertAction, DeleteAction, ReplaceAction,
-       SetCursorAction, SetMarkAction, ClearMarkAction, SetContentAction,
+       SetCursorAction, SetMarkAction, ClearMarkAction, SetContentAction, IndentLineAction,
+       ExecuteCommandAction,
        # Buffer access functions
        buffer_content, buffer_line, buffer_line_count, buffer_char_count,
-       buffer_substring, buffer_insert!, buffer_delete!,
+       buffer_substring, buffer_insert!, buffer_delete!, buffer_major_mode,
+       # Indentation registration
+       register_indent_command, register_newline_indent_command,
        # Minor mode API (key handlers)
        define_mode, mode_perform, has_mode, reset_mode_state,
        ClearTextAction, InsertTextModeAction, OpenFileAction, ExecuteCommandAction,

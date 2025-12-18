@@ -82,6 +82,12 @@ struct SetContentAction <: Action
     content::String
 end
 
+# Indent a line to a specific level (handles cursor positioning)
+struct IndentLineAction <: Action
+    line::Int      # 0-indexed line number
+    indent::Int    # target indent in spaces
+end
+
 # Convert action to Dict for Rust consumption
 function action_to_dict(a::EchoAction)
     Dict("type" => "echo", "message" => a.message)
@@ -121,6 +127,10 @@ end
 
 function action_to_dict(a::SetContentAction)
     Dict("type" => "set_content", "content" => a.content)
+end
+
+function action_to_dict(a::IndentLineAction)
+    Dict("type" => "indent_line", "line" => a.line, "indent" => a.indent)
 end
 
 """
@@ -268,4 +278,45 @@ define_command("buffer-test-delete", "Test direct buffer delete via FFI") do ctx
     else
         EchoAction("Nothing to delete")
     end
+end
+
+# ============================================
+# Mode-aware indentation commands
+# ============================================
+
+# Registry of mode-specific indent commands
+const _indent_commands = Dict{String, String}()
+const _newline_indent_commands = Dict{String, String}()
+
+"""
+Register an indent-line command for a major mode.
+"""
+function register_indent_command(mode::String, command::String)
+    _indent_commands[mode] = command
+end
+
+"""
+Register a newline-and-indent command for a major mode.
+"""
+function register_newline_indent_command(mode::String, command::String)
+    _newline_indent_commands[mode] = command
+end
+
+define_command("indent-line", "Re-indent current line based on major mode") do ctx
+    mode = buffer_major_mode()
+    if mode !== nothing && haskey(_indent_commands, mode)
+        return ExecuteCommandAction(_indent_commands[mode])
+    end
+    # Default: insert 4 spaces
+    return InsertAction(ctx.cursor_pos, "    ")
+end
+
+define_command("newline-and-indent", "Insert newline and indent based on major mode") do ctx
+    mode = buffer_major_mode()
+    if mode !== nothing && haskey(_newline_indent_commands, mode)
+        # Call the mode-specific newline-and-indent command
+        return ExecuteCommandAction(_newline_indent_commands[mode])
+    end
+    # Default: just insert newline
+    return InsertAction(ctx.cursor_pos, "\n")
 end

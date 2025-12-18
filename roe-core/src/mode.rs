@@ -190,17 +190,22 @@ impl Mode for ScratchMode {
                 None => ModeResult::Consumed(vec![ModeAction::Yank(ActionPosition::cursor())]),
             },
             KeyAction::ForceIndent => ModeResult::Ignored,
-            KeyAction::Tab => ModeResult::Ignored,
+            KeyAction::Tab => {
+                // Dispatch to indent-line command (mode-aware indentation)
+                ModeResult::Consumed(vec![ModeAction::ExecuteCommand("indent-line".to_string())])
+            }
             KeyAction::Delete => {
                 ModeResult::Consumed(vec![ModeAction::DeleteText(ActionPosition::cursor(), 1)])
             }
             KeyAction::Backspace => {
                 ModeResult::Consumed(vec![ModeAction::DeleteText(ActionPosition::cursor(), -1)])
             }
-            KeyAction::Enter => ModeResult::Consumed(vec![ModeAction::InsertText(
-                ActionPosition::cursor(),
-                "\n".to_string(),
-            )]),
+            KeyAction::Enter => {
+                // Dispatch to newline-and-indent command (mode-aware)
+                ModeResult::Consumed(vec![ModeAction::ExecuteCommand(
+                    "newline-and-indent".to_string(),
+                )])
+            }
             KeyAction::Escape => ModeResult::Ignored,
             KeyAction::DeleteWord => ModeResult::Ignored,
             KeyAction::ToggleCapsLock => ModeResult::Ignored,
@@ -279,17 +284,22 @@ impl Mode for FileMode {
                 None => ModeResult::Consumed(vec![ModeAction::Yank(ActionPosition::cursor())]),
             },
             KeyAction::ForceIndent => ModeResult::Ignored,
-            KeyAction::Tab => ModeResult::Ignored,
+            KeyAction::Tab => {
+                // Dispatch to indent-line command (mode-aware indentation)
+                ModeResult::Consumed(vec![ModeAction::ExecuteCommand("indent-line".to_string())])
+            }
             KeyAction::Delete => {
                 ModeResult::Consumed(vec![ModeAction::DeleteText(ActionPosition::cursor(), 1)])
             }
             KeyAction::Backspace => {
                 ModeResult::Consumed(vec![ModeAction::DeleteText(ActionPosition::cursor(), -1)])
             }
-            KeyAction::Enter => ModeResult::Consumed(vec![ModeAction::InsertText(
-                ActionPosition::cursor(),
-                "\n".to_string(),
-            )]),
+            KeyAction::Enter => {
+                // Dispatch to newline-and-indent command (mode-aware)
+                ModeResult::Consumed(vec![ModeAction::ExecuteCommand(
+                    "newline-and-indent".to_string(),
+                )])
+            }
             KeyAction::Escape => ModeResult::Ignored,
             KeyAction::DeleteWord => ModeResult::Ignored,
             KeyAction::ToggleCapsLock => ModeResult::Ignored,
