@@ -3,9 +3,9 @@
 A minimalistic text editor in the spirit of the Emacs family of editors, built in Rust.
 
 This editor follows the Emacs tradition in three key ways: (a) it's buffer-oriented rather than
-file-oriented, (b) it uses the default GNU Emacs keybinding set, and (c) it's fully programmable
-via an embedded scripting language. Unlike the current trend toward "modal" editors, this is a
-direct manipulation editor and proud of it.
+file-oriented, (b) it uses the default GNU Emacs keybinding set, and (c) it's fully programmable via
+an embedded scripting language. Unlike the current trend toward "modal" editors, this is a direct
+manipulation editor and proud of it.
 
 Roe uses Julia as its extension language (where Emacs uses Elisp). Keybindings, commands, and
 interactive modes can all be defined in Julia. The core editor is implemented in Rust for
@@ -19,7 +19,8 @@ performance, while Julia provides the high-level customization layer.
 
 Roe supports two rendering backends:
 
-- **Terminal** (`roe`): Lightweight, runs in your terminal using crossterm with efficient incremental updates
+- **Terminal** (`roe`): Lightweight, runs in your terminal using crossterm with efficient
+  incremental updates
 - **Vello/GPU** (`roe-vello`): Native window with GPU-accelerated rendering via Vello/wgpu
 
 Both renderers share the same core editor, keybindings, and Julia integration.
@@ -39,9 +40,9 @@ Both renderers share the same core editor, keybindings, and Julia integration.
 
 ## Key Bindings
 
-Keybindings are defined in Julia and can be customized in your `.roe.jl` configuration file.
-The defaults follow GNU Emacs conventions. Use `define_key("C-x C-s", "save-buffer")` syntax
-to add or override bindings.
+Keybindings are defined in Julia and can be customized in your `.roe.jl` configuration file. The
+defaults follow GNU Emacs conventions. Use `define_key("C-x C-s", "save-buffer")` syntax to add or
+override bindings.
 
 ### Cursor Movement
 

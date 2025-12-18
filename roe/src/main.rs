@@ -18,8 +18,10 @@ use crossterm::event::{
 use crossterm::execute;
 use crossterm::terminal::disable_raw_mode;
 use roe_core::{
-    buffer_host, command_registry, editor, kill_ring, mode, Buffer, BufferId, ConfigurableBindings,
-    Editor, Frame, KeyState, Mode, ModeId, Renderer, Window, WindowId,
+    buffer_host, command_registry, editor,
+    julia_runtime::{clear_current_buffer, set_current_buffer},
+    kill_ring, mode, Buffer, BufferId, ConfigurableBindings, Editor, Frame, KeyState, Mode, ModeId,
+    Renderer, Window, WindowId,
 };
 use roe_terminal::{TerminalRenderer, ECHO_AREA_HEIGHT};
 use slotmap::SlotMap;
@@ -154,7 +156,15 @@ async fn terminal_main<W: Write>(stdout: W, config: EditorConfig) -> Result<(), 
         if let Some(roe_module_path) =
             roe_core::julia_runtime::RoeJuliaRuntime::bundled_roe_module_path()
         {
-            let _ = runtime.load_roe_module(roe_module_path.clone()).await;
+            if let Err(e) = runtime.load_roe_module(roe_module_path.clone()).await {
+                eprintln!("Fatal: Failed to load Roe Julia module: {}", e);
+                eprintln!("The editor cannot start without the Roe module.");
+                std::process::exit(1);
+            }
+        } else {
+            eprintln!("Fatal: Could not find Roe Julia module (jl/roe.jl)");
+            eprintln!("Make sure to run from the roe directory or install properly.");
+            std::process::exit(1);
         }
         drop(runtime);
 
@@ -219,6 +229,20 @@ async fn terminal_main<W: Write>(stdout: W, config: EditorConfig) -> Result<(), 
                     buffer
                 }
             };
+
+            // Get and apply major mode for this file
+            if let Some(ref jr) = julia_runtime {
+                let runtime = jr.lock().await;
+                if let Ok(major_mode) = runtime.get_major_mode_for_file(&file_path).await {
+                    buffer.set_major_mode(major_mode.clone());
+
+                    // Call the major mode's init hook
+                    set_current_buffer(buffer.clone());
+                    let _ = runtime.call_major_mode_init(&major_mode).await;
+                    clear_current_buffer();
+                }
+                drop(runtime);
+            }
 
             let buffer_id = buffers.insert(buffer.clone());
 

@@ -1,0 +1,20 @@
+# This file is machine-generated - editing it directly is not advised
+
+julia_version = "1.11.2"
+manifest_format = "2.0"
+project_hash = "f9042802c7b6cfcfad2381bc0172c957c663ecaa"
+
+[[deps.JuliaSyntax]]
+git-tree-sha1 = "937da4713526b96ac9a178e2035019d3b78ead4a"
+uuid = "70703baa-626e-46a2-a12c-08ffd08c73b4"
+version = "0.4.10"
+
+[[deps.JuliaSyntaxHighlighting]]
+deps = ["JuliaSyntax", "StyledStrings"]
+git-tree-sha1 = "19ecee1ea81c60156486a92b062e443b6bba60b7"
+uuid = "ac6e5ff7-fb65-4e79-a425-ec3bc9c03011"
+version = "0.1.0"
+
+[[deps.StyledStrings]]
+uuid = "f489334b-da3d-4c2e-b8f0-e476e12c162b"
+version = "1.11.0"

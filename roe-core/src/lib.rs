@@ -27,6 +27,7 @@ pub mod mode;
 pub mod renderer;
 pub mod scripted_mode;
 pub mod selection_menu;
+pub mod syntax;
 pub mod window;
 
 new_key_type! {
@@ -46,3 +47,4 @@ pub use editor::{Editor, Frame, Window};
 pub use keys::{Bindings, ConfigurableBindings, KeyState};
 pub use mode::{FileMode, Mode};
 pub use renderer::Renderer;
+pub use syntax::{Color, Face, FaceId, FaceRegistry, HighlightSpan, SpanStore};

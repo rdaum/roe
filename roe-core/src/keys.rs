@@ -542,10 +542,8 @@ impl Bindings for ConfigurableBindings {
 
         // Handle Shift+alpha for uppercase
         if keys.len() == 2 {
-            if let (
-                LogicalKey::Modifier(KeyModifier::Shift(_)),
-                LogicalKey::AlphaNumeric(c),
-            ) = (&keys[0], &keys[1])
+            if let (LogicalKey::Modifier(KeyModifier::Shift(_)), LogicalKey::AlphaNumeric(c)) =
+                (&keys[0], &keys[1])
             {
                 return KeyAction::AlphaNumeric(c.to_ascii_uppercase());
             }

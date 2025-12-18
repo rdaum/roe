@@ -17,12 +17,13 @@ use crate::buffer_switch_mode::{BufferSwitchMode, BufferSwitchPurpose};
 use crate::command_mode::CommandMode;
 use crate::command_registry::CommandRegistry;
 use crate::file_selector_mode::FileSelectorMode;
-use crate::scripted_mode::ScriptedMode;
+use crate::julia_runtime::{clear_current_buffer, set_current_buffer};
 use crate::keys::KeyAction::ChordNext;
 use crate::keys::{Bindings, CursorDirection, KeyAction, KeyState, LogicalKey};
 use crate::kill_ring::KillRing;
 use crate::mode::{ActionPosition, MessagesMode, Mode, ModeAction, ModeResult};
 use crate::renderer::{DirtyRegion, ModelineComponent};
+use crate::scripted_mode::ScriptedMode;
 use crate::{BufferId, ModeId, WindowId};
 use slotmap::SlotMap;
 use std::collections::{HashMap, HashSet};
@@ -243,7 +244,11 @@ pub enum BufferOperation {
     /// Delete text from start to end (exclusive)
     Delete { start: usize, end: usize },
     /// Replace text from start to end with new text
-    Replace { start: usize, end: usize, text: String },
+    Replace {
+        start: usize,
+        end: usize,
+        text: String,
+    },
     /// Set cursor position
     SetCursor(usize),
     /// Set mark at position
@@ -298,6 +303,13 @@ pub enum ChromeAction {
     BufferOps(Vec<BufferOperation>),
     /// Dump messages buffer to a file
     DumpMessages(String),
+    /// Buffer content changed - trigger major mode after-change hook
+    BufferChanged {
+        buffer_id: BufferId,
+        start: usize,
+        old_end: usize,
+        new_end: usize,
+    },
 }
 
 impl Editor {
@@ -366,17 +378,22 @@ impl Editor {
 
                 // Try to use Julia-based buffer switcher if runtime is available
                 if let Some(ref runtime) = self.julia_runtime {
-                    let mut scripted_mode = ScriptedMode::new(
-                        "julia-buffer-switcher".to_string(),
-                        runtime.clone(),
-                    );
+                    let mut scripted_mode =
+                        ScriptedMode::new("julia-buffer-switcher".to_string(), runtime.clone());
 
                     // Build buffer ID map and JSON for Julia
-                    let buffer_id_map: Vec<BufferId> = buffer_list.iter().map(|(id, _)| *id).collect();
+                    let buffer_id_map: Vec<BufferId> =
+                        buffer_list.iter().map(|(id, _)| *id).collect();
                     let buffers_json = buffer_list
                         .iter()
                         .enumerate()
-                        .map(|(i, (_, name))| format!(r#"{{"index":{},"name":"{}"}}"#, i, name.replace('"', "\\\"")))
+                        .map(|(i, (_, name))| {
+                            format!(
+                                r#"{{"index":{},"name":"{}"}}"#,
+                                i,
+                                name.replace('"', "\\\"")
+                            )
+                        })
                         .collect::<Vec<_>>()
                         .join(",");
                     let buffers_json = format!("[{}]", buffers_json);
@@ -388,7 +405,10 @@ impl Editor {
                     // For switch mode, pre-select the previous buffer
                     let current_buffer_id = self.windows[self.active_window].active_buffer;
                     if let Some(previous_buffer_id) = self.get_previous_buffer(current_buffer_id) {
-                        if let Some(idx) = buffer_list.iter().position(|(id, _)| *id == previous_buffer_id) {
+                        if let Some(idx) = buffer_list
+                            .iter()
+                            .position(|(id, _)| *id == previous_buffer_id)
+                        {
                             scripted_mode.set_init_param("preselect", &idx.to_string());
                         }
                     }
@@ -396,15 +416,16 @@ impl Editor {
                     // Trigger init immediately
                     let init_result = scripted_mode.perform(&KeyAction::Unbound);
                     let content = match init_result {
-                        ModeResult::Consumed(actions) | ModeResult::Annotated(actions) => {
-                            actions.into_iter().find_map(|action| {
+                        ModeResult::Consumed(actions) | ModeResult::Annotated(actions) => actions
+                            .into_iter()
+                            .find_map(|action| {
                                 if let ModeAction::InsertText(_, text) = action {
                                     Some(text)
                                 } else {
                                     None
                                 }
-                            }).unwrap_or_else(|| "Loading buffer switcher...\n".to_string())
-                        }
+                            })
+                            .unwrap_or_else(|| "Loading buffer switcher...\n".to_string()),
                         ModeResult::Ignored => "Loading buffer switcher...\n".to_string(),
                     };
 
@@ -458,17 +479,22 @@ impl Editor {
 
                 // Try to use Julia-based buffer switcher if runtime is available
                 if let Some(ref runtime) = self.julia_runtime {
-                    let mut scripted_mode = ScriptedMode::new(
-                        "julia-buffer-switcher".to_string(),
-                        runtime.clone(),
-                    );
+                    let mut scripted_mode =
+                        ScriptedMode::new("julia-buffer-switcher".to_string(), runtime.clone());
 
                     // Build buffer ID map and JSON for Julia
-                    let buffer_id_map: Vec<BufferId> = buffer_list.iter().map(|(id, _)| *id).collect();
+                    let buffer_id_map: Vec<BufferId> =
+                        buffer_list.iter().map(|(id, _)| *id).collect();
                     let buffers_json = buffer_list
                         .iter()
                         .enumerate()
-                        .map(|(i, (_, name))| format!(r#"{{"index":{},"name":"{}"}}"#, i, name.replace('"', "\\\"")))
+                        .map(|(i, (_, name))| {
+                            format!(
+                                r#"{{"index":{},"name":"{}"}}"#,
+                                i,
+                                name.replace('"', "\\\"")
+                            )
+                        })
                         .collect::<Vec<_>>()
                         .join(",");
                     let buffers_json = format!("[{}]", buffers_json);
@@ -479,22 +505,26 @@ impl Editor {
 
                     // For kill mode, pre-select the current buffer
                     let current_buffer_id = self.windows[self.active_window].active_buffer;
-                    if let Some(idx) = buffer_list.iter().position(|(id, _)| *id == current_buffer_id) {
+                    if let Some(idx) = buffer_list
+                        .iter()
+                        .position(|(id, _)| *id == current_buffer_id)
+                    {
                         scripted_mode.set_init_param("preselect", &idx.to_string());
                     }
 
                     // Trigger init immediately
                     let init_result = scripted_mode.perform(&KeyAction::Unbound);
                     let content = match init_result {
-                        ModeResult::Consumed(actions) | ModeResult::Annotated(actions) => {
-                            actions.into_iter().find_map(|action| {
+                        ModeResult::Consumed(actions) | ModeResult::Annotated(actions) => actions
+                            .into_iter()
+                            .find_map(|action| {
                                 if let ModeAction::InsertText(_, text) = action {
                                     Some(text)
                                 } else {
                                     None
                                 }
-                            }).unwrap_or_else(|| "Loading buffer switcher...\n".to_string())
-                        }
+                            })
+                            .unwrap_or_else(|| "Loading buffer switcher...\n".to_string()),
                         ModeResult::Ignored => "Loading buffer switcher...\n".to_string(),
                     };
 
@@ -526,10 +556,8 @@ impl Editor {
                 // Try to use Julia-based file selector if runtime is available
                 if let Some(ref runtime) = self.julia_runtime {
                     // Create ScriptedMode that delegates to Julia
-                    let mut scripted_mode = ScriptedMode::new(
-                        "julia-file-selector".to_string(),
-                        runtime.clone(),
-                    );
+                    let mut scripted_mode =
+                        ScriptedMode::new("julia-file-selector".to_string(), runtime.clone());
 
                     // Set open_type in the mode so it can pass it to Julia
                     let open_type_str = match open_type {
@@ -546,13 +574,16 @@ impl Editor {
                     let content = match init_result {
                         ModeResult::Consumed(actions) | ModeResult::Annotated(actions) => {
                             // Look for InsertText action to get the content
-                            actions.into_iter().find_map(|action| {
-                                if let ModeAction::InsertText(_, text) = action {
-                                    Some(text)
-                                } else {
-                                    None
-                                }
-                            }).unwrap_or_else(|| "Loading file selector...\n".to_string())
+                            actions
+                                .into_iter()
+                                .find_map(|action| {
+                                    if let ModeAction::InsertText(_, text) = action {
+                                        Some(text)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or_else(|| "Loading file selector...\n".to_string())
                         }
                         ModeResult::Ignored => "Loading file selector...\n".to_string(),
                     };
@@ -1467,8 +1498,13 @@ impl Editor {
                     // Auto-scroll to keep cursor visible
                     let content_height = window.height_chars.saturating_sub(3); // Account for border + modeline
                     let content_width = window.width_chars.saturating_sub(4); // Account for borders + scrollbar
-                    let needs_redraw =
-                        Self::ensure_cursor_visible_static(window, col, line, content_width, content_height);
+                    let needs_redraw = Self::ensure_cursor_visible_static(
+                        window,
+                        col,
+                        line,
+                        content_width,
+                        content_height,
+                    );
 
                     let mut actions = vec![ChromeAction::CursorMove(
                         window.absolute_cursor_position(col, line),
@@ -1554,18 +1590,22 @@ impl Editor {
                         };
                         if let Some(buffer_host) = self.buffer_hosts.get(&buffer_id).cloned() {
                             let response_result = tokio::task::block_in_place(|| {
-                                tokio::runtime::Handle::current()
-                                    .block_on(async { buffer_host.handle_key(mode_key_action, cursor_pos).await })
+                                tokio::runtime::Handle::current().block_on(async {
+                                    buffer_host.handle_key(mode_key_action, cursor_pos).await
+                                })
                             });
                             match response_result {
                                 Ok(response) => {
                                     return Ok(tokio::task::block_in_place(|| {
-                                        tokio::runtime::Handle::current()
-                                            .block_on(async { self.handle_buffer_response(response).await })
+                                        tokio::runtime::Handle::current().block_on(async {
+                                            self.handle_buffer_response(response).await
+                                        })
                                     }));
                                 }
                                 Err(err) => {
-                                    return Ok(vec![ChromeAction::Echo(format!("Buffer error: {err}"))]);
+                                    return Ok(vec![ChromeAction::Echo(format!(
+                                        "Buffer error: {err}"
+                                    ))]);
                                 }
                             }
                         }
@@ -1660,6 +1700,7 @@ impl Editor {
                 dirty_regions,
                 new_cursor_pos,
                 editor_action,
+                buffer_change,
             } => {
                 let mut actions = vec![];
 
@@ -1682,6 +1723,20 @@ impl Editor {
                     actions.push(ChromeAction::CursorMove(
                         window.absolute_cursor_position(col, line),
                     ));
+                }
+
+                // Handle buffer change for after-change hooks
+                if let Some(change) = buffer_change {
+                    let buffer_id = {
+                        let window = &self.windows[self.active_window];
+                        window.active_buffer
+                    };
+                    actions.push(ChromeAction::BufferChanged {
+                        buffer_id,
+                        start: change.start,
+                        old_end: change.old_end,
+                        new_end: change.new_end,
+                    });
                 }
 
                 // Handle editor action
@@ -1953,8 +2008,10 @@ impl Editor {
             .expect("Active buffer should exist");
         match position {
             ActionPosition::Cursor => {
+                let start = window.cursor;
                 let length = text.len();
                 let has_newline = text.contains('\n');
+                let buffer_id = window.active_buffer;
                 buffer.insert_pos(text, window.cursor);
 
                 // Advance the cursor
@@ -1967,13 +2024,11 @@ impl Editor {
                 let cursor_line = buffer.to_column_line(window.cursor).1 as usize;
                 let dirty_action = if has_newline {
                     // Newlines affect multiple lines, mark entire buffer dirty
-                    ChromeAction::MarkDirty(DirtyRegion::Buffer {
-                        buffer_id: window.active_buffer,
-                    })
+                    ChromeAction::MarkDirty(DirtyRegion::Buffer { buffer_id })
                 } else {
                     // Simple text insertion, only current line affected
                     ChromeAction::MarkDirty(DirtyRegion::Line {
-                        buffer_id: window.active_buffer,
+                        buffer_id,
                         line: cursor_line,
                     })
                 };
@@ -1982,9 +2037,19 @@ impl Editor {
                     ChromeAction::Echo("Inserted text".to_string()),
                     dirty_action,
                     ChromeAction::CursorMove(window_cursor),
+                    // Notify major mode of buffer change for syntax highlighting
+                    ChromeAction::BufferChanged {
+                        buffer_id,
+                        start,
+                        old_end: start,
+                        new_end: start + length,
+                    },
                 ]
             }
             ActionPosition::Absolute(l, c) => {
+                let buffer_id = window.active_buffer;
+                let start = buffer.to_char_index(*c, *l);
+                let length = text.len();
                 buffer.insert_col_line(text.clone(), (*l, *c));
 
                 let new_cursor = buffer.to_column_line(window.cursor);
@@ -1992,13 +2057,11 @@ impl Editor {
 
                 let dirty_action = if text.contains('\n') {
                     // Newlines affect multiple lines, mark entire buffer dirty
-                    ChromeAction::MarkDirty(DirtyRegion::Buffer {
-                        buffer_id: window.active_buffer,
-                    })
+                    ChromeAction::MarkDirty(DirtyRegion::Buffer { buffer_id })
                 } else {
                     // Simple text insertion, only current line affected
                     ChromeAction::MarkDirty(DirtyRegion::Line {
-                        buffer_id: window.active_buffer,
+                        buffer_id,
                         line: *l as usize,
                     })
                 };
@@ -2007,6 +2070,12 @@ impl Editor {
                     ChromeAction::Echo("Inserted text".to_string()),
                     dirty_action,
                     ChromeAction::CursorMove(window_cursor),
+                    ChromeAction::BufferChanged {
+                        buffer_id,
+                        start,
+                        old_end: start,
+                        new_end: start + length,
+                    },
                 ]
             }
             ActionPosition::End => {
@@ -2030,17 +2099,30 @@ impl Editor {
 
         match position {
             ActionPosition::Cursor => {
+                let buffer_id = window.active_buffer;
+                let cursor_before = window.cursor;
                 let Some(deleted) = buffer.delete_pos(window.cursor, count) else {
                     return vec![];
                 };
                 if deleted.is_empty() {
                     return vec![];
                 }
+                let deleted_len = deleted.len();
+
+                // Calculate change region for after-change hook
+                let (start, old_end) = if count < 0 {
+                    // Deleted backward: text was before cursor
+                    let start = cursor_before - deleted_len;
+                    (start, cursor_before)
+                } else {
+                    // Deleted forward: text was after cursor
+                    (cursor_before, cursor_before + deleted_len)
+                };
+
                 // If the count was negative, then we need to adjust the cursor back by the size
                 // of the deleted fragment.
                 if count < 0 {
-                    let length = deleted.len();
-                    window.cursor -= length;
+                    window.cursor -= deleted_len;
                 }
                 let new_cursor = buffer.to_column_line(window.cursor);
                 let window_cursor = window.absolute_cursor_position(new_cursor.0, new_cursor.1);
@@ -2048,12 +2130,10 @@ impl Editor {
 
                 // If we deleted a newline, mark entire buffer dirty to handle line merging
                 let dirty_action = if deleted.contains('\n') {
-                    ChromeAction::MarkDirty(DirtyRegion::Buffer {
-                        buffer_id: window.active_buffer,
-                    })
+                    ChromeAction::MarkDirty(DirtyRegion::Buffer { buffer_id })
                 } else {
                     ChromeAction::MarkDirty(DirtyRegion::Line {
-                        buffer_id: window.active_buffer,
+                        buffer_id,
                         line: cursor_line,
                     })
                 };
@@ -2062,26 +2142,39 @@ impl Editor {
                     ChromeAction::Echo("Deleted text".to_string()),
                     dirty_action,
                     ChromeAction::CursorMove(window_cursor),
+                    ChromeAction::BufferChanged {
+                        buffer_id,
+                        start,
+                        old_end,
+                        new_end: start, // After delete, start == new_end
+                    },
                 ]
             }
             ActionPosition::Absolute(l, c) => {
+                let buffer_id = window.active_buffer;
+                let start = buffer.to_char_index(*c, *l);
                 let Some(deleted) = buffer.delete_col_line((*l, *c), count) else {
                     return vec![];
                 };
                 if deleted.is_empty() {
                     return vec![];
                 }
+                let deleted_len = deleted.len();
+                let old_end = if count < 0 {
+                    start // For backward delete, we'd need more complex calculation
+                } else {
+                    start + deleted_len
+                };
+
                 let new_cursor = buffer.to_column_line(window.cursor);
                 let window_cursor = window.absolute_cursor_position(new_cursor.0, new_cursor.1);
 
                 // If we deleted a newline, mark entire buffer dirty to handle line merging
                 let dirty_action = if deleted.contains('\n') {
-                    ChromeAction::MarkDirty(DirtyRegion::Buffer {
-                        buffer_id: window.active_buffer,
-                    })
+                    ChromeAction::MarkDirty(DirtyRegion::Buffer { buffer_id })
                 } else {
                     ChromeAction::MarkDirty(DirtyRegion::Line {
-                        buffer_id: window.active_buffer,
+                        buffer_id,
                         line: *l as usize,
                     })
                 };
@@ -2090,6 +2183,12 @@ impl Editor {
                     ChromeAction::Echo("Deleted text".to_string()),
                     dirty_action,
                     ChromeAction::CursorMove(window_cursor),
+                    ChromeAction::BufferChanged {
+                        buffer_id,
+                        start,
+                        old_end,
+                        new_end: start,
+                    },
                 ]
             }
             ActionPosition::End => {
@@ -2438,6 +2537,13 @@ impl Editor {
             }
         };
 
+        // Apply syntax highlighting for .jl files
+        if let Some(ext) = file_path.extension() {
+            if ext == "jl" {
+                self.apply_julia_highlighting(&buffer).await;
+            }
+        }
+
         let buffer_id = self.buffers.insert(buffer.clone());
 
         // Create FileMode for this file
@@ -2471,6 +2577,44 @@ impl Editor {
         } else {
             Err("Window no longer exists".to_string())
         }
+    }
+
+    /// Apply Julia syntax highlighting to a buffer
+    /// Uses JuliaSyntaxHighlighting.jl if available
+    async fn apply_julia_highlighting(&self, buffer: &Buffer) {
+        let Some(ref julia_runtime) = self.julia_runtime else {
+            eprintln!("[syntax] No Julia runtime available");
+            return;
+        };
+
+        // Set the buffer as the current buffer for Julia FFI calls
+        set_current_buffer(buffer.clone());
+
+        // Call Julia to define faces and apply highlighting
+        // Note: Roe is already loaded as a module, no need for 'using'
+        let highlight_code = r#"
+            try
+                # Define Julia faces if not already defined
+                if !Roe.face_exists("julia-keyword")
+                    Roe.define_julia_faces()
+                end
+                # Apply highlighting to the buffer
+                count = Roe.highlight_julia_buffer()
+                "Applied $count spans"
+            catch e
+                "Error: $e"
+            end
+        "#;
+
+        let runtime = julia_runtime.lock().await;
+        match runtime.eval_expression(highlight_code).await {
+            Ok(result) => eprintln!("[syntax] Julia highlighting result: {}", result),
+            Err(e) => eprintln!("[syntax] Julia highlighting error: {}", e),
+        }
+        drop(runtime);
+
+        // Clear the current buffer
+        clear_current_buffer();
     }
 
     /// Create a CommandContext from the current editor state
@@ -2590,16 +2734,16 @@ impl Editor {
                             match op {
                                 BufferOperation::Insert { pos, text } => {
                                     buffer.insert_pos(text, pos);
-                                    result_actions.push(ChromeAction::MarkDirty(DirtyRegion::Buffer {
-                                        buffer_id,
-                                    }));
+                                    result_actions.push(ChromeAction::MarkDirty(
+                                        DirtyRegion::Buffer { buffer_id },
+                                    ));
                                 }
                                 BufferOperation::Delete { start, end } => {
                                     if end > start {
                                         buffer.delete_pos(start, (end - start) as isize);
-                                        result_actions.push(ChromeAction::MarkDirty(DirtyRegion::Buffer {
-                                            buffer_id,
-                                        }));
+                                        result_actions.push(ChromeAction::MarkDirty(
+                                            DirtyRegion::Buffer { buffer_id },
+                                        ));
                                     }
                                 }
                                 BufferOperation::Replace { start, end, text } => {
@@ -2607,9 +2751,9 @@ impl Editor {
                                         buffer.delete_pos(start, (end - start) as isize);
                                     }
                                     buffer.insert_pos(text, start);
-                                    result_actions.push(ChromeAction::MarkDirty(DirtyRegion::Buffer {
-                                        buffer_id,
-                                    }));
+                                    result_actions.push(ChromeAction::MarkDirty(
+                                        DirtyRegion::Buffer { buffer_id },
+                                    ));
                                 }
                                 BufferOperation::SetCursor(pos) => {
                                     self.windows[self.active_window].cursor = pos;
@@ -2622,14 +2766,15 @@ impl Editor {
                                 }
                                 BufferOperation::ClearMark => {
                                     buffer.clear_mark();
-                                    result_actions.push(ChromeAction::Echo("Mark cleared".to_string()));
+                                    result_actions
+                                        .push(ChromeAction::Echo("Mark cleared".to_string()));
                                 }
                                 BufferOperation::SetContent(content) => {
                                     buffer.load_str(&content);
                                     self.windows[self.active_window].cursor = 0;
-                                    result_actions.push(ChromeAction::MarkDirty(DirtyRegion::Buffer {
-                                        buffer_id,
-                                    }));
+                                    result_actions.push(ChromeAction::MarkDirty(
+                                        DirtyRegion::Buffer { buffer_id },
+                                    ));
                                     result_actions.push(ChromeAction::CursorMove((0, 0)));
                                 }
                             }
@@ -2644,12 +2789,15 @@ impl Editor {
                         continue;
                     };
                     let Some(buffer) = self.buffers.get(messages_buffer_id) else {
-                        result_actions.push(ChromeAction::Echo("Messages buffer not found".to_string()));
+                        result_actions
+                            .push(ChromeAction::Echo("Messages buffer not found".to_string()));
                         continue;
                     };
                     match std::fs::write(&path, buffer.content()) {
-                        Ok(()) => result_actions.push(ChromeAction::Echo(format!("Messages written to {path}"))),
-                        Err(e) => result_actions.push(ChromeAction::Echo(format!("Failed to write messages: {e}"))),
+                        Ok(()) => result_actions
+                            .push(ChromeAction::Echo(format!("Messages written to {path}"))),
+                        Err(e) => result_actions
+                            .push(ChromeAction::Echo(format!("Failed to write messages: {e}"))),
                     }
                 }
                 // All other actions pass through unchanged

@@ -52,11 +52,7 @@ impl Default for VelloTheme {
 
 impl VelloTheme {
     /// Create a theme from hex color strings
-    pub fn from_hex(
-        bg: &str,
-        fg: &str,
-        selection: &str,
-    ) -> Self {
+    pub fn from_hex(bg: &str, fg: &str, selection: &str) -> Self {
         let mut theme = Self::default();
 
         if let Some(color) = parse_hex_color(bg) {

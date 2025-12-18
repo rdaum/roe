@@ -11,7 +11,9 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
+use crate::syntax::{FaceId, HighlightSpan, SpanStore};
 use crate::ModeId;
+use std::ops::Range;
 use std::sync::{Arc, RwLock};
 
 /// The internal data structure for a buffer
@@ -25,6 +27,10 @@ pub struct BufferInner {
     pub(crate) buffer: ropey::Rope,
     /// Mark position for region selection (None = no mark set)
     pub(crate) mark: Option<usize>,
+    /// Syntax highlighting spans (auto-adjusted on edits)
+    pub(crate) spans: SpanStore,
+    /// Major mode name (e.g., "julia-mode", "fundamental-mode")
+    pub(crate) major_mode: Option<String>,
 }
 
 impl BufferInner {
@@ -34,6 +40,8 @@ impl BufferInner {
             modes: modes.to_vec(),
             buffer: ropey::Rope::new(),
             mark: None,
+            spans: SpanStore::new(),
+            major_mode: None,
         }
     }
 
@@ -49,6 +57,8 @@ impl BufferInner {
             modes: modes.to_vec(),
             buffer: ropey::Rope::from_str(&content),
             mark: None,
+            spans: SpanStore::new(),
+            major_mode: None,
         };
         Ok(buffer_inner)
     }
@@ -60,7 +70,10 @@ impl BufferInner {
     }
 
     pub fn insert_pos(&mut self, fragment: String, position: usize) {
+        let len = fragment.chars().count();
         self.buffer.insert(position, &fragment);
+        // Adjust highlight spans for the insertion
+        self.spans.adjust_for_insert(position, len);
     }
 
     /// Delete a fragment of text from the buffer at the given line/col position.
@@ -87,6 +100,8 @@ impl BufferInner {
 
         let deleted = self.buffer.slice(start as usize..end as usize).to_string();
         self.buffer.remove(start as usize..end as usize);
+        // Adjust highlight spans for the deletion
+        self.spans.adjust_for_delete(start as usize, end as usize);
         Some(deleted)
     }
 
@@ -463,9 +478,53 @@ impl BufferInner {
 
         let deleted = self.buffer.slice(start..end).to_string();
         self.buffer.remove(start..end);
+        // Adjust highlight spans for the deletion
+        self.spans.adjust_for_delete(start, end);
         self.clear_mark();
         // Cursor should be at the start of the deleted region
         Some((deleted, start))
+    }
+
+    // === SYNTAX HIGHLIGHTING SPAN OPERATIONS ===
+
+    /// Add a highlight span to the buffer
+    pub fn add_span(&mut self, span: HighlightSpan) {
+        self.spans.add_span(span);
+    }
+
+    /// Add multiple highlight spans at once
+    pub fn add_spans(&mut self, spans: impl IntoIterator<Item = HighlightSpan>) {
+        self.spans.add_spans(spans);
+    }
+
+    /// Clear all highlight spans
+    pub fn clear_spans(&mut self) {
+        self.spans.clear();
+    }
+
+    /// Clear highlight spans in a specific range (for incremental re-highlighting)
+    pub fn clear_spans_in_range(&mut self, range: Range<usize>) {
+        self.spans.clear_range(range);
+    }
+
+    /// Get the face ID at a specific position
+    pub fn face_at(&mut self, pos: usize) -> Option<FaceId> {
+        self.spans.face_at(pos)
+    }
+
+    /// Get all spans that overlap with a range
+    pub fn spans_in_range(&mut self, range: Range<usize>) -> Vec<&HighlightSpan> {
+        self.spans.spans_in_range(range)
+    }
+
+    /// Get all spans (for debugging/inspection)
+    pub fn all_spans(&mut self) -> &[HighlightSpan] {
+        self.spans.all_spans()
+    }
+
+    /// Check if buffer has any highlight spans
+    pub fn has_spans(&self) -> bool {
+        !self.spans.is_empty()
     }
 }
 
@@ -648,6 +707,16 @@ impl Buffer {
         self.with_write(|b| b.object = object)
     }
 
+    /// Get the major mode name for this buffer
+    pub fn major_mode(&self) -> Option<String> {
+        self.with_read(|b| b.major_mode.clone())
+    }
+
+    /// Set the major mode for this buffer
+    pub fn set_major_mode(&self, mode_name: String) {
+        self.with_write(|b| b.major_mode = Some(mode_name))
+    }
+
     pub fn content(&self) -> String {
         self.with_read(|b| b.content())
     }
@@ -662,6 +731,43 @@ impl Buffer {
 
     pub fn buffer_len_chars(&self) -> usize {
         self.with_read(|b| b.buffer.len_chars())
+    }
+
+    // === SYNTAX HIGHLIGHTING SPAN OPERATIONS ===
+
+    /// Add a highlight span to the buffer
+    pub fn add_span(&self, span: HighlightSpan) {
+        self.with_write(|b| b.add_span(span))
+    }
+
+    /// Add multiple highlight spans at once
+    pub fn add_spans(&self, spans: Vec<HighlightSpan>) {
+        self.with_write(|b| b.add_spans(spans))
+    }
+
+    /// Clear all highlight spans
+    pub fn clear_spans(&self) {
+        self.with_write(|b| b.clear_spans())
+    }
+
+    /// Clear highlight spans in a specific range (for incremental re-highlighting)
+    pub fn clear_spans_in_range(&self, range: Range<usize>) {
+        self.with_write(|b| b.clear_spans_in_range(range))
+    }
+
+    /// Get the face ID at a specific position
+    pub fn face_at(&self, pos: usize) -> Option<FaceId> {
+        self.with_write(|b| b.face_at(pos))
+    }
+
+    /// Get all spans that overlap with a range (returns cloned spans for thread safety)
+    pub fn spans_in_range(&self, range: Range<usize>) -> Vec<HighlightSpan> {
+        self.with_write(|b| b.spans_in_range(range).into_iter().cloned().collect())
+    }
+
+    /// Check if buffer has any highlight spans
+    pub fn has_spans(&self) -> bool {
+        self.with_read(|b| b.has_spans())
     }
 }
 

@@ -345,7 +345,9 @@ pub fn create_default_registry() -> CommandRegistry {
         "Write Messages buffer to /tmp/roe-messages.txt",
         CommandCategory::Global,
         sync_handler(|_context| {
-            Ok(vec![ChromeAction::DumpMessages("/tmp/roe-messages.txt".to_string())])
+            Ok(vec![ChromeAction::DumpMessages(
+                "/tmp/roe-messages.txt".to_string(),
+            )])
         }),
     ));
 

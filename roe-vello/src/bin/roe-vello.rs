@@ -14,8 +14,10 @@
 //! Roe editor with Vello/GPU rendering backend.
 
 use roe_core::{
-    buffer_host, command_registry, editor, kill_ring, mode, Buffer, BufferId, ConfigurableBindings,
-    Editor, Frame, KeyState, Mode, ModeId, Window, WindowId,
+    buffer_host, command_registry, editor,
+    julia_runtime::{clear_current_buffer, set_current_buffer},
+    kill_ring, mode, Buffer, BufferId, ConfigurableBindings, Editor, Frame, KeyState, Mode, ModeId,
+    Window, WindowId,
 };
 use slotmap::SlotMap;
 use std::collections::HashMap;
@@ -142,8 +144,14 @@ async fn create_editor(config: EditorConfig) -> Editor {
         {
             eprintln!("[roe-vello] Loading Roe module from: {:?}", roe_module_path);
             if let Err(e) = runtime.load_roe_module(roe_module_path.clone()).await {
-                eprintln!("[roe-vello] Warning: Failed to load Roe module: {e}");
+                eprintln!("[roe-vello] Fatal: Failed to load Roe module: {e}");
+                eprintln!("[roe-vello] The editor cannot start without the Roe module.");
+                std::process::exit(1);
             }
+        } else {
+            eprintln!("[roe-vello] Fatal: Could not find Roe Julia module (jl/roe.jl)");
+            eprintln!("[roe-vello] Make sure to run from the roe directory or install properly.");
+            std::process::exit(1);
         }
         drop(runtime);
 
@@ -158,7 +166,10 @@ async fn create_editor(config: EditorConfig) -> Editor {
         let runtime = julia_runtime.lock().await;
         match runtime.list_keybindings().await {
             Ok(julia_bindings) => {
-                eprintln!("[roe-vello] Loaded {} keybindings from Julia", julia_bindings.len());
+                eprintln!(
+                    "[roe-vello] Loaded {} keybindings from Julia",
+                    julia_bindings.len()
+                );
                 for (key_seq, action) in julia_bindings {
                     bindings.add_binding(&key_seq, &action);
                 }
@@ -213,15 +224,27 @@ async fn create_editor(config: EditorConfig) -> Editor {
                 }
             };
 
+            // Get and apply major mode for this file
+            if let Some(ref jr) = julia_runtime {
+                let runtime = jr.lock().await;
+                if let Ok(major_mode) = runtime.get_major_mode_for_file(&file_path).await {
+                    buffer.set_major_mode(major_mode.clone());
+
+                    // Call the major mode's init hook
+                    set_current_buffer(buffer.clone());
+                    let _ = runtime.call_major_mode_init(&major_mode).await;
+                    clear_current_buffer();
+                }
+                drop(runtime);
+            }
+
             let buffer_id = buffers.insert(buffer.clone());
 
             if first_buffer_id.is_none() {
                 first_buffer_id = Some(buffer_id);
             }
 
-            let file_mode = modes
-                .remove(file_mode_id)
-                .expect("FileMode should exist");
+            let file_mode = modes.remove(file_mode_id).expect("FileMode should exist");
             let mode_list = vec![(file_mode_id, "file".to_string(), file_mode)];
 
             let (buffer_client, _buffer_handle) = buffer_host::create_buffer_host(

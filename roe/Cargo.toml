@@ -10,8 +10,8 @@ path = "src/main.rs"
 
 [dependencies]
 crossterm = { workspace = true }
+jlrs = { workspace = true }
 roe-core = { path = "../roe-core" }
 roe-terminal = { path = "../roe-terminal" }
 slotmap = { workspace = true }
 tokio = { workspace = true }
-jlrs = { workspace = true }

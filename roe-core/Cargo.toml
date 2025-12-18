@@ -7,7 +7,7 @@ description = "Core editor logic for Roe (Ryan's Own Emacs)"
 [dependencies]
 async-trait = "0.1"
 futures = { workspace = true }
+jlrs = { workspace = true }
 ropey = { workspace = true }
 slotmap = { workspace = true }
 tokio = { workspace = true }
-jlrs = { workspace = true }

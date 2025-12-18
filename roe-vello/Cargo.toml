@@ -23,9 +23,9 @@ winit = "0.30"
 parley = "0.2"
 
 # Async
-tokio = { workspace = true }
 pollster = "0.4"
+tokio = { workspace = true }
 
 # Utilities
-slotmap = { workspace = true }
 jlrs = { workspace = true }
+slotmap = { workspace = true }

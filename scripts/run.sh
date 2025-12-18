@@ -15,4 +15,19 @@ JULIA_DIR="$PROJECT_ROOT/julia"
 
 export LD_LIBRARY_PATH="$JULIA_DIR/lib:${LD_LIBRARY_PATH:-}"
 
+# Quick check for required Julia packages (only installs if missing)
+MARKER_FILE="$PROJECT_ROOT/.julia-packages-installed"
+if [[ ! -f "$MARKER_FILE" ]]; then
+    echo "First run: checking Julia packages..."
+    "$JULIA_DIR/bin/julia" --project="$PROJECT_ROOT" -e '
+        using Pkg
+        try
+            using JuliaSyntaxHighlighting
+        catch
+            println("Installing JuliaSyntaxHighlighting...")
+            Pkg.add("JuliaSyntaxHighlighting")
+        end
+    ' && touch "$MARKER_FILE"
+fi
+
 exec cargo run --release --bin roe --manifest-path "$PROJECT_ROOT/Cargo.toml" "$@"

@@ -15,11 +15,12 @@
 #![allow(clippy::manual_async_fn)]
 
 use crate::buffer::Buffer;
+use crate::syntax::{Color, Face, FaceRegistry, HighlightSpan};
 use jlrs::memory::target::frame::GcFrame;
 use jlrs::prelude::*;
 use jlrs::runtime::handle::async_handle::AsyncHandle;
 use std::collections::HashMap;
-use std::ffi::{c_char, c_longlong, CStr, CString};
+use std::ffi::{c_char, c_longlong, c_uchar, CStr, CString};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -52,6 +53,24 @@ pub fn clear_current_buffer() {
 fn get_current_buffer() -> Option<Buffer> {
     let guard = CURRENT_BUFFER.lock().expect("Buffer lock poisoned");
     guard.clone()
+}
+
+// ============================================
+// Face registry for syntax highlighting
+// ============================================
+
+/// Global face registry, initialized lazily
+static FACE_REGISTRY: std::sync::OnceLock<std::sync::Mutex<FaceRegistry>> =
+    std::sync::OnceLock::new();
+
+/// Get or initialize the global face registry
+fn get_face_registry() -> &'static std::sync::Mutex<FaceRegistry> {
+    FACE_REGISTRY.get_or_init(|| std::sync::Mutex::new(FaceRegistry::new()))
+}
+
+/// Get the global face registry (public for use by renderers)
+pub fn face_registry() -> &'static std::sync::Mutex<FaceRegistry> {
+    get_face_registry()
 }
 
 // ============================================
@@ -169,6 +188,229 @@ pub extern "C" fn roe_buffer_delete(start: c_longlong, end: c_longlong) {
     }
     let count = end - start;
     buffer.delete_pos(start as usize, count as isize);
+}
+
+// ============================================
+// Face and syntax highlighting FFI
+// ============================================
+
+/// Define a new face with the given name and attributes.
+/// Returns 1 on success, 0 on failure.
+///
+/// # Safety
+/// All string pointers must be valid null-terminated C strings or null.
+#[no_mangle]
+pub unsafe extern "C" fn roe_define_face(
+    name: *const c_char,
+    fg_hex: *const c_char,
+    bg_hex: *const c_char,
+    bold: c_uchar,
+    italic: c_uchar,
+    underline: c_uchar,
+) -> c_longlong {
+    if name.is_null() {
+        return 0;
+    }
+
+    let name_str = match CStr::from_ptr(name).to_str() {
+        Ok(s) => s.to_string(),
+        Err(_) => return 0,
+    };
+
+    let mut face = Face::new(&name_str);
+
+    // Parse foreground color
+    if !fg_hex.is_null() {
+        if let Ok(hex) = CStr::from_ptr(fg_hex).to_str() {
+            if let Some(color) = Color::from_hex(hex) {
+                face.foreground = Some(color);
+            }
+        }
+    }
+
+    // Parse background color
+    if !bg_hex.is_null() {
+        if let Ok(hex) = CStr::from_ptr(bg_hex).to_str() {
+            if let Some(color) = Color::from_hex(hex) {
+                face.background = Some(color);
+            }
+        }
+    }
+
+    face.bold = bold != 0;
+    face.italic = italic != 0;
+    face.underline = underline != 0;
+
+    let registry = get_face_registry();
+    let mut guard = registry.lock().expect("Face registry lock poisoned");
+
+    // Check if face already exists
+    if let Some(existing_id) = guard.get_id(&name_str) {
+        // Update existing face
+        guard.update_face(existing_id, face);
+    } else {
+        // Define new face
+        guard.define_face(face);
+    }
+
+    1 // Success
+}
+
+/// Check if a face with the given name exists.
+/// Returns 1 if found, 0 if not found.
+///
+/// # Safety
+/// The name pointer must be a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn roe_face_exists(name: *const c_char) -> c_longlong {
+    if name.is_null() {
+        return 0;
+    }
+
+    let name_str = match CStr::from_ptr(name).to_str() {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+
+    let registry = get_face_registry();
+    let guard = registry.lock().expect("Face registry lock poisoned");
+
+    if guard.get_id(name_str).is_some() {
+        1
+    } else {
+        0
+    }
+}
+
+/// Add a highlight span to the current buffer.
+/// Returns 1 on success, 0 on failure.
+///
+/// # Safety
+/// The face_name pointer must be a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn roe_add_span(
+    start: c_longlong,
+    end: c_longlong,
+    face_name: *const c_char,
+) -> c_longlong {
+    if face_name.is_null() || start < 0 || end <= start {
+        return 0;
+    }
+
+    let Some(buffer) = get_current_buffer() else {
+        return 0;
+    };
+
+    let face_name_str = match CStr::from_ptr(face_name).to_str() {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+
+    // Look up the face ID
+    let registry = get_face_registry();
+    let guard = registry.lock().expect("Face registry lock poisoned");
+
+    let Some(face_id) = guard.get_id(face_name_str) else {
+        return 0; // Face not found
+    };
+
+    drop(guard); // Release lock before accessing buffer
+
+    let span = HighlightSpan::new(start as usize, end as usize, face_id);
+    buffer.add_span(span);
+
+    1 // Success
+}
+
+/// Add multiple highlight spans to the current buffer at once.
+/// Takes arrays of starts, ends, and face names.
+/// Returns number of successfully added spans.
+///
+/// # Safety
+/// All array pointers must be valid and have at least `count` elements.
+/// Face name pointers must be valid null-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn roe_add_spans(
+    starts: *const c_longlong,
+    ends: *const c_longlong,
+    face_names: *const *const c_char,
+    count: c_longlong,
+) -> c_longlong {
+    if starts.is_null() || ends.is_null() || face_names.is_null() || count <= 0 {
+        return 0;
+    }
+
+    let Some(buffer) = get_current_buffer() else {
+        return 0;
+    };
+
+    let registry = get_face_registry();
+    let guard = registry.lock().expect("Face registry lock poisoned");
+
+    let mut spans = Vec::with_capacity(count as usize);
+    let mut added = 0;
+
+    for i in 0..count as isize {
+        let start = *starts.offset(i);
+        let end = *ends.offset(i);
+        let face_name_ptr = *face_names.offset(i);
+
+        if start < 0 || end <= start || face_name_ptr.is_null() {
+            continue;
+        }
+
+        let face_name_str = match CStr::from_ptr(face_name_ptr).to_str() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        if let Some(face_id) = guard.get_id(face_name_str) {
+            spans.push(HighlightSpan::new(start as usize, end as usize, face_id));
+            added += 1;
+        }
+    }
+
+    drop(guard); // Release lock before accessing buffer
+
+    buffer.add_spans(spans);
+
+    added
+}
+
+/// Clear all highlight spans from the current buffer.
+#[no_mangle]
+pub extern "C" fn roe_clear_spans() {
+    if let Some(buffer) = get_current_buffer() {
+        buffer.clear_spans();
+    }
+}
+
+/// Clear highlight spans in a specific range from the current buffer.
+#[no_mangle]
+pub extern "C" fn roe_clear_spans_in_range(start: c_longlong, end: c_longlong) {
+    if start < 0 || end <= start {
+        return;
+    }
+
+    if let Some(buffer) = get_current_buffer() {
+        buffer.clear_spans_in_range(start as usize..end as usize);
+    }
+}
+
+/// Check if the current buffer has any highlight spans.
+/// Returns 1 if spans exist, 0 otherwise.
+#[no_mangle]
+pub extern "C" fn roe_buffer_has_spans() -> c_longlong {
+    match get_current_buffer() {
+        Some(buffer) => {
+            if buffer.has_spans() {
+                1
+            } else {
+                0
+            }
+        }
+        None => 0,
+    }
 }
 
 /// Error types for Julia runtime operations
@@ -345,15 +587,12 @@ impl AsyncTask for JuliaReplTask {
                     Ok(value) => {
                         // Convert result to string representation
                         let string_func = Module::base(&frame).global(&mut frame, "string")?;
-                        let string_result =
-                            match unsafe { string_func.call(&mut frame, [value]) } {
-                                Ok(result) => result,
-                                Err(_) => {
-                                    return Ok(
-                                        "(result could not be converted to string)".to_string()
-                                    )
-                                }
-                            };
+                        let string_result = match unsafe { string_func.call(&mut frame, [value]) } {
+                            Ok(result) => result,
+                            Err(_) => {
+                                return Ok("(result could not be converted to string)".to_string())
+                            }
+                        };
 
                         if let Ok(julia_string) = string_result.cast::<JuliaString>() {
                             if let Ok(rust_string) = julia_string.as_str() {
@@ -527,10 +766,7 @@ impl AsyncTask for LoadRoeModuleTask {
                             Err(e) => Ok(Err(format!("Failed 'using .Roe': {:?}", e))),
                         }
                     }
-                    Err(e) => Ok(Err(format!(
-                        "Failed to include {:?}: {:?}",
-                        abs_path, e
-                    ))),
+                    Err(e) => Ok(Err(format!("Failed to include {:?}: {:?}", abs_path, e))),
                 }
             })
         }
@@ -655,9 +891,9 @@ impl AsyncTask for CallCommandTask {
                         let getindex = Module::base(&frame).global(&mut frame, "getindex")?;
                         let type_key = JuliaString::new(&mut frame, "type");
 
-                        let Ok(type_val) =
-                            (unsafe { getindex.call(&mut frame, [result_dict, type_key.as_value()]) })
-                        else {
+                        let Ok(type_val) = (unsafe {
+                            getindex.call(&mut frame, [result_dict, type_key.as_value()])
+                        }) else {
                             return Ok(JuliaCommandResult::Error(
                                 "Missing 'type' in result".to_string(),
                             ));
@@ -688,7 +924,8 @@ impl AsyncTask for CallCommandTask {
                                     getindex.call(&mut frame, [result_dict, message_key.as_value()])
                                 } {
                                     if let Ok(js) = msg_val.cast::<JuliaString>() {
-                                        let msg = js.as_str().unwrap_or("Unknown error").to_string();
+                                        let msg =
+                                            js.as_str().unwrap_or("Unknown error").to_string();
                                         return Ok(JuliaCommandResult::Error(msg));
                                     }
                                 }
@@ -697,35 +934,89 @@ impl AsyncTask for CallCommandTask {
                             "none" => Ok(JuliaCommandResult::None),
                             // Buffer operations
                             "insert" => {
-                                let pos = Self::get_int_field(&mut frame, &getindex, result_dict, "pos").unwrap_or(0) as usize;
-                                let text = Self::get_string_field(&mut frame, &getindex, result_dict, "text").unwrap_or_default();
-                                Ok(JuliaCommandResult::BufferOps(vec![JuliaBufferOp::Insert { pos, text }]))
+                                let pos =
+                                    Self::get_int_field(&mut frame, &getindex, result_dict, "pos")
+                                        .unwrap_or(0) as usize;
+                                let text = Self::get_string_field(
+                                    &mut frame,
+                                    &getindex,
+                                    result_dict,
+                                    "text",
+                                )
+                                .unwrap_or_default();
+                                Ok(JuliaCommandResult::BufferOps(vec![JuliaBufferOp::Insert {
+                                    pos,
+                                    text,
+                                }]))
                             }
                             "delete" => {
-                                let start = Self::get_int_field(&mut frame, &getindex, result_dict, "start").unwrap_or(0) as usize;
-                                let end = Self::get_int_field(&mut frame, &getindex, result_dict, "end").unwrap_or(0) as usize;
-                                Ok(JuliaCommandResult::BufferOps(vec![JuliaBufferOp::Delete { start, end }]))
+                                let start = Self::get_int_field(
+                                    &mut frame,
+                                    &getindex,
+                                    result_dict,
+                                    "start",
+                                )
+                                .unwrap_or(0) as usize;
+                                let end =
+                                    Self::get_int_field(&mut frame, &getindex, result_dict, "end")
+                                        .unwrap_or(0) as usize;
+                                Ok(JuliaCommandResult::BufferOps(vec![JuliaBufferOp::Delete {
+                                    start,
+                                    end,
+                                }]))
                             }
                             "replace" => {
-                                let start = Self::get_int_field(&mut frame, &getindex, result_dict, "start").unwrap_or(0) as usize;
-                                let end = Self::get_int_field(&mut frame, &getindex, result_dict, "end").unwrap_or(0) as usize;
-                                let text = Self::get_string_field(&mut frame, &getindex, result_dict, "text").unwrap_or_default();
-                                Ok(JuliaCommandResult::BufferOps(vec![JuliaBufferOp::Replace { start, end, text }]))
+                                let start = Self::get_int_field(
+                                    &mut frame,
+                                    &getindex,
+                                    result_dict,
+                                    "start",
+                                )
+                                .unwrap_or(0) as usize;
+                                let end =
+                                    Self::get_int_field(&mut frame, &getindex, result_dict, "end")
+                                        .unwrap_or(0) as usize;
+                                let text = Self::get_string_field(
+                                    &mut frame,
+                                    &getindex,
+                                    result_dict,
+                                    "text",
+                                )
+                                .unwrap_or_default();
+                                Ok(JuliaCommandResult::BufferOps(vec![
+                                    JuliaBufferOp::Replace { start, end, text },
+                                ]))
                             }
                             "set_cursor" => {
-                                let pos = Self::get_int_field(&mut frame, &getindex, result_dict, "pos").unwrap_or(0) as usize;
-                                Ok(JuliaCommandResult::BufferOps(vec![JuliaBufferOp::SetCursor(pos)]))
+                                let pos =
+                                    Self::get_int_field(&mut frame, &getindex, result_dict, "pos")
+                                        .unwrap_or(0) as usize;
+                                Ok(JuliaCommandResult::BufferOps(vec![
+                                    JuliaBufferOp::SetCursor(pos),
+                                ]))
                             }
                             "set_mark" => {
-                                let pos = Self::get_int_field(&mut frame, &getindex, result_dict, "pos").unwrap_or(0) as usize;
-                                Ok(JuliaCommandResult::BufferOps(vec![JuliaBufferOp::SetMark(pos)]))
+                                let pos =
+                                    Self::get_int_field(&mut frame, &getindex, result_dict, "pos")
+                                        .unwrap_or(0) as usize;
+                                Ok(JuliaCommandResult::BufferOps(vec![JuliaBufferOp::SetMark(
+                                    pos,
+                                )]))
                             }
-                            "clear_mark" => {
-                                Ok(JuliaCommandResult::BufferOps(vec![JuliaBufferOp::ClearMark]))
-                            }
+                            "clear_mark" => Ok(JuliaCommandResult::BufferOps(vec![
+                                JuliaBufferOp::ClearMark,
+                            ])),
                             "set_content" => {
-                                let content = Self::get_string_field(&mut frame, &getindex, result_dict, "content").unwrap_or_default();
-                                Ok(JuliaCommandResult::BufferOps(vec![JuliaBufferOp::SetContent(content)]))
+                                let content = Self::get_string_field(
+                                    &mut frame,
+                                    &getindex,
+                                    result_dict,
+                                    "content",
+                                )
+                                .unwrap_or_default();
+                                Ok(JuliaCommandResult::BufferOps(vec![
+                                    JuliaBufferOp::SetContent(content),
+                                ]))
                             }
                             "multi" => {
                                 // Parse array of actions - for now just return None
@@ -930,7 +1221,10 @@ impl AsyncTask for ModePerformTask {
                     let key_jl = JuliaString::new(&mut frame, key);
                     let value_jl = JuliaString::new(&mut frame, value);
                     unsafe {
-                        setindex_fn.call(&mut frame, [action_jl, value_jl.as_value(), key_jl.as_value()])?;
+                        setindex_fn.call(
+                            &mut frame,
+                            [action_jl, value_jl.as_value(), key_jl.as_value()],
+                        )?;
                     };
                 }
 
@@ -949,9 +1243,9 @@ impl AsyncTask for ModePerformTask {
 
                 // Get result type
                 let result_key = JuliaString::new(&mut frame, "result");
-                let Ok(result_type_val) = (unsafe {
-                    getindex.call(&mut frame, [result, result_key.as_value()])
-                }) else {
+                let Ok(result_type_val) =
+                    (unsafe { getindex.call(&mut frame, [result, result_key.as_value()]) })
+                else {
                     return Ok(None);
                 };
                 let result_type = result_type_val
@@ -964,7 +1258,8 @@ impl AsyncTask for ModePerformTask {
                 // Get actions array
                 let actions_key = JuliaString::new(&mut frame, "actions");
                 let has_actions = unsafe {
-                    haskey.call(&mut frame, [result, actions_key.as_value()])
+                    haskey
+                        .call(&mut frame, [result, actions_key.as_value()])
                         .ok()
                         .and_then(|v| v.unbox::<Bool>().ok())
                         .map(|b| b.as_bool())
@@ -973,14 +1268,18 @@ impl AsyncTask for ModePerformTask {
 
                 let mut actions = Vec::new();
                 if has_actions {
-                    let Ok(actions_arr) = (unsafe {
-                        getindex.call(&mut frame, [result, actions_key.as_value()])
-                    }) else {
-                        return Ok(Some(JuliaModeResult { result_type, actions }));
+                    let Ok(actions_arr) =
+                        (unsafe { getindex.call(&mut frame, [result, actions_key.as_value()]) })
+                    else {
+                        return Ok(Some(JuliaModeResult {
+                            result_type,
+                            actions,
+                        }));
                     };
 
                     let actions_len: i64 = unsafe {
-                        length_fn.call(&mut frame, [actions_arr])
+                        length_fn
+                            .call(&mut frame, [actions_arr])
                             .ok()
                             .and_then(|v| v.unbox::<i64>().ok())
                             .unwrap_or(0)
@@ -988,14 +1287,17 @@ impl AsyncTask for ModePerformTask {
 
                     for i in 1..=actions_len {
                         let idx = Value::new(&mut frame, i);
-                        let Ok(action_dict) = (unsafe { getindex.call(&mut frame, [actions_arr, idx]) }) else {
+                        let Ok(action_dict) =
+                            (unsafe { getindex.call(&mut frame, [actions_arr, idx]) })
+                        else {
                             continue;
                         };
 
                         // Parse individual action
                         let type_key = JuliaString::new(&mut frame, "type");
                         let action_type = unsafe {
-                            getindex.call(&mut frame, [action_dict, type_key.as_value()])
+                            getindex
+                                .call(&mut frame, [action_dict, type_key.as_value()])
                                 .ok()
                                 .and_then(|v| v.cast::<JuliaString>().ok())
                                 .and_then(|s| s.as_str().ok().map(|s| s.to_string()))
@@ -1008,26 +1310,29 @@ impl AsyncTask for ModePerformTask {
                         };
 
                         // Get optional fields
-                        let get_str_field = |field: &str, frame: &mut GcFrame, dict: Value| -> Option<String> {
-                            let key = JuliaString::new(&mut *frame, field);
-                            let has = unsafe {
-                                haskey.call(&mut *frame, [dict, key.as_value()])
-                                    .ok()
-                                    .and_then(|v| v.unbox::<Bool>().ok())
-                                    .map(|b| b.as_bool())
-                                    .unwrap_or(false)
-                            };
-                            if has {
-                                unsafe {
-                                    getindex.call(&mut *frame, [dict, key.as_value()])
+                        let get_str_field =
+                            |field: &str, frame: &mut GcFrame, dict: Value| -> Option<String> {
+                                let key = JuliaString::new(&mut *frame, field);
+                                let has = unsafe {
+                                    haskey
+                                        .call(&mut *frame, [dict, key.as_value()])
                                         .ok()
-                                        .and_then(|v| v.cast::<JuliaString>().ok())
-                                        .and_then(|s| s.as_str().ok().map(|s| s.to_string()))
+                                        .and_then(|v| v.unbox::<Bool>().ok())
+                                        .map(|b| b.as_bool())
+                                        .unwrap_or(false)
+                                };
+                                if has {
+                                    unsafe {
+                                        getindex
+                                            .call(&mut *frame, [dict, key.as_value()])
+                                            .ok()
+                                            .and_then(|v| v.cast::<JuliaString>().ok())
+                                            .and_then(|s| s.as_str().ok().map(|s| s.to_string()))
+                                    }
+                                } else {
+                                    None
                                 }
-                            } else {
-                                None
-                            }
-                        };
+                            };
 
                         mode_action.text = get_str_field("text", &mut frame, action_dict);
                         mode_action.position = get_str_field("position", &mut frame, action_dict);
@@ -1039,7 +1344,8 @@ impl AsyncTask for ModePerformTask {
                         mode_action.buffer_index = {
                             let key = JuliaString::new(&mut frame, "buffer_index");
                             let has = unsafe {
-                                haskey.call(&mut frame, [action_dict, key.as_value()])
+                                haskey
+                                    .call(&mut frame, [action_dict, key.as_value()])
                                     .ok()
                                     .and_then(|v| v.unbox::<Bool>().ok())
                                     .map(|b| b.as_bool())
@@ -1047,7 +1353,8 @@ impl AsyncTask for ModePerformTask {
                             };
                             if has {
                                 unsafe {
-                                    getindex.call(&mut frame, [action_dict, key.as_value()])
+                                    getindex
+                                        .call(&mut frame, [action_dict, key.as_value()])
                                         .ok()
                                         .and_then(|v| v.unbox::<i64>().ok())
                                 }
@@ -1060,7 +1367,158 @@ impl AsyncTask for ModePerformTask {
                     }
                 }
 
-                Ok(Some(JuliaModeResult { result_type, actions }))
+                Ok(Some(JuliaModeResult {
+                    result_type,
+                    actions,
+                }))
+            })
+        }
+    }
+}
+
+/// Task to get major mode for a file path
+pub struct GetMajorModeForFileTask {
+    pub file_path: String,
+}
+
+impl AsyncTask for GetMajorModeForFileTask {
+    type Output = JlrsResult<String>;
+
+    fn run(self, mut frame: AsyncGcFrame<'_>) -> impl std::future::Future<Output = Self::Output> {
+        async move {
+            frame.scope(|mut frame| {
+                let main_module = Module::main(&frame);
+
+                // Get the Roe module
+                let Ok(roe_module) = main_module.global(&mut frame, "Roe") else {
+                    return Ok("fundamental-mode".to_string());
+                };
+                let roe_module = roe_module.cast::<Module>().unwrap();
+
+                // Get get_major_mode_for_file function
+                let Ok(get_mode_fn) = roe_module.global(&mut frame, "get_major_mode_for_file")
+                else {
+                    return Ok("fundamental-mode".to_string());
+                };
+
+                // Call Roe.get_major_mode_for_file(file_path)
+                let file_path_jl = JuliaString::new(&mut frame, &self.file_path);
+                let result = unsafe { get_mode_fn.call(&mut frame, [file_path_jl.as_value()]) };
+
+                match result {
+                    Ok(mode_name) => {
+                        let mode_str = mode_name
+                            .cast::<JuliaString>()
+                            .ok()
+                            .and_then(|s| s.as_str().ok())
+                            .unwrap_or("fundamental-mode")
+                            .to_string();
+                        Ok(mode_str)
+                    }
+                    Err(_) => Ok("fundamental-mode".to_string()),
+                }
+            })
+        }
+    }
+}
+
+/// Task to call a major mode's init hook
+pub struct CallMajorModeInitTask {
+    pub mode_name: String,
+}
+
+impl AsyncTask for CallMajorModeInitTask {
+    type Output = JlrsResult<bool>;
+
+    fn run(self, mut frame: AsyncGcFrame<'_>) -> impl std::future::Future<Output = Self::Output> {
+        async move {
+            frame.scope(|mut frame| {
+                let main_module = Module::main(&frame);
+
+                // Get the Roe module
+                let Ok(roe_module) = main_module.global(&mut frame, "Roe") else {
+                    return Ok(false);
+                };
+                let roe_module = roe_module.cast::<Module>().unwrap();
+
+                // Get call_major_mode_init function
+                let Ok(init_fn) = roe_module.global(&mut frame, "call_major_mode_init") else {
+                    return Ok(false);
+                };
+
+                // Call Roe.call_major_mode_init(mode_name)
+                let mode_name_jl = JuliaString::new(&mut frame, &self.mode_name);
+                let result = unsafe { init_fn.call(&mut frame, [mode_name_jl.as_value()]) };
+
+                match result {
+                    Ok(success) => {
+                        let success_bool = success
+                            .unbox::<Bool>()
+                            .ok()
+                            .map(|b| b.as_bool())
+                            .unwrap_or(false);
+                        Ok(success_bool)
+                    }
+                    Err(_) => Ok(false),
+                }
+            })
+        }
+    }
+}
+
+/// Task to call a major mode's after_change hook
+pub struct CallMajorModeAfterChangeTask {
+    pub mode_name: String,
+    pub start: i64,
+    pub old_end: i64,
+    pub new_end: i64,
+}
+
+impl AsyncTask for CallMajorModeAfterChangeTask {
+    type Output = JlrsResult<bool>;
+
+    fn run(self, mut frame: AsyncGcFrame<'_>) -> impl std::future::Future<Output = Self::Output> {
+        async move {
+            frame.scope(|mut frame| {
+                let main_module = Module::main(&frame);
+
+                // Get the Roe module
+                let Ok(roe_module) = main_module.global(&mut frame, "Roe") else {
+                    return Ok(false);
+                };
+                let roe_module = roe_module.cast::<Module>().unwrap();
+
+                // Get call_major_mode_after_change function
+                let Ok(after_change_fn) =
+                    roe_module.global(&mut frame, "call_major_mode_after_change")
+                else {
+                    return Ok(false);
+                };
+
+                // Call Roe.call_major_mode_after_change(mode_name, start, old_end, new_end)
+                let mode_name_jl = JuliaString::new(&mut frame, &self.mode_name);
+                let start_jl = Value::new(&mut frame, self.start);
+                let old_end_jl = Value::new(&mut frame, self.old_end);
+                let new_end_jl = Value::new(&mut frame, self.new_end);
+
+                let result = unsafe {
+                    after_change_fn.call(
+                        &mut frame,
+                        [mode_name_jl.as_value(), start_jl, old_end_jl, new_end_jl],
+                    )
+                };
+
+                match result {
+                    Ok(success) => {
+                        let success_bool = success
+                            .unbox::<Bool>()
+                            .ok()
+                            .map(|b| b.as_bool())
+                            .unwrap_or(false);
+                        Ok(success_bool)
+                    }
+                    Err(_) => Ok(false),
+                }
             })
         }
     }
@@ -1083,9 +1541,19 @@ pub struct JuliaCommandContext {
 /// Buffer operation from Julia (mirrors editor::BufferOperation)
 #[derive(Debug, Clone)]
 pub enum JuliaBufferOp {
-    Insert { pos: usize, text: String },
-    Delete { start: usize, end: usize },
-    Replace { start: usize, end: usize, text: String },
+    Insert {
+        pos: usize,
+        text: String,
+    },
+    Delete {
+        start: usize,
+        end: usize,
+    },
+    Replace {
+        start: usize,
+        end: usize,
+        text: String,
+    },
     SetCursor(usize),
     SetMark(usize),
     ClearMark,
@@ -1134,16 +1602,34 @@ pub enum JuliaCommand {
     CallCommand(
         String,
         JuliaCommandContext,
-        Buffer,  // The buffer for this command's context
+        Buffer, // The buffer for this command's context
         tokio::sync::oneshot::Sender<JuliaCommandResult>,
     ),
     ListCommands(tokio::sync::oneshot::Sender<Vec<(String, String)>>),
     ListKeybindings(tokio::sync::oneshot::Sender<Vec<(String, String)>>),
     /// Call a Julia mode's perform handler
     ModePerform(
-        String,                                              // mode name
-        std::collections::HashMap<String, String>,           // key action as dict
+        String,                                    // mode name
+        std::collections::HashMap<String, String>, // key action as dict
         tokio::sync::oneshot::Sender<JuliaModeResult>,
+    ),
+    /// Get major mode name for a file path
+    GetMajorModeForFile(
+        String,                               // file path
+        tokio::sync::oneshot::Sender<String>, // mode name
+    ),
+    /// Call a major mode's init hook
+    CallMajorModeInit(
+        String,                             // mode name
+        tokio::sync::oneshot::Sender<bool>, // success
+    ),
+    /// Call a major mode's after_change hook
+    CallMajorModeAfterChange(
+        String, // mode name
+        i64,
+        i64,
+        i64,                                // start, old_end, new_end
+        tokio::sync::oneshot::Sender<bool>, // success
     ),
     Shutdown,
 }
@@ -1351,14 +1837,67 @@ impl RoeJuliaRuntime {
                         continue;
                     };
 
-                    let mode_result = result
-                        .ok()
-                        .flatten()
-                        .unwrap_or_else(|| JuliaModeResult {
-                            result_type: "ignored".to_string(),
-                            actions: vec![],
-                        });
+                    let mode_result = result.ok().flatten().unwrap_or_else(|| JuliaModeResult {
+                        result_type: "ignored".to_string(),
+                        actions: vec![],
+                    });
                     let _ = response_tx.send(mode_result);
+                }
+                JuliaCommand::GetMajorModeForFile(file_path, response_tx) => {
+                    let task = GetMajorModeForFileTask { file_path };
+                    let Ok(async_task) = julia.task(task).try_dispatch() else {
+                        let _ = response_tx.send("fundamental-mode".to_string());
+                        continue;
+                    };
+
+                    let Ok(result) = async_task.await else {
+                        let _ = response_tx.send("fundamental-mode".to_string());
+                        continue;
+                    };
+
+                    let mode_name = result.unwrap_or_else(|_| "fundamental-mode".to_string());
+                    let _ = response_tx.send(mode_name);
+                }
+                JuliaCommand::CallMajorModeInit(mode_name, response_tx) => {
+                    let task = CallMajorModeInitTask { mode_name };
+                    let Ok(async_task) = julia.task(task).try_dispatch() else {
+                        let _ = response_tx.send(false);
+                        continue;
+                    };
+
+                    let Ok(result) = async_task.await else {
+                        let _ = response_tx.send(false);
+                        continue;
+                    };
+
+                    let success = result.unwrap_or(false);
+                    let _ = response_tx.send(success);
+                }
+                JuliaCommand::CallMajorModeAfterChange(
+                    mode_name,
+                    start,
+                    old_end,
+                    new_end,
+                    response_tx,
+                ) => {
+                    let task = CallMajorModeAfterChangeTask {
+                        mode_name,
+                        start,
+                        old_end,
+                        new_end,
+                    };
+                    let Ok(async_task) = julia.task(task).try_dispatch() else {
+                        let _ = response_tx.send(false);
+                        continue;
+                    };
+
+                    let Ok(result) = async_task.await else {
+                        let _ = response_tx.send(false);
+                        continue;
+                    };
+
+                    let success = result.unwrap_or(false);
+                    let _ = response_tx.send(success);
                 }
                 JuliaCommand::Shutdown => {
                     break;
@@ -1540,10 +2079,7 @@ impl RoeJuliaRuntime {
     }
 
     /// Load the Roe Julia module for command definitions
-    pub async fn load_roe_module(
-        &self,
-        module_path: PathBuf,
-    ) -> Result<(), JuliaRuntimeError> {
+    pub async fn load_roe_module(&self, module_path: PathBuf) -> Result<(), JuliaRuntimeError> {
         let Some(ref command_tx) = self.command_tx else {
             return Err(JuliaRuntimeError::ScriptLoadFailed(
                 "Runtime not initialized".to_string(),
@@ -1664,6 +2200,90 @@ impl RoeJuliaRuntime {
 
         // Block waiting for response - this is called from Mode::perform which is sync
         response_rx.blocking_recv().map_err(|_| {
+            JuliaRuntimeError::TaskExecutionFailed("Response channel closed".to_string())
+        })
+    }
+
+    /// Get the major mode name for a file path based on extension
+    pub async fn get_major_mode_for_file(
+        &self,
+        file_path: &str,
+    ) -> Result<String, JuliaRuntimeError> {
+        let Some(ref command_tx) = self.command_tx else {
+            return Err(JuliaRuntimeError::TaskExecutionFailed(
+                "Runtime not initialized".to_string(),
+            ));
+        };
+
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+        command_tx
+            .send(JuliaCommand::GetMajorModeForFile(
+                file_path.to_string(),
+                response_tx,
+            ))
+            .map_err(|_| {
+                JuliaRuntimeError::TaskExecutionFailed("Command channel closed".to_string())
+            })?;
+
+        response_rx.await.map_err(|_| {
+            JuliaRuntimeError::TaskExecutionFailed("Response channel closed".to_string())
+        })
+    }
+
+    /// Call a major mode's init hook
+    pub async fn call_major_mode_init(&self, mode_name: &str) -> Result<bool, JuliaRuntimeError> {
+        let Some(ref command_tx) = self.command_tx else {
+            return Err(JuliaRuntimeError::TaskExecutionFailed(
+                "Runtime not initialized".to_string(),
+            ));
+        };
+
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+        command_tx
+            .send(JuliaCommand::CallMajorModeInit(
+                mode_name.to_string(),
+                response_tx,
+            ))
+            .map_err(|_| {
+                JuliaRuntimeError::TaskExecutionFailed("Command channel closed".to_string())
+            })?;
+
+        response_rx.await.map_err(|_| {
+            JuliaRuntimeError::TaskExecutionFailed("Response channel closed".to_string())
+        })
+    }
+
+    /// Call a major mode's after_change hook
+    pub async fn call_major_mode_after_change(
+        &self,
+        mode_name: &str,
+        start: i64,
+        old_end: i64,
+        new_end: i64,
+    ) -> Result<bool, JuliaRuntimeError> {
+        let Some(ref command_tx) = self.command_tx else {
+            return Err(JuliaRuntimeError::TaskExecutionFailed(
+                "Runtime not initialized".to_string(),
+            ));
+        };
+
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+        command_tx
+            .send(JuliaCommand::CallMajorModeAfterChange(
+                mode_name.to_string(),
+                start,
+                old_end,
+                new_end,
+                response_tx,
+            ))
+            .map_err(|_| {
+                JuliaRuntimeError::TaskExecutionFailed("Command channel closed".to_string())
+            })?;
+
+        response_rx.await.map_err(|_| {
             JuliaRuntimeError::TaskExecutionFailed("Response channel closed".to_string())
         })
     }

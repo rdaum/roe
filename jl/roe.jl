@@ -7,6 +7,14 @@
 # Roe Editor Julia API
 # This module provides the interface for extending Roe from Julia
 
+# Activate the project environment so packages can be found
+# This is needed because jlrs doesn't automatically use --project
+import Pkg
+const _project_dir = dirname(@__DIR__)
+if isfile(joinpath(_project_dir, "Project.toml"))
+    Pkg.activate(_project_dir; io=devnull)
+end
+
 module Roe
 
 export define_command, call_command, CommandContext, define_key, define_keys, undefine_key,
@@ -16,21 +24,37 @@ export define_command, call_command, CommandContext, define_key, define_keys, un
        # Buffer access functions
        buffer_content, buffer_line, buffer_line_count, buffer_char_count,
        buffer_substring, buffer_insert!, buffer_delete!,
-       # Mode API
+       # Minor mode API (key handlers)
        define_mode, mode_perform, has_mode, reset_mode_state,
        ClearTextAction, InsertTextModeAction, OpenFileAction, ExecuteCommandAction,
        CursorUpAction, CursorDownAction, CursorLeftAction, CursorRightAction,
-       SwitchBufferAction, KillBufferAction
+       SwitchBufferAction, KillBufferAction,
+       # Major mode API (file type associations)
+       define_major_mode, get_major_mode_for_file, call_major_mode_init,
+       call_major_mode_after_change, has_major_mode, list_major_modes,
+       get_major_mode_extensions, set_default_major_mode,
+       # Syntax highlighting API
+       define_face, face_exists, add_span, add_spans, clear_spans,
+       clear_spans_in_range, has_spans, define_standard_faces,
+       Span, highlight_matches, apply_spans,
+       # Julia syntax highlighting
+       define_julia_faces, highlight_julia, highlight_julia_buffer,
+       highlight_julia_region
 
 # Get the directory containing this file
 const _module_dir = @__DIR__
 
 # Include sub-modules in dependency order
 include(joinpath(_module_dir, "buffer_api.jl"))
+include(joinpath(_module_dir, "syntax.jl"))
 include(joinpath(_module_dir, "commands.jl"))
 include(joinpath(_module_dir, "keybindings.jl"))
 include(joinpath(_module_dir, "modes.jl"))
 include(joinpath(_module_dir, "file_selector.jl"))
 include(joinpath(_module_dir, "buffer_switcher.jl"))
+# Major mode system - defines define_major_mode() etc.
+include(joinpath(_module_dir, "major_modes.jl"))
+# Julia highlighting depends on commands.jl and major_modes.jl
+include(joinpath(_module_dir, "julia_highlighting.jl"))
 
 end # module Roe

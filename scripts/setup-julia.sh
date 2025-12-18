@@ -1,9 +1,3 @@
-# Copyright (C) 2025 Ryan Daum <ryan.daum@gmail.com> This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, version 3.
-#
-# This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License along with this program. If not, see <https://www.gnu.org/licenses/>.
-#
 #!/usr/bin/env bash
 #
 # Setup script for Roe editor - downloads Julia and configures the build environment
@@ -148,6 +142,36 @@ EOF
     echo "Cargo config updated"
 }
 
+# Install required Julia packages
+install_julia_packages() {
+    echo ""
+    echo "Installing Julia packages..."
+    echo ""
+
+    "$JULIA_DIR/bin/julia" --project="$PROJECT_ROOT" -e '
+        using Pkg
+
+        # Required packages for Roe
+        packages = [
+            "JuliaSyntaxHighlighting",  # Syntax highlighting for Julia files
+        ]
+
+        for pkg in packages
+            println("Installing $pkg...")
+            try
+                Pkg.add(pkg)
+                println("  ✓ $pkg installed")
+            catch e
+                println("  ✗ Failed to install $pkg: $e")
+            end
+        end
+
+        println("\nPrecompiling packages...")
+        Pkg.precompile()
+        println("Done!")
+    '
+}
+
 # Add julia/lib to a shell config hint
 print_runtime_hint() {
     echo ""
@@ -174,14 +198,21 @@ main() {
     echo "========================"
     echo ""
 
+    local need_packages=false
+
     if check_existing; then
         create_cargo_config
-        print_runtime_hint
-        exit 0
+    else
+        download_julia
+        create_cargo_config
+        need_packages=true
     fi
 
-    download_julia
-    create_cargo_config
+    # Install packages if this is a fresh install or if --packages flag is passed
+    if [[ "$need_packages" == true ]] || [[ "${1:-}" == "--packages" ]]; then
+        install_julia_packages
+    fi
+
     print_runtime_hint
 }
 

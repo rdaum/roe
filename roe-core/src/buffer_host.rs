@@ -184,6 +184,14 @@ pub enum EditorAction {
     },
 }
 
+/// Represents a buffer content change for after-change hooks
+#[derive(Debug, Clone)]
+pub struct BufferChange {
+    pub start: usize,
+    pub old_end: usize,
+    pub new_end: usize,
+}
+
 /// Response from BufferHost
 #[derive(Debug, Clone)]
 pub enum BufferResponse {
@@ -192,6 +200,7 @@ pub enum BufferResponse {
         dirty_regions: Vec<DirtyRegion>,
         new_cursor_pos: Option<usize>, // None means cursor didn't move
         editor_action: Option<EditorAction>, // Action to perform at Editor level
+        buffer_change: Option<BufferChange>, // Change info for after-change hooks
     },
     /// File operation completed
     Saved(String),
@@ -441,6 +450,7 @@ impl BufferHost {
         let mut dirty_regions = vec![];
         let mut new_cursor_pos = None;
         let mut editor_action = None;
+        let mut buffer_changed = false; // Track if any text change occurred
 
         for action in actions {
             match action {
@@ -449,6 +459,7 @@ impl BufferHost {
                         ActionPosition::Cursor => {
                             let has_newline = text.contains('\n');
                             self.buffer.insert_pos(text.clone(), cursor_pos);
+                            buffer_changed = true;
 
                             // Advance the cursor by number of characters (not bytes)
                             cursor_pos += text.chars().count();
@@ -470,6 +481,7 @@ impl BufferHost {
                         ActionPosition::Absolute(col, row) => {
                             let has_newline = text.contains('\n');
                             self.buffer.insert_col_line(text.clone(), (col, row));
+                            buffer_changed = true;
 
                             // For command mode, position cursor at end of user input line
                             if let Some(newline_pos) = text.find('\n') {
@@ -498,6 +510,7 @@ impl BufferHost {
                             let buffer_len = self.buffer.buffer_len_chars();
                             let has_newline = text.contains('\n');
                             self.buffer.insert_pos(text.clone(), buffer_len);
+                            buffer_changed = true;
 
                             if has_newline {
                                 dirty_regions.push(DirtyRegion::Buffer {
@@ -517,6 +530,7 @@ impl BufferHost {
                     match pos {
                         ActionPosition::Cursor => {
                             if let Some(deleted) = self.buffer.delete_pos(cursor_pos, count) {
+                                buffer_changed = true;
                                 // Check if deleted text contains newlines
                                 let has_newline = deleted.contains('\n');
 
@@ -550,6 +564,7 @@ impl BufferHost {
                         }
                         ActionPosition::Absolute(col, row) => {
                             if let Some(deleted) = self.buffer.delete_col_line((col, row), count) {
+                                buffer_changed = true;
                                 // Check if deleted text contains newlines
                                 let has_newline = deleted.contains('\n');
 
@@ -571,6 +586,7 @@ impl BufferHost {
                             // Delete from end of buffer backwards
                             let buffer_len = self.buffer.buffer_len_chars();
                             if let Some(deleted) = self.buffer.delete_pos(buffer_len, count) {
+                                buffer_changed = true;
                                 let has_newline = deleted.contains('\n');
 
                                 if has_newline {
@@ -596,6 +612,7 @@ impl BufferHost {
                     let buffer_len = self.buffer.buffer_len_chars();
                     if buffer_len > 0 {
                         self.buffer.delete_pos(0, buffer_len as isize);
+                        buffer_changed = true;
                         dirty_regions.push(DirtyRegion::Buffer {
                             buffer_id: self.buffer_id,
                         });
@@ -721,11 +738,29 @@ impl BufferHost {
             }
         }
 
-        if !dirty_regions.is_empty() || new_cursor_pos.is_some() || editor_action.is_some() {
+        if !dirty_regions.is_empty()
+            || new_cursor_pos.is_some()
+            || editor_action.is_some()
+            || buffer_changed
+        {
+            // Create buffer change info if content was modified
+            let buffer_change = if buffer_changed {
+                // Use full buffer range since we're re-highlighting everything anyway
+                let buffer_len = self.buffer.buffer_len_chars();
+                Some(BufferChange {
+                    start: 0,
+                    old_end: buffer_len,
+                    new_end: buffer_len,
+                })
+            } else {
+                None
+            };
+
             BufferResponse::ActionsCompleted {
                 dirty_regions,
                 new_cursor_pos,
                 editor_action,
+                buffer_change,
             }
         } else {
             BufferResponse::NoChange

@@ -27,6 +27,43 @@ pub const DEFAULT_FONT_SIZE: f32 = 14.0;
 /// Line height multiplier
 pub const LINE_HEIGHT_FACTOR: f32 = 1.3;
 
+/// A styled span for rendering text with syntax highlighting
+#[derive(Clone, Debug)]
+pub struct StyledSpan {
+    /// Character offset start (relative to line text)
+    pub start: usize,
+    /// Character offset end (relative to line text)
+    pub end: usize,
+    /// Foreground color
+    pub color: Color,
+    /// Bold
+    pub bold: bool,
+    /// Italic
+    pub italic: bool,
+}
+
+impl StyledSpan {
+    pub fn new(start: usize, end: usize, color: Color) -> Self {
+        Self {
+            start,
+            end,
+            color,
+            bold: false,
+            italic: false,
+        }
+    }
+
+    pub fn with_bold(mut self, bold: bool) -> Self {
+        self.bold = bold;
+        self
+    }
+
+    pub fn with_italic(mut self, italic: bool) -> Self {
+        self.italic = italic;
+        self
+    }
+}
+
 /// Text renderer using Parley for layout
 pub struct TextRenderer {
     font_cx: FontContext,
@@ -49,8 +86,12 @@ impl TextRenderer {
         let mut layout_cx = LayoutContext::new();
 
         // Measure actual character metrics by laying out a test string
-        let (char_width, line_height) =
-            Self::measure_metrics(&mut font_cx, &mut layout_cx, font_size, font_family.as_deref());
+        let (char_width, line_height) = Self::measure_metrics(
+            &mut font_cx,
+            &mut layout_cx,
+            font_size,
+            font_family.as_deref(),
+        );
 
         Self {
             font_cx,
@@ -167,6 +208,103 @@ impl TextRenderer {
 
         // Don't wrap lines - let clipping handle overflow
         // For proper wrapping we'd need to pre-calculate visual line counts
+        layout.break_all_lines(None);
+        layout.align(None, Alignment::Start);
+
+        // Render glyphs
+        self.render_layout(scene, &layout, x, y);
+    }
+
+    /// Render a single line of text with multiple styled spans
+    pub fn render_line_with_styles(
+        &mut self,
+        scene: &mut Scene,
+        text: &str,
+        x: f32,
+        y: f32,
+        default_color: Color,
+        spans: &[StyledSpan],
+        _max_width: Option<f32>, // Reserved for future wrapping support
+    ) {
+        if text.is_empty() {
+            return;
+        }
+
+        // Build layout with ranged styles
+        let mut builder = self.layout_cx.ranged_builder(&mut self.font_cx, text, 1.0);
+
+        // Set default styles
+        builder.push_default(StyleProperty::FontSize(self.font_size));
+
+        // Use custom font family if specified, otherwise fall back to system monospace
+        if let Some(ref family_name) = self.font_family {
+            builder.push_default(StyleProperty::FontStack(FontStack::List(Cow::Borrowed(&[
+                FontFamily::Named(Cow::Owned(family_name.clone())),
+                FontFamily::Generic(parley::style::GenericFamily::Monospace),
+            ]))));
+        } else {
+            builder.push_default(StyleProperty::FontStack(FontStack::Single(
+                FontFamily::Generic(parley::style::GenericFamily::Monospace),
+            )));
+        }
+
+        builder.push_default(StyleProperty::Brush(default_color));
+
+        // Apply styled spans
+        for span in spans {
+            // Ensure span is within text bounds
+            let start = span.start.min(text.len());
+            let end = span.end.min(text.len());
+            if start >= end {
+                continue;
+            }
+
+            // Convert byte offsets to valid char boundaries
+            // Use the position directly if it's a valid char boundary, otherwise find nearest
+            let start_idx = if text.is_char_boundary(start) {
+                start
+            } else {
+                // Find the nearest char boundary at or before start
+                text[..start]
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .last()
+                    .unwrap_or(0)
+            };
+            // Find the nearest char boundary at or after end
+            let end_idx = if text.is_char_boundary(end) {
+                end
+            } else {
+                text[end..]
+                    .char_indices()
+                    .next()
+                    .map(|(i, _)| end + i)
+                    .unwrap_or(text.len())
+            };
+
+            // Apply color for this span
+            builder.push(StyleProperty::Brush(span.color), start_idx..end_idx);
+
+            // Apply bold if set
+            if span.bold {
+                builder.push(
+                    StyleProperty::FontWeight(parley::style::FontWeight::BOLD),
+                    start_idx..end_idx,
+                );
+            }
+
+            // Apply italic if set
+            if span.italic {
+                builder.push(
+                    StyleProperty::FontStyle(parley::style::FontStyle::Italic),
+                    start_idx..end_idx,
+                );
+            }
+        }
+
+        let mut layout: Layout<Color> = builder.build(text);
+
+        // Don't wrap lines - let clipping handle overflow
         layout.break_all_lines(None);
         layout.align(None, Alignment::Start);
 

@@ -22,9 +22,12 @@ mod text;
 mod theme;
 
 pub use renderer::VelloRenderer;
+pub use text::StyledSpan;
 pub use theme::VelloTheme;
 
 use roe_core::editor::ChromeAction;
+use roe_core::julia_runtime::face_registry;
+use roe_core::syntax::Color as SyntaxColor;
 use roe_core::Editor;
 use std::sync::Arc;
 use text::TextRenderer;
@@ -43,6 +46,25 @@ use winit::window::{CursorIcon, Window, WindowId};
 /// Default window dimensions
 const DEFAULT_WIDTH: u32 = 1200;
 const DEFAULT_HEIGHT: u32 = 800;
+
+/// Convert a syntax color to Vello Color
+fn syntax_color_to_vello(color: &SyntaxColor, default: Color) -> Color {
+    match color {
+        SyntaxColor::Rgb { r, g, b } => Color::rgba8(*r, *g, *b, 255),
+        SyntaxColor::Named(name) => match name.to_lowercase().as_str() {
+            "black" => Color::BLACK,
+            "red" => Color::rgba8(255, 0, 0, 255),
+            "green" => Color::rgba8(0, 255, 0, 255),
+            "yellow" => Color::rgba8(255, 255, 0, 255),
+            "blue" => Color::rgba8(0, 0, 255, 255),
+            "magenta" => Color::rgba8(255, 0, 255, 255),
+            "cyan" => Color::rgba8(0, 255, 255, 255),
+            "white" => Color::WHITE,
+            _ => default,
+        },
+        SyntaxColor::Inherit => default,
+    }
+}
 
 /// Scrollbar width in logical pixels
 const SCROLLBAR_WIDTH: f64 = 14.0;
@@ -116,7 +138,11 @@ impl<'a> RoeVelloApp<'a> {
             .with_title("Roe - Ryan's Own Emacs")
             .with_inner_size(LogicalSize::new(DEFAULT_WIDTH, DEFAULT_HEIGHT));
 
-        Arc::new(event_loop.create_window(attrs).expect("Failed to create window"))
+        Arc::new(
+            event_loop
+                .create_window(attrs)
+                .expect("Failed to create window"),
+        )
     }
 
     fn render(&mut self) {
@@ -145,7 +171,8 @@ impl<'a> RoeVelloApp<'a> {
         // Update editor frame dimensions (using logical dimensions)
         let cols = (logical_width as f32 / char_width).floor() as u16;
         let lines = (logical_height as f32 / line_height).floor() as u16;
-        self.editor.handle_resize(cols.max(1), lines.saturating_sub(1).max(1)); // -1 for echo area
+        self.editor
+            .handle_resize(cols.max(1), lines.saturating_sub(1).max(1)); // -1 for echo area
 
         // Build the scene in logical coordinates, then scale for physical rendering
         self.scene.reset();
@@ -353,7 +380,11 @@ impl<'a> RoeVelloApp<'a> {
             .filter(|(idx, _)| *idx >= start_line && (*idx - start_line) < content_height)
             .map(|(idx, text)| {
                 let line_start_pos = buffer.to_char_index(0, idx as u16);
-                (idx - start_line, line_start_pos, text.trim_end_matches('\n').to_string())
+                (
+                    idx - start_line,
+                    line_start_pos,
+                    text.trim_end_matches('\n').to_string(),
+                )
             })
             .collect();
 
@@ -386,7 +417,8 @@ impl<'a> RoeVelloApp<'a> {
                         let sel_y = content_y + (*visual_line as f64 * line_height);
                         let sel_width = (visible_sel_end - visible_sel_start) as f64 * char_width;
 
-                        let sel_rect = Rect::new(sel_x, sel_y, sel_x + sel_width, sel_y + line_height);
+                        let sel_rect =
+                            Rect::new(sel_x, sel_y, sel_x + sel_width, sel_y + line_height);
                         self.scene.fill(
                             vello::peniko::Fill::NonZero,
                             Affine::IDENTITY,
@@ -399,9 +431,11 @@ impl<'a> RoeVelloApp<'a> {
             }
         }
 
-        // Render each line of text with horizontal scroll offset
+        // Render each line of text with horizontal scroll offset and syntax highlighting
         let fg_color = self.theme.fg_color;
-        for (visual_line, _line_start_pos, line_text) in lines_to_render {
+        let face_registry_guard = face_registry().lock().ok();
+
+        for (visual_line, line_start_pos, line_text) in lines_to_render {
             // Apply horizontal scroll - skip start_column characters
             let visible_text: String = line_text.chars().skip(start_column).collect();
             if visible_text.is_empty() {
@@ -411,14 +445,76 @@ impl<'a> RoeVelloApp<'a> {
             let text_x = content_x as f32;
             let text_y = content_y as f32 + (visual_line as f32) * line_height as f32;
 
-            self.text_renderer.render_line(
-                &mut self.scene,
-                &visible_text,
-                text_x,
-                text_y,
-                fg_color,
-                Some(content_width),
-            );
+            // Get syntax spans for this line from buffer
+            let line_end_pos = line_start_pos + line_text.chars().count();
+            let syntax_spans = buffer.spans_in_range(line_start_pos..line_end_pos);
+
+            // Convert buffer spans to StyledSpans for rendering
+            let styled_spans: Vec<StyledSpan> = if let Some(ref registry) = face_registry_guard {
+                syntax_spans
+                    .iter()
+                    .filter_map(|span| {
+                        let face = registry.get(span.face_id)?;
+                        // Convert buffer positions to positions within visible_text
+                        // Account for horizontal scroll
+                        let span_start_in_line = span.start.saturating_sub(line_start_pos);
+                        let span_end_in_line =
+                            span.end.saturating_sub(line_start_pos).min(line_text.len());
+
+                        // Adjust for horizontal scroll
+                        if span_end_in_line <= start_column
+                            || span_start_in_line >= start_column + visible_text.len()
+                        {
+                            return None; // Span is not visible
+                        }
+
+                        let visible_start = span_start_in_line.saturating_sub(start_column);
+                        let visible_end = span_end_in_line
+                            .saturating_sub(start_column)
+                            .min(visible_text.len());
+
+                        if visible_start >= visible_end {
+                            return None;
+                        }
+
+                        let color = face
+                            .foreground
+                            .as_ref()
+                            .map(|c| syntax_color_to_vello(c, fg_color))
+                            .unwrap_or(fg_color);
+
+                        Some(
+                            StyledSpan::new(visible_start, visible_end, color)
+                                .with_bold(face.bold)
+                                .with_italic(face.italic),
+                        )
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            // Use styled rendering if we have spans, otherwise plain rendering
+            if styled_spans.is_empty() {
+                self.text_renderer.render_line(
+                    &mut self.scene,
+                    &visible_text,
+                    text_x,
+                    text_y,
+                    fg_color,
+                    Some(content_width),
+                );
+            } else {
+                self.text_renderer.render_line_with_styles(
+                    &mut self.scene,
+                    &visible_text,
+                    text_x,
+                    text_y,
+                    fg_color,
+                    &styled_spans,
+                    Some(content_width),
+                );
+            }
         }
 
         // Draw cursor (inside clipping region), accounting for horizontal scroll
@@ -429,12 +525,16 @@ impl<'a> RoeVelloApp<'a> {
             if line >= start_line {
                 let cursor_visual_line = line - start_line;
                 // Check if cursor is horizontally visible
-                if cursor_visual_line < content_height && col >= start_column && col < start_column + content_width_chars {
+                if cursor_visual_line < content_height
+                    && col >= start_column
+                    && col < start_column + content_width_chars
+                {
                     let visual_col = col - start_column;
                     let cursor_x = content_x + (visual_col as f64 * char_width);
                     let cursor_y = content_y + (cursor_visual_line as f64) * line_height;
 
-                    let cursor_rect = Rect::new(cursor_x, cursor_y, cursor_x + 2.0, cursor_y + line_height);
+                    let cursor_rect =
+                        Rect::new(cursor_x, cursor_y, cursor_x + 2.0, cursor_y + line_height);
                     self.scene.fill(
                         vello::peniko::Fill::NonZero,
                         Affine::IDENTITY,
@@ -595,10 +695,7 @@ impl<'a> RoeVelloApp<'a> {
         }
     }
 
-    async fn handle_key_event(
-        &mut self,
-        event: winit::event::KeyEvent,
-    ) -> Vec<ChromeAction> {
+    async fn handle_key_event(&mut self, event: winit::event::KeyEvent) -> Vec<ChromeAction> {
         if event.state != ElementState::Pressed {
             return vec![];
         }
@@ -656,7 +753,11 @@ impl<'a> RoeVelloApp<'a> {
         let clamped_line = buffer_line.min(total_lines - 1);
 
         // Get line length to clamp column
-        let line_text = buffer.buffer_lines().into_iter().nth(clamped_line).unwrap_or_default();
+        let line_text = buffer
+            .buffer_lines()
+            .into_iter()
+            .nth(clamped_line)
+            .unwrap_or_default();
         let line_len = line_text.trim_end_matches('\n').len();
         let clamped_col = buffer_col.min(line_len);
 
@@ -665,7 +766,11 @@ impl<'a> RoeVelloApp<'a> {
 
         // Final safety clamp to buffer length
         let buffer_len = buffer.buffer_len_chars();
-        let clamped_cursor = if buffer_len == 0 { 0 } else { new_cursor.min(buffer_len - 1) };
+        let clamped_cursor = if buffer_len == 0 {
+            0
+        } else {
+            new_cursor.min(buffer_len - 1)
+        };
 
         // Update cursor in window
         let window = self.editor.windows.get_mut(window_id).unwrap();
@@ -958,7 +1063,8 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
             }
             WindowEvent::Resized(size) => {
                 if let Some(ref mut state) = self.state {
-                    self.render_cx.resize_surface(&mut state.surface, size.width, size.height);
+                    self.render_cx
+                        .resize_surface(&mut state.surface, size.width, size.height);
                     state.window.request_redraw();
                 }
             }
@@ -1023,6 +1129,33 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
                                 current_window.cursor = 0;
                             }
                         }
+                        ChromeAction::BufferChanged {
+                            buffer_id,
+                            start,
+                            old_end,
+                            new_end,
+                        } => {
+                            // Call major mode after-change hook for syntax highlighting
+                            let Some(buffer) = self.editor.buffers.get(buffer_id) else {
+                                continue;
+                            };
+                            let Some(major_mode) = buffer.major_mode() else {
+                                continue;
+                            };
+                            let Some(ref julia_runtime) = self.editor.julia_runtime else {
+                                continue;
+                            };
+
+                            roe_core::julia_runtime::set_current_buffer(buffer.clone());
+                            let runtime = pollster::block_on(julia_runtime.lock());
+                            let _ = pollster::block_on(runtime.call_major_mode_after_change(
+                                &major_mode,
+                                start as i64,
+                                old_end as i64,
+                                new_end as i64,
+                            ));
+                            roe_core::julia_runtime::clear_current_buffer();
+                        }
                         _ => {}
                     }
                 }
@@ -1068,7 +1201,9 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
 
                 // Update cursor icon based on hover state
                 if let Some(ref state) = self.state {
-                    let cursor = if self.scrollbar_dragging.is_some() || self.hscrollbar_dragging.is_some() {
+                    let cursor = if self.scrollbar_dragging.is_some()
+                        || self.hscrollbar_dragging.is_some()
+                    {
                         CursorIcon::Grabbing
                     } else if self.check_scrollbar_hit(logical_x, logical_y).is_some()
                         || self.check_hscrollbar_hit(logical_x, logical_y).is_some()
@@ -1094,7 +1229,9 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
                                     }
                                 }
                                 // Check horizontal scrollbar
-                                else if let Some((window_id, ratio)) = self.check_hscrollbar_hit(x, y) {
+                                else if let Some((window_id, ratio)) =
+                                    self.check_hscrollbar_hit(x, y)
+                                {
                                     self.handle_hscrollbar_click(window_id, ratio);
                                     self.hscrollbar_dragging = Some(window_id);
                                     if let Some(ref state) = self.state {
@@ -1104,7 +1241,8 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
                                     // Normal text click
                                     pollster::block_on(self.handle_mouse_click(x, y));
                                     // Save cursor position for potential drag selection
-                                    let cursor = self.editor.windows[self.editor.active_window].cursor;
+                                    let cursor =
+                                        self.editor.windows[self.editor.active_window].cursor;
                                     self.drag_start_cursor = Some(cursor);
                                     self.mouse_dragging = true;
                                 }
@@ -1154,7 +1292,11 @@ async fn load_theme_from_julia(editor: &Editor) -> VelloTheme {
         // Try "colours.key" first, then "colors.key"
         let value = match runtime.get_config(&format!("colours.{}", key)).await {
             Ok(Some(v)) => Some(v),
-            _ => runtime.get_config(&format!("colors.{}", key)).await.ok().flatten(),
+            _ => runtime
+                .get_config(&format!("colors.{}", key))
+                .await
+                .ok()
+                .flatten(),
         };
 
         if let Some(config_value) = value {

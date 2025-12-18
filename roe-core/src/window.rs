@@ -18,9 +18,10 @@ impl Window {
     /// This is relative to the window, not the frame.
     /// column, line
     pub fn cursor_position(&self, buffer_column: u16, buffer_line: u16) -> (u16, u16) {
-        // The screen line should be buffer_line minus start_line (the scroll offset)
+        // The screen line should be buffer_line minus start_line (the vertical scroll offset)
         let screen_line = buffer_line.saturating_sub(self.start_line);
-        let screen_column = buffer_column;
+        // The screen column should be buffer_column minus start_column (the horizontal scroll offset)
+        let screen_column = buffer_column.saturating_sub(self.start_column);
         (screen_column, screen_line)
     }
 

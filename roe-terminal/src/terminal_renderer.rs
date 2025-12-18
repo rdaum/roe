@@ -20,9 +20,11 @@ use crossterm::terminal::{Clear, ClearType};
 use crossterm::{cursor, queue};
 use futures::{future::FutureExt, select, StreamExt};
 use roe_core::editor::{BorderInfo, ChromeAction, DragType, Frame, MouseDragState, Window};
+use roe_core::julia_runtime::face_registry;
 use roe_core::keys::{KeyModifier, LogicalKey, Side};
 use roe_core::renderer::{DirtyRegion, DirtyTracker, ModelineComponent, Renderer};
-use roe_core::{Editor, WindowId};
+use roe_core::syntax::Color as SyntaxColor;
+use roe_core::{Editor, HighlightSpan, WindowId};
 use std::io::Write;
 use tokio::time::{interval, Duration};
 
@@ -59,6 +61,34 @@ fn parse_hex_color(hex: &str) -> Color {
         }
     }
     Color::White // fallback
+}
+
+/// Convert a syntax color to crossterm Color
+fn syntax_color_to_crossterm(color: &SyntaxColor, default: Color) -> Color {
+    match color {
+        SyntaxColor::Rgb { r, g, b } => Color::Rgb {
+            r: *r,
+            g: *g,
+            b: *b,
+        },
+        SyntaxColor::Named(name) => {
+            // Map common color names
+            match name.to_lowercase().as_str() {
+                "black" => Color::Black,
+                "red" => Color::Red,
+                "green" => Color::Green,
+                "yellow" => Color::Yellow,
+                "blue" => Color::Blue,
+                "magenta" => Color::Magenta,
+                "cyan" => Color::Cyan,
+                "white" => Color::White,
+                "grey" | "gray" => Color::Grey,
+                "darkgrey" | "darkgray" => Color::DarkGrey,
+                _ => default,
+            }
+        }
+        SyntaxColor::Inherit => default,
+    }
 }
 
 /// Cached theme colors loaded from Julia at startup
@@ -176,7 +206,7 @@ impl<W: Write> TerminalRenderer<W> {
         }
     }
 
-    /// Render a single line with proper highlighting
+    /// Render a single line with proper highlighting (region + syntax)
     fn render_line_incremental(
         &mut self,
         editor: &Editor,
@@ -215,13 +245,15 @@ impl<W: Write> TerminalRenderer<W> {
         let line_text = line_text.trim_end_matches('\n');
 
         let line_start_pos = buffer.buffer_line_to_char(buffer_line);
+        let line_end_pos = line_start_pos + line_text.chars().count();
 
         let content_x = window.x + 1;
         let content_width = window.width_chars.saturating_sub(2);
+        let start_column = window.start_column as usize;
 
+        // Clear the line first
         queue!(&mut self.device, cursor::MoveTo(content_x, screen_row))?;
         let clear_spaces = " ".repeat(content_width as usize);
-
         queue!(
             &mut self.device,
             Print(
@@ -230,28 +262,49 @@ impl<W: Write> TerminalRenderer<W> {
                     .on(self.theme.bg_color)
             )
         )?;
-
         queue!(&mut self.device, cursor::MoveTo(content_x, screen_row))?;
 
-        let chars_to_render: Vec<char> = line_text.chars().take(content_width as usize).collect();
+        // Apply horizontal scroll - skip start_column characters, then take content_width
+        let chars_to_render: Vec<char> = line_text
+            .chars()
+            .skip(start_column)
+            .take(content_width as usize)
+            .collect();
+
+        // Get syntax spans for this line
+        let syntax_spans: Vec<HighlightSpan> = buffer.spans_in_range(line_start_pos..line_end_pos);
+
+        // Get face registry for looking up face colors
+        let face_registry_guard = face_registry().lock().ok();
+
+        // Render character by character with merged highlighting
+        for (char_idx, ch) in chars_to_render.iter().enumerate() {
+            // Account for horizontal scroll when calculating buffer position
+            let buffer_pos = line_start_pos + start_column + char_idx;
+
+            // Determine the style for this character
+            // Priority: region selection > syntax highlighting > default
+            let (fg, bg) = if let Some((region_start, region_end)) = region_bounds {
+                if buffer_pos >= region_start && buffer_pos < region_end {
+                    // Character is in selection region
+                    (Color::Black, self.theme.selection_color)
+                } else {
+                    // Check syntax highlighting
+                    self.get_syntax_colors(buffer_pos, &syntax_spans, &face_registry_guard)
+                }
+            } else {
+                // No region, check syntax highlighting
+                self.get_syntax_colors(buffer_pos, &syntax_spans, &face_registry_guard)
+            };
+
+            queue!(&mut self.device, Print(ch.to_string().with(fg).on(bg)))?;
+        }
+
+        // Handle region extending past line content (fill with selection color)
         if let Some((region_start, region_end)) = region_bounds {
-            let line_end_pos = line_start_pos + line_text.len();
-
-            // Check if this entire line is within the region
-            if line_start_pos >= region_start && line_end_pos <= region_end {
-                // Entire line is highlighted - render text + fill rest of line with highlighted spaces
-                let text_to_render: String = chars_to_render.iter().collect();
-                queue!(
-                    &mut self.device,
-                    Print(
-                        text_to_render
-                            .on(self.theme.selection_color)
-                            .with(Color::Black)
-                    )
-                )?;
-
-                // Fill the remaining width with highlighted spaces for full-line highlighting
-                let remaining_width = content_width as usize - chars_to_render.len();
+            if region_start < line_end_pos && region_end > line_end_pos {
+                let chars_rendered = chars_to_render.len();
+                let remaining_width = content_width as usize - chars_rendered;
                 if remaining_width > 0 {
                     let highlighted_spaces = " ".repeat(remaining_width);
                     queue!(
@@ -263,61 +316,47 @@ impl<W: Write> TerminalRenderer<W> {
                         )
                     )?;
                 }
-            } else {
-                // Partial line highlighting - render character by character
-                for (char_idx, ch) in chars_to_render.iter().enumerate() {
-                    let buffer_pos = line_start_pos + char_idx;
-
-                    // Check if this character is within the selected region
-                    if buffer_pos >= region_start && buffer_pos < region_end {
-                        // Highlighted character - yellow background with black text
-                        queue!(
-                            &mut self.device,
-                            Print(ch.to_string().on(Color::Yellow).with(Color::Black))
-                        )?;
-                    } else {
-                        // Normal character
-                        queue!(
-                            &mut self.device,
-                            Print(
-                                ch.to_string()
-                                    .with(self.theme.fg_color)
-                                    .on(self.theme.bg_color)
-                            )
-                        )?;
-                    }
-                }
-
-                // For partial highlighting, if the region extends past the line content,
-                // fill remaining space with highlighted background
-                if region_start < line_end_pos && region_end > line_end_pos {
-                    let chars_rendered = chars_to_render.len();
-                    let remaining_width = content_width as usize - chars_rendered;
-                    if remaining_width > 0 {
-                        let highlighted_spaces = " ".repeat(remaining_width);
-                        queue!(
-                            &mut self.device,
-                            Print(highlighted_spaces.on(Color::Yellow).with(Color::Black))
-                        )?;
-                    }
-                }
             }
-        } else {
-            // No region selected, render normally
-            let text_to_render: String = chars_to_render.iter().collect();
-            queue!(
-                &mut self.device,
-                Print(
-                    text_to_render
-                        .with(self.theme.fg_color)
-                        .on(self.theme.bg_color)
-                )
-            )?;
         }
 
         // Line is already cleared at the beginning, no need to clear again
 
         Ok(())
+    }
+
+    /// Get the foreground and background colors for a character position based on syntax spans
+    fn get_syntax_colors(
+        &self,
+        buffer_pos: usize,
+        syntax_spans: &[HighlightSpan],
+        face_registry_guard: &Option<std::sync::MutexGuard<'_, roe_core::FaceRegistry>>,
+    ) -> (Color, Color) {
+        // Find the last span that contains this position (later spans override earlier ones)
+        let matching_span = syntax_spans
+            .iter()
+            .rev()
+            .find(|span| buffer_pos >= span.start && buffer_pos < span.end);
+
+        if let Some(span) = matching_span {
+            if let Some(ref registry) = face_registry_guard {
+                if let Some(face) = registry.get(span.face_id) {
+                    let fg = face
+                        .foreground
+                        .as_ref()
+                        .map(|c| syntax_color_to_crossterm(c, self.theme.fg_color))
+                        .unwrap_or(self.theme.fg_color);
+                    let bg = face
+                        .background
+                        .as_ref()
+                        .map(|c| syntax_color_to_crossterm(c, self.theme.bg_color))
+                        .unwrap_or(self.theme.bg_color);
+                    return (fg, bg);
+                }
+            }
+        }
+
+        // Default colors
+        (self.theme.fg_color, self.theme.bg_color)
     }
 
     /// Render specific modeline components that are dirty
@@ -516,7 +555,10 @@ impl<W: Write> Renderer for TerminalRenderer<W> {
         queue!(&mut self.device, cursor::MoveTo(x, y))?;
 
         // Hide cursor in command windows (they use visual indicators like ">")
-        if matches!(active_window.window_type, roe_core::editor::WindowType::Command { .. }) {
+        if matches!(
+            active_window.window_type,
+            roe_core::editor::WindowType::Command { .. }
+        ) {
             queue!(&mut self.device, cursor::Hide)?;
         } else {
             queue!(&mut self.device, cursor::Show)?;
@@ -591,7 +633,10 @@ impl<W: Write> Renderer for TerminalRenderer<W> {
         queue!(&mut self.device, cursor::MoveTo(x, y))?;
 
         // Hide cursor in command windows (they use visual indicators like ">")
-        if matches!(active_window.window_type, roe_core::editor::WindowType::Command { .. }) {
+        if matches!(
+            active_window.window_type,
+            roe_core::editor::WindowType::Command { .. }
+        ) {
             queue!(&mut self.device, cursor::Hide)?;
         } else {
             queue!(&mut self.device, cursor::Show)?;
@@ -864,6 +909,41 @@ fn draw_window_modeline(
     Ok(())
 }
 
+/// Get syntax colors for a position (standalone version for use outside TerminalRenderer methods)
+fn get_syntax_colors_standalone(
+    buffer_pos: usize,
+    syntax_spans: &[HighlightSpan],
+    face_registry_guard: &Option<std::sync::MutexGuard<'_, roe_core::FaceRegistry>>,
+    theme: &CachedTheme,
+) -> (Color, Color) {
+    // Find the last span that contains this position (later spans override earlier ones)
+    let matching_span = syntax_spans
+        .iter()
+        .rev()
+        .find(|span| buffer_pos >= span.start && buffer_pos < span.end);
+
+    if let Some(span) = matching_span {
+        if let Some(ref registry) = face_registry_guard {
+            if let Some(face) = registry.get(span.face_id) {
+                let fg = face
+                    .foreground
+                    .as_ref()
+                    .map(|c| syntax_color_to_crossterm(c, theme.fg_color))
+                    .unwrap_or(theme.fg_color);
+                let bg = face
+                    .background
+                    .as_ref()
+                    .map(|c| syntax_color_to_crossterm(c, theme.bg_color))
+                    .unwrap_or(theme.bg_color);
+                return (fg, bg);
+            }
+        }
+    }
+
+    // Default colors
+    (theme.fg_color, theme.bg_color)
+}
+
 /// Redraw the entire buffer in a window.
 pub fn draw_window(
     device: &mut impl Write,
@@ -893,6 +973,9 @@ pub fn draw_window(
     // Check if there's a region selected for highlighting
     let region_bounds = buffer.get_region(window.cursor);
 
+    // Get face registry for looking up face colors
+    let face_registry_guard = face_registry().lock().ok();
+
     // Draw the buffer content within the content bounds
     for (line_idx, line_text) in buffer.buffer_lines().into_iter().enumerate() {
         let screen_line = line_idx as u16;
@@ -911,32 +994,55 @@ pub fn draw_window(
 
         // Get the line start position in the buffer
         let line_start_pos = buffer.buffer_line_to_char(line_idx);
+        let line_end_pos = line_start_pos + line_text.chars().count();
+        let start_column = window.start_column as usize;
 
-        // Truncate line if it's too long for the content area
+        // Apply horizontal scroll - skip start_column characters, then take content_width
         let line_str = line_text;
-        let truncated_line = if line_str.len() > content_width as usize {
-            &line_str[..content_width as usize]
-        } else {
-            &line_str
-        };
+        let visible_chars: Vec<char> = line_str
+            .chars()
+            .skip(start_column)
+            .take(content_width as usize)
+            .collect();
+
+        // Get syntax spans for this line
+        let syntax_spans: Vec<HighlightSpan> = buffer.spans_in_range(line_start_pos..line_end_pos);
 
         // Move cursor to the start of the line
         queue!(device, cursor::MoveTo(content_x, content_y + content_line))?;
 
-        // Draw the line with region highlighting
+        // Render character by character with merged highlighting (region + syntax)
+        for (char_idx, ch) in visible_chars.iter().enumerate() {
+            // Account for horizontal scroll when calculating buffer position
+            let buffer_pos = line_start_pos + start_column + char_idx;
+
+            // Determine colors: region selection > syntax > default
+            let (fg, bg) = if let Some((region_start, region_end)) = region_bounds {
+                if buffer_pos >= region_start && buffer_pos < region_end {
+                    // Character is in selection region
+                    (Color::Black, Color::Yellow)
+                } else {
+                    // Check syntax highlighting
+                    get_syntax_colors_standalone(
+                        buffer_pos,
+                        &syntax_spans,
+                        &face_registry_guard,
+                        theme,
+                    )
+                }
+            } else {
+                // No region, check syntax highlighting
+                get_syntax_colors_standalone(buffer_pos, &syntax_spans, &face_registry_guard, theme)
+            };
+
+            queue!(device, Print(ch.to_string().with(fg).on(bg)))?;
+        }
+
+        // Handle region extending past line content
         if let Some((region_start, region_end)) = region_bounds {
-            let line_end_pos = line_start_pos + line_str.len();
-
-            // Check if this entire line is within the region
-            if line_start_pos >= region_start && line_end_pos <= region_end {
-                // Entire line is highlighted - render text + fill rest of line with highlighted spaces
-                queue!(
-                    device,
-                    Print(truncated_line.on(Color::Yellow).with(Color::Black))
-                )?;
-
-                // Fill the remaining width with highlighted spaces for full-line highlighting
-                let remaining_width = content_width as usize - truncated_line.len();
+            if region_start < line_end_pos && region_end > line_end_pos {
+                let chars_rendered = visible_chars.len();
+                let remaining_width = content_width as usize - chars_rendered;
                 if remaining_width > 0 {
                     let highlighted_spaces = " ".repeat(remaining_width);
                     queue!(
@@ -944,47 +1050,7 @@ pub fn draw_window(
                         Print(highlighted_spaces.on(Color::Yellow).with(Color::Black))
                     )?;
                 }
-            } else {
-                // Partial line highlighting - render character by character
-                for (char_idx, ch) in truncated_line.chars().enumerate() {
-                    let buffer_pos = line_start_pos + char_idx;
-
-                    // Check if this character is within the selected region
-                    if buffer_pos >= region_start && buffer_pos < region_end {
-                        // Highlighted character - yellow background with black text
-                        queue!(
-                            device,
-                            Print(ch.to_string().on(Color::Yellow).with(Color::Black))
-                        )?;
-                    } else {
-                        // Normal character
-                        queue!(
-                            device,
-                            Print(ch.to_string().with(theme.fg_color).on(theme.bg_color))
-                        )?;
-                    }
-                }
-
-                // For partial highlighting, if the region extends past the line content,
-                // fill remaining space with highlighted background
-                if region_start < line_end_pos && region_end > line_end_pos {
-                    let chars_rendered = truncated_line.len();
-                    let remaining_width = content_width as usize - chars_rendered;
-                    if remaining_width > 0 {
-                        let highlighted_spaces = " ".repeat(remaining_width);
-                        queue!(
-                            device,
-                            Print(highlighted_spaces.on(Color::Yellow).with(Color::Black))
-                        )?;
-                    }
-                }
             }
-        } else {
-            // No region selected, draw normally
-            queue!(
-                device,
-                Print(truncated_line.with(theme.fg_color).on(theme.bg_color))
-            )?;
         }
     }
 
@@ -1228,6 +1294,35 @@ pub async fn event_loop_with_renderer<W: Write>(
                 }
                 ChromeAction::DumpMessages(_) => {
                     // Handled in Editor::process_chrome_actions
+                }
+                ChromeAction::BufferChanged {
+                    buffer_id,
+                    start,
+                    old_end,
+                    new_end,
+                } => {
+                    // Call major mode after-change hook for syntax highlighting
+                    let Some(buffer) = editor.buffers.get(buffer_id) else {
+                        continue;
+                    };
+                    let Some(major_mode) = buffer.major_mode() else {
+                        continue;
+                    };
+                    let Some(ref julia_runtime) = editor.julia_runtime else {
+                        continue;
+                    };
+
+                    roe_core::julia_runtime::set_current_buffer(buffer.clone());
+                    let runtime = julia_runtime.lock().await;
+                    let _ = runtime
+                        .call_major_mode_after_change(
+                            &major_mode,
+                            start as i64,
+                            old_end as i64,
+                            new_end as i64,
+                        )
+                        .await;
+                    roe_core::julia_runtime::clear_current_buffer();
                 }
             }
         }

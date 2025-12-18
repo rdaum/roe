@@ -354,10 +354,7 @@ mod tests {
         assert!(!tracker.is_line_dirty(buffer_id, 5));
 
         // Mark line 5 dirty
-        tracker.mark_dirty(DirtyRegion::Line {
-            buffer_id,
-            line: 5,
-        });
+        tracker.mark_dirty(DirtyRegion::Line { buffer_id, line: 5 });
         assert!(tracker.is_line_dirty(buffer_id, 5));
         assert!(!tracker.is_line_dirty(buffer_id, 4));
         assert!(!tracker.is_line_dirty(buffer_id, 6));
