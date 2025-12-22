@@ -28,6 +28,7 @@ pub mod renderer;
 pub mod scripted_mode;
 pub mod selection_menu;
 pub mod syntax;
+pub mod undo;
 pub mod window;
 
 new_key_type! {

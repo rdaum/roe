@@ -1459,6 +1459,9 @@ impl Editor {
                         .expect("Active window should exist");
                     let buffer = &self.buffers[window.active_buffer];
 
+                    // Insert undo boundary - cursor movement breaks undo groups
+                    buffer.undo_boundary();
+
                     // Clear transient mark on non-shift cursor movement (CUA-style)
                     let had_transient_mark = buffer.clear_transient_mark();
 
@@ -1632,6 +1635,13 @@ impl Editor {
                 }
             }
             KeyAction::Cancel => {
+                // Insert undo boundary - Cancel breaks undo groups
+                {
+                    let window = &self.windows[self.active_window];
+                    let buffer = &self.buffers[window.active_buffer];
+                    buffer.undo_boundary();
+                }
+
                 // Cancel current operation - check command window first, then mark
                 if let Some(command_window_id) = self.find_command_window() {
                     self.close_command_window(command_window_id);
@@ -1648,6 +1658,68 @@ impl Editor {
                     return Ok(self.clear_mark());
                 } else {
                     return Ok(vec![ChromeAction::Echo("Quit".to_string())]);
+                }
+            }
+            KeyAction::Undo => {
+                let window = &mut self.windows[self.active_window];
+                let buffer = &self.buffers[window.active_buffer];
+
+                if let Some(new_cursor) = buffer.undo() {
+                    window.cursor = new_cursor;
+                    let (col, line) = buffer.to_column_line(new_cursor);
+
+                    let content_height = window.height_chars.saturating_sub(3);
+                    let content_width = window.width_chars.saturating_sub(4);
+                    Self::ensure_cursor_visible_static(
+                        window,
+                        col,
+                        line,
+                        content_width,
+                        content_height,
+                    );
+
+                    return Ok(vec![
+                        ChromeAction::CursorMove(window.absolute_cursor_position(col, line)),
+                        ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                            buffer_id: window.active_buffer,
+                        }),
+                        ChromeAction::Echo("Undo".to_string()),
+                    ]);
+                } else {
+                    return Ok(vec![ChromeAction::Echo(
+                        "No further undo information".to_string(),
+                    )]);
+                }
+            }
+            KeyAction::Redo => {
+                let window = &mut self.windows[self.active_window];
+                let buffer = &self.buffers[window.active_buffer];
+
+                if let Some(new_cursor) = buffer.redo() {
+                    window.cursor = new_cursor;
+                    let (col, line) = buffer.to_column_line(new_cursor);
+
+                    let content_height = window.height_chars.saturating_sub(3);
+                    let content_width = window.width_chars.saturating_sub(4);
+                    Self::ensure_cursor_visible_static(
+                        window,
+                        col,
+                        line,
+                        content_width,
+                        content_height,
+                    );
+
+                    return Ok(vec![
+                        ChromeAction::CursorMove(window.absolute_cursor_position(col, line)),
+                        ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                            buffer_id: window.active_buffer,
+                        }),
+                        ChromeAction::Echo("Redo".to_string()),
+                    ]);
+                } else {
+                    return Ok(vec![ChromeAction::Echo(
+                        "No further redo information".to_string(),
+                    )]);
                 }
             }
             KeyAction::Unbound => {
@@ -2511,6 +2583,9 @@ impl Editor {
     pub fn save_buffer(&mut self) -> Vec<ChromeAction> {
         let window = &self.windows[self.active_window];
         let buffer = &self.buffers[window.active_buffer];
+
+        // Insert undo boundary - save breaks undo groups
+        buffer.undo_boundary();
 
         // For now, we need to know the file path. In a real implementation,
         // this would be stored with the buffer or mode. For now, let's look

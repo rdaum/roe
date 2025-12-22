@@ -12,6 +12,7 @@
 //
 
 use crate::syntax::{FaceId, HighlightSpan, SpanStore};
+use crate::undo::{EditOp, UndoManager};
 use crate::ModeId;
 use std::ops::Range;
 use std::sync::{Arc, RwLock};
@@ -34,6 +35,8 @@ pub struct BufferInner {
     pub(crate) spans: SpanStore,
     /// Major mode name (e.g., "julia-mode", "fundamental-mode")
     pub(crate) major_mode: Option<String>,
+    /// Undo/redo history manager
+    pub(crate) undo_manager: UndoManager,
 }
 
 impl BufferInner {
@@ -46,6 +49,7 @@ impl BufferInner {
             transient_mark: false,
             spans: SpanStore::new(),
             major_mode: None,
+            undo_manager: UndoManager::new(),
         }
     }
 
@@ -64,6 +68,7 @@ impl BufferInner {
             transient_mark: false,
             spans: SpanStore::new(),
             major_mode: None,
+            undo_manager: UndoManager::new(),
         };
         Ok(buffer_inner)
     }
@@ -76,6 +81,8 @@ impl BufferInner {
 
     pub fn insert_pos(&mut self, fragment: String, position: usize) {
         let len = fragment.chars().count();
+        // Record for undo before modifying
+        self.undo_manager.record_insert(position, fragment.clone());
         self.buffer.insert(position, &fragment);
         // Adjust highlight spans for the insertion
         self.spans.adjust_for_insert(position, len);
@@ -104,6 +111,9 @@ impl BufferInner {
         }
 
         let deleted = self.buffer.slice(start as usize..end as usize).to_string();
+        // Record for undo before modifying
+        self.undo_manager
+            .record_delete(start as usize, deleted.clone());
         self.buffer.remove(start as usize..end as usize);
         // Adjust highlight spans for the deletion
         self.spans.adjust_for_delete(start as usize, end as usize);
@@ -510,12 +520,83 @@ impl BufferInner {
         }
 
         let deleted = self.buffer.slice(start..end).to_string();
+        // Record for undo before modifying
+        self.undo_manager.record_delete(start, deleted.clone());
         self.buffer.remove(start..end);
         // Adjust highlight spans for the deletion
         self.spans.adjust_for_delete(start, end);
         self.clear_mark();
         // Cursor should be at the start of the deleted region
         Some((deleted, start))
+    }
+
+    // === UNDO/REDO OPERATIONS ===
+
+    /// Perform undo, returns the new cursor position if successful
+    pub fn undo(&mut self) -> Option<usize> {
+        let op = self.undo_manager.pop_undo()?;
+        let cursor = self.apply_edit_op(&op.reverse());
+        self.undo_manager.did_undo(op);
+        Some(cursor)
+    }
+
+    /// Perform redo, returns the new cursor position if successful
+    pub fn redo(&mut self) -> Option<usize> {
+        let op = self.undo_manager.pop_redo()?;
+        let cursor = self.apply_edit_op(&op);
+        self.undo_manager.did_redo(op);
+        Some(cursor)
+    }
+
+    /// Apply an edit operation without recording it (used for undo/redo)
+    fn apply_edit_op(&mut self, op: &EditOp) -> usize {
+        match op {
+            EditOp::Insert { pos, text } => {
+                let len = text.chars().count();
+                self.buffer.insert(*pos, text);
+                self.spans.adjust_for_insert(*pos, len);
+                pos + len
+            }
+            EditOp::Delete { pos, text } => {
+                let end = pos + text.chars().count();
+                self.buffer.remove(*pos..end);
+                self.spans.adjust_for_delete(*pos, end);
+                *pos
+            }
+            EditOp::Group(ops) => {
+                let mut cursor = 0;
+                for op in ops {
+                    cursor = self.apply_edit_op(op);
+                }
+                cursor
+            }
+        }
+    }
+
+    /// Check if undo is available
+    pub fn can_undo(&self) -> bool {
+        self.undo_manager.can_undo()
+    }
+
+    /// Check if redo is available
+    pub fn can_redo(&self) -> bool {
+        self.undo_manager.can_redo()
+    }
+
+    /// Begin a group of operations for undo
+    pub fn begin_undo_group(&mut self) {
+        self.undo_manager.begin_group();
+    }
+
+    /// End a group of operations for undo
+    pub fn end_undo_group(&mut self) {
+        self.undo_manager.end_group();
+    }
+
+    /// Insert an undo boundary - seals current auto-group, next edit starts fresh
+    /// Call this on cursor movement, certain commands, etc.
+    pub fn undo_boundary(&mut self) {
+        self.undo_manager.boundary();
     }
 
     // === SYNTAX HIGHLIGHTING SPAN OPERATIONS ===
@@ -715,6 +796,35 @@ impl Buffer {
 
     pub fn delete_region(&self, cursor_pos: usize) -> Option<(String, usize)> {
         self.with_write(|b| b.delete_region(cursor_pos))
+    }
+
+    // Undo/redo operations
+    pub fn undo(&self) -> Option<usize> {
+        self.with_write(|b| b.undo())
+    }
+
+    pub fn redo(&self) -> Option<usize> {
+        self.with_write(|b| b.redo())
+    }
+
+    pub fn can_undo(&self) -> bool {
+        self.with_read(|b| b.can_undo())
+    }
+
+    pub fn can_redo(&self) -> bool {
+        self.with_read(|b| b.can_redo())
+    }
+
+    pub fn begin_undo_group(&self) {
+        self.with_write(|b| b.begin_undo_group())
+    }
+
+    pub fn end_undo_group(&self) {
+        self.with_write(|b| b.end_undo_group())
+    }
+
+    pub fn undo_boundary(&self) {
+        self.with_write(|b| b.undo_boundary())
     }
 
     // Properties that need read access

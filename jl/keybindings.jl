@@ -178,7 +178,11 @@ define_key("Escape", ":escape")
 
 # --- Undo/redo ---
 define_key("C-/", ":undo")
-define_key("C-S-/", ":redo")
+define_key("C-_", ":undo")
+define_key("C-x u", ":undo")
+define_key("M-/", ":redo")
+# Terminal sends Ctrl+/ as Ctrl+7 (ASCII control code limitation)
+define_key("C-7", ":undo")
 
 # --- Commands (C-x prefix) ---
 define_key("C-x C-c", "quit")

@@ -1076,7 +1076,7 @@ fn crossterm_modifier_translate(mk: &ModifierKeyCode) -> KeyModifier {
     }
 }
 
-fn crossterm_key_translate(ck: &KeyCode) -> LogicalKey {
+fn crossterm_key_translate(ck: &KeyCode, modifiers: KeyModifiers) -> LogicalKey {
     match &ck {
         KeyCode::Backspace => LogicalKey::Backspace,
         KeyCode::Enter => LogicalKey::Enter,
@@ -1093,7 +1093,20 @@ fn crossterm_key_translate(ck: &KeyCode) -> LogicalKey {
         KeyCode::Delete => LogicalKey::Delete,
         KeyCode::Insert => LogicalKey::Insert,
         KeyCode::F(f) => LogicalKey::Function(*f),
-        KeyCode::Char(c) => LogicalKey::AlphaNumeric(*c),
+        KeyCode::Char(c) => {
+            // Handle terminal control character translations
+            // Ctrl+/ sends 0x1F (Unit Separator) in terminals
+            // Ctrl+_ also sends 0x1F
+            if modifiers.contains(KeyModifiers::CONTROL) {
+                match *c {
+                    '\x1f' => LogicalKey::AlphaNumeric('/'), // Ctrl+/ or Ctrl+_
+                    '\x00' => LogicalKey::AlphaNumeric(' '), // Ctrl+Space (NUL)
+                    _ => LogicalKey::AlphaNumeric(*c),
+                }
+            } else {
+                LogicalKey::AlphaNumeric(*c)
+            }
+        }
         KeyCode::Null => LogicalKey::Unmapped,
         KeyCode::Esc => LogicalKey::Esc,
         KeyCode::CapsLock => LogicalKey::CapsLock,
@@ -1170,7 +1183,7 @@ pub async fn event_loop_with_renderer<W: Write>(
         let event = event.expect("Event stream should provide valid events");
         let keys = match event {
             Event::Key(keystroke) => {
-                let key = crossterm_key_translate(&keystroke.code);
+                let key = crossterm_key_translate(&keystroke.code, keystroke.modifiers);
 
                 let mut keys = vec![];
 
