@@ -27,6 +27,9 @@ pub struct BufferInner {
     pub(crate) buffer: ropey::Rope,
     /// Mark position for region selection (None = no mark set)
     pub(crate) mark: Option<usize>,
+    /// Whether the mark is transient (CUA-style shift-select) vs persistent (Emacs C-Space)
+    /// Transient marks are cleared on non-shift cursor movement
+    pub(crate) transient_mark: bool,
     /// Syntax highlighting spans (auto-adjusted on edits)
     pub(crate) spans: SpanStore,
     /// Major mode name (e.g., "julia-mode", "fundamental-mode")
@@ -40,6 +43,7 @@ impl BufferInner {
             modes: modes.to_vec(),
             buffer: ropey::Rope::new(),
             mark: None,
+            transient_mark: false,
             spans: SpanStore::new(),
             major_mode: None,
         }
@@ -57,6 +61,7 @@ impl BufferInner {
             modes: modes.to_vec(),
             buffer: ropey::Rope::from_str(&content),
             mark: None,
+            transient_mark: false,
             spans: SpanStore::new(),
             major_mode: None,
         };
@@ -419,14 +424,35 @@ impl BufferInner {
 
     // === MARK AND REGION OPERATIONS ===
 
-    /// Set the mark at the given position
+    /// Set the mark at the given position (persistent, Emacs C-Space style)
     pub fn set_mark(&mut self, pos: usize) {
         self.mark = Some(self.clamp_position(pos));
+        self.transient_mark = false;
+    }
+
+    /// Set a transient mark at the given position (CUA-style shift-select)
+    /// Transient marks are cleared on non-shift cursor movement
+    pub fn set_transient_mark(&mut self, pos: usize) {
+        self.mark = Some(self.clamp_position(pos));
+        self.transient_mark = true;
     }
 
     /// Clear the mark
     pub fn clear_mark(&mut self) {
         self.mark = None;
+        self.transient_mark = false;
+    }
+
+    /// Clear the mark only if it's transient (CUA-style)
+    /// Returns true if the mark was cleared
+    pub fn clear_transient_mark(&mut self) -> bool {
+        if self.transient_mark && self.mark.is_some() {
+            self.mark = None;
+            self.transient_mark = false;
+            true
+        } else {
+            false
+        }
     }
 
     /// Get the current mark position
@@ -437,6 +463,11 @@ impl BufferInner {
     /// Check if mark is set
     pub fn has_mark(&self) -> bool {
         self.mark.is_some()
+    }
+
+    /// Check if the current mark is transient (CUA-style shift-select)
+    pub fn is_transient_mark(&self) -> bool {
+        self.transient_mark && self.mark.is_some()
     }
 
     pub fn content(&self) -> String {
@@ -666,8 +697,20 @@ impl Buffer {
         self.with_write(|b| b.set_mark(pos))
     }
 
+    pub fn set_transient_mark(&self, pos: usize) {
+        self.with_write(|b| b.set_transient_mark(pos))
+    }
+
     pub fn clear_mark(&self) {
         self.with_write(|b| b.clear_mark())
+    }
+
+    pub fn clear_transient_mark(&self) -> bool {
+        self.with_write(|b| b.clear_transient_mark())
+    }
+
+    pub fn is_transient_mark(&self) -> bool {
+        self.with_read(|b| b.is_transient_mark())
     }
 
     pub fn delete_region(&self, cursor_pos: usize) -> Option<(String, usize)> {

@@ -1035,13 +1035,9 @@ impl AsyncTask for CallCommandTask {
                                 ]))
                             }
                             "indent_line" => {
-                                let line = Self::get_int_field(
-                                    &mut frame,
-                                    &getindex,
-                                    result_dict,
-                                    "line",
-                                )
-                                .unwrap_or(0) as usize;
+                                let line =
+                                    Self::get_int_field(&mut frame, &getindex, result_dict, "line")
+                                        .unwrap_or(0) as usize;
                                 let indent = Self::get_int_field(
                                     &mut frame,
                                     &getindex,

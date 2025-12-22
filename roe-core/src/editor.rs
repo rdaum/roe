@@ -258,10 +258,7 @@ pub enum BufferOperation {
     /// Set the entire buffer content
     SetContent(String),
     /// Indent a line to a specific level (handles cursor positioning)
-    IndentLine {
-        line: usize,
-        indent: usize,
-    },
+    IndentLine { line: usize, indent: usize },
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1462,6 +1459,9 @@ impl Editor {
                         .expect("Active window should exist");
                     let buffer = &self.buffers[window.active_buffer];
 
+                    // Clear transient mark on non-shift cursor movement (CUA-style)
+                    let had_transient_mark = buffer.clear_transient_mark();
+
                     // Use clean character-position API
                     let new_pos = match cd {
                         CursorDirection::Left => buffer.move_left(window.cursor),
@@ -1526,13 +1526,103 @@ impl Editor {
 
                     // If there's a mark set, cursor movement changes the region highlighting
                     // so we need to mark the buffer dirty to trigger a redraw
-                    if buffer.has_mark() {
+                    // Also redraw if we just cleared a transient mark (to remove highlighting)
+                    if buffer.has_mark() || had_transient_mark {
                         actions.push(ChromeAction::MarkDirty(DirtyRegion::Buffer {
                             buffer_id: window.active_buffer,
                         }));
                     }
 
                     // Cursor movement always updates the position in the modeline
+                    actions.push(ChromeAction::MarkDirty(DirtyRegion::Modeline {
+                        window_id: self.active_window,
+                        component: ModelineComponent::CursorPosition,
+                    }));
+
+                    return Ok(actions);
+                }
+            }
+            KeyAction::CursorSelect(cd) => {
+                // CUA-style shift-arrow selection: set transient mark if not set, then move
+                let current_window = &self.windows[self.active_window];
+                if matches!(current_window.window_type, WindowType::Command { .. }) {
+                    // Let the Mode system handle in command windows
+                } else {
+                    let window = &mut self
+                        .windows
+                        .get_mut(self.active_window)
+                        .expect("Active window should exist");
+                    let buffer = &self.buffers[window.active_buffer];
+
+                    // Set transient mark at current position if no mark is set
+                    // (preserves existing persistent marks from C-Space)
+                    if !buffer.has_mark() {
+                        buffer.set_transient_mark(window.cursor);
+                    }
+
+                    // Use clean character-position API for movement
+                    let new_pos = match cd {
+                        CursorDirection::Left => buffer.move_left(window.cursor),
+                        CursorDirection::Right => buffer.move_right(window.cursor),
+                        CursorDirection::Up => buffer.move_up(window.cursor),
+                        CursorDirection::Down => buffer.move_down(window.cursor),
+                        CursorDirection::LineStart => buffer.move_line_start(window.cursor),
+                        CursorDirection::LineEnd => buffer.move_line_end(window.cursor),
+                        CursorDirection::BufferStart => buffer.move_buffer_start(),
+                        CursorDirection::BufferEnd => buffer.move_buffer_end(),
+                        CursorDirection::PageUp => {
+                            let content_height = window.height_chars.saturating_sub(3);
+                            let (current_col, current_line) = buffer.to_column_line(window.cursor);
+                            let target_line = current_line.saturating_sub(content_height);
+                            buffer.to_char_index(current_col, target_line)
+                        }
+                        CursorDirection::PageDown => {
+                            let content_height = window.height_chars.saturating_sub(3);
+                            let (current_col, current_line) = buffer.to_column_line(window.cursor);
+                            let target_line = current_line + content_height;
+                            let max_line = buffer.buffer_len_lines().saturating_sub(1) as u16;
+                            let safe_target_line = target_line.min(max_line);
+                            buffer.to_char_index(current_col, safe_target_line)
+                        }
+                        CursorDirection::WordForward => buffer.move_word_forward(window.cursor),
+                        CursorDirection::WordBackward => buffer.move_word_backward(window.cursor),
+                        CursorDirection::ParagraphForward => {
+                            buffer.move_paragraph_forward(window.cursor)
+                        }
+                        CursorDirection::ParagraphBackward => {
+                            buffer.move_paragraph_backward(window.cursor)
+                        }
+                    };
+
+                    window.cursor = new_pos;
+
+                    let (col, line) = buffer.to_column_line(new_pos);
+
+                    let content_height = window.height_chars.saturating_sub(3);
+                    let content_width = window.width_chars.saturating_sub(4);
+                    let needs_redraw = Self::ensure_cursor_visible_static(
+                        window,
+                        col,
+                        line,
+                        content_width,
+                        content_height,
+                    );
+
+                    let mut actions = vec![ChromeAction::CursorMove(
+                        window.absolute_cursor_position(col, line),
+                    )];
+
+                    if needs_redraw {
+                        actions.push(ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                            buffer_id: window.active_buffer,
+                        }));
+                    }
+
+                    // Selection always needs redraw since mark is set
+                    actions.push(ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                        buffer_id: window.active_buffer,
+                    }));
+
                     actions.push(ChromeAction::MarkDirty(DirtyRegion::Modeline {
                         window_id: self.active_window,
                         component: ModelineComponent::CursorPosition,

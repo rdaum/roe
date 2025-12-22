@@ -1177,8 +1177,9 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
                                         }
                                     }
                                     Err(error_msg) => {
-                                        self.editor
-                                            .set_echo_message(format!("Command error: {error_msg}"));
+                                        self.editor.set_echo_message(format!(
+                                            "Command error: {error_msg}"
+                                        ));
                                     }
                                 }
                             }

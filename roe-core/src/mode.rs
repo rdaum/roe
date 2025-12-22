@@ -167,6 +167,7 @@ impl Mode for ScratchMode {
     fn perform(&mut self, action: &KeyAction) -> ModeResult {
         match action {
             KeyAction::Cursor(_) => ModeResult::Ignored,
+            KeyAction::CursorSelect(_) => ModeResult::Ignored,
             KeyAction::InsertModeToggle => ModeResult::Ignored,
             KeyAction::Undo => ModeResult::Ignored,
             KeyAction::Redo => ModeResult::Ignored,
@@ -261,6 +262,7 @@ impl Mode for FileMode {
     fn perform(&mut self, action: &KeyAction) -> ModeResult {
         match action {
             KeyAction::Cursor(_) => ModeResult::Ignored,
+            KeyAction::CursorSelect(_) => ModeResult::Ignored,
             KeyAction::InsertModeToggle => ModeResult::Ignored,
             KeyAction::Undo => ModeResult::Ignored,
             KeyAction::Redo => ModeResult::Ignored,

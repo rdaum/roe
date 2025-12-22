@@ -34,6 +34,7 @@ Special actions available:
 - `:cursor-buffer-start`, `:cursor-buffer-end`
 - `:cursor-word-forward`, `:cursor-word-backward`
 - `:cursor-page-up`, `:cursor-page-down`
+- `:cursor-*-select` variants (e.g., `:cursor-left-select`) - move and select
 - `:delete`, `:backspace`, `:enter`, `:tab`
 - `:kill-line`, `:kill-region`, `:copy-region`
 - `:yank`, `:mark-start`, `:cancel`
@@ -202,3 +203,21 @@ define_key("M-x", "command-mode")
 # --- Page up/down with Meta ---
 define_key("M-Up", ":cursor-page-up")
 define_key("M-Down", ":cursor-page-down")
+
+# --- CUA-style shift-arrow selection ---
+define_key("S-Left", ":cursor-left-select")
+define_key("S-Right", ":cursor-right-select")
+define_key("S-Up", ":cursor-up-select")
+define_key("S-Down", ":cursor-down-select")
+define_key("S-Home", ":cursor-line-start-select")
+define_key("S-End", ":cursor-line-end-select")
+define_key("S-PageUp", ":cursor-page-up-select")
+define_key("S-PageDown", ":cursor-page-down-select")
+
+# Shift+Ctrl for word selection
+define_key("C-S-Left", ":cursor-word-backward-select")
+define_key("C-S-Right", ":cursor-word-forward-select")
+
+# Shift+Ctrl for buffer start/end selection
+define_key("C-S-Home", ":cursor-buffer-start-select")
+define_key("C-S-End", ":cursor-buffer-end-select")

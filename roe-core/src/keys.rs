@@ -28,6 +28,8 @@ pub enum KeyAction {
     AlphaNumeric(char),
     /// Move the cursor in a direction
     Cursor(CursorDirection),
+    /// Move cursor with selection (sets mark if not set, then moves)
+    CursorSelect(CursorDirection),
     /// Delete the character under the cursor
     Delete,
     /// Backspace-delete the character before the cursor
@@ -423,6 +425,38 @@ impl ConfigurableBindings {
                 }
                 "cursor-paragraph-backward" => {
                     Some(KeyAction::Cursor(CursorDirection::ParagraphBackward))
+                }
+
+                // Cursor movement with selection (CUA-style shift-arrow)
+                "cursor-up-select" => Some(KeyAction::CursorSelect(CursorDirection::Up)),
+                "cursor-down-select" => Some(KeyAction::CursorSelect(CursorDirection::Down)),
+                "cursor-left-select" => Some(KeyAction::CursorSelect(CursorDirection::Left)),
+                "cursor-right-select" => Some(KeyAction::CursorSelect(CursorDirection::Right)),
+                "cursor-line-start-select" => {
+                    Some(KeyAction::CursorSelect(CursorDirection::LineStart))
+                }
+                "cursor-line-end-select" => Some(KeyAction::CursorSelect(CursorDirection::LineEnd)),
+                "cursor-buffer-start-select" => {
+                    Some(KeyAction::CursorSelect(CursorDirection::BufferStart))
+                }
+                "cursor-buffer-end-select" => {
+                    Some(KeyAction::CursorSelect(CursorDirection::BufferEnd))
+                }
+                "cursor-word-forward-select" => {
+                    Some(KeyAction::CursorSelect(CursorDirection::WordForward))
+                }
+                "cursor-word-backward-select" => {
+                    Some(KeyAction::CursorSelect(CursorDirection::WordBackward))
+                }
+                "cursor-page-up-select" => Some(KeyAction::CursorSelect(CursorDirection::PageUp)),
+                "cursor-page-down-select" => {
+                    Some(KeyAction::CursorSelect(CursorDirection::PageDown))
+                }
+                "cursor-paragraph-forward-select" => {
+                    Some(KeyAction::CursorSelect(CursorDirection::ParagraphForward))
+                }
+                "cursor-paragraph-backward-select" => {
+                    Some(KeyAction::CursorSelect(CursorDirection::ParagraphBackward))
                 }
 
                 // Text manipulation
