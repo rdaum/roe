@@ -2905,7 +2905,15 @@ impl Editor {
                         for op in ops {
                             match op {
                                 BufferOperation::Insert { pos, text } => {
+                                    let char_count = text.chars().count();
                                     buffer.insert_pos(text, pos);
+                                    // Move cursor to end of inserted text
+                                    let window = &mut self.windows[self.active_window];
+                                    window.cursor = pos + char_count;
+                                    let (col, line) = buffer.to_column_line(window.cursor);
+                                    result_actions.push(ChromeAction::CursorMove(
+                                        window.absolute_cursor_position(col, line),
+                                    ));
                                     result_actions.push(ChromeAction::MarkDirty(
                                         DirtyRegion::Buffer { buffer_id },
                                     ));
