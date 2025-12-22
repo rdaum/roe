@@ -2,7 +2,32 @@
 
 julia_version = "1.11.2"
 manifest_format = "2.0"
-project_hash = "f9042802c7b6cfcfad2381bc0172c957c663ecaa"
+project_hash = "edc62534f486adad2f8717ffd330d7816b18d985"
+
+[[deps.AbstractTrees]]
+git-tree-sha1 = "2d9c9a55f9c93e8887ad391fbae72f8ef55e1177"
+uuid = "1520ce14-60c1-5f80-bbc7-55ef81b5835c"
+version = "0.4.5"
+
+[[deps.Artifacts]]
+uuid = "56f22d72-fd6d-98f1-02f0-08ddc0907c33"
+version = "1.11.0"
+
+[[deps.CEnum]]
+git-tree-sha1 = "389ad5c84de1ae7cf0e28e381131c98ea87d54fc"
+uuid = "fa961155-64e5-5f13-b03f-caf6b980ea82"
+version = "0.5.0"
+
+[[deps.Dates]]
+deps = ["Printf"]
+uuid = "ade2ca70-3891-5945-98fb-dc099432e06a"
+version = "1.11.0"
+
+[[deps.JLLWrappers]]
+deps = ["Artifacts", "Preferences"]
+git-tree-sha1 = "0533e564aae234aff59ab625543145446d8b6ec2"
+uuid = "692b3bcd-3c85-4b1f-b108-f13ce0eb3210"
+version = "1.7.1"
 
 [[deps.JuliaSyntax]]
 git-tree-sha1 = "937da4713526b96ac9a178e2035019d3b78ead4a"
@@ -15,6 +40,48 @@ git-tree-sha1 = "19ecee1ea81c60156486a92b062e443b6bba60b7"
 uuid = "ac6e5ff7-fb65-4e79-a425-ec3bc9c03011"
 version = "0.1.0"
 
+[[deps.Libdl]]
+uuid = "8f399da3-3557-5675-b5ff-fb832c97cbdb"
+version = "1.11.0"
+
+[[deps.Preferences]]
+deps = ["TOML"]
+git-tree-sha1 = "522f093a29b31a93e34eaea17ba055d850edea28"
+uuid = "21216c6a-2e73-6563-6e65-726566657250"
+version = "1.5.1"
+
+[[deps.Printf]]
+deps = ["Unicode"]
+uuid = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+version = "1.11.0"
+
 [[deps.StyledStrings]]
 uuid = "f489334b-da3d-4c2e-b8f0-e476e12c162b"
 version = "1.11.0"
+
+[[deps.TOML]]
+deps = ["Dates"]
+uuid = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
+version = "1.0.3"
+
+[[deps.TreeSitter]]
+deps = ["AbstractTrees", "CEnum", "Libdl", "tree_sitter_jll"]
+git-tree-sha1 = "2646bbcbc67d5f20d59ebf93c0020a7bbd0bad40"
+uuid = "f42328cb-ece0-4cf2-995f-9e7abb27d006"
+version = "0.2.0"
+
+[[deps.Unicode]]
+uuid = "4ec0a83e-493e-50e2-b9ac-8f72acf5a8f5"
+version = "1.11.0"
+
+[[deps.tree_sitter_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "cd8c31cbd887c3260b79acfeb0dce1298deca1c9"
+uuid = "695101d5-1b81-5434-9529-70430e482717"
+version = "0.25.10+0"
+
+[[deps.tree_sitter_rust_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "1064ebedadcfd1d6efaf171565c91955bfe6727e"
+uuid = "b2197e8e-fe20-5781-846b-d7979e3cddf2"
+version = "0.24.0+0"

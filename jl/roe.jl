@@ -42,7 +42,10 @@ export define_command, call_command, CommandContext, define_key, define_keys, un
        Span, highlight_matches, apply_spans,
        # Julia syntax highlighting
        define_julia_faces, highlight_julia, highlight_julia_buffer,
-       highlight_julia_region
+       highlight_julia_region,
+       # Rust syntax highlighting
+       define_rust_faces, highlight_rust, highlight_rust_buffer,
+       highlight_rust_region
 
 # Get the directory containing this file
 const _module_dir = @__DIR__
@@ -59,5 +62,7 @@ include(joinpath(_module_dir, "buffer_switcher.jl"))
 include(joinpath(_module_dir, "major_modes.jl"))
 # Julia highlighting depends on commands.jl and major_modes.jl
 include(joinpath(_module_dir, "julia_highlighting.jl"))
+# Rust highlighting uses TreeSitter.jl
+include(joinpath(_module_dir, "rust_highlighting.jl"))
 
 end # module Roe

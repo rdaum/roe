@@ -154,6 +154,8 @@ install_julia_packages() {
         # Required packages for Roe
         packages = [
             "JuliaSyntaxHighlighting",  # Syntax highlighting for Julia files
+            "TreeSitter",              # Tree-sitter parsing for multiple languages
+            "tree_sitter_rust_jll",     # Rust parser for tree-sitter
         ]
 
         for pkg in packages
