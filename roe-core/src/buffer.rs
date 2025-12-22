@@ -530,6 +530,21 @@ impl BufferInner {
         Some((deleted, start))
     }
 
+    /// Delete a range of text from start to end (exclusive), returns deleted text
+    pub fn delete_range(&mut self, start: usize, end: usize) -> Option<String> {
+        if start >= end || end > self.buffer.len_chars() {
+            return None;
+        }
+
+        let deleted = self.buffer.slice(start..end).to_string();
+        // Record for undo before modifying
+        self.undo_manager.record_delete(start, deleted.clone());
+        self.buffer.remove(start..end);
+        // Adjust highlight spans for the deletion
+        self.spans.adjust_for_delete(start, end);
+        Some(deleted)
+    }
+
     // === UNDO/REDO OPERATIONS ===
 
     /// Perform undo, returns the new cursor position if successful
@@ -796,6 +811,10 @@ impl Buffer {
 
     pub fn delete_region(&self, cursor_pos: usize) -> Option<(String, usize)> {
         self.with_write(|b| b.delete_region(cursor_pos))
+    }
+
+    pub fn delete_region_range(&self, start: usize, end: usize) -> Option<String> {
+        self.with_write(|b| b.delete_range(start, end))
     }
 
     // Undo/redo operations

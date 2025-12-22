@@ -230,6 +230,8 @@ pub struct Editor {
     /// Julia runtime for scripting and configuration
     pub julia_runtime:
         Option<std::sync::Arc<tokio::sync::Mutex<crate::julia_runtime::RoeJuliaRuntime>>>,
+    /// File watcher for detecting external changes
+    pub file_watcher: crate::file_watcher::FileWatcher,
 }
 
 /// The main event loop, which receives keystrokes and dispatches them to the mode in the buffer
@@ -314,6 +316,8 @@ pub enum ChromeAction {
     },
     /// Execute a command by name
     ExecuteCommand(String),
+    /// Show file watcher status
+    FileWatcherStatus,
 }
 
 impl Editor {
@@ -2581,31 +2585,36 @@ impl Editor {
 
     /// Save the current buffer to file
     pub fn save_buffer(&mut self) -> Vec<ChromeAction> {
-        let window = &self.windows[self.active_window];
-        let buffer = &self.buffers[window.active_buffer];
+        // Extract all needed data from buffer first to avoid borrow conflicts
+        let (buffer_id, file_path, content) = {
+            let window = &self.windows[self.active_window];
+            let buffer = &self.buffers[window.active_buffer];
 
-        // Insert undo boundary - save breaks undo groups
-        buffer.undo_boundary();
+            // Insert undo boundary - save breaks undo groups
+            buffer.undo_boundary();
 
-        // For now, we need to know the file path. In a real implementation,
-        // this would be stored with the buffer or mode. For now, let's look
-        // for a FileMode that has the file path.
-        let file_path = if let Some(mode_id) = buffer.modes().first() {
-            if let Some(_mode) = self.modes.get(*mode_id) {
-                // Try to downcast to FileMode to get the file path
-                // For now, we'll use the buffer's object name as the file path
-                buffer.object()
+            // Get file path from buffer's object name
+            let file_path = if let Some(mode_id) = buffer.modes().first() {
+                if self.modes.get(*mode_id).is_some() {
+                    buffer.object()
+                } else {
+                    return vec![ChromeAction::Echo("No mode found for save".to_string())];
+                }
             } else {
                 return vec![ChromeAction::Echo("No mode found for save".to_string())];
-            }
-        } else {
-            return vec![ChromeAction::Echo("No mode found for save".to_string())];
+            };
+
+            let content = buffer.with_read(|b| b.buffer.to_string());
+            (window.active_buffer, file_path, content)
         };
 
-        // Start async save operation without blocking
-        let content = buffer.with_read(|b| b.buffer.to_string());
+        // Now we can call mutable methods on self
+        self.mark_buffer_saving(buffer_id);
+        self.update_buffer_base(buffer_id);
+
         let file_path_clone = file_path.clone();
 
+        // Start async save operation without blocking
         tokio::spawn(async move {
             match tokio::fs::write(&file_path_clone, content.as_bytes()).await {
                 Ok(()) => {
@@ -3048,6 +3057,168 @@ impl Editor {
             current_column: current_column + 1, // Convert to 1-based
         }
     }
+
+    /// Poll for external file changes and handle them with CRDT-lite merge
+    /// Returns actions to update the UI if any changes were applied
+    pub fn poll_file_changes(&mut self) -> Vec<ChromeAction> {
+        use crate::file_watcher::{merge_changes, MergeResult};
+
+        let mut actions = Vec::new();
+        let events = self.file_watcher.poll_events();
+
+        for event in events {
+            // Read the new file content
+            let new_content = match std::fs::read_to_string(&event.file_path) {
+                Ok(content) => content,
+                Err(_) => continue, // File might have been deleted
+            };
+
+            // Get the buffer and sync state
+            let buffer = match self.buffers.get(event.buffer_id) {
+                Some(b) => b,
+                None => continue,
+            };
+
+            let base_content = match self.file_watcher.get_sync_state(event.buffer_id) {
+                Some(state) => state.base_content.clone(),
+                None => continue,
+            };
+
+            let local_content = buffer.content();
+
+            // Attempt merge
+            match merge_changes(&base_content, &local_content, &new_content) {
+                MergeResult::NoChange => {
+                    // Nothing to do
+                }
+                MergeResult::CleanReload(content) => {
+                    // No local changes, just reload
+                    // Push current state to undo first (for safety)
+                    buffer.begin_undo_group();
+                    let old_len = buffer.buffer_len_chars();
+                    if old_len > 0 {
+                        buffer.delete_region_range(0, old_len);
+                    }
+                    let new_len = content.chars().count();
+                    buffer.insert_pos(content.clone(), 0);
+                    buffer.end_undo_group();
+
+                    // Update base
+                    self.file_watcher.update_base(event.buffer_id, content);
+
+                    actions.push(ChromeAction::Echo("Reloaded from disk".to_string()));
+                    actions.push(ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                        buffer_id: event.buffer_id,
+                    }));
+                    // Trigger syntax highlighting
+                    actions.push(ChromeAction::BufferChanged {
+                        buffer_id: event.buffer_id,
+                        start: 0,
+                        old_end: old_len,
+                        new_end: new_len,
+                    });
+                }
+                MergeResult::Merged { content, message } => {
+                    // Actual merge - replace buffer with merged content
+                    buffer.begin_undo_group();
+                    let old_len = buffer.buffer_len_chars();
+                    if old_len > 0 {
+                        buffer.delete_region_range(0, old_len);
+                    }
+                    let new_len = content.chars().count();
+                    buffer.insert_pos(content.clone(), 0);
+                    buffer.end_undo_group();
+
+                    // Update base to what's on disk (new_content), NOT merged content!
+                    // The buffer now has merged content which differs from disk.
+                    // Base must track disk state so future changes can be detected correctly.
+                    self.file_watcher
+                        .update_base(event.buffer_id, new_content.clone());
+
+                    actions.push(ChromeAction::Echo(message));
+                    actions.push(ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                        buffer_id: event.buffer_id,
+                    }));
+                    // Trigger syntax highlighting
+                    actions.push(ChromeAction::BufferChanged {
+                        buffer_id: event.buffer_id,
+                        start: 0,
+                        old_end: old_len,
+                        new_end: new_len,
+                    });
+                }
+                MergeResult::LocalPreserved { new_base, message } => {
+                    // Local changes kept, just update base to what's on disk
+                    // Don't touch the buffer - it already has the user's changes
+                    self.file_watcher.update_base(event.buffer_id, new_base);
+                    actions.push(ChromeAction::Echo(message));
+                }
+                MergeResult::MergedWithConflicts {
+                    content,
+                    conflict_count,
+                } => {
+                    // Merge with conflicts - apply but warn user
+                    buffer.begin_undo_group();
+                    let old_len = buffer.buffer_len_chars();
+                    if old_len > 0 {
+                        buffer.delete_region_range(0, old_len);
+                    }
+                    let new_len = content.chars().count();
+                    buffer.insert_pos(content.clone(), 0);
+                    buffer.end_undo_group();
+
+                    // Update base to what's on disk, NOT the conflict-marked content
+                    self.file_watcher
+                        .update_base(event.buffer_id, new_content.clone());
+
+                    actions.push(ChromeAction::Echo(format!(
+                        "Merged with {} conflict(s) - see <<<<<<< markers",
+                        conflict_count
+                    )));
+                    actions.push(ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                        buffer_id: event.buffer_id,
+                    }));
+                    // Trigger syntax highlighting
+                    actions.push(ChromeAction::BufferChanged {
+                        buffer_id: event.buffer_id,
+                        start: 0,
+                        old_end: old_len,
+                        new_end: new_len,
+                    });
+                }
+            }
+        }
+
+        actions
+    }
+
+    /// Register a buffer for file watching (call when opening a file)
+    pub fn watch_buffer(&mut self, buffer_id: BufferId, file_path: &std::path::Path) {
+        if let Some(buffer) = self.buffers.get(buffer_id) {
+            let content = buffer.content();
+            if let Err(e) = self.file_watcher.watch_file(buffer_id, file_path, content) {
+                self.set_echo_message(format!("Warning: Failed to watch file: {e}"));
+            }
+        }
+    }
+
+    /// Stop watching a buffer's file (call when closing a buffer)
+    pub fn unwatch_buffer(&mut self, buffer_id: BufferId) {
+        self.file_watcher.unwatch_file(buffer_id);
+    }
+
+    /// Mark that we're about to save a buffer (prevents false external change detection)
+    pub fn mark_buffer_saving(&mut self, buffer_id: BufferId) {
+        self.file_watcher.mark_saving(buffer_id);
+    }
+
+    /// Update base content after saving
+    pub fn update_buffer_base(&mut self, buffer_id: BufferId) {
+        if let Some(buffer) = self.buffers.get(buffer_id) {
+            let content = buffer.content();
+            self.file_watcher.update_base(buffer_id, content);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3103,6 +3274,7 @@ mod tests {
             mouse_drag_state: None,
             messages_buffer_id: None,
             julia_runtime: None,
+            file_watcher: crate::file_watcher::FileWatcher::new(),
         }
     }
 

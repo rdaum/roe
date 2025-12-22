@@ -1069,6 +1069,47 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
                 }
             }
             WindowEvent::RedrawRequested => {
+                // Poll for external file changes
+                let file_change_actions = self.editor.poll_file_changes();
+                for action in file_change_actions {
+                    match action {
+                        ChromeAction::Echo(msg) => {
+                            self.editor.set_echo_message(msg);
+                        }
+                        ChromeAction::MarkDirty(_) => {
+                            // Will be redrawn anyway
+                        }
+                        ChromeAction::BufferChanged {
+                            buffer_id,
+                            start,
+                            old_end,
+                            new_end,
+                        } => {
+                            // Call major mode after-change hook for syntax highlighting
+                            let Some(buffer) = self.editor.buffers.get(buffer_id) else {
+                                continue;
+                            };
+                            let Some(major_mode) = buffer.major_mode() else {
+                                continue;
+                            };
+                            let Some(ref julia_runtime) = self.editor.julia_runtime else {
+                                continue;
+                            };
+
+                            roe_core::julia_runtime::set_current_buffer(buffer.clone());
+                            let runtime = pollster::block_on(julia_runtime.lock());
+                            let _ = pollster::block_on(runtime.call_major_mode_after_change(
+                                &major_mode,
+                                start as i64,
+                                old_end as i64,
+                                new_end as i64,
+                            ));
+                            roe_core::julia_runtime::clear_current_buffer();
+                        }
+                        _ => {}
+                    }
+                }
+
                 self.render();
             }
             WindowEvent::KeyboardInput { event, .. } => {
@@ -1183,6 +1224,10 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
                                     }
                                 }
                             }
+                        }
+                        ChromeAction::FileWatcherStatus => {
+                            let status = self.editor.file_watcher.status();
+                            self.editor.set_echo_message(status);
                         }
                         _ => {}
                     }

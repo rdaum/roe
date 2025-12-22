@@ -359,6 +359,14 @@ pub fn create_default_registry() -> CommandRegistry {
         sync_handler(|_context| Ok(vec![ChromeAction::Echo("Quit".to_string())])),
     ));
 
+    // Diagnostic commands
+    registry.register_command(Command::new(
+        "file-watcher-status",
+        "Show file watcher diagnostic info",
+        CommandCategory::Global,
+        sync_handler(|_context| Ok(vec![ChromeAction::FileWatcherStatus])),
+    ));
+
     // Julia commands
     registry.register_command(Command::new(
         CMD_JULIA_REPL,

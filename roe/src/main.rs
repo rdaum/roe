@@ -335,6 +335,12 @@ async fn terminal_main<W: Write>(stdout: W, config: EditorConfig) -> Result<(), 
         window_tree = editor::WindowNode::new_leaf(active_window_id);
     }
 
+    // Initialize file watcher
+    let mut file_watcher = roe_core::file_watcher::FileWatcher::new();
+    if let Err(e) = file_watcher.init() {
+        eprintln!("Warning: Failed to initialize file watcher: {e}");
+    }
+
     let mut editor = Editor {
         frame: Frame::new(tsize.0, tsize.1 - ECHO_AREA_HEIGHT),
         buffers,
@@ -355,11 +361,27 @@ async fn terminal_main<W: Write>(stdout: W, config: EditorConfig) -> Result<(), 
         mouse_drag_state: None,
         messages_buffer_id: None,
         julia_runtime,
+        file_watcher,
     };
 
     // Initialize buffer history with the current buffer
     let initial_buffer_id = editor.windows[active_window_id].active_buffer;
     editor.record_buffer_access(initial_buffer_id);
+
+    // Register file-backed buffers with the file watcher
+    for (buffer_id, buffer) in &editor.buffers {
+        let file_path = buffer.object();
+        if !file_path.is_empty() && std::path::Path::new(&file_path).exists() {
+            let content = buffer.content();
+            if let Err(e) =
+                editor
+                    .file_watcher
+                    .watch_file(buffer_id, std::path::Path::new(&file_path), content)
+            {
+                eprintln!("Warning: Failed to watch file {file_path}: {e}");
+            }
+        }
+    }
 
     // Register Julia commands into the command registry
     // (Julia runtime and config were already loaded earlier for keybindings)

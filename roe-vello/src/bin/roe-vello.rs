@@ -275,6 +275,10 @@ async fn create_editor(config: EditorConfig) -> Editor {
     let active_window_id = windows.insert(window);
     let window_tree = editor::WindowNode::new_leaf(active_window_id);
 
+    // Initialize file watcher
+    let mut file_watcher = roe_core::file_watcher::FileWatcher::new();
+    let _ = file_watcher.init(); // Ignore errors for now
+
     let mut editor = Editor {
         frame: Frame::new(DEFAULT_COLS, DEFAULT_LINES),
         buffers,
@@ -295,10 +299,24 @@ async fn create_editor(config: EditorConfig) -> Editor {
         mouse_drag_state: None,
         messages_buffer_id: None,
         julia_runtime,
+        file_watcher,
     };
 
     // Initialize buffer history
     editor.record_buffer_access(active_buffer);
+
+    // Register file-backed buffers with the file watcher
+    for (buffer_id, buffer) in &editor.buffers {
+        let file_path = buffer.object();
+        if !file_path.is_empty() && std::path::Path::new(&file_path).exists() {
+            let content = buffer.content();
+            let _ = editor.file_watcher.watch_file(
+                buffer_id,
+                std::path::Path::new(&file_path),
+                content,
+            );
+        }
+    }
 
     // Register Julia commands
     if let Some(ref julia_runtime) = editor.julia_runtime {

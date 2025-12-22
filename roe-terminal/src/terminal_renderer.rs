@@ -1171,12 +1171,39 @@ pub async fn event_loop_with_renderer<W: Write>(
             _ = echo_timer.tick().fuse() => None, // Timer tick, check for expired echo
         };
 
-        // Handle timer tick (check for expired echo messages)
-        if event.is_none() {
+        // Always poll for file changes and expired echo (every event, not just timer)
+        {
+            let mut needs_redraw = false;
+
+            // Check for expired echo messages
             if editor.check_and_clear_expired_echo() {
-                // Echo message expired, trigger a redraw
+                needs_redraw = true;
+            }
+
+            // Poll for external file changes
+            let file_change_actions = editor.poll_file_changes();
+            if !file_change_actions.is_empty() {
+                for action in file_change_actions {
+                    match action {
+                        roe_core::editor::ChromeAction::Echo(msg) => {
+                            editor.set_echo_message(msg.clone());
+                            echo(&mut renderer.device, editor, &msg, &renderer.theme)?;
+                        }
+                        roe_core::editor::ChromeAction::MarkDirty(_) => {
+                            needs_redraw = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            if needs_redraw {
                 renderer.render_full(editor)?;
             }
+        }
+
+        // Handle timer tick - just continue to next iteration
+        if event.is_none() {
             continue;
         }
 
@@ -1360,6 +1387,11 @@ pub async fn event_loop_with_renderer<W: Write>(
                             }
                         }
                     }
+                }
+                ChromeAction::FileWatcherStatus => {
+                    let status = editor.file_watcher.status();
+                    editor.set_echo_message(status.clone());
+                    echo(&mut renderer.device, editor, &status, &renderer.theme)?;
                 }
             }
         }

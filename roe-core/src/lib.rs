@@ -20,6 +20,7 @@ pub mod command_mode;
 pub mod command_registry;
 pub mod editor;
 pub mod file_selector_mode;
+pub mod file_watcher;
 pub mod julia_runtime;
 pub mod keys;
 pub mod kill_ring;

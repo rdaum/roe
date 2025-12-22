@@ -9,6 +9,8 @@ arboard = { workspace = true }
 async-trait = "0.1"
 futures = { workspace = true }
 jlrs = { workspace = true }
+notify = { workspace = true }
 ropey = { workspace = true }
+similar = { workspace = true }
 slotmap = { workspace = true }
 tokio = { workspace = true }
