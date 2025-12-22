@@ -5,6 +5,7 @@ edition = "2021"
 description = "Core editor logic for Roe (Ryan's Own Emacs)"
 
 [dependencies]
+arboard = { workspace = true }
 async-trait = "0.1"
 futures = { workspace = true }
 jlrs = { workspace = true }

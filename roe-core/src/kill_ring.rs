@@ -11,13 +11,18 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
-/// Emacs-style kill-ring implementation
+use arboard::Clipboard;
+
+/// Emacs-style kill-ring implementation with system clipboard integration
 ///
 /// The kill-ring is a circular buffer that stores killed (cut/copied) text.
 /// It maintains a history of killed text that can be yanked (pasted) back.
 /// Multiple consecutive kills are appended together, following Emacs conventions.
+///
+/// Kill operations copy to both the kill-ring and the system clipboard.
+/// Yank operations check the system clipboard first - if it contains text
+/// that differs from the kill-ring head, it's treated as external input.
 
-#[derive(Debug, Clone)]
 pub struct KillRing {
     /// Ring buffer of killed text entries
     entries: Vec<String>,
@@ -27,6 +32,8 @@ pub struct KillRing {
     current_index: usize,
     /// Whether the last operation was a kill (for appending consecutive kills)
     last_was_kill: bool,
+    /// System clipboard handle (optional - clipboard may not be available)
+    clipboard: Option<Clipboard>,
 }
 
 impl Default for KillRing {
@@ -43,15 +50,35 @@ impl KillRing {
 
     /// Create a new kill-ring with specified maximum capacity
     pub fn with_capacity(max_size: usize) -> Self {
+        // Try to initialize clipboard, but don't fail if unavailable
+        let clipboard = Clipboard::new().ok();
+
         KillRing {
             entries: Vec::new(),
             max_size: max_size.max(1), // Ensure at least 1 entry
             current_index: 0,
             last_was_kill: false,
+            clipboard,
         }
     }
 
-    /// Add text to the kill-ring
+    /// Copy text to system clipboard (best effort, ignores errors)
+    fn copy_to_clipboard(&mut self, text: &str) {
+        if let Some(ref mut clipboard) = self.clipboard {
+            let _ = clipboard.set_text(text.to_string());
+        }
+    }
+
+    /// Get text from system clipboard
+    fn get_from_clipboard(&mut self) -> Option<String> {
+        if let Some(ref mut clipboard) = self.clipboard {
+            clipboard.get_text().ok()
+        } else {
+            None
+        }
+    }
+
+    /// Add text to the kill-ring and copy to system clipboard
     /// If the last operation was also a kill, append to the most recent entry
     pub fn kill(&mut self, text: String) {
         if text.is_empty() {
@@ -80,10 +107,16 @@ impl KillRing {
             self.entries.len() - 1
         };
         self.last_was_kill = true;
+
+        // Copy the current entry to system clipboard
+        if let Some(entry) = self.entries.last().cloned() {
+            self.copy_to_clipboard(&entry);
+        }
     }
 
     /// Add text to the kill-ring, prepending to the most recent entry if last was kill
     /// This is used for backward kills (like C-Backspace)
+    /// Also copies to system clipboard
     pub fn kill_prepend(&mut self, text: String) {
         if text.is_empty() {
             return;
@@ -111,11 +144,40 @@ impl KillRing {
             self.entries.len() - 1
         };
         self.last_was_kill = true;
+
+        // Copy the current entry to system clipboard
+        if let Some(entry) = self.entries.last().cloned() {
+            self.copy_to_clipboard(&entry);
+        }
     }
 
     /// Get the most recent kill for yanking
+    /// Checks system clipboard first - if it contains text different from the
+    /// most recent entry, that text is added to the ring and returned.
     pub fn yank(&mut self) -> Option<&str> {
         self.last_was_kill = false;
+
+        // Check system clipboard for external content
+        if let Some(clipboard_text) = self.get_from_clipboard() {
+            if !clipboard_text.is_empty() {
+                // Check if this differs from our most recent entry
+                let is_new = self
+                    .entries
+                    .last()
+                    .map_or(true, |last| last != &clipboard_text);
+
+                if is_new {
+                    // External clipboard content - add to ring
+                    self.entries.push(clipboard_text);
+
+                    // Maintain ring size limit
+                    if self.entries.len() > self.max_size {
+                        self.entries.remove(0);
+                    }
+                }
+            }
+        }
+
         if self.entries.is_empty() {
             return None;
         }
