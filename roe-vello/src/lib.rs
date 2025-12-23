@@ -25,13 +25,15 @@ pub use renderer::VelloRenderer;
 pub use text::StyledSpan;
 pub use theme::VelloTheme;
 
-use roe_core::editor::ChromeAction;
+use roe_core::editor::{
+    BorderInfo, ChromeAction, DragType, MouseDragState, SplitDirection, WindowNode,
+};
 use roe_core::gutter::{
     calculate_gutter_width, format_line_number, get_line_status, GutterConfig, LineStatus,
 };
 use roe_core::julia_runtime::face_registry;
 use roe_core::syntax::Color as SyntaxColor;
-use roe_core::Editor;
+use roe_core::{Editor, WindowId};
 use std::collections::HashSet;
 use std::sync::Arc;
 use text::TextRenderer;
@@ -45,7 +47,7 @@ use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::ModifiersState;
-use winit::window::{CursorIcon, Window, WindowId};
+use winit::window::{CursorIcon, Window};
 
 /// Default window dimensions
 const DEFAULT_WIDTH: u32 = 1200;
@@ -1166,6 +1168,149 @@ impl<'a> RoeVelloApp<'a> {
         let window = self.editor.windows.get_mut(window_id).unwrap();
         window.start_column = new_start as u16;
     }
+
+    /// Check if a pixel position is on a window border that can be dragged to resize
+    fn check_border_hit(&self, px: f64, py: f64) -> Option<(BorderInfo, WindowId)> {
+        let char_width = self.text_renderer.char_width() as f64;
+        let line_height = self.text_renderer.line_height() as f64;
+
+        // Convert to grid coordinates
+        let grid_x = (px / char_width) as u16;
+        let grid_y = (py / line_height) as u16;
+
+        // Check all windows to see if the click is on a border
+        for (window_id, window) in &self.editor.windows {
+            let left_border = window.x;
+            let right_border = window.x + window.width_chars - 1;
+            let top_border = window.y;
+            let bottom_border = window.y + window.height_chars - 1;
+
+            // Check vertical borders (left and right sides)
+            if (grid_x == left_border || grid_x == right_border)
+                && grid_y >= top_border
+                && grid_y <= bottom_border
+            {
+                // This is a vertical border
+                if let Some(split_info) = self.find_split_for_border(window_id, true) {
+                    return Some((
+                        BorderInfo {
+                            is_vertical: true,
+                            split_node_path: split_info.0,
+                            original_ratio: split_info.1,
+                        },
+                        window_id,
+                    ));
+                }
+            }
+
+            // Check horizontal borders (top and bottom sides)
+            if (grid_y == top_border || grid_y == bottom_border)
+                && grid_x >= left_border
+                && grid_x <= right_border
+            {
+                // This is a horizontal border
+                if let Some(split_info) = self.find_split_for_border(window_id, false) {
+                    return Some((
+                        BorderInfo {
+                            is_vertical: false,
+                            split_node_path: split_info.0,
+                            original_ratio: split_info.1,
+                        },
+                        window_id,
+                    ));
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Find the split node that controls the given border
+    fn find_split_for_border(
+        &self,
+        window_id: WindowId,
+        is_vertical_border: bool,
+    ) -> Option<(Vec<usize>, f32)> {
+        // Find if this window has a sibling that shares the border
+        for (other_window_id, other_window) in &self.editor.windows {
+            if other_window_id == window_id {
+                continue;
+            }
+
+            let window = &self.editor.windows[window_id];
+
+            if is_vertical_border {
+                // Check if windows are horizontally adjacent
+                if (window.x + window.width_chars == other_window.x
+                    || other_window.x + other_window.width_chars == window.x)
+                    && window.y < other_window.y + other_window.height_chars
+                    && other_window.y < window.y + window.height_chars
+                {
+                    return Some((vec![0], 0.5)); // Simplified path and ratio
+                }
+            } else {
+                // Check if windows are vertically adjacent
+                if (window.y + window.height_chars == other_window.y
+                    || other_window.y + other_window.height_chars == window.y)
+                    && window.x < other_window.x + other_window.width_chars
+                    && other_window.x < window.x + window.width_chars
+                {
+                    return Some((vec![0], 0.5)); // Simplified path and ratio
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Handle border drag for window resizing
+    fn handle_border_drag(&mut self, px: f64, py: f64) {
+        let Some(ref drag_state) = self.editor.mouse_drag_state else {
+            return;
+        };
+
+        let char_width = self.text_renderer.char_width() as f64;
+        let line_height = self.text_renderer.line_height() as f64;
+
+        // Convert to grid coordinates
+        let grid_x = (px / char_width) as u16;
+        let grid_y = (py / line_height) as u16;
+
+        let new_pos = (grid_x, grid_y);
+        let dx = new_pos.0 as i32 - drag_state.last_pos.0 as i32;
+        let dy = new_pos.1 as i32 - drag_state.last_pos.1 as i32;
+
+        if dx == 0 && dy == 0 {
+            return;
+        }
+
+        let border_info = drag_state.border_info.clone();
+        let target_window = drag_state.target_window;
+
+        // Update drag state positions
+        if let Some(ref mut drag_state_mut) = self.editor.mouse_drag_state {
+            drag_state_mut.current_pos = new_pos;
+            drag_state_mut.last_pos = new_pos;
+        }
+
+        let Some(border_info) = border_info else {
+            return;
+        };
+
+        // Apply the resize
+        update_window_resize_incremental(
+            &mut self.editor.window_tree,
+            &mut self.editor.windows,
+            &self.editor.frame,
+            target_window,
+            &border_info,
+            dx,
+            dy,
+        );
+
+        // Recalculate window layout
+        self.editor.calculate_window_layout();
+    }
 }
 
 impl<'a> ApplicationHandler for RoeVelloApp<'a> {
@@ -1190,7 +1335,7 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
+        _window_id: winit::window::WindowId,
         event: WindowEvent,
     ) {
         match event {
@@ -1389,8 +1534,15 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
 
                 self.cursor_position = Some((logical_x, logical_y));
 
+                // Handle window border dragging (for resizing splits)
+                if self.editor.mouse_drag_state.is_some() {
+                    self.handle_border_drag(logical_x, logical_y);
+                    if let Some(ref render_state) = self.state {
+                        render_state.window.request_redraw();
+                    }
+                }
                 // Handle vertical scrollbar dragging
-                if self.scrollbar_dragging.is_some() {
+                else if self.scrollbar_dragging.is_some() {
                     self.handle_scrollbar_drag(logical_y);
                     if let Some(ref render_state) = self.state {
                         render_state.window.request_redraw();
@@ -1413,10 +1565,33 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
 
                 // Update cursor icon based on hover state
                 if let Some(ref state) = self.state {
-                    let cursor = if self.scrollbar_dragging.is_some()
+                    let cursor = if self.editor.mouse_drag_state.is_some() {
+                        // Check if dragging vertical or horizontal border
+                        if let Some(ref drag_state) = self.editor.mouse_drag_state {
+                            if let Some(ref border_info) = drag_state.border_info {
+                                if border_info.is_vertical {
+                                    CursorIcon::ColResize
+                                } else {
+                                    CursorIcon::RowResize
+                                }
+                            } else {
+                                CursorIcon::Default
+                            }
+                        } else {
+                            CursorIcon::Default
+                        }
+                    } else if self.scrollbar_dragging.is_some()
                         || self.hscrollbar_dragging.is_some()
                     {
                         CursorIcon::Grabbing
+                    } else if let Some((border_info, _)) = self.check_border_hit(logical_x, logical_y)
+                    {
+                        // Show resize cursor when hovering over draggable borders
+                        if border_info.is_vertical {
+                            CursorIcon::ColResize
+                        } else {
+                            CursorIcon::RowResize
+                        }
                     } else if self.check_scrollbar_hit(logical_x, logical_y).is_some()
                         || self.check_hscrollbar_hit(logical_x, logical_y).is_some()
                     {
@@ -1432,8 +1607,36 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
                     match state {
                         ElementState::Pressed => {
                             if let Some((x, y)) = self.cursor_position {
-                                // Check if click is on vertical scrollbar first
-                                if let Some((window_id, ratio)) = self.check_scrollbar_hit(x, y) {
+                                // Check if click is on a window border (for resizing splits)
+                                if let Some((border_info, target_window)) =
+                                    self.check_border_hit(x, y)
+                                {
+                                    let char_width = self.text_renderer.char_width() as f64;
+                                    let line_height = self.text_renderer.line_height() as f64;
+                                    let grid_x = (x / char_width) as u16;
+                                    let grid_y = (y / line_height) as u16;
+
+                                    self.editor.mouse_drag_state = Some(MouseDragState {
+                                        drag_type: DragType::WindowBorder,
+                                        start_pos: (grid_x, grid_y),
+                                        last_pos: (grid_x, grid_y),
+                                        current_pos: (grid_x, grid_y),
+                                        target_window: Some(target_window),
+                                        border_info: Some(border_info.clone()),
+                                    });
+                                    if let Some(ref state) = self.state {
+                                        let cursor = if border_info.is_vertical {
+                                            CursorIcon::ColResize
+                                        } else {
+                                            CursorIcon::RowResize
+                                        };
+                                        state.window.set_cursor(cursor);
+                                    }
+                                }
+                                // Check if click is on vertical scrollbar
+                                else if let Some((window_id, ratio)) =
+                                    self.check_scrollbar_hit(x, y)
+                                {
                                     self.handle_scrollbar_click(window_id, ratio);
                                     self.scrollbar_dragging = Some(window_id);
                                     if let Some(ref state) = self.state {
@@ -1468,11 +1671,72 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
                             self.drag_start_cursor = None;
                             self.scrollbar_dragging = None;
                             self.hscrollbar_dragging = None;
+                            // Clear border drag state
+                            if self.editor.mouse_drag_state.is_some() {
+                                self.editor.mouse_drag_state = None;
+                            }
                         }
                     }
                 }
             }
             _ => {}
+        }
+    }
+}
+
+/// Update window layout based on incremental mouse drag
+fn update_window_resize_incremental(
+    window_tree: &mut WindowNode,
+    _windows: &mut slotmap::SlotMap<WindowId, roe_core::editor::Window>,
+    _frame: &roe_core::editor::Frame,
+    _target_window_id: Option<WindowId>,
+    border_info: &BorderInfo,
+    dx: i32,
+    dy: i32,
+) {
+    // Use a sensitivity factor to make resizing smoother
+    // Each pixel of mouse movement = 0.5% ratio change
+    const SENSITIVITY: f32 = 0.005;
+
+    // Calculate the incremental ratio change
+    if border_info.is_vertical && dx != 0 {
+        // For vertical borders, adjust the split ratio based on horizontal movement
+        let ratio_change = dx as f32 * SENSITIVITY;
+        adjust_window_tree_ratio_incremental(window_tree, ratio_change, true);
+    } else if !border_info.is_vertical && dy != 0 {
+        // For horizontal borders, adjust the split ratio based on vertical movement
+        let ratio_change = dy as f32 * SENSITIVITY;
+        adjust_window_tree_ratio_incremental(window_tree, ratio_change, false);
+    }
+}
+
+/// Recursively adjust window tree ratios for incremental resizing
+fn adjust_window_tree_ratio_incremental(node: &mut WindowNode, ratio_change: f32, is_vertical: bool) {
+    match node {
+        WindowNode::Leaf { .. } => {
+            // Nothing to adjust for leaf nodes
+        }
+        WindowNode::Split {
+            direction,
+            ratio,
+            first,
+            second,
+        } => {
+            // Only adjust if the split direction matches the resize direction
+            let should_adjust = match direction {
+                SplitDirection::Vertical => is_vertical,
+                SplitDirection::Horizontal => !is_vertical,
+            };
+
+            if should_adjust {
+                // Adjust the ratio incrementally, keeping it within bounds
+                // Use tighter bounds to prevent extreme layouts
+                *ratio = (*ratio + ratio_change).clamp(0.15, 0.85);
+            } else {
+                // Recurse into child nodes
+                adjust_window_tree_ratio_incremental(first, ratio_change, is_vertical);
+                adjust_window_tree_ratio_incremental(second, ratio_change, is_vertical);
+            }
         }
     }
 }
