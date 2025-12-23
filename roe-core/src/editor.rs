@@ -1448,6 +1448,11 @@ impl Editor {
                 // Otherwise, pass to modes
             }
 
+            KeyAction::Redraw => {
+                // Force a full screen redraw
+                return Ok(vec![ChromeAction::MarkDirty(DirtyRegion::FullScreen)]);
+            }
+
             KeyAction::Cursor(cd) => {
                 // Check if we're in a command window - if so, delegate to Mode system
                 let current_window = &self.windows[self.active_window];

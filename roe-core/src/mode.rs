@@ -231,6 +231,7 @@ impl Mode for ScratchMode {
             KeyAction::KillBuffer => ModeResult::Ignored,
             KeyAction::Unbound => ModeResult::Ignored,
             KeyAction::Command(_) => ModeResult::Ignored,
+            KeyAction::Redraw => ModeResult::Ignored,
         }
     }
 
@@ -326,6 +327,7 @@ impl Mode for FileMode {
             KeyAction::KillBuffer => ModeResult::Ignored,
             KeyAction::Unbound => ModeResult::Ignored,
             KeyAction::Command(_) => ModeResult::Ignored,
+            KeyAction::Redraw => ModeResult::Ignored,
         }
     }
 

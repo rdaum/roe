@@ -26,9 +26,13 @@ pub use text::StyledSpan;
 pub use theme::VelloTheme;
 
 use roe_core::editor::ChromeAction;
+use roe_core::gutter::{
+    calculate_gutter_width, format_line_number, get_line_status, GutterConfig, LineStatus,
+};
 use roe_core::julia_runtime::face_registry;
 use roe_core::syntax::Color as SyntaxColor;
 use roe_core::Editor;
+use std::collections::HashSet;
 use std::sync::Arc;
 use text::TextRenderer;
 use vello::kurbo::{Affine, Rect};
@@ -68,6 +72,14 @@ fn syntax_color_to_vello(color: &SyntaxColor, default: Color) -> Color {
 
 /// Scrollbar width in logical pixels
 const SCROLLBAR_WIDTH: f64 = 14.0;
+
+/// Gutter colors
+const GUTTER_BG_COLOR: Color = Color::rgba8(0x14, 0x14, 0x14, 0xFF); // Slightly darker than bg
+const GUTTER_FG_COLOR: Color = Color::rgba8(0x60, 0x60, 0x60, 0xFF); // Dimmed line numbers
+const GUTTER_SEPARATOR_COLOR: Color = Color::rgba8(0x40, 0x40, 0x40, 0xFF);
+const GUTTER_MODIFIED_COLOR: Color = Color::rgba8(0xFF, 0xD7, 0x00, 0xFF); // Yellow
+const GUTTER_SAVED_COLOR: Color = Color::rgba8(0x00, 0xC8, 0x00, 0xFF); // Green
+const GUTTER_CONFLICT_COLOR: Color = Color::rgba8(0xFF, 0x40, 0x40, 0xFF); // Red
 
 /// Application state for the Vello renderer
 pub struct RoeVelloApp<'a> {
@@ -333,16 +345,140 @@ impl<'a> RoeVelloApp<'a> {
 
         // Get buffer info
         let buffer = &self.editor.buffers[window.active_buffer];
-        let content_x = x + char_width;
+        let base_content_x = x + char_width;
         let content_y = y + line_height;
         // Reserve space for horizontal scrollbar at bottom
         let content_height = window.height_chars.saturating_sub(3) as usize; // -3 for top border, modeline, h-scrollbar
         let start_line = window.start_line as usize;
         let start_column = window.start_column as usize;
-        // Account for scrollbar width in content area
-        let content_width_px = w - (2.0 * char_width) - SCROLLBAR_WIDTH - 4.0;
+
+        // Check if gutter should be shown (controlled by major mode / Julia)
+        let show_gutter = buffer.show_gutter();
+
+        // Calculate gutter width and get modified lines
+        let (gutter_width_chars, modified_lines): (usize, HashSet<usize>) = if show_gutter {
+            let total_lines = buffer.buffer_len_lines();
+            let config = GutterConfig::default();
+            let width = calculate_gutter_width(total_lines, &config);
+            let buffer_content = buffer.content();
+            let modified = self
+                .editor
+                .file_watcher
+                .get_modified_lines(window.active_buffer, &buffer_content);
+            (width, modified)
+        } else {
+            (0, HashSet::new())
+        };
+
+        let gutter_width_px = gutter_width_chars as f64 * char_width;
+        let content_x = base_content_x + gutter_width_px;
+
+        // Account for scrollbar width and gutter in content area
+        let content_width_px = w - (2.0 * char_width) - SCROLLBAR_WIDTH - 4.0 - gutter_width_px;
         let content_width = content_width_px as f32;
         let content_width_chars = (content_width_px / char_width) as usize;
+
+        // Calculate line number width for formatting
+        let line_number_width = gutter_width_chars.saturating_sub(2); // Subtract status indicator and separator
+
+        // For tracking merged lines (TODO: track separately)
+        let merged_lines: HashSet<usize> = HashSet::new();
+
+        // Draw gutter background and content (outside clip region)
+        if show_gutter {
+            // Gutter background
+            let gutter_rect = Rect::new(
+                base_content_x,
+                content_y,
+                base_content_x + gutter_width_px,
+                content_y + (content_height as f64 * line_height),
+            );
+            self.scene.fill(
+                vello::peniko::Fill::NonZero,
+                Affine::IDENTITY,
+                GUTTER_BG_COLOR,
+                None,
+                &gutter_rect,
+            );
+
+            // Gutter separator line
+            let separator_x = base_content_x + gutter_width_px - 1.0;
+            let separator_rect = Rect::new(
+                separator_x,
+                content_y,
+                separator_x + 1.0,
+                content_y + (content_height as f64 * line_height),
+            );
+            self.scene.fill(
+                vello::peniko::Fill::NonZero,
+                Affine::IDENTITY,
+                GUTTER_SEPARATOR_COLOR,
+                None,
+                &separator_rect,
+            );
+
+            // Draw line numbers and status indicators for visible lines
+            let total_buffer_lines = buffer.buffer_len_lines();
+            for visual_row in 0..content_height {
+                let buffer_line = start_line + visual_row;
+                let gutter_y = content_y + (visual_row as f64 * line_height);
+
+                if buffer_line < total_buffer_lines {
+                    // Get line content for status check
+                    let line_text = buffer.buffer_line(buffer_line);
+                    let line_status =
+                        get_line_status(&line_text, buffer_line, &modified_lines, &merged_lines);
+
+                    // Draw status indicator bar
+                    let status_color = match line_status {
+                        LineStatus::Clean => None,
+                        LineStatus::Modified => Some(GUTTER_MODIFIED_COLOR),
+                        LineStatus::ModifiedSaved => Some(GUTTER_SAVED_COLOR),
+                        LineStatus::Conflict => Some(GUTTER_CONFLICT_COLOR),
+                    };
+
+                    if let Some(color) = status_color {
+                        let status_rect = Rect::new(
+                            base_content_x,
+                            gutter_y,
+                            base_content_x + 3.0, // 3px wide bar
+                            gutter_y + line_height,
+                        );
+                        self.scene.fill(
+                            vello::peniko::Fill::NonZero,
+                            Affine::IDENTITY,
+                            color,
+                            None,
+                            &status_rect,
+                        );
+                    }
+
+                    // Draw line number (right-aligned)
+                    let line_num_str = format_line_number(buffer_line + 1, line_number_width);
+                    let line_num_x = base_content_x + char_width; // After status indicator
+                    self.text_renderer.render_line(
+                        &mut self.scene,
+                        &line_num_str,
+                        line_num_x as f32,
+                        gutter_y as f32,
+                        GUTTER_FG_COLOR,
+                        None,
+                    );
+                } else {
+                    // Empty line (past end of buffer) - show tilde
+                    let tilde_str = format!("{:>width$}", "~", width = line_number_width);
+                    let line_num_x = base_content_x + char_width;
+                    self.text_renderer.render_line(
+                        &mut self.scene,
+                        &tilde_str,
+                        line_num_x as f32,
+                        gutter_y as f32,
+                        GUTTER_FG_COLOR,
+                        None,
+                    );
+                }
+            }
+        }
 
         // Set up clipping region for content area (prevents text overflow)
         let clip_rect = Rect::new(

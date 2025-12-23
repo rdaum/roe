@@ -38,7 +38,7 @@ Special actions available:
 - `:delete`, `:backspace`, `:enter`, `:tab`
 - `:kill-line`, `:kill-region`, `:copy-region`
 - `:yank`, `:mark-start`, `:cancel`
-- `:undo`, `:redo`
+- `:undo`, `:redo`, `:redraw`
 
 # Example
 ```julia
@@ -160,6 +160,7 @@ define_key("M->", ":cursor-buffer-end")
 # --- Basic text manipulation ---
 define_key("Backspace", ":backspace")
 define_key("Delete", ":delete")
+define_key("C-d", ":delete")
 define_key("Enter", ":enter")
 define_key("Tab", ":tab")
 
@@ -175,6 +176,9 @@ define_key("C-Space", ":set-mark")
 # --- Cancel/escape ---
 define_key("C-g", ":cancel")
 define_key("Escape", ":escape")
+
+# --- Display ---
+define_key("C-l", ":redraw")
 
 # --- Undo/redo ---
 define_key("C-/", ":undo")

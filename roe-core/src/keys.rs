@@ -82,6 +82,8 @@ pub enum KeyAction {
     ForceIndent,
     /// Mark end (unused but referenced)
     MarkEnd,
+    /// Force a full screen redraw
+    Redraw,
 
     // TEMPORARY: Keep these during transition
     CommandMode,
@@ -480,6 +482,7 @@ impl ConfigurableBindings {
                 "escape" => Some(KeyAction::Escape),
                 "undo" => Some(KeyAction::Undo),
                 "redo" => Some(KeyAction::Redo),
+                "redraw" => Some(KeyAction::Redraw),
 
                 // Chord continuation
                 "chord-next" => Some(KeyAction::ChordNext),

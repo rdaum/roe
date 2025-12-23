@@ -206,6 +206,30 @@ pub extern "C" fn roe_buffer_major_mode() -> *mut c_char {
     }
 }
 
+/// Get whether the gutter should be shown for the current buffer
+/// Returns 1 if gutter should be shown, 0 otherwise
+#[no_mangle]
+pub extern "C" fn roe_buffer_show_gutter() -> c_longlong {
+    let Some(buffer) = get_current_buffer() else {
+        return 0;
+    };
+    if buffer.show_gutter() {
+        1
+    } else {
+        0
+    }
+}
+
+/// Set whether the gutter should be shown for the current buffer
+/// Pass 1 to show, 0 to hide
+#[no_mangle]
+pub extern "C" fn roe_buffer_set_show_gutter(show: c_longlong) {
+    let Some(buffer) = get_current_buffer() else {
+        return;
+    };
+    buffer.set_show_gutter(show != 0);
+}
+
 // ============================================
 // Face and syntax highlighting FFI
 // ============================================

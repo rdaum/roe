@@ -129,3 +129,25 @@ function buffer_major_mode()
     ccall(Libdl.dlsym(handle, :roe_free_string), Cvoid, (Ptr{Cchar},), ptr)
     return result
 end
+
+"""
+    buffer_show_gutter() -> Bool
+
+Check if the gutter (line numbers, status indicators) should be shown for the current buffer.
+"""
+function buffer_show_gutter()
+    handle = _get_roe_handle()
+    result = ccall(Libdl.dlsym(handle, :roe_buffer_show_gutter), Clonglong, ())
+    return result != 0
+end
+
+"""
+    buffer_set_show_gutter!(show::Bool)
+
+Set whether the gutter should be shown for the current buffer.
+"""
+function buffer_set_show_gutter!(show::Bool)
+    handle = _get_roe_handle()
+    ccall(Libdl.dlsym(handle, :roe_buffer_set_show_gutter), Cvoid, (Clonglong,), show ? 1 : 0)
+    return nothing
+end

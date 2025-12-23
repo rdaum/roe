@@ -8,6 +8,34 @@
 # Emacs-style major modes with lifecycle hooks and file extension associations.
 
 """
+    ModeProperties
+
+Bundle of configurable properties for a major mode.
+Use `mode_properties()` to create with defaults, then override as needed.
+"""
+Base.@kwdef struct ModeProperties
+    show_gutter::Bool = true
+    # Add more properties here as needed:
+    # indent_width::Int = 4
+    # use_tabs::Bool = false
+    # word_wrap::Bool = false
+    # etc.
+end
+
+"""
+    mode_properties(; kwargs...) -> ModeProperties
+
+Create a ModeProperties with the given overrides.
+All properties have sensible defaults.
+
+# Example
+```julia
+mode_properties(show_gutter = false)
+```
+"""
+mode_properties(; kwargs...) = ModeProperties(; kwargs...)
+
+"""
     MajorModeDefinition
 
 Holds the definition of a major mode including its hooks and configuration.
@@ -17,6 +45,7 @@ struct MajorModeDefinition
     extensions::Vector{String}
     init::Union{Function, Nothing}
     after_change::Union{Function, Nothing}
+    properties::ModeProperties
     # Future hooks can be added here:
     # before_save, after_save, on_enter, on_exit, etc.
 end
@@ -31,7 +60,7 @@ const _extension_to_mode = Dict{String, String}()
 const _default_mode = Ref{String}("fundamental-mode")
 
 """
-    define_major_mode(name::String; extensions=String[], init=nothing, after_change=nothing)
+    define_major_mode(name::String; extensions=String[], init=nothing, after_change=nothing, properties=ModeProperties())
 
 Define a major mode with the given name and configuration.
 
@@ -42,11 +71,13 @@ Define a major mode with the given name and configuration.
           Called with no arguments, should set up faces and initial highlighting.
 - `after_change`: Function called after buffer content changes.
                   Called with (start::Int, old_end::Int, new_end::Int) for incremental updates.
+- `properties`: Mode properties bundle (use `mode_properties()` to create)
 
 # Example
 ```julia
 define_major_mode("julia-mode",
     extensions = [".jl"],
+    properties = mode_properties(show_gutter = true),
     init = () -> begin
         define_julia_faces()
         highlight_julia_buffer()
@@ -61,7 +92,8 @@ define_major_mode("julia-mode",
 function define_major_mode(name::String;
                            extensions::Vector{String}=String[],
                            init::Union{Function, Nothing}=nothing,
-                           after_change::Union{Function, Nothing}=nothing)
+                           after_change::Union{Function, Nothing}=nothing,
+                           properties::ModeProperties=ModeProperties())
 
     # Normalize extensions (ensure they start with .)
     normalized_extensions = String[]
@@ -74,7 +106,7 @@ function define_major_mode(name::String;
     end
 
     # Create mode definition
-    mode_def = MajorModeDefinition(name, normalized_extensions, init, after_change)
+    mode_def = MajorModeDefinition(name, normalized_extensions, init, after_change, properties)
     _major_modes[name] = mode_def
 
     # Register extension mappings
@@ -106,6 +138,7 @@ end
     call_major_mode_init(mode_name::String) -> Bool
 
 Call the init hook for the given major mode.
+Also sets buffer properties like gutter visibility based on the mode's configuration.
 Returns true if the hook was called successfully, false otherwise.
 """
 function call_major_mode_init(mode_name::String)
@@ -114,6 +147,10 @@ function call_major_mode_init(mode_name::String)
     end
 
     mode_def = _major_modes[mode_name]
+
+    # Set gutter visibility based on mode configuration
+    buffer_set_show_gutter!(mode_def.properties.show_gutter)
+
     if mode_def.init === nothing
         return true  # No init hook, but mode exists
     end

@@ -288,6 +288,43 @@ impl FileWatcher {
             watched_files.join(", ")
         )
     }
+
+    /// Get the set of line indices that differ between base and current content
+    ///
+    /// Returns a HashSet of 0-indexed line numbers that have been modified
+    pub fn get_modified_lines(
+        &self,
+        buffer_id: BufferId,
+        current_content: &str,
+    ) -> std::collections::HashSet<usize> {
+        use std::collections::HashSet;
+
+        let Some(state) = self.sync_states.get(&buffer_id) else {
+            return HashSet::new();
+        };
+
+        let changes = compute_line_diff(&state.base_content, current_content);
+        let mut modified_lines = HashSet::new();
+
+        for change in changes {
+            // Mark all lines in the affected range as modified
+            // For deletions, mark the line where deletion happened
+            // For insertions/modifications, mark the new lines
+            if change.new_lines.is_empty() {
+                // Deletion - mark the line where it was deleted
+                if change.start_line < current_content.lines().count() {
+                    modified_lines.insert(change.start_line);
+                }
+            } else {
+                // Insertion or modification - mark all new lines
+                for i in 0..change.new_lines.len() {
+                    modified_lines.insert(change.start_line + i);
+                }
+            }
+        }
+
+        modified_lines
+    }
 }
 
 impl Default for FileWatcher {

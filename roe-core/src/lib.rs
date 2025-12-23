@@ -21,6 +21,7 @@ pub mod command_registry;
 pub mod editor;
 pub mod file_selector_mode;
 pub mod file_watcher;
+pub mod gutter;
 pub mod julia_runtime;
 pub mod keys;
 pub mod kill_ring;
@@ -46,6 +47,10 @@ new_key_type! {
 
 pub use buffer::Buffer;
 pub use editor::{Editor, Frame, Window};
+pub use gutter::{
+    calculate_gutter_width, format_line_number, get_line_status, GutterConfig, GutterLine,
+    LineStatus,
+};
 pub use keys::{Bindings, ConfigurableBindings, KeyState};
 pub use mode::{FileMode, Mode};
 pub use renderer::Renderer;

@@ -20,11 +20,15 @@ use crossterm::terminal::{Clear, ClearType};
 use crossterm::{cursor, queue};
 use futures::{future::FutureExt, select, StreamExt};
 use roe_core::editor::{BorderInfo, ChromeAction, DragType, Frame, MouseDragState, Window};
+use roe_core::gutter::{
+    calculate_gutter_width, format_line_number, get_line_status, GutterConfig, LineStatus,
+};
 use roe_core::julia_runtime::face_registry;
 use roe_core::keys::{KeyModifier, LogicalKey, Side};
 use roe_core::renderer::{DirtyRegion, DirtyTracker, ModelineComponent, Renderer};
 use roe_core::syntax::Color as SyntaxColor;
 use roe_core::{Editor, HighlightSpan, WindowId};
+use std::collections::HashSet;
 use std::io::Write;
 use tokio::time::{interval, Duration};
 
@@ -48,6 +52,18 @@ pub const _BORDER_T_DOWN: &str = "┬";
 pub const _BORDER_T_UP: &str = "┴";
 pub const BORDER_T_RIGHT: &str = "├";
 pub const BORDER_T_LEFT: &str = "┤";
+
+// Gutter colors
+pub const GUTTER_BG_COLOR: Color = Color::Rgb {
+    r: 20,
+    g: 20,
+    b: 20,
+}; // Slightly darker than BG
+pub const GUTTER_FG_COLOR: Color = Color::DarkGrey; // Dimmed line numbers
+pub const GUTTER_SEPARATOR_COLOR: Color = Color::DarkGrey;
+pub const GUTTER_MODIFIED_COLOR: Color = Color::Yellow;
+pub const GUTTER_SAVED_COLOR: Color = Color::Green;
+pub const GUTTER_CONFLICT_COLOR: Color = Color::Red;
 
 /// Parse a hex color string (e.g., "#272822") to crossterm Color
 fn parse_hex_color(hex: &str) -> Color {
@@ -226,12 +242,41 @@ impl<W: Write> TerminalRenderer<W> {
             None
         };
 
-        if buffer_line >= buffer.buffer_len_lines() {
-            // Past end of buffer - clear the entire content line
-            let content_x = window.x + 1;
-            let content_width = window.width_chars.saturating_sub(2);
-            let spaces = " ".repeat(content_width as usize);
+        // Check if gutter should be shown (controlled by major mode / Julia)
+        let show_gutter = buffer.show_gutter();
 
+        // Calculate gutter width
+        let (gutter_width, modified_lines): (usize, HashSet<usize>) = if show_gutter {
+            let total_lines = buffer.buffer_len_lines();
+            let config = GutterConfig::default();
+            let width = calculate_gutter_width(total_lines, &config);
+            let buffer_content = buffer.content();
+            let modified = editor
+                .file_watcher
+                .get_modified_lines(window.active_buffer, &buffer_content);
+            (width, modified)
+        } else {
+            (0, HashSet::new())
+        };
+
+        let base_content_x = window.x + 1;
+        let total_content_width = window.width_chars.saturating_sub(2);
+        let content_x = base_content_x + gutter_width as u16;
+        let content_width = total_content_width.saturating_sub(gutter_width as u16);
+        let line_number_width = gutter_width.saturating_sub(2);
+
+        if buffer_line >= buffer.buffer_len_lines() {
+            // Past end of buffer - draw gutter with tilde and clear content
+            if show_gutter {
+                queue!(&mut self.device, cursor::MoveTo(base_content_x, screen_row))?;
+                let empty_gutter = format!(" {:>width$}│", "~", width = line_number_width);
+                queue!(
+                    &mut self.device,
+                    Print(empty_gutter.with(GUTTER_FG_COLOR).on(GUTTER_BG_COLOR))
+                )?;
+            }
+
+            let spaces = " ".repeat(content_width as usize);
             queue!(
                 &mut self.device,
                 cursor::MoveTo(content_x, screen_row),
@@ -246,12 +291,43 @@ impl<W: Write> TerminalRenderer<W> {
 
         let line_start_pos = buffer.buffer_line_to_char(buffer_line);
         let line_end_pos = line_start_pos + line_text.chars().count();
-
-        let content_x = window.x + 1;
-        let content_width = window.width_chars.saturating_sub(2);
         let start_column = window.start_column as usize;
 
-        // Clear the line first
+        // Draw gutter
+        if show_gutter {
+            let merged_lines: HashSet<usize> = HashSet::new();
+            let line_status =
+                get_line_status(line_text, buffer_line, &modified_lines, &merged_lines);
+
+            queue!(&mut self.device, cursor::MoveTo(base_content_x, screen_row))?;
+
+            // Status indicator
+            let (status_char, status_color) = match line_status {
+                LineStatus::Clean => (" ", GUTTER_FG_COLOR),
+                LineStatus::Modified => ("│", GUTTER_MODIFIED_COLOR),
+                LineStatus::ModifiedSaved => ("│", GUTTER_SAVED_COLOR),
+                LineStatus::Conflict => ("!", GUTTER_CONFLICT_COLOR),
+            };
+            queue!(
+                &mut self.device,
+                Print(status_char.with(status_color).on(GUTTER_BG_COLOR))
+            )?;
+
+            // Line number
+            let line_num_str = format_line_number(buffer_line + 1, line_number_width);
+            queue!(
+                &mut self.device,
+                Print(line_num_str.with(GUTTER_FG_COLOR).on(GUTTER_BG_COLOR))
+            )?;
+
+            // Separator
+            queue!(
+                &mut self.device,
+                Print("│".with(GUTTER_SEPARATOR_COLOR).on(GUTTER_BG_COLOR))
+            )?;
+        }
+
+        // Clear the content area
         queue!(&mut self.device, cursor::MoveTo(content_x, screen_row))?;
         let clear_spaces = " ".repeat(content_width as usize);
         queue!(
@@ -318,8 +394,6 @@ impl<W: Write> TerminalRenderer<W> {
                 }
             }
         }
-
-        // Line is already cleared at the beginning, no need to clear again
 
         Ok(())
     }
@@ -549,9 +623,18 @@ impl<W: Write> Renderer for TerminalRenderer<W> {
 
         // Move cursor to correct position and show it (unless in command window)
         let active_window = &editor.windows[editor.active_window];
-        let (col, line) =
-            editor.buffers[active_window.active_buffer].to_column_line(active_window.cursor);
-        let (x, y) = active_window.absolute_cursor_position(col, line);
+        let buffer = &editor.buffers[active_window.active_buffer];
+        let (col, line) = buffer.to_column_line(active_window.cursor);
+        let (mut x, y) = active_window.absolute_cursor_position(col, line);
+
+        // Adjust cursor x for gutter width if gutter is enabled
+        if buffer.show_gutter() {
+            let total_lines = buffer.buffer_len_lines();
+            let config = GutterConfig::default();
+            let gutter_width = calculate_gutter_width(total_lines, &config);
+            x += gutter_width as u16;
+        }
+
         queue!(&mut self.device, cursor::MoveTo(x, y))?;
 
         // Hide cursor in command windows (they use visual indicators like ">")
@@ -627,9 +710,18 @@ impl<W: Write> Renderer for TerminalRenderer<W> {
 
         // Position cursor and show it (unless in command window)
         let active_window = &editor.windows[editor.active_window];
-        let (col, line) =
-            editor.buffers[active_window.active_buffer].to_column_line(active_window.cursor);
-        let (x, y) = active_window.absolute_cursor_position(col, line);
+        let buffer = &editor.buffers[active_window.active_buffer];
+        let (col, line) = buffer.to_column_line(active_window.cursor);
+        let (mut x, y) = active_window.absolute_cursor_position(col, line);
+
+        // Adjust cursor x for gutter width if gutter is enabled
+        if buffer.show_gutter() {
+            let total_lines = buffer.buffer_len_lines();
+            let config = GutterConfig::default();
+            let gutter_width = calculate_gutter_width(total_lines, &config);
+            x += gutter_width as u16;
+        }
+
         queue!(&mut self.device, cursor::MoveTo(x, y))?;
 
         // Hide cursor in command windows (they use visual indicators like ">")
@@ -954,18 +1046,42 @@ pub fn draw_window(
     // Draw the buffer in the window
     let buffer = &editor.buffers[window.active_buffer];
 
-    // Calculate content area (inside the border, above the modeline which is now in the bottom border)
-    let content_x = window.x + 1;
+    // Calculate base content area (inside the border)
+    let base_content_x = window.x + 1;
     let content_y = window.y + 1;
-    let content_width = window.width_chars.saturating_sub(2);
-    let content_height = window.height_chars.saturating_sub(2); // Only subtract for top and bottom borders
+    let total_content_width = window.width_chars.saturating_sub(2);
+    let content_height = window.height_chars.saturating_sub(2);
 
-    // Clear the content area first (only the content, not the whole line)
+    // Check if gutter should be shown (controlled by major mode / Julia)
+    let show_gutter = buffer.show_gutter();
+
+    // Calculate gutter width and get modified lines
+    let (gutter_width, modified_lines): (usize, HashSet<usize>) = if show_gutter {
+        let total_lines = buffer.buffer_len_lines();
+        let config = GutterConfig::default();
+        let width = calculate_gutter_width(total_lines, &config);
+
+        // Get modified lines from file watcher
+        let buffer_content = buffer.content();
+        let modified = editor
+            .file_watcher
+            .get_modified_lines(window.active_buffer, &buffer_content);
+
+        (width, modified)
+    } else {
+        (0, HashSet::new())
+    };
+
+    // Adjust content area for gutter
+    let content_x = base_content_x + gutter_width as u16;
+    let content_width = total_content_width.saturating_sub(gutter_width as u16);
+
+    // Clear the entire content area first (gutter + text)
     for row in 0..content_height {
-        let spaces = " ".repeat(content_width as usize);
+        let spaces = " ".repeat(total_content_width as usize);
         queue!(
             device,
-            cursor::MoveTo(content_x, content_y + row),
+            cursor::MoveTo(base_content_x, content_y + row),
             Print(spaces.with(theme.fg_color).on(theme.bg_color))
         )?;
     }
@@ -975,6 +1091,16 @@ pub fn draw_window(
 
     // Get face registry for looking up face colors
     let face_registry_guard = face_registry().lock().ok();
+
+    // For detecting conflict lines
+    let merged_lines: HashSet<usize> = HashSet::new(); // TODO: track merged lines separately
+
+    // Calculate line number width (for formatting)
+    let line_number_width = if show_gutter {
+        gutter_width.saturating_sub(2) // Subtract status indicator and separator
+    } else {
+        0
+    };
 
     // Draw the buffer content within the content bounds
     for (line_idx, line_text) in buffer.buffer_lines().into_iter().enumerate() {
@@ -990,6 +1116,43 @@ pub fn draw_window(
         // Stop if we've reached the bottom of the content area
         if content_line >= content_height {
             break;
+        }
+
+        // Draw gutter for this line
+        if show_gutter {
+            // Get line status
+            let line_status = get_line_status(&line_text, line_idx, &modified_lines, &merged_lines);
+
+            // Draw gutter background
+            queue!(
+                device,
+                cursor::MoveTo(base_content_x, content_y + content_line)
+            )?;
+
+            // Status indicator
+            let (status_char, status_color) = match line_status {
+                LineStatus::Clean => (" ", GUTTER_FG_COLOR),
+                LineStatus::Modified => ("│", GUTTER_MODIFIED_COLOR),
+                LineStatus::ModifiedSaved => ("│", GUTTER_SAVED_COLOR),
+                LineStatus::Conflict => ("!", GUTTER_CONFLICT_COLOR),
+            };
+            queue!(
+                device,
+                Print(status_char.with(status_color).on(GUTTER_BG_COLOR))
+            )?;
+
+            // Line number (1-based, right-aligned)
+            let line_num_str = format_line_number(line_idx + 1, line_number_width);
+            queue!(
+                device,
+                Print(line_num_str.with(GUTTER_FG_COLOR).on(GUTTER_BG_COLOR))
+            )?;
+
+            // Separator
+            queue!(
+                device,
+                Print("│".with(GUTTER_SEPARATOR_COLOR).on(GUTTER_BG_COLOR))
+            )?;
         }
 
         // Get the line start position in the buffer
@@ -1008,7 +1171,7 @@ pub fn draw_window(
         // Get syntax spans for this line
         let syntax_spans: Vec<HighlightSpan> = buffer.spans_in_range(line_start_pos..line_end_pos);
 
-        // Move cursor to the start of the line
+        // Move cursor to the start of the text content
         queue!(device, cursor::MoveTo(content_x, content_y + content_line))?;
 
         // Render character by character with merged highlighting (region + syntax)
@@ -1050,6 +1213,30 @@ pub fn draw_window(
                         Print(highlighted_spaces.on(Color::Yellow).with(Color::Black))
                     )?;
                 }
+            }
+        }
+    }
+
+    // Draw gutter for empty lines (lines that exist in the window but not in buffer)
+    if show_gutter {
+        let buffer_lines = buffer.buffer_len_lines();
+        let first_visible_line = window.start_line as usize;
+
+        for row in 0..content_height as usize {
+            let buffer_line = first_visible_line + row;
+            if buffer_line >= buffer_lines {
+                // This row has no corresponding buffer line - draw empty gutter
+                queue!(
+                    device,
+                    cursor::MoveTo(base_content_x, content_y + row as u16)
+                )?;
+
+                // Empty status + tildes for non-existent lines (like vim)
+                let empty_gutter = format!(" {:>width$}│", "~", width = line_number_width);
+                queue!(
+                    device,
+                    Print(empty_gutter.with(GUTTER_FG_COLOR).on(GUTTER_BG_COLOR))
+                )?;
             }
         }
     }

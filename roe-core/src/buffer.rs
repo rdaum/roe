@@ -35,6 +35,8 @@ pub struct BufferInner {
     pub(crate) spans: SpanStore,
     /// Major mode name (e.g., "julia-mode", "fundamental-mode")
     pub(crate) major_mode: Option<String>,
+    /// Whether to show the gutter (line numbers, status) for this buffer
+    pub(crate) show_gutter: bool,
     /// Undo/redo history manager
     pub(crate) undo_manager: UndoManager,
 }
@@ -49,6 +51,7 @@ impl BufferInner {
             transient_mark: false,
             spans: SpanStore::new(),
             major_mode: None,
+            show_gutter: false, // Default to no gutter for scratch buffers
             undo_manager: UndoManager::new(),
         }
     }
@@ -68,6 +71,7 @@ impl BufferInner {
             transient_mark: false,
             spans: SpanStore::new(),
             major_mode: None,
+            show_gutter: true, // Default to show gutter for file buffers
             undo_manager: UndoManager::new(),
         };
         Ok(buffer_inner)
@@ -889,6 +893,16 @@ impl Buffer {
     /// Set the major mode for this buffer
     pub fn set_major_mode(&self, mode_name: String) {
         self.with_write(|b| b.major_mode = Some(mode_name))
+    }
+
+    /// Get whether the gutter should be shown for this buffer
+    pub fn show_gutter(&self) -> bool {
+        self.with_read(|b| b.show_gutter)
+    }
+
+    /// Set whether the gutter should be shown for this buffer
+    pub fn set_show_gutter(&self, show: bool) {
+        self.with_write(|b| b.show_gutter = show)
     }
 
     pub fn content(&self) -> String {
