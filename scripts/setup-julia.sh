@@ -4,7 +4,7 @@
 #
 set -euo pipefail
 
-JULIA_VERSION="1.11.2"
+JULIA_VERSION="1.11.8"
 JULIA_MINOR="1.11"
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 JULIA_DIR="$PROJECT_ROOT/julia"
