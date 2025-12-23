@@ -2723,10 +2723,16 @@ impl Editor {
             }
         };
 
-        // Apply syntax highlighting for .jl files
-        if let Some(ext) = file_path.extension() {
-            if ext == "jl" {
-                self.apply_julia_highlighting(&buffer).await;
+        // Apply major mode based on file extension
+        if let Some(ref julia_runtime) = self.julia_runtime {
+            let file_path_str = file_path.to_string_lossy().to_string();
+            let runtime = julia_runtime.lock().await;
+            if let Ok(major_mode) = runtime.get_major_mode_for_file(&file_path_str).await {
+                buffer.set_major_mode(major_mode.clone());
+                // Set the buffer as current for the init hook
+                set_current_buffer(buffer.clone());
+                let _ = runtime.call_major_mode_init(&major_mode).await;
+                clear_current_buffer();
             }
         }
 
@@ -2763,44 +2769,6 @@ impl Editor {
         } else {
             Err("Window no longer exists".to_string())
         }
-    }
-
-    /// Apply Julia syntax highlighting to a buffer
-    /// Uses JuliaSyntaxHighlighting.jl if available
-    async fn apply_julia_highlighting(&self, buffer: &Buffer) {
-        let Some(ref julia_runtime) = self.julia_runtime else {
-            eprintln!("[syntax] No Julia runtime available");
-            return;
-        };
-
-        // Set the buffer as the current buffer for Julia FFI calls
-        set_current_buffer(buffer.clone());
-
-        // Call Julia to define faces and apply highlighting
-        // Note: Roe is already loaded as a module, no need for 'using'
-        let highlight_code = r#"
-            try
-                # Define Julia faces if not already defined
-                if !Roe.face_exists("julia-keyword")
-                    Roe.define_julia_faces()
-                end
-                # Apply highlighting to the buffer
-                count = Roe.highlight_julia_buffer()
-                "Applied $count spans"
-            catch e
-                "Error: $e"
-            end
-        "#;
-
-        let runtime = julia_runtime.lock().await;
-        match runtime.eval_expression(highlight_code).await {
-            Ok(result) => eprintln!("[syntax] Julia highlighting result: {}", result),
-            Err(e) => eprintln!("[syntax] Julia highlighting error: {}", e),
-        }
-        drop(runtime);
-
-        // Clear the current buffer
-        clear_current_buffer();
     }
 
     /// Create a CommandContext from the current editor state

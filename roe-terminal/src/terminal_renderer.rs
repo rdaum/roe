@@ -233,7 +233,9 @@ impl<W: Write> TerminalRenderer<W> {
         _end_col: usize,
     ) -> Result<(), std::io::Error> {
         let window = &editor.windows[window_id];
-        let buffer = &editor.buffers[window.active_buffer];
+        let Some(buffer) = editor.buffers.get(window.active_buffer) else {
+            return Ok(()); // Buffer no longer exists
+        };
 
         // Only show region highlighting in the active window
         let region_bounds = if window_id == editor.active_window {
@@ -441,7 +443,9 @@ impl<W: Write> TerminalRenderer<W> {
         dirty_components: &std::collections::HashSet<ModelineComponent>,
     ) -> Result<(), std::io::Error> {
         let window = &editor.windows[window_id];
-        let buffer = &editor.buffers[window.active_buffer];
+        let Some(buffer) = editor.buffers.get(window.active_buffer) else {
+            return Ok(()); // Buffer no longer exists
+        };
         let is_active = window_id == editor.active_window;
 
         // Calculate modeline position - now in the bottom border
@@ -910,7 +914,9 @@ fn draw_window_modeline(
     theme: &CachedTheme,
 ) -> Result<(), std::io::Error> {
     let window = &editor.windows[window_id];
-    let buffer = &editor.buffers[window.active_buffer];
+    let Some(buffer) = editor.buffers.get(window.active_buffer) else {
+        return Ok(()); // Buffer no longer exists
+    };
     let is_active = window_id == editor.active_window;
 
     // Calculate modeline position and width - now in the bottom border
@@ -1044,7 +1050,9 @@ pub fn draw_window(
     theme: &CachedTheme,
 ) -> Result<(), std::io::Error> {
     // Draw the buffer in the window
-    let buffer = &editor.buffers[window.active_buffer];
+    let Some(buffer) = editor.buffers.get(window.active_buffer) else {
+        return Ok(()); // Buffer no longer exists
+    };
 
     // Calculate base content area (inside the border)
     let base_content_x = window.x + 1;

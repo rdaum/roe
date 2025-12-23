@@ -343,8 +343,11 @@ impl<'a> RoeVelloApp<'a> {
             &right_border,
         );
 
-        // Get buffer info
-        let buffer = &self.editor.buffers[window.active_buffer];
+        // Get buffer info - guard against stale buffer IDs
+        let Some(buffer) = self.editor.buffers.get(window.active_buffer) else {
+            // Buffer no longer exists (likely replaced by visit-file), skip rendering
+            return;
+        };
         let base_content_x = x + char_width;
         let content_y = y + line_height;
         // Reserve space for horizontal scrollbar at bottom
