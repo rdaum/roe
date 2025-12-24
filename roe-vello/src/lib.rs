@@ -72,6 +72,19 @@ fn syntax_color_to_vello(color: &SyntaxColor, default: Color) -> Color {
     }
 }
 
+/// Convert a character position to byte position in a string
+fn char_to_byte(s: &str, char_pos: usize) -> usize {
+    s.char_indices()
+        .nth(char_pos)
+        .map(|(byte_idx, _)| byte_idx)
+        .unwrap_or(s.len())
+}
+
+/// Convert a byte position to character position in a string
+fn byte_to_char(s: &str, byte_pos: usize) -> usize {
+    s[..byte_pos.min(s.len())].chars().count()
+}
+
 /// Scrollbar width in logical pixels
 const SCROLLBAR_WIDTH: f64 = 14.0;
 
@@ -513,7 +526,7 @@ impl<'a> RoeVelloApp<'a> {
             .into_iter()
             .enumerate()
             .inspect(|(_, text)| {
-                let len = text.trim_end_matches('\n').len();
+                let len = text.trim_end_matches('\n').chars().count();
                 if len > max_line_len {
                     max_line_len = len;
                 }
@@ -533,7 +546,8 @@ impl<'a> RoeVelloApp<'a> {
         if let Some((region_start, region_end)) = region_bounds {
             let selection_color = self.theme.selection_color;
             for (visual_line, line_start_pos, line_text) in &lines_to_render {
-                let line_end_pos = line_start_pos + line_text.len();
+                let line_char_len = line_text.chars().count();
+                let line_end_pos = line_start_pos + line_char_len;
 
                 // Check if this line intersects with selection
                 if *line_start_pos < region_end && line_end_pos > region_start {
@@ -546,7 +560,7 @@ impl<'a> RoeVelloApp<'a> {
                     let sel_end_in_line = if region_end < line_end_pos {
                         region_end - line_start_pos
                     } else {
-                        line_text.len()
+                        line_char_len
                     };
 
                     // Adjust for horizontal scroll
@@ -576,7 +590,10 @@ impl<'a> RoeVelloApp<'a> {
         let fg_color = self.theme.fg_color;
         let face_registry_guard = face_registry().lock().ok();
 
-        for (visual_line, line_start_pos, line_text) in lines_to_render {
+        // Get full buffer content for byte<->char conversion
+        let buffer_content = buffer.content();
+
+        for (visual_line, line_start_char, line_text) in lines_to_render {
             // Apply horizontal scroll - skip start_column characters
             let visible_text: String = line_text.chars().skip(start_column).collect();
             if visible_text.is_empty() {
@@ -586,9 +603,66 @@ impl<'a> RoeVelloApp<'a> {
             let text_x = content_x as f32;
             let text_y = content_y as f32 + (visual_line as f32) * line_height as f32;
 
-            // Get syntax spans for this line from buffer
-            let line_end_pos = line_start_pos + line_text.chars().count();
-            let syntax_spans = buffer.spans_in_range(line_start_pos..line_end_pos);
+            // Convert char positions to byte positions for span query
+            // (spans use byte positions for tree-sitter/Julia compatibility)
+            let line_start_byte = char_to_byte(&buffer_content, line_start_char);
+            let line_end_byte =
+                char_to_byte(&buffer_content, line_start_char + line_text.chars().count());
+            let syntax_spans = buffer.spans_in_range(line_start_byte..line_end_byte);
+
+            // Draw background rectangles for spans with background colors
+            let line_char_count = line_text.chars().count();
+            let visible_char_count = visible_text.chars().count();
+            if let Some(ref registry) = face_registry_guard {
+                for span in &syntax_spans {
+                    if let Some(face) = registry.get(span.face_id) {
+                        if let Some(ref bg_color) = face.background {
+                            // Convert span byte positions to char positions within line
+                            let span_byte_start_in_line =
+                                span.start.saturating_sub(line_start_byte);
+                            let span_byte_end_in_line = span.end.saturating_sub(line_start_byte);
+                            let span_start_in_line =
+                                byte_to_char(&line_text, span_byte_start_in_line);
+                            let span_end_in_line = byte_to_char(&line_text, span_byte_end_in_line)
+                                .min(line_char_count);
+
+                            // Adjust for horizontal scroll
+                            if span_end_in_line <= start_column
+                                || span_start_in_line >= start_column + visible_char_count
+                            {
+                                continue; // Span is not visible
+                            }
+
+                            let visible_start = span_start_in_line.saturating_sub(start_column);
+                            let visible_end = span_end_in_line
+                                .saturating_sub(start_column)
+                                .min(visible_char_count);
+
+                            if visible_start >= visible_end {
+                                continue;
+                            }
+
+                            // Draw background rectangle
+                            let bg_x = text_x + (visible_start as f32 * char_width as f32);
+                            let bg_w = (visible_end - visible_start) as f32 * char_width as f32;
+                            let bg_rect = Rect::new(
+                                bg_x as f64,
+                                text_y as f64,
+                                (bg_x + bg_w) as f64,
+                                (text_y + line_height as f32) as f64,
+                            );
+                            let vello_bg = syntax_color_to_vello(bg_color, self.theme.bg_color);
+                            self.scene.fill(
+                                vello::peniko::Fill::NonZero,
+                                Affine::IDENTITY,
+                                vello_bg,
+                                None,
+                                &bg_rect,
+                            );
+                        }
+                    }
+                }
+            }
 
             // Convert buffer spans to StyledSpans for rendering
             let styled_spans: Vec<StyledSpan> = if let Some(ref registry) = face_registry_guard {
@@ -596,15 +670,16 @@ impl<'a> RoeVelloApp<'a> {
                     .iter()
                     .filter_map(|span| {
                         let face = registry.get(span.face_id)?;
-                        // Convert buffer positions to positions within visible_text
-                        // Account for horizontal scroll
-                        let span_start_in_line = span.start.saturating_sub(line_start_pos);
+                        // Convert span byte positions to char positions within line
+                        let span_byte_start_in_line = span.start.saturating_sub(line_start_byte);
+                        let span_byte_end_in_line = span.end.saturating_sub(line_start_byte);
+                        let span_start_in_line = byte_to_char(&line_text, span_byte_start_in_line);
                         let span_end_in_line =
-                            span.end.saturating_sub(line_start_pos).min(line_text.len());
+                            byte_to_char(&line_text, span_byte_end_in_line).min(line_char_count);
 
                         // Adjust for horizontal scroll
                         if span_end_in_line <= start_column
-                            || span_start_in_line >= start_column + visible_text.len()
+                            || span_start_in_line >= start_column + visible_char_count
                         {
                             return None; // Span is not visible
                         }
@@ -612,7 +687,7 @@ impl<'a> RoeVelloApp<'a> {
                         let visible_start = span_start_in_line.saturating_sub(start_column);
                         let visible_end = span_end_in_line
                             .saturating_sub(start_column)
-                            .min(visible_text.len());
+                            .min(visible_char_count);
 
                         if visible_start >= visible_end {
                             return None;
@@ -1113,7 +1188,7 @@ impl<'a> RoeVelloApp<'a> {
         buffer
             .buffer_lines()
             .into_iter()
-            .map(|line| line.trim_end_matches('\n').len())
+            .map(|line| line.trim_end_matches('\n').chars().count())
             .max()
             .unwrap_or(0)
     }
@@ -1584,7 +1659,8 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
                         || self.hscrollbar_dragging.is_some()
                     {
                         CursorIcon::Grabbing
-                    } else if let Some((border_info, _)) = self.check_border_hit(logical_x, logical_y)
+                    } else if let Some((border_info, _)) =
+                        self.check_border_hit(logical_x, logical_y)
                     {
                         // Show resize cursor when hovering over draggable borders
                         if border_info.is_vertical {
@@ -1711,7 +1787,11 @@ fn update_window_resize_incremental(
 }
 
 /// Recursively adjust window tree ratios for incremental resizing
-fn adjust_window_tree_ratio_incremental(node: &mut WindowNode, ratio_change: f32, is_vertical: bool) {
+fn adjust_window_tree_ratio_incremental(
+    node: &mut WindowNode,
+    ratio_change: f32,
+    is_vertical: bool,
+) {
     match node {
         WindowNode::Leaf { .. } => {
             // Nothing to adjust for leaf nodes

@@ -22,6 +22,7 @@ pub mod editor;
 pub mod file_selector_mode;
 pub mod file_watcher;
 pub mod gutter;
+pub mod isearch_mode;
 pub mod julia_runtime;
 pub mod keys;
 pub mod kill_ring;

@@ -300,6 +300,7 @@ async fn create_editor(config: EditorConfig) -> Editor {
         messages_buffer_id: None,
         julia_runtime,
         file_watcher,
+        last_search_term: String::new(),
     };
 
     // Initialize buffer history

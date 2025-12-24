@@ -251,36 +251,27 @@ impl TextRenderer {
         builder.push_default(StyleProperty::Brush(default_color));
 
         // Apply styled spans
+        // Note: span.start and span.end are character positions, convert to byte positions
+        let char_count = text.chars().count();
         for span in spans {
-            // Ensure span is within text bounds
-            let start = span.start.min(text.len());
-            let end = span.end.min(text.len());
-            if start >= end {
+            // Ensure span is within text bounds (character positions)
+            let start_char = span.start.min(char_count);
+            let end_char = span.end.min(char_count);
+            if start_char >= end_char {
                 continue;
             }
 
-            // Convert byte offsets to valid char boundaries
-            // Use the position directly if it's a valid char boundary, otherwise find nearest
-            let start_idx = if text.is_char_boundary(start) {
-                start
-            } else {
-                // Find the nearest char boundary at or before start
-                text[..start]
-                    .char_indices()
-                    .map(|(i, _)| i)
-                    .next_back()
-                    .unwrap_or(0)
-            };
-            // Find the nearest char boundary at or after end
-            let end_idx = if text.is_char_boundary(end) {
-                end
-            } else {
-                text[end..]
-                    .char_indices()
-                    .next()
-                    .map(|(i, _)| end + i)
-                    .unwrap_or(text.len())
-            };
+            // Convert character positions to byte positions
+            let start_idx = text
+                .char_indices()
+                .nth(start_char)
+                .map(|(i, _)| i)
+                .unwrap_or(text.len());
+            let end_idx = text
+                .char_indices()
+                .nth(end_char)
+                .map(|(i, _)| i)
+                .unwrap_or(text.len());
 
             // Apply color for this span
             builder.push(StyleProperty::Brush(span.color), start_idx..end_idx);

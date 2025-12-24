@@ -39,6 +39,8 @@ pub const CMD_SHOW_MESSAGES: &str = "show-messages";
 pub const CMD_KEYBOARD_QUIT: &str = "keyboard-quit";
 pub const CMD_JULIA_REPL: &str = "julia-repl";
 pub const CMD_DUMP_MESSAGES: &str = "dump-messages";
+pub const CMD_ISEARCH_FORWARD: &str = "isearch-forward";
+pub const CMD_ISEARCH_BACKWARD: &str = "isearch-backward";
 
 /// Context information passed to commands when they execute
 #[derive(Clone)]
@@ -379,6 +381,21 @@ pub fn create_default_registry() -> CommandRegistry {
                 initial_content: "julia> ".to_string(),
             }])
         }),
+    ));
+
+    // Search commands
+    registry.register_command(Command::new(
+        CMD_ISEARCH_FORWARD,
+        "Incremental search forward",
+        CommandCategory::Global,
+        sync_handler(|_context| Ok(vec![ChromeAction::ISearchForward])),
+    ));
+
+    registry.register_command(Command::new(
+        CMD_ISEARCH_BACKWARD,
+        "Incremental search backward",
+        CommandCategory::Global,
+        sync_handler(|_context| Ok(vec![ChromeAction::ISearchBackward])),
     ));
 
     registry

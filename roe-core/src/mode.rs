@@ -97,6 +97,25 @@ pub enum ModeAction {
 
     /// Evaluate Julia expression and append result to buffer
     EvalJulia(String),
+
+    /// Update isearch state in target buffer (highlights + cursor)
+    UpdateIsearch {
+        target_buffer_id: crate::BufferId,
+        target_window_id: crate::WindowId,
+        matches: Vec<(usize, usize)>,
+        current_match: Option<usize>,
+    },
+    /// Accept isearch result - keep cursor at match position
+    AcceptIsearch {
+        target_buffer_id: crate::BufferId,
+        search_term: String,
+    },
+    /// Cancel isearch and restore original cursor position
+    CancelIsearch {
+        target_buffer_id: crate::BufferId,
+        target_window_id: crate::WindowId,
+        original_cursor: usize,
+    },
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]

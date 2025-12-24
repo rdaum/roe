@@ -219,6 +219,18 @@ impl FaceRegistry {
                 .with_foreground(Color::from_hex("#cca700").unwrap())
                 .with_underline(true),
         );
+
+        // Isearch highlighting - all matches get a subtle background
+        self.define_face(
+            Face::new("isearch-match").with_background(Color::from_hex("#3a3a3a").unwrap()),
+        );
+
+        // Isearch highlighting - current match is inverted (bright yellow bg, black fg)
+        self.define_face(
+            Face::new("isearch-current")
+                .with_background(Color::from_hex("#ffff00").unwrap())
+                .with_foreground(Color::from_hex("#000000").unwrap()),
+        );
     }
 
     /// Define a new face and return its ID

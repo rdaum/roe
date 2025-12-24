@@ -107,6 +107,14 @@ fn syntax_color_to_crossterm(color: &SyntaxColor, default: Color) -> Color {
     }
 }
 
+/// Convert a character position to byte position in a string
+fn char_to_byte(s: &str, char_pos: usize) -> usize {
+    s.char_indices()
+        .nth(char_pos)
+        .map(|(byte_idx, _)| byte_idx)
+        .unwrap_or(s.len())
+}
+
 /// Cached theme colors loaded from Julia at startup
 #[derive(Clone)]
 pub struct CachedTheme {
@@ -291,9 +299,16 @@ impl<W: Write> TerminalRenderer<W> {
         // Remove trailing newline if present
         let line_text = line_text.trim_end_matches('\n');
 
-        let line_start_pos = buffer.buffer_line_to_char(buffer_line);
-        let line_end_pos = line_start_pos + line_text.chars().count();
+        let line_start_char = buffer.buffer_line_to_char(buffer_line);
+        let line_char_count = line_text.chars().count();
+        let line_end_char = line_start_char + line_char_count;
         let start_column = window.start_column as usize;
+
+        // Get buffer content for byte<->char position conversion
+        // (spans use byte positions for tree-sitter/Julia compatibility)
+        let buffer_content = buffer.content();
+        let line_start_byte = char_to_byte(&buffer_content, line_start_char);
+        let line_end_byte = char_to_byte(&buffer_content, line_end_char);
 
         // Draw gutter
         if show_gutter {
@@ -349,30 +364,33 @@ impl<W: Write> TerminalRenderer<W> {
             .take(content_width as usize)
             .collect();
 
-        // Get syntax spans for this line
-        let syntax_spans: Vec<HighlightSpan> = buffer.spans_in_range(line_start_pos..line_end_pos);
+        // Get syntax spans for this line (using byte positions)
+        let syntax_spans: Vec<HighlightSpan> = buffer.spans_in_range(line_start_byte..line_end_byte);
 
         // Get face registry for looking up face colors
         let face_registry_guard = face_registry().lock().ok();
 
         // Render character by character with merged highlighting
         for (char_idx, ch) in chars_to_render.iter().enumerate() {
-            // Account for horizontal scroll when calculating buffer position
-            let buffer_pos = line_start_pos + start_column + char_idx;
+            // Account for horizontal scroll when calculating buffer position (in chars)
+            let buffer_pos_char = line_start_char + start_column + char_idx;
+            // Convert to byte position for span lookup
+            let buffer_pos_byte = char_to_byte(&buffer_content, buffer_pos_char);
 
             // Determine the style for this character
             // Priority: region selection > syntax highlighting > default
+            // Note: region_bounds uses char positions, span lookup uses byte positions
             let (fg, bg) = if let Some((region_start, region_end)) = region_bounds {
-                if buffer_pos >= region_start && buffer_pos < region_end {
+                if buffer_pos_char >= region_start && buffer_pos_char < region_end {
                     // Character is in selection region
                     (Color::Black, self.theme.selection_color)
                 } else {
                     // Check syntax highlighting
-                    self.get_syntax_colors(buffer_pos, &syntax_spans, &face_registry_guard)
+                    self.get_syntax_colors(buffer_pos_byte, &syntax_spans, &face_registry_guard)
                 }
             } else {
                 // No region, check syntax highlighting
-                self.get_syntax_colors(buffer_pos, &syntax_spans, &face_registry_guard)
+                self.get_syntax_colors(buffer_pos_byte, &syntax_spans, &face_registry_guard)
             };
 
             queue!(&mut self.device, Print(ch.to_string().with(fg).on(bg)))?;
@@ -380,7 +398,7 @@ impl<W: Write> TerminalRenderer<W> {
 
         // Handle region extending past line content (fill with selection color)
         if let Some((region_start, region_end)) = region_bounds {
-            if region_start < line_end_pos && region_end > line_end_pos {
+            if region_start < line_end_char && region_end > line_end_char {
                 let chars_rendered = chars_to_render.len();
                 let remaining_width = content_width as usize - chars_rendered;
                 if remaining_width > 0 {
@@ -1163,10 +1181,16 @@ pub fn draw_window(
             )?;
         }
 
-        // Get the line start position in the buffer
-        let line_start_pos = buffer.buffer_line_to_char(line_idx);
-        let line_end_pos = line_start_pos + line_text.chars().count();
+        // Get the line start position in the buffer (char position)
+        let line_start_char = buffer.buffer_line_to_char(line_idx);
+        let line_char_count = line_text.chars().count();
+        let line_end_char = line_start_char + line_char_count;
         let start_column = window.start_column as usize;
+
+        // Get buffer content for byte<->char conversion (spans use byte positions)
+        let buffer_content = buffer.content();
+        let line_start_byte = char_to_byte(&buffer_content, line_start_char);
+        let line_end_byte = char_to_byte(&buffer_content, line_end_char);
 
         // Apply horizontal scroll - skip start_column characters, then take content_width
         let line_str = line_text;
@@ -1176,26 +1200,29 @@ pub fn draw_window(
             .take(content_width as usize)
             .collect();
 
-        // Get syntax spans for this line
-        let syntax_spans: Vec<HighlightSpan> = buffer.spans_in_range(line_start_pos..line_end_pos);
+        // Get syntax spans for this line (using byte positions)
+        let syntax_spans: Vec<HighlightSpan> = buffer.spans_in_range(line_start_byte..line_end_byte);
 
         // Move cursor to the start of the text content
         queue!(device, cursor::MoveTo(content_x, content_y + content_line))?;
 
         // Render character by character with merged highlighting (region + syntax)
         for (char_idx, ch) in visible_chars.iter().enumerate() {
-            // Account for horizontal scroll when calculating buffer position
-            let buffer_pos = line_start_pos + start_column + char_idx;
+            // Account for horizontal scroll when calculating buffer position (char position)
+            let buffer_pos_char = line_start_char + start_column + char_idx;
+            // Convert to byte position for span lookup
+            let buffer_pos_byte = char_to_byte(&buffer_content, buffer_pos_char);
 
             // Determine colors: region selection > syntax > default
+            // Note: region_bounds uses char positions, span lookup uses byte positions
             let (fg, bg) = if let Some((region_start, region_end)) = region_bounds {
-                if buffer_pos >= region_start && buffer_pos < region_end {
+                if buffer_pos_char >= region_start && buffer_pos_char < region_end {
                     // Character is in selection region
                     (Color::Black, Color::Yellow)
                 } else {
                     // Check syntax highlighting
                     get_syntax_colors_standalone(
-                        buffer_pos,
+                        buffer_pos_byte,
                         &syntax_spans,
                         &face_registry_guard,
                         theme,
@@ -1203,7 +1230,7 @@ pub fn draw_window(
                 }
             } else {
                 // No region, check syntax highlighting
-                get_syntax_colors_standalone(buffer_pos, &syntax_spans, &face_registry_guard, theme)
+                get_syntax_colors_standalone(buffer_pos_byte, &syntax_spans, &face_registry_guard, theme)
             };
 
             queue!(device, Print(ch.to_string().with(fg).on(bg)))?;
@@ -1211,7 +1238,7 @@ pub fn draw_window(
 
         // Handle region extending past line content
         if let Some((region_start, region_end)) = region_bounds {
-            if region_start < line_end_pos && region_end > line_end_pos {
+            if region_start < line_end_char && region_end > line_end_char {
                 let chars_rendered = visible_chars.len();
                 let remaining_width = content_width as usize - chars_rendered;
                 if remaining_width > 0 {
@@ -1587,6 +1614,9 @@ pub async fn event_loop_with_renderer<W: Write>(
                     let status = editor.file_watcher.status();
                     editor.set_echo_message(status.clone());
                     echo(&mut renderer.device, editor, &status, &renderer.theme)?;
+                }
+                ChromeAction::ISearchForward | ChromeAction::ISearchBackward => {
+                    // Handled in Editor::process_chrome_actions
                 }
             }
         }

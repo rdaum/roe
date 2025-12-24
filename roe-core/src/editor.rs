@@ -64,6 +64,8 @@ pub enum CommandType {
     KillBuffer,
     /// File opening
     OpenFile(OpenType),
+    /// Incremental search
+    ISearch { forward: bool },
 }
 
 /// Command window position
@@ -232,6 +234,8 @@ pub struct Editor {
         Option<std::sync::Arc<tokio::sync::Mutex<crate::julia_runtime::RoeJuliaRuntime>>>,
     /// File watcher for detecting external changes
     pub file_watcher: crate::file_watcher::FileWatcher,
+    /// Last search term used in isearch (for prepopulating next search)
+    pub last_search_term: String,
 }
 
 /// The main event loop, which receives keystrokes and dispatches them to the mode in the buffer
@@ -318,6 +322,10 @@ pub enum ChromeAction {
     ExecuteCommand(String),
     /// Show file watcher status
     FileWatcherStatus,
+    /// Start incremental search forward
+    ISearchForward,
+    /// Start incremental search backward
+    ISearchBackward,
 }
 
 impl Editor {
@@ -338,6 +346,7 @@ impl Editor {
                 CommandType::KillBuffer => "Kill Buffer",
                 CommandType::OpenFile(OpenType::New) => "Find File",
                 CommandType::OpenFile(OpenType::Visit) => "Visit File",
+                CommandType::ISearch { .. } => "I-search",
             }
         ));
 
@@ -614,6 +623,10 @@ impl Editor {
                     )
                 }
             }
+            CommandType::ISearch { .. } => {
+                // ISearch has its own create_isearch_window function
+                unreachable!("ISearch should use create_isearch_window, not create_command_window")
+            }
         };
 
         // Generate initial buffer content with completions
@@ -670,6 +683,158 @@ impl Editor {
         self.previous_active_window = Some(self.active_window);
 
         // Make the command window the active window so keys go to it
+        self.active_window = window_id;
+
+        self.calculate_window_layout();
+        window_id
+    }
+
+    /// Create an isearch command window
+    pub fn create_isearch_window(&mut self, forward: bool) -> WindowId {
+        use crate::isearch_mode::{IsearchMode, SearchDirection};
+
+        // Get target buffer and window info before creating command window
+        let target_window_id = self.active_window;
+        let target_window = &self.windows[target_window_id];
+        let target_buffer_id = target_window.active_buffer;
+        let original_cursor = target_window.cursor;
+        let target_buffer = self.buffers[target_buffer_id].clone();
+
+        // Create command buffer for isearch prompt
+        let command_buffer = Buffer::new(&[]);
+        command_buffer.set_object("*I-search*".to_string());
+        let command_buffer_id = self.buffers.insert(command_buffer.clone());
+
+        // Create the isearch mode
+        let direction = if forward {
+            SearchDirection::Forward
+        } else {
+            SearchDirection::Backward
+        };
+
+        // Get previous search term if available
+        let previous_search = if self.last_search_term.is_empty() {
+            None
+        } else {
+            Some(self.last_search_term.clone())
+        };
+
+        let isearch_mode = IsearchMode::new(
+            direction,
+            target_buffer_id,
+            target_window_id,
+            original_cursor,
+            target_buffer,
+            previous_search,
+        );
+
+        // Set initial content
+        let initial_content = isearch_mode.generate_buffer_content();
+        command_buffer.load_str(&initial_content);
+
+        // If we have a previous search term with matches, apply highlights now
+        let initial_matches = isearch_mode.matches().to_vec();
+        let initial_current = isearch_mode.current_match_index();
+        if !initial_matches.is_empty() {
+            // Apply highlights to target buffer
+            if let Some(buffer) = self.buffers.get(target_buffer_id) {
+                let face_registry = crate::julia_runtime::face_registry();
+                if let Ok(registry) = face_registry.lock() {
+                    let match_face_id = registry.get_id("isearch-match");
+                    let current_face_id = registry.get_id("isearch-current");
+
+                    if let (Some(match_face_id), Some(current_face_id)) =
+                        (match_face_id, current_face_id)
+                    {
+                        let spans: Vec<_> = initial_matches
+                            .iter()
+                            .enumerate()
+                            .map(|(i, (start, end))| {
+                                let face_id = if initial_current == Some(i) {
+                                    current_face_id
+                                } else {
+                                    match_face_id
+                                };
+                                crate::syntax::HighlightSpan::new(*start, *end, face_id)
+                            })
+                            .collect();
+
+                        buffer.with_write(|b| {
+                            b.spans.add_spans(spans);
+                        });
+                    }
+                }
+
+                // Move cursor to current match if any
+                if let Some(current_idx) = initial_current {
+                    if let Some((start_byte, _)) = initial_matches.get(current_idx) {
+                        let content = buffer.content();
+                        let char_pos = crate::isearch_mode::byte_to_char_pos(&content, *start_byte);
+                        if let Some(window) = self.windows.get_mut(target_window_id) {
+                            window.cursor = char_pos;
+
+                            // Ensure cursor is visible by scrolling if needed
+                            let (col, line) = buffer.to_column_line(char_pos);
+                            let content_height = window.height_chars.saturating_sub(3);
+                            let content_width = window.width_chars.saturating_sub(4);
+                            Self::ensure_cursor_visible_static(
+                                window,
+                                col,
+                                line,
+                                content_width,
+                                content_height,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Create buffer host for the isearch mode
+        // Use a dummy FileMode as the base mode (isearch mode will handle all keys)
+        let dummy_mode_id = self.modes.insert(Box::new(crate::mode::FileMode {
+            file_path: String::new(),
+        }));
+        let mode_list = vec![(
+            dummy_mode_id,
+            "isearch".to_string(),
+            Box::new(isearch_mode) as Box<dyn Mode>,
+        )];
+
+        let (buffer_client, _buffer_handle) = crate::buffer_host::create_buffer_host(
+            command_buffer,
+            mode_list,
+            command_buffer_id,
+            self.julia_runtime.clone(),
+        );
+
+        self.buffer_hosts.insert(command_buffer_id, buffer_client);
+
+        // Create command window for isearch prompt
+        // Height 4: Vello needs extra line for scrollbar chrome
+        let height = 4;
+        let y = self.frame.available_lines.saturating_sub(height);
+        let command_window = Window {
+            x: 0,
+            y,
+            width_chars: self.frame.available_columns,
+            height_chars: height,
+            active_buffer: command_buffer_id,
+            start_line: 0,
+            start_column: 0,
+            cursor: initial_content.chars().count(),
+            window_type: WindowType::Command {
+                position: CommandWindowPosition::Bottom,
+                command_type: CommandType::ISearch { forward },
+            },
+        };
+
+        let window_id = self.windows.insert(command_window);
+
+        // Save the current active window before switching
+        self.previous_active_window = Some(self.active_window);
+
+        // Make the command window active
         self.active_window = window_id;
 
         self.calculate_window_layout();
@@ -1653,20 +1818,31 @@ impl Editor {
 
                 // Cancel current operation - check command window first, then mark
                 if let Some(command_window_id) = self.find_command_window() {
-                    self.close_command_window(command_window_id);
-                    return Ok(vec![
-                        ChromeAction::Echo("Command mode cancelled".to_string()),
-                        ChromeAction::MarkDirty(DirtyRegion::FullScreen),
-                    ]);
-                }
-
-                let window = &self.windows[self.active_window];
-                let buffer = &self.buffers[window.active_buffer];
-
-                if buffer.has_mark() {
-                    return Ok(self.clear_mark());
+                    // For ISearch, let the mode handle cancel (it needs to clear highlights)
+                    let is_isearch = matches!(
+                        self.windows[command_window_id].window_type,
+                        WindowType::Command {
+                            command_type: CommandType::ISearch { .. },
+                            ..
+                        }
+                    );
+                    if !is_isearch {
+                        self.close_command_window(command_window_id);
+                        return Ok(vec![
+                            ChromeAction::Echo("Command mode cancelled".to_string()),
+                            ChromeAction::MarkDirty(DirtyRegion::FullScreen),
+                        ]);
+                    }
+                    // For ISearch, fall through to let the mode handle it
                 } else {
-                    return Ok(vec![ChromeAction::Echo("Quit".to_string())]);
+                    let window = &self.windows[self.active_window];
+                    let buffer = &self.buffers[window.active_buffer];
+
+                    if buffer.has_mark() {
+                        return Ok(self.clear_mark());
+                    } else {
+                        return Ok(vec![ChromeAction::Echo("Quit".to_string())]);
+                    }
                 }
             }
             KeyAction::Undo => {
@@ -1802,30 +1978,99 @@ impl Editor {
                     return Ok(vec![ChromeAction::Echo(unbound_message)]);
                 }
             }
-            KeyAction::Command(command_name) => {
-                // Execute command through unified command system
-                let context = self.create_command_context();
-
-                if let Some(command) = self.command_registry.get_command(command_name) {
-                    match command.execute(context).await {
-                        Ok(actions) => return Ok(self.process_chrome_actions(actions)),
-                        Err(error_msg) => {
-                            return Ok(vec![ChromeAction::Echo(format!("Error: {error_msg}"))]);
+            KeyAction::Command(ref command_name) => {
+                // If there's an isearch window and the command is isearch-forward/backward,
+                // switch to the isearch window and dispatch the command to it
+                if let Some(command_window_id) = self.find_command_window() {
+                    let is_isearch = matches!(
+                        self.windows[command_window_id].window_type,
+                        WindowType::Command {
+                            command_type: CommandType::ISearch { .. },
+                            ..
+                        }
+                    );
+                    if is_isearch
+                        && (command_name == "isearch-forward" || command_name == "isearch-backward")
+                    {
+                        // Make the isearch window active and dispatch to its buffer
+                        self.active_window = command_window_id;
+                        let isearch_buffer_id = self.windows[command_window_id].active_buffer;
+                        if let Some(buffer_host) =
+                            self.buffer_hosts.get(&isearch_buffer_id).cloned()
+                        {
+                            let cursor_pos = self.windows[command_window_id].cursor;
+                            let response_result = tokio::task::block_in_place(|| {
+                                tokio::runtime::Handle::current().block_on(async {
+                                    buffer_host.handle_key(key_action.clone(), cursor_pos).await
+                                })
+                            });
+                            match response_result {
+                                Ok(response) => {
+                                    return Ok(tokio::task::block_in_place(|| {
+                                        tokio::runtime::Handle::current().block_on(async {
+                                            self.handle_buffer_response(response).await
+                                        })
+                                    }));
+                                }
+                                Err(err) => {
+                                    return Ok(vec![ChromeAction::Echo(format!(
+                                        "Buffer error: {err}"
+                                    ))]);
+                                }
+                            }
+                        }
+                        // Fall through if buffer host not found
+                    } else {
+                        // Execute command through unified command system
+                        let context = self.create_command_context();
+                        if let Some(command) = self.command_registry.get_command(command_name) {
+                            match command.execute(context).await {
+                                Ok(actions) => return Ok(self.process_chrome_actions(actions)),
+                                Err(error_msg) => {
+                                    return Ok(vec![ChromeAction::Echo(format!(
+                                        "Error: {error_msg}"
+                                    ))]);
+                                }
+                            }
+                        } else {
+                            return Ok(vec![ChromeAction::Echo(format!(
+                                "Command not found: '{}'. Available commands: {}",
+                                command_name,
+                                self.command_registry
+                                    .all_commands()
+                                    .iter()
+                                    .map(|c| &c.name)
+                                    .take(5)
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ))]);
                         }
                     }
                 } else {
-                    return Ok(vec![ChromeAction::Echo(format!(
-                        "Command not found: '{}'. Available commands: {}",
-                        command_name,
-                        self.command_registry
-                            .all_commands()
-                            .iter()
-                            .map(|c| &c.name)
-                            .take(5)
-                            .cloned()
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ))]);
+                    // No command window, execute command normally
+                    let context = self.create_command_context();
+                    if let Some(command) = self.command_registry.get_command(command_name) {
+                        match command.execute(context).await {
+                            Ok(actions) => return Ok(self.process_chrome_actions(actions)),
+                            Err(error_msg) => {
+                                return Ok(vec![ChromeAction::Echo(format!("Error: {error_msg}"))]);
+                            }
+                        }
+                    } else {
+                        return Ok(vec![ChromeAction::Echo(format!(
+                            "Command not found: '{}'. Available commands: {}",
+                            command_name,
+                            self.command_registry
+                                .all_commands()
+                                .iter()
+                                .map(|c| &c.name)
+                                .take(5)
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ))]);
+                    }
                 }
             }
             _ => {}
@@ -2149,6 +2394,133 @@ impl Editor {
                             // Delegate to yank_index method
                             let yank_actions = self.yank_index(&position, index);
                             actions.extend(yank_actions);
+                        }
+                        EditorAction::UpdateIsearch {
+                            target_buffer_id,
+                            target_window_id,
+                            matches,
+                            current_match,
+                        } => {
+                            // Update highlights in the target buffer
+                            if let Some(buffer) = self.buffers.get(target_buffer_id) {
+                                // Clear existing isearch spans
+                                buffer.with_write(|b| {
+                                    b.spans.clear();
+                                });
+
+                                // Add spans for all matches
+                                let face_registry = crate::julia_runtime::face_registry();
+                                if let Ok(registry) = face_registry.lock() {
+                                    let match_face_id = registry.get_id("isearch-match");
+                                    let current_face_id = registry.get_id("isearch-current");
+
+                                    if let (Some(match_face_id), Some(current_face_id)) =
+                                        (match_face_id, current_face_id)
+                                    {
+                                        let spans: Vec<_> = matches
+                                            .iter()
+                                            .enumerate()
+                                            .map(|(i, (start, end))| {
+                                                let face_id = if current_match == Some(i) {
+                                                    current_face_id
+                                                } else {
+                                                    match_face_id
+                                                };
+                                                crate::syntax::HighlightSpan::new(
+                                                    *start, *end, face_id,
+                                                )
+                                            })
+                                            .collect();
+
+                                        buffer.with_write(|b| {
+                                            b.spans.add_spans(spans);
+                                        });
+                                    }
+                                }
+
+                                // Move cursor to current match if any
+                                if let Some(current_idx) = current_match {
+                                    if let Some((start_byte, _)) = matches.get(current_idx) {
+                                        if let Some(window) = self.windows.get_mut(target_window_id)
+                                        {
+                                            // Convert byte position to char position for cursor
+                                            let content = buffer.content();
+                                            let char_pos = crate::isearch_mode::byte_to_char_pos(
+                                                &content,
+                                                *start_byte,
+                                            );
+                                            window.cursor = char_pos;
+
+                                            // Ensure cursor is visible by scrolling if needed
+                                            let (col, line) = buffer.to_column_line(char_pos);
+                                            let content_height =
+                                                window.height_chars.saturating_sub(3);
+                                            let content_width =
+                                                window.width_chars.saturating_sub(4);
+                                            Self::ensure_cursor_visible_static(
+                                                window,
+                                                col,
+                                                line,
+                                                content_width,
+                                                content_height,
+                                            );
+
+                                            actions.push(ChromeAction::CursorMove(
+                                                window.absolute_cursor_position(col, line),
+                                            ));
+                                        }
+                                    }
+                                }
+
+                                actions.push(ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                                    buffer_id: target_buffer_id,
+                                }));
+                            }
+                        }
+                        EditorAction::AcceptIsearch {
+                            target_buffer_id,
+                            search_term,
+                        } => {
+                            // Save the search term for next isearch
+                            self.last_search_term = search_term;
+
+                            // Clear isearch highlights
+                            if let Some(buffer) = self.buffers.get(target_buffer_id) {
+                                buffer.with_write(|b| {
+                                    b.spans.clear();
+                                });
+                            }
+
+                            // Close the isearch command window
+                            if let Some(command_window_id) = self.find_command_window() {
+                                self.close_command_window(command_window_id);
+                            }
+
+                            actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
+                        }
+                        EditorAction::CancelIsearch {
+                            target_buffer_id,
+                            target_window_id,
+                            original_cursor,
+                        } => {
+                            // Clear isearch highlights
+                            if let Some(buffer) = self.buffers.get(target_buffer_id) {
+                                buffer.with_write(|b| {
+                                    b.spans.clear();
+                                });
+                            }
+
+                            // Restore original cursor position
+                            if let Some(window) = self.windows.get_mut(target_window_id) {
+                                window.cursor = original_cursor;
+                            }
+
+                            // Close the isearch command window
+                            if let Some(command_window_id) = self.find_command_window() {
+                                self.close_command_window(command_window_id);
+                            }
+
+                            actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
                         }
                     }
                 }
@@ -3006,6 +3378,26 @@ impl Editor {
                             .push(ChromeAction::Echo(format!("Failed to write messages: {e}"))),
                     }
                 }
+                ChromeAction::ISearchForward => {
+                    // If a command window is already open, close it first
+                    if let Some(existing_command_window_id) = self.find_command_window() {
+                        self.close_command_window(existing_command_window_id);
+                    }
+
+                    // Create isearch window at bottom (single line for prompt)
+                    let _isearch_window_id = self.create_isearch_window(true);
+                    result_actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
+                }
+                ChromeAction::ISearchBackward => {
+                    // If a command window is already open, close it first
+                    if let Some(existing_command_window_id) = self.find_command_window() {
+                        self.close_command_window(existing_command_window_id);
+                    }
+
+                    // Create isearch window at bottom (single line for prompt)
+                    let _isearch_window_id = self.create_isearch_window(false);
+                    result_actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
+                }
                 // All other actions pass through unchanged
                 other => result_actions.push(other),
             }
@@ -3248,6 +3640,7 @@ mod tests {
             messages_buffer_id: None,
             julia_runtime: None,
             file_watcher: crate::file_watcher::FileWatcher::new(),
+            last_search_term: String::new(),
         }
     }
 

@@ -188,6 +188,10 @@ define_key("M-/", ":redo")
 # Terminal sends Ctrl+/ as Ctrl+7 (ASCII control code limitation)
 define_key("C-7", ":undo")
 
+# --- Search ---
+define_key("C-s", "isearch-forward")
+define_key("C-r", "isearch-backward")
+
 # --- Commands (C-x prefix) ---
 define_key("C-x C-c", "quit")
 define_key("C-x C-s", "save-buffer")

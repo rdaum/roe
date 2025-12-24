@@ -362,6 +362,7 @@ async fn terminal_main<W: Write>(stdout: W, config: EditorConfig) -> Result<(), 
         messages_buffer_id: None,
         julia_runtime,
         file_watcher,
+        last_search_term: String::new(),
     };
 
     // Initialize buffer history with the current buffer

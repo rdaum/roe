@@ -182,6 +182,24 @@ pub enum EditorAction {
         position: crate::mode::ActionPosition,
         index: usize,
     },
+    /// Update isearch highlights and cursor in target buffer/window
+    UpdateIsearch {
+        target_buffer_id: crate::BufferId,
+        target_window_id: crate::WindowId,
+        matches: Vec<(usize, usize)>,
+        current_match: Option<usize>,
+    },
+    /// Accept isearch result - close command window, keep cursor
+    AcceptIsearch {
+        target_buffer_id: crate::BufferId,
+        search_term: String,
+    },
+    /// Cancel isearch - close command window, restore cursor
+    CancelIsearch {
+        target_buffer_id: crate::BufferId,
+        target_window_id: crate::WindowId,
+        original_cursor: usize,
+    },
 }
 
 /// Represents a buffer content change for after-change hooks
@@ -733,6 +751,39 @@ impl BufferHost {
                             buffer_id: self.buffer_id,
                         });
                     }
+                }
+                ModeAction::UpdateIsearch {
+                    target_buffer_id,
+                    target_window_id,
+                    matches,
+                    current_match,
+                } => {
+                    editor_action = Some(EditorAction::UpdateIsearch {
+                        target_buffer_id,
+                        target_window_id,
+                        matches,
+                        current_match,
+                    });
+                }
+                ModeAction::AcceptIsearch {
+                    target_buffer_id,
+                    search_term,
+                } => {
+                    editor_action = Some(EditorAction::AcceptIsearch {
+                        target_buffer_id,
+                        search_term,
+                    });
+                }
+                ModeAction::CancelIsearch {
+                    target_buffer_id,
+                    target_window_id,
+                    original_cursor,
+                } => {
+                    editor_action = Some(EditorAction::CancelIsearch {
+                        target_buffer_id,
+                        target_window_id,
+                        original_cursor,
+                    });
                 }
                 _ => {}
             }
