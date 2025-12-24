@@ -768,10 +768,26 @@ impl<'a> RoeVelloApp<'a> {
         // Draw modeline text (outside clip)
         let buffer_name = buffer.object();
         let (col, line) = buffer.to_column_line(window.cursor);
+        let major_mode_str = buffer
+            .major_mode()
+            .map(|m| format!("({}) ", m))
+            .unwrap_or_default();
         let modeline_text = if is_active {
-            format!(" ᚱᛟ {} {}:{}", buffer_name, line + 1, col + 1)
+            format!(
+                " ᚱᛟ {} {}{}:{}",
+                buffer_name,
+                major_mode_str,
+                line + 1,
+                col + 1
+            )
         } else {
-            format!("    {} {}:{}", buffer_name, line + 1, col + 1)
+            format!(
+                "    {} {}{}:{}",
+                buffer_name,
+                major_mode_str,
+                line + 1,
+                col + 1
+            )
         };
 
         self.text_renderer.render_line(
