@@ -36,6 +36,7 @@ Both renderers share the same core editor, keybindings, and Julia integration.
 - **Mouse support**: Even in console mode, click to position cursor, drag window borders to resize,
   click to switch windows, etc.
 - **Modular architecture**: Has an extensible mode system for different editing behaviors
+- **Syntax highlighting**: Major modes with syntax highlighting and auto-indentation for Julia, Rust, and Markdown
 - **Dual rendering**: Terminal or GPU-accelerated native window
 
 ## Key Bindings
@@ -227,12 +228,15 @@ This is a work-in-progress editor. Currently implemented:
   - Interactive modes written in Julia (file selector, buffer switcher, Julia REPL)
   - FFI access to buffer contents from Julia
   - Theme/font configuration via Julia config file
+- **Syntax highlighting & major modes**:
+  - Julia mode with JuliaSyntax.jl-based highlighting and smart indentation
+  - Rust mode with TreeSitter-based highlighting
+  - Markdown mode with highlighting and list/blockquote continuation
 
 ## Next steps / not yet implemented
 
 - **Macro system**: Record and playback keystroke sequences
 - **Search and replace**: Interactive search, query-replace functionality
-- **Syntax highlighting**: TreeSitter integration for language-aware editing
 - **LSP integration**: Language server protocol support for modern development features
 - **Advanced editing**: Multiple cursors, rectangular selections, etc.
 - **Undo/redo**: Currently partially implemented

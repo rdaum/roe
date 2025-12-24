@@ -46,7 +46,9 @@ function _get_rust_parser()
     end
 
     try
-        parser = Base.invokelatest(Main.Parser, Main.tree_sitter_rust_jll)
+        # Use Core.eval to create parser in latest world age context
+        # This avoids world age issues with TreeSitter's internal method dispatch
+        parser = Base.invokelatest(Core.eval, Main, :(TreeSitter.Parser(tree_sitter_rust_jll)))
         _rust_parser[] = parser
         return parser
     catch e

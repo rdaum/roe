@@ -972,12 +972,10 @@ fn draw_window_modeline(
     let object_part = format!("{} ", buffer.object());
     rest_content.push_str(&object_part);
 
-    // Add mode name
-    if let Some(mode_id) = buffer.modes().first() {
-        if let Some(mode) = editor.modes.get(*mode_id) {
-            let mode_part = format!("({}) ", mode.name());
-            rest_content.push_str(&mode_part);
-        }
+    // Add major mode name (if set)
+    if let Some(major_mode) = buffer.major_mode() {
+        let mode_part = format!("({}) ", major_mode);
+        rest_content.push_str(&mode_part);
     }
 
     // Add cursor position

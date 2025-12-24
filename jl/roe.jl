@@ -45,7 +45,9 @@ export define_command, call_command, CommandContext, define_key, define_keys, un
        highlight_julia_region,
        # Rust syntax highlighting
        define_rust_faces, highlight_rust, highlight_rust_buffer,
-       highlight_rust_region
+       highlight_rust_region,
+       # Markdown syntax highlighting
+       define_markdown_faces, highlight_markdown_buffer
 
 # Get the directory containing this file
 const _module_dir = @__DIR__
@@ -64,5 +66,7 @@ include(joinpath(_module_dir, "major_modes.jl"))
 include(joinpath(_module_dir, "julia_highlighting.jl"))
 # Rust highlighting uses TreeSitter.jl
 include(joinpath(_module_dir, "rust_highlighting.jl"))
+# Markdown mode uses CommonMark.jl
+include(joinpath(_module_dir, "markdown_mode.jl"))
 
 end # module Roe
