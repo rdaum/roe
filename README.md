@@ -19,8 +19,7 @@ performance, while Julia provides the high-level customization layer.
 
 Roe supports two rendering backends:
 
-- **Terminal** (`roe`): Lightweight, runs in your terminal using crossterm with efficient
-  incremental updates
+- **Terminal** (`roe`): Lightweight, runs in your terminal
 - **Vello/GPU** (`roe-vello`): Native window with GPU-accelerated rendering via Vello/wgpu
 
 Both renderers share the same core editor, keybindings, and Julia integration.
@@ -29,13 +28,14 @@ Both renderers share the same core editor, keybindings, and Julia integration.
 
 - **Emacs-style keybindings**: Familiar keyboard shortcuts for Emacs users, fully customizable
 - **Julia scripting**: Define commands, keybindings, and interactive modes in Julia
-- **Buffer-oriented editing**: Work with buffers as the primary unit, not just files like other
-  editors. Just like GNU emacs.
-  - Even the command entry window is a buffer.
+- **Buffer-oriented editing**: Beyond embedding a Lisp and having macros, one of the core pieces
+  that differentiates an "emacs" from other editors is working with "buffers" not just files and
+  having buffer interaction as a fundamental tool use. Windows are views into buffers, and not all
+  buffers need to be backed by files.
 - **Window management**: Split windows horizontally/vertically, switch between them, same as emacs.
-- **Mouse support**: Click to position cursor, drag window borders to resize, click to switch
-  windows
-- **Modular architecture**: Extensible mode system for different editing behaviors
+- **Mouse support**: Even in console mode, click to position cursor, drag window borders to resize,
+  click to switch windows, etc.
+- **Modular architecture**: Has an extensible mode system for different editing behaviors
 - **Dual rendering**: Terminal or GPU-accelerated native window
 
 ## Key Bindings
@@ -217,6 +217,7 @@ This is a work-in-progress editor. Currently implemented:
 - **Command mode**: Interactive command execution (M-x) with completion
 - **File operations**: Open and save files with interactive file selector
 - **Mouse integration**: Click-to-position cursor, window switching, border dragging for resizing
+- **Incremental search (isearch)**: Simple forward and backward incremental search.
 - **Dual rendering**:
   - Terminal UI with efficient incremental rendering via crossterm
   - GPU-accelerated native window via Vello/wgpu with configurable fonts
