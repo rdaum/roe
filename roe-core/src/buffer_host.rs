@@ -169,6 +169,10 @@ pub enum EditorAction {
     },
     /// Kill line (to kill-ring)
     KillLine,
+    /// Kill word backward (to kill-ring)
+    BackwardKillWord,
+    /// Kill word forward (to kill-ring)
+    ForwardKillWord,
     /// Kill region (to kill-ring)
     KillRegion,
     /// Copy region to kill-ring without deleting
@@ -672,6 +676,14 @@ impl BufferHost {
                 ModeAction::KillLine => {
                     // Kill from cursor to end of line (store in kill-ring - will be handled at Editor level)
                     editor_action = Some(EditorAction::KillLine);
+                }
+                ModeAction::BackwardKillWord => {
+                    // Kill word backward (store in kill-ring - will be handled at Editor level)
+                    editor_action = Some(EditorAction::BackwardKillWord);
+                }
+                ModeAction::ForwardKillWord => {
+                    // Kill word forward (store in kill-ring - will be handled at Editor level)
+                    editor_action = Some(EditorAction::ForwardKillWord);
                 }
                 ModeAction::KillRegion => {
                     // Kill the region between mark and cursor (store in kill-ring - will be handled at Editor level)

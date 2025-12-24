@@ -472,6 +472,8 @@ impl ConfigurableBindings {
                 "kill-whole-line" => Some(KeyAction::KillLine(true)),
                 "kill-region" => Some(KeyAction::KillRegion(true)),
                 "copy-region" => Some(KeyAction::KillRegion(false)),
+                "backward-kill-word" => Some(KeyAction::BackspaceWord),
+                "kill-word" => Some(KeyAction::DeleteWord),
                 "yank" => Some(KeyAction::Yank(None)),
 
                 // Mark

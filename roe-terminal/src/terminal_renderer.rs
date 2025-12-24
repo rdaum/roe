@@ -365,7 +365,8 @@ impl<W: Write> TerminalRenderer<W> {
             .collect();
 
         // Get syntax spans for this line (using byte positions)
-        let syntax_spans: Vec<HighlightSpan> = buffer.spans_in_range(line_start_byte..line_end_byte);
+        let syntax_spans: Vec<HighlightSpan> =
+            buffer.spans_in_range(line_start_byte..line_end_byte);
 
         // Get face registry for looking up face colors
         let face_registry_guard = face_registry().lock().ok();
@@ -1201,7 +1202,8 @@ pub fn draw_window(
             .collect();
 
         // Get syntax spans for this line (using byte positions)
-        let syntax_spans: Vec<HighlightSpan> = buffer.spans_in_range(line_start_byte..line_end_byte);
+        let syntax_spans: Vec<HighlightSpan> =
+            buffer.spans_in_range(line_start_byte..line_end_byte);
 
         // Move cursor to the start of the text content
         queue!(device, cursor::MoveTo(content_x, content_y + content_line))?;
@@ -1230,7 +1232,12 @@ pub fn draw_window(
                 }
             } else {
                 // No region, check syntax highlighting
-                get_syntax_colors_standalone(buffer_pos_byte, &syntax_spans, &face_registry_guard, theme)
+                get_syntax_colors_standalone(
+                    buffer_pos_byte,
+                    &syntax_spans,
+                    &face_registry_guard,
+                    theme,
+                )
             };
 
             queue!(device, Print(ch.to_string().with(fg).on(bg)))?;

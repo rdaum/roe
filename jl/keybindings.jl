@@ -37,6 +37,7 @@ Special actions available:
 - `:cursor-*-select` variants (e.g., `:cursor-left-select`) - move and select
 - `:delete`, `:backspace`, `:enter`, `:tab`
 - `:kill-line`, `:kill-region`, `:copy-region`
+- `:kill-word`, `:backward-kill-word`
 - `:yank`, `:mark-start`, `:cancel`
 - `:undo`, `:redo`, `:redraw`
 
@@ -169,6 +170,11 @@ define_key("C-k", ":kill-line")
 define_key("C-w", ":kill-region")
 define_key("M-w", ":copy-region")
 define_key("C-y", ":yank")
+
+# Kill word
+define_key("M-d", ":kill-word")
+define_key("M-Backspace", ":backward-kill-word")
+define_key("C-Backspace", ":backward-kill-word")
 
 # --- Mark ---
 define_key("C-Space", ":set-mark")

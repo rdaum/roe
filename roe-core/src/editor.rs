@@ -2375,6 +2375,16 @@ impl Editor {
                             let kill_actions = self.kill_line();
                             actions.extend(kill_actions);
                         }
+                        EditorAction::BackwardKillWord => {
+                            // Delegate to backward_kill_word method which handles kill-ring
+                            let kill_actions = self.backward_kill_word();
+                            actions.extend(kill_actions);
+                        }
+                        EditorAction::ForwardKillWord => {
+                            // Delegate to forward_kill_word method which handles kill-ring
+                            let kill_actions = self.forward_kill_word();
+                            actions.extend(kill_actions);
+                        }
                         EditorAction::KillRegion => {
                             // Delegate to kill_region method which handles kill-ring
                             let kill_actions = self.kill_region();
@@ -2846,6 +2856,88 @@ impl Editor {
                 let window_cursor = window.absolute_cursor_position(new_cursor.0, new_cursor.1);
                 vec![
                     ChromeAction::Echo(format!("Killed line: {}", killed.replace('\n', "\\n"))),
+                    ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                        buffer_id: window.active_buffer,
+                    }),
+                    ChromeAction::CursorMove(window_cursor),
+                ]
+            }
+            _ => {
+                vec![ChromeAction::Echo("Nothing to kill".to_string())]
+            }
+        }
+    }
+
+    /// Kill word backward (like M-DEL or C-Backspace in Emacs)
+    pub fn backward_kill_word(&mut self) -> Vec<ChromeAction> {
+        let window = &mut self
+            .windows
+            .get_mut(self.active_window)
+            .expect("Active window should exist");
+        let buffer = &mut self
+            .buffers
+            .get_mut(window.active_buffer)
+            .expect("Active buffer should exist");
+
+        let current_pos = window.cursor;
+        let word_start = buffer.move_word_backward(current_pos);
+
+        if word_start >= current_pos {
+            return vec![ChromeAction::Echo("Nothing to kill".to_string())];
+        }
+
+        // Delete from word_start to current_pos
+        let count = current_pos - word_start;
+        let text_to_kill = buffer.delete_pos(word_start, count as isize);
+
+        match text_to_kill {
+            Some(killed) if !killed.is_empty() => {
+                self.kill_ring.kill(killed.clone());
+                window.cursor = word_start;
+                let new_cursor = buffer.to_column_line(window.cursor);
+                let window_cursor = window.absolute_cursor_position(new_cursor.0, new_cursor.1);
+                vec![
+                    ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                        buffer_id: window.active_buffer,
+                    }),
+                    ChromeAction::CursorMove(window_cursor),
+                ]
+            }
+            _ => {
+                vec![ChromeAction::Echo("Nothing to kill".to_string())]
+            }
+        }
+    }
+
+    /// Kill word forward (like M-d in Emacs)
+    pub fn forward_kill_word(&mut self) -> Vec<ChromeAction> {
+        let window = &mut self
+            .windows
+            .get_mut(self.active_window)
+            .expect("Active window should exist");
+        let buffer = &mut self
+            .buffers
+            .get_mut(window.active_buffer)
+            .expect("Active buffer should exist");
+
+        let current_pos = window.cursor;
+        let word_end = buffer.move_word_forward(current_pos);
+
+        if word_end <= current_pos {
+            return vec![ChromeAction::Echo("Nothing to kill".to_string())];
+        }
+
+        // Delete from current_pos to word_end
+        let count = word_end - current_pos;
+        let text_to_kill = buffer.delete_pos(current_pos, count as isize);
+
+        match text_to_kill {
+            Some(killed) if !killed.is_empty() => {
+                self.kill_ring.kill(killed.clone());
+                // Cursor stays at current_pos
+                let new_cursor = buffer.to_column_line(window.cursor);
+                let window_cursor = window.absolute_cursor_position(new_cursor.0, new_cursor.1);
+                vec![
                     ChromeAction::MarkDirty(DirtyRegion::Buffer {
                         buffer_id: window.active_buffer,
                     }),

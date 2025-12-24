@@ -59,6 +59,10 @@ pub enum ModeAction {
     KillText(ActionPosition, isize),
     /// Kill from cursor to end of line
     KillLine,
+    /// Kill word backward (to kill-ring)
+    BackwardKillWord,
+    /// Kill word forward (to kill-ring)
+    ForwardKillWord,
     /// Kill the selected region (requires mark to be set)
     KillRegion,
     /// Copy the selected region to kill-ring without deleting (requires mark to be set)
@@ -227,10 +231,10 @@ impl Mode for ScratchMode {
                 )])
             }
             KeyAction::Escape => ModeResult::Ignored,
-            KeyAction::DeleteWord => ModeResult::Ignored,
+            KeyAction::DeleteWord => ModeResult::Consumed(vec![ModeAction::ForwardKillWord]),
             KeyAction::ToggleCapsLock => ModeResult::Ignored,
             KeyAction::ToggleScrollLock => ModeResult::Ignored,
-            KeyAction::BackspaceWord => ModeResult::Ignored,
+            KeyAction::BackspaceWord => ModeResult::Consumed(vec![ModeAction::BackwardKillWord]),
             KeyAction::AlphaNumeric(x) => ModeResult::Annotated(vec![ModeAction::InsertText(
                 ActionPosition::cursor(),
                 x.to_string(),
@@ -323,10 +327,10 @@ impl Mode for FileMode {
                 )])
             }
             KeyAction::Escape => ModeResult::Ignored,
-            KeyAction::DeleteWord => ModeResult::Ignored,
+            KeyAction::DeleteWord => ModeResult::Consumed(vec![ModeAction::ForwardKillWord]),
             KeyAction::ToggleCapsLock => ModeResult::Ignored,
             KeyAction::ToggleScrollLock => ModeResult::Ignored,
-            KeyAction::BackspaceWord => ModeResult::Ignored,
+            KeyAction::BackspaceWord => ModeResult::Consumed(vec![ModeAction::BackwardKillWord]),
             KeyAction::AlphaNumeric(x) => ModeResult::Annotated(vec![ModeAction::InsertText(
                 ActionPosition::cursor(),
                 x.to_string(),
