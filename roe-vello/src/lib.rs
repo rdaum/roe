@@ -56,15 +56,15 @@ const DEFAULT_HEIGHT: u32 = 800;
 /// Convert a syntax color to Vello Color
 fn syntax_color_to_vello(color: &SyntaxColor, default: Color) -> Color {
     match color {
-        SyntaxColor::Rgb { r, g, b } => Color::rgba8(*r, *g, *b, 255),
+        SyntaxColor::Rgb { r, g, b } => Color::from_rgba8(*r, *g, *b, 255),
         SyntaxColor::Named(name) => match name.to_lowercase().as_str() {
             "black" => Color::BLACK,
-            "red" => Color::rgba8(255, 0, 0, 255),
-            "green" => Color::rgba8(0, 255, 0, 255),
-            "yellow" => Color::rgba8(255, 255, 0, 255),
-            "blue" => Color::rgba8(0, 0, 255, 255),
-            "magenta" => Color::rgba8(255, 0, 255, 255),
-            "cyan" => Color::rgba8(0, 255, 255, 255),
+            "red" => Color::from_rgba8(255, 0, 0, 255),
+            "green" => Color::from_rgba8(0, 255, 0, 255),
+            "yellow" => Color::from_rgba8(255, 255, 0, 255),
+            "blue" => Color::from_rgba8(0, 0, 255, 255),
+            "magenta" => Color::from_rgba8(255, 0, 255, 255),
+            "cyan" => Color::from_rgba8(0, 255, 255, 255),
             "white" => Color::WHITE,
             _ => default,
         },
@@ -89,12 +89,12 @@ fn byte_to_char(s: &str, byte_pos: usize) -> usize {
 const SCROLLBAR_WIDTH: f64 = 14.0;
 
 /// Gutter colors
-const GUTTER_BG_COLOR: Color = Color::rgba8(0x14, 0x14, 0x14, 0xFF); // Slightly darker than bg
-const GUTTER_FG_COLOR: Color = Color::rgba8(0x60, 0x60, 0x60, 0xFF); // Dimmed line numbers
-const GUTTER_SEPARATOR_COLOR: Color = Color::rgba8(0x40, 0x40, 0x40, 0xFF);
-const GUTTER_MODIFIED_COLOR: Color = Color::rgba8(0xFF, 0xD7, 0x00, 0xFF); // Yellow
-const GUTTER_SAVED_COLOR: Color = Color::rgba8(0x00, 0xC8, 0x00, 0xFF); // Green
-const GUTTER_CONFLICT_COLOR: Color = Color::rgba8(0xFF, 0x40, 0x40, 0xFF); // Red
+const GUTTER_BG_COLOR: Color = Color::from_rgba8(0x14, 0x14, 0x14, 0xFF); // Slightly darker than bg
+const GUTTER_FG_COLOR: Color = Color::from_rgba8(0x60, 0x60, 0x60, 0xFF); // Dimmed line numbers
+const GUTTER_SEPARATOR_COLOR: Color = Color::from_rgba8(0x40, 0x40, 0x40, 0xFF);
+const GUTTER_MODIFIED_COLOR: Color = Color::from_rgba8(0xFF, 0xD7, 0x00, 0xFF); // Yellow
+const GUTTER_SAVED_COLOR: Color = Color::from_rgba8(0x00, 0xC8, 0x00, 0xFF); // Green
+const GUTTER_CONFLICT_COLOR: Color = Color::from_rgba8(0xFF, 0x40, 0x40, 0xFF); // Red
 
 /// Application state for the Vello renderer
 pub struct RoeVelloApp<'a> {
@@ -174,7 +174,7 @@ impl<'a> RoeVelloApp<'a> {
 
     fn render(&mut self) {
         // Extract surface info first to avoid borrow conflicts
-        let (width, height, dev_id, format, scale_factor) = {
+        let (width, height, dev_id, scale_factor) = {
             let Some(ref state) = self.state else {
                 return;
             };
@@ -182,7 +182,6 @@ impl<'a> RoeVelloApp<'a> {
                 state.surface.config.width,
                 state.surface.config.height,
                 state.surface.dev_id,
-                state.surface.format,
                 state.window.scale_factor(),
             )
         };
@@ -232,10 +231,10 @@ impl<'a> RoeVelloApp<'a> {
             let renderer = vello::Renderer::new(
                 &device_handle.device,
                 RendererOptions {
-                    surface_format: Some(format),
                     use_cpu: false,
                     antialiasing_support: vello::AaSupport::all(),
                     num_init_threads: None,
+                    pipeline_cache: None,
                 },
             )
             .expect("Failed to create Vello renderer");
@@ -245,11 +244,11 @@ impl<'a> RoeVelloApp<'a> {
         let renderer = self.renderers[dev_id].as_mut().unwrap();
 
         renderer
-            .render_to_surface(
+            .render_to_texture(
                 &device_handle.device,
                 &device_handle.queue,
                 &self.scene,
-                &surface_texture,
+                &state.surface.target_view,
                 &RenderParams {
                     base_color: self.theme.bg_color,
                     width,
@@ -257,8 +256,23 @@ impl<'a> RoeVelloApp<'a> {
                     antialiasing_method: AaConfig::Msaa16,
                 },
             )
-            .expect("Failed to render to surface");
+            .expect("Failed to render to texture");
 
+        let surface_view = surface_texture
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = device_handle
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("vello_blit"),
+            });
+        state.surface.blitter.copy(
+            &device_handle.device,
+            &mut encoder,
+            &state.surface.target_view,
+            &surface_view,
+        );
+        device_handle.queue.submit(Some(encoder.finish()));
         surface_texture.present();
     }
 
@@ -815,7 +829,7 @@ impl<'a> RoeVelloApp<'a> {
         self.scene.fill(
             vello::peniko::Fill::NonZero,
             Affine::IDENTITY,
-            Color::rgba8(0x40, 0x40, 0x40, 0x80),
+            Color::from_rgba8(0x40, 0x40, 0x40, 0x80),
             None,
             &track_rect,
         );
@@ -838,9 +852,9 @@ impl<'a> RoeVelloApp<'a> {
             thumb_y + thumb_height,
         );
         let thumb_color = if is_active {
-            Color::rgba8(0x80, 0x80, 0x80, 0xC0)
+            Color::from_rgba8(0x80, 0x80, 0x80, 0xC0)
         } else {
-            Color::rgba8(0x60, 0x60, 0x60, 0xA0)
+            Color::from_rgba8(0x60, 0x60, 0x60, 0xA0)
         };
         self.scene.fill(
             vello::peniko::Fill::NonZero,
@@ -866,7 +880,7 @@ impl<'a> RoeVelloApp<'a> {
             self.scene.fill(
                 vello::peniko::Fill::NonZero,
                 Affine::IDENTITY,
-                Color::rgba8(0x40, 0x40, 0x40, 0x80),
+                Color::from_rgba8(0x40, 0x40, 0x40, 0x80),
                 None,
                 &htrack_rect,
             );

@@ -13,19 +13,29 @@
 
 //! Text rendering with Parley.
 
-use parley::layout::{Alignment, Layout};
+use parley::layout::{Alignment, AlignmentOptions, Layout};
 use parley::style::{FontFamily, FontStack, StyleProperty};
 use parley::{FontContext, LayoutContext};
 use std::borrow::Cow;
 use vello::kurbo::Affine;
 use vello::peniko::{Brush, Color, Fill};
-use vello::Scene;
+use vello::{NormalizedCoord, Scene};
 
 /// Font size in pixels
 pub const DEFAULT_FONT_SIZE: f32 = 14.0;
 
 /// Line height multiplier
 pub const LINE_HEIGHT_FACTOR: f32 = 1.3;
+
+type TextBrush = [u8; 4];
+
+fn brush_from_color(color: Color) -> TextBrush {
+    color.to_rgba8().to_u8_array()
+}
+
+fn color_from_brush(brush: TextBrush) -> Color {
+    Color::from_rgba8(brush[0], brush[1], brush[2], brush[3])
+}
 
 /// A styled span for rendering text with syntax highlighting
 #[derive(Clone, Debug)]
@@ -67,7 +77,7 @@ impl StyledSpan {
 /// Text renderer using Parley for layout
 pub struct TextRenderer {
     font_cx: FontContext,
-    layout_cx: LayoutContext<Color>,
+    layout_cx: LayoutContext<TextBrush>,
     font_size: f32,
     line_height: f32,
     char_width: f32,
@@ -106,13 +116,13 @@ impl TextRenderer {
     /// Measure actual character width and line height from the font
     fn measure_metrics(
         font_cx: &mut FontContext,
-        layout_cx: &mut LayoutContext<Color>,
+        layout_cx: &mut LayoutContext<TextBrush>,
         font_size: f32,
         font_family: Option<&str>,
     ) -> (f32, f32) {
         // Use a test string to measure character width - 'M' is typically the widest
         let test_str = "MMMMMMMMMM";
-        let mut builder = layout_cx.ranged_builder(font_cx, test_str, 1.0);
+        let mut builder = layout_cx.ranged_builder(font_cx, test_str, 1.0, true);
 
         builder.push_default(StyleProperty::FontSize(font_size));
 
@@ -127,9 +137,9 @@ impl TextRenderer {
             )));
         }
 
-        builder.push_default(StyleProperty::Brush(Color::WHITE));
+        builder.push_default(StyleProperty::Brush(brush_from_color(Color::WHITE)));
 
-        let mut layout: Layout<Color> = builder.build(test_str);
+        let mut layout: Layout<TextBrush> = builder.build(test_str);
         layout.break_all_lines(None);
 
         // Get metrics from the layout
@@ -184,7 +194,9 @@ impl TextRenderer {
         }
 
         // Build layout
-        let mut builder = self.layout_cx.ranged_builder(&mut self.font_cx, text, 1.0);
+        let mut builder = self
+            .layout_cx
+            .ranged_builder(&mut self.font_cx, text, 1.0, true);
 
         // Set styles
         builder.push_default(StyleProperty::FontSize(self.font_size));
@@ -202,14 +214,14 @@ impl TextRenderer {
             )));
         }
 
-        builder.push_default(StyleProperty::Brush(color));
+        builder.push_default(StyleProperty::Brush(brush_from_color(color)));
 
-        let mut layout: Layout<Color> = builder.build(text);
+        let mut layout: Layout<TextBrush> = builder.build(text);
 
         // Don't wrap lines - let clipping handle overflow
         // For proper wrapping we'd need to pre-calculate visual line counts
         layout.break_all_lines(None);
-        layout.align(None, Alignment::Start);
+        layout.align(None, Alignment::Start, AlignmentOptions::default());
 
         // Render glyphs
         self.render_layout(scene, &layout, x, y);
@@ -231,7 +243,9 @@ impl TextRenderer {
         }
 
         // Build layout with ranged styles
-        let mut builder = self.layout_cx.ranged_builder(&mut self.font_cx, text, 1.0);
+        let mut builder = self
+            .layout_cx
+            .ranged_builder(&mut self.font_cx, text, 1.0, true);
 
         // Set default styles
         builder.push_default(StyleProperty::FontSize(self.font_size));
@@ -248,7 +262,7 @@ impl TextRenderer {
             )));
         }
 
-        builder.push_default(StyleProperty::Brush(default_color));
+        builder.push_default(StyleProperty::Brush(brush_from_color(default_color)));
 
         // Apply styled spans
         // Note: span.start and span.end are character positions, convert to byte positions
@@ -274,7 +288,10 @@ impl TextRenderer {
                 .unwrap_or(text.len());
 
             // Apply color for this span
-            builder.push(StyleProperty::Brush(span.color), start_idx..end_idx);
+            builder.push(
+                StyleProperty::Brush(brush_from_color(span.color)),
+                start_idx..end_idx,
+            );
 
             // Apply bold if set
             if span.bold {
@@ -293,18 +310,18 @@ impl TextRenderer {
             }
         }
 
-        let mut layout: Layout<Color> = builder.build(text);
+        let mut layout: Layout<TextBrush> = builder.build(text);
 
         // Don't wrap lines - let clipping handle overflow
         layout.break_all_lines(None);
-        layout.align(None, Alignment::Start);
+        layout.align(None, Alignment::Start, AlignmentOptions::default());
 
         // Render glyphs
         self.render_layout(scene, &layout, x, y);
     }
 
     /// Render a pre-built layout
-    fn render_layout(&self, scene: &mut Scene, layout: &Layout<Color>, x: f32, y: f32) {
+    fn render_layout(&self, scene: &mut Scene, layout: &Layout<TextBrush>, x: f32, y: f32) {
         for line in layout.lines() {
             for item in line.items() {
                 let parley::layout::PositionedLayoutItem::GlyphRun(glyph_run) = item else {
@@ -315,7 +332,7 @@ impl TextRenderer {
                 let font = run.font();
                 let font_size = run.font_size();
                 let synthesis = run.synthesis();
-                let brush = glyph_run.style().brush;
+                let brush = color_from_brush(glyph_run.style().brush);
 
                 let run_x = x + glyph_run.offset();
                 let run_y = y + glyph_run.baseline();
@@ -329,11 +346,8 @@ impl TextRenderer {
                     .map(|angle| Affine::skew(angle.to_radians().tan() as f64, 0.0));
 
                 // Get normalized coordinates for variable fonts
-                let coords: Vec<_> = run
-                    .normalized_coords()
-                    .iter()
-                    .map(|coord| vello::skrifa::instance::NormalizedCoord::from_bits(*coord))
-                    .collect();
+                let coords: Vec<NormalizedCoord> =
+                    run.normalized_coords().iter().copied().collect();
 
                 // Track cumulative x position - glyphs need to be advanced manually
                 let mut cursor_x = 0.0f32;

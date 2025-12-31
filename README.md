@@ -36,7 +36,8 @@ Both renderers share the same core editor, keybindings, and Julia integration.
 - **Mouse support**: Even in console mode, click to position cursor, drag window borders to resize,
   click to switch windows, etc.
 - **Modular architecture**: Has an extensible mode system for different editing behaviors
-- **Syntax highlighting**: Major modes with syntax highlighting and auto-indentation for Julia, Rust, and Markdown
+- **Syntax highlighting**: Major modes with syntax highlighting and auto-indentation for Julia,
+  Rust, and Markdown
 - **Dual rendering**: Terminal or GPU-accelerated native window
 
 ## Key Bindings

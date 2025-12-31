@@ -35,15 +35,15 @@ impl Default for VelloTheme {
     fn default() -> Self {
         Self {
             // Dark theme similar to terminal version
-            bg_color: Color::rgb8(0x1e, 0x1e, 0x1e),
-            fg_color: Color::rgb8(0xd4, 0xd4, 0xd4),
-            selection_color: Color::rgb8(0x26, 0x4f, 0x78),
-            mode_line_bg_color: Color::rgb8(0x00, 0x7a, 0xcc),
-            inactive_mode_line_bg_color: Color::rgb8(0x3c, 0x3c, 0x3c),
-            rune_color: Color::rgb8(0xdc, 0xdc, 0xaa),
-            border_color: Color::rgb8(0x3c, 0x3c, 0x3c),
-            active_border_color: Color::rgb8(0x00, 0x7a, 0xcc),
-            cursor_color: Color::rgb8(0xae, 0xaf, 0xad),
+            bg_color: Color::from_rgb8(0x1e, 0x1e, 0x1e),
+            fg_color: Color::from_rgb8(0xd4, 0xd4, 0xd4),
+            selection_color: Color::from_rgb8(0x26, 0x4f, 0x78),
+            mode_line_bg_color: Color::from_rgb8(0x00, 0x7a, 0xcc),
+            inactive_mode_line_bg_color: Color::from_rgb8(0x3c, 0x3c, 0x3c),
+            rune_color: Color::from_rgb8(0xdc, 0xdc, 0xaa),
+            border_color: Color::from_rgb8(0x3c, 0x3c, 0x3c),
+            active_border_color: Color::from_rgb8(0x00, 0x7a, 0xcc),
+            cursor_color: Color::from_rgb8(0xae, 0xaf, 0xad),
             font_family: String::new(), // Empty means use system monospace
             font_size: 14.0,
         }
@@ -115,5 +115,5 @@ pub fn parse_hex_color(hex: &str) -> Option<Color> {
     let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
     let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
 
-    Some(Color::rgb8(r, g, b))
+    Some(Color::from_rgb8(r, g, b))
 }

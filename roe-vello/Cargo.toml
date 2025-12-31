@@ -13,14 +13,14 @@ path = "src/bin/roe-vello.rs"
 roe-core = { path = "../roe-core" }
 
 # Rendering
-vello = "0.3"
-# Note: wgpu version must match what vello uses (0.3 uses wgpu 22)
+vello = "0.6"
+# Note: wgpu version must match what vello uses.
 
 # Windowing
 winit = "0.30"
 
 # Text
-parley = "0.2"
+parley = "0.7"
 
 # Async
 pollster = "0.4"
