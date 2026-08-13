@@ -6,8 +6,8 @@ description = "Terminal rendering for Roe (Ryan's Own Emacs)"
 
 [dependencies]
 async-trait = "0.1"
+compio = { workspace = true }
 crossterm = { workspace = true }
 futures = { workspace = true }
 roe-core = { path = "../roe-core" }
 slotmap = { workspace = true }
-tokio = { workspace = true }

@@ -31,7 +31,7 @@ use roe_core::editor::{
 use roe_core::gutter::{
     calculate_gutter_width, format_line_number, get_line_status, GutterConfig, LineStatus,
 };
-use roe_core::julia_runtime::face_registry;
+use roe_core::syntax::face_registry;
 use roe_core::syntax::Color as SyntaxColor;
 use roe_core::{Editor, WindowId};
 use std::collections::HashSet;
@@ -100,6 +100,8 @@ const GUTTER_CONFLICT_COLOR: Color = Color::from_rgba8(0xFF, 0x40, 0x40, 0xFF); 
 pub struct RoeVelloApp<'a> {
     /// The editor state
     editor: &'a mut Editor,
+    /// The compio runtime driving buffer host tasks
+    runtime: compio::runtime::Runtime,
     /// Vello render context
     render_cx: RenderContext,
     /// The renderer
@@ -134,7 +136,11 @@ struct RenderState<'s> {
 }
 
 impl<'a> RoeVelloApp<'a> {
-    pub fn new(editor: &'a mut Editor, theme: VelloTheme) -> Self {
+    pub fn new(
+        editor: &'a mut Editor,
+        theme: VelloTheme,
+        runtime: compio::runtime::Runtime,
+    ) -> Self {
         let font_size = theme.font_size;
         let font_family = if theme.font_family.is_empty() {
             None
@@ -144,6 +150,7 @@ impl<'a> RoeVelloApp<'a> {
 
         Self {
             editor,
+            runtime,
             render_cx: RenderContext::new(),
             renderers: vec![],
             state: None,
@@ -384,7 +391,7 @@ impl<'a> RoeVelloApp<'a> {
         let start_line = window.start_line as usize;
         let start_column = window.start_column as usize;
 
-        // Check if gutter should be shown (controlled by major mode / Julia)
+        // Check if gutter should be shown (controlled by major mode)
         let show_gutter = buffer.show_gutter();
 
         // Calculate gutter width and get modified lines
@@ -618,7 +625,7 @@ impl<'a> RoeVelloApp<'a> {
             let text_y = content_y as f32 + (visual_line as f32) * line_height as f32;
 
             // Convert char positions to byte positions for span query
-            // (spans use byte positions for tree-sitter/Julia compatibility)
+            // (spans use byte positions for highlighting compatibility)
             let line_start_byte = char_to_byte(&buffer_content, line_start_char);
             let line_end_byte =
                 char_to_byte(&buffer_content, line_start_char + line_text.chars().count());
@@ -1443,6 +1450,10 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
         _window_id: winit::window::WindowId,
         event: WindowEvent,
     ) {
+        // Editor mutations must run inside the compio runtime context: they may
+        // lazily spawn buffer hosts, which requires an active runtime.
+        let runtime = self.runtime.clone();
+        runtime.block_on(async {
         match event {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
@@ -1469,31 +1480,13 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
                             // Will be redrawn anyway
                         }
                         ChromeAction::BufferChanged {
-                            buffer_id,
-                            start,
-                            old_end,
-                            new_end,
+                            buffer_id: _,
+                            start: _,
+                            old_end: _,
+                            new_end: _,
                         } => {
-                            // Call major mode after-change hook for syntax highlighting
-                            let Some(buffer) = self.editor.buffers.get(buffer_id) else {
-                                continue;
-                            };
-                            let Some(major_mode) = buffer.major_mode() else {
-                                continue;
-                            };
-                            let Some(ref julia_runtime) = self.editor.julia_runtime else {
-                                continue;
-                            };
-
-                            roe_core::julia_runtime::set_current_buffer(buffer.clone());
-                            let runtime = pollster::block_on(julia_runtime.lock());
-                            let _ = pollster::block_on(runtime.call_major_mode_after_change(
-                                &major_mode,
-                                start as i64,
-                                old_end as i64,
-                                new_end as i64,
-                            ));
-                            roe_core::julia_runtime::clear_current_buffer();
+                            // Major mode after-change hooks will be dispatched here once
+                            // the scripting runtime (mica) is integrated.
                         }
                         _ => {}
                     }
@@ -1503,7 +1496,7 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 let mut actions: std::collections::VecDeque<_> =
-                    pollster::block_on(self.handle_key_event(event)).into();
+                    self.handle_key_event(event).await.into();
 
                 while let Some(action) = actions.pop_front() {
                     match action {
@@ -1534,7 +1527,7 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
                             mode_name,
                             initial_content,
                         } => {
-                            // Create a new buffer with the specified mode (e.g., Julia REPL)
+                            // Create a new buffer with the specified mode
                             let cursor_pos = initial_content.len();
                             if let Some(buffer_id) = self.editor.create_buffer_with_mode(
                                 buffer_name,
@@ -1561,56 +1554,38 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
                             }
                         }
                         ChromeAction::BufferChanged {
-                            buffer_id,
-                            start,
-                            old_end,
-                            new_end,
+                            buffer_id: _,
+                            start: _,
+                            old_end: _,
+                            new_end: _,
                         } => {
-                            // Call major mode after-change hook for syntax highlighting
-                            let Some(buffer) = self.editor.buffers.get(buffer_id) else {
-                                continue;
-                            };
-                            let Some(major_mode) = buffer.major_mode() else {
-                                continue;
-                            };
-                            let Some(ref julia_runtime) = self.editor.julia_runtime else {
-                                continue;
-                            };
-
-                            roe_core::julia_runtime::set_current_buffer(buffer.clone());
-                            let runtime = pollster::block_on(julia_runtime.lock());
-                            let _ = pollster::block_on(runtime.call_major_mode_after_change(
-                                &major_mode,
-                                start as i64,
-                                old_end as i64,
-                                new_end as i64,
-                            ));
-                            roe_core::julia_runtime::clear_current_buffer();
+                            // Major mode after-change hooks will be dispatched here once
+                            // the scripting runtime (mica) is integrated.
                         }
                         ChromeAction::ExecuteCommand(command_name) => {
                             // Execute another command via the command registry
                             let context = self.editor.create_command_context();
-                            if self.editor.julia_runtime.is_some() {
-                                match pollster::block_on(
-                                    roe_core::command_mode::CommandMode::execute_command(
-                                        &command_name,
-                                        &self.editor.command_registry,
-                                        context,
-                                    ),
-                                ) {
-                                    Ok(command_actions) => {
-                                        // Process through editor to handle BufferOps etc.
-                                        let processed =
-                                            self.editor.process_chrome_actions(command_actions);
-                                        for a in processed {
-                                            actions.push_back(a);
-                                        }
+                            match roe_core::command_mode::CommandMode::execute_command(
+                                &command_name,
+                                &self.editor.command_registry,
+                                context,
+                            )
+                            .await
+                            {
+                                Ok(command_actions) => {
+                                    // Process through editor to handle BufferOps etc.
+                                    let processed = self
+                                        .editor
+                                        .process_chrome_actions(command_actions)
+                                        .await;
+                                    for a in processed {
+                                        actions.push_back(a);
                                     }
-                                    Err(error_msg) => {
-                                        self.editor.set_echo_message(format!(
-                                            "Command error: {error_msg}"
-                                        ));
-                                    }
+                                }
+                                Err(error_msg) => {
+                                    self.editor.set_echo_message(format!(
+                                        "Command error: {error_msg}"
+                                    ));
                                 }
                             }
                         }
@@ -1760,7 +1735,7 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
                                     }
                                 } else {
                                     // Normal text click
-                                    pollster::block_on(self.handle_mouse_click(x, y));
+                                    self.handle_mouse_click(x, y).await;
                                     // Save cursor position for potential drag selection
                                     let cursor =
                                         self.editor.windows[self.editor.active_window].cursor;
@@ -1787,6 +1762,7 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
             }
             _ => {}
         }
+        });
     }
 }
 
@@ -1851,82 +1827,19 @@ fn adjust_window_tree_ratio_incremental(
     }
 }
 
-/// Load theme settings from Julia runtime
-async fn load_theme_from_julia(editor: &Editor) -> VelloTheme {
-    let mut theme = VelloTheme::default();
-
-    let Some(ref julia_runtime) = editor.julia_runtime else {
-        return theme;
-    };
-
-    let runtime = julia_runtime.lock().await;
-
-    // Color keys to load (supports both "colours" and "colors" spelling)
-    let color_keys = [
-        ("background", "bg"),
-        ("foreground", "fg"),
-        ("selection", "sel"),
-        ("modeline", "mode-line"),
-        ("modeline_inactive", "mode-line-inactive"),
-        ("border", "border"),
-        ("border_active", "active-border"),
-        ("cursor", "cursor"),
-        ("rune", "rune"),
-    ];
-
-    for (key, alias) in color_keys {
-        // Try "colours.key" first, then "colors.key"
-        let value = match runtime.get_config(&format!("colours.{}", key)).await {
-            Ok(Some(v)) => Some(v),
-            _ => runtime
-                .get_config(&format!("colors.{}", key))
-                .await
-                .ok()
-                .flatten(),
-        };
-
-        if let Some(config_value) = value {
-            if let Some(color_str) = config_value.as_string() {
-                theme.set_color(alias, &color_str);
-            }
-        }
-    }
-
-    // Load font settings - try "font.family" or "font.name"
-    let font_family = match runtime.get_config("font.family").await {
-        Ok(Some(v)) => v.as_string(),
-        _ => runtime
-            .get_config("font.name")
-            .await
-            .ok()
-            .flatten()
-            .and_then(|v| v.as_string()),
-    };
-    if let Some(family) = font_family {
-        theme.set_font_family(&family);
-    }
-
-    // Load font size
-    let font_size = match runtime.get_config("font.size").await {
-        Ok(Some(v)) => v.as_integer().map(|i| i as f32),
-        _ => None,
-    };
-    if let Some(size) = font_size {
-        theme.set_font_size(size);
-    }
-
-    theme
-}
-
 /// Run the editor with the Vello renderer
-pub fn run_vello(editor: &mut Editor) -> Result<(), Box<dyn std::error::Error>> {
-    // Load theme from Julia config
-    let theme = pollster::block_on(load_theme_from_julia(editor));
+pub fn run_vello(
+    editor: &mut Editor,
+    runtime: compio::runtime::Runtime,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Theme configuration will come from the scripting runtime (mica) once
+    // integrated; use defaults for now.
+    let theme = VelloTheme::default();
 
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Wait);
 
-    let mut app = RoeVelloApp::new(editor, theme);
+    let mut app = RoeVelloApp::new(editor, theme, runtime);
     event_loop.run_app(&mut app)?;
 
     Ok(())

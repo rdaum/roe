@@ -23,7 +23,7 @@
 //! from the text, but the SpanStore automatically adjusts span positions when
 //! text is inserted or deleted.
 //!
-//! Highlighters (Rust-native or Julia-defined) produce spans which are stored
+//! Highlighters produce spans which are stored
 //! in the SpanStore. Renderers query the SpanStore when drawing to get the
 //! appropriate face for each character.
 
@@ -275,6 +275,15 @@ impl FaceRegistry {
     pub fn iter(&self) -> impl Iterator<Item = (FaceId, &Face)> {
         self.faces.iter()
     }
+}
+
+/// Global face registry, initialized lazily
+static FACE_REGISTRY: std::sync::OnceLock<std::sync::Mutex<FaceRegistry>> =
+    std::sync::OnceLock::new();
+
+/// Get the global face registry (public for use by renderers)
+pub fn face_registry() -> &'static std::sync::Mutex<FaceRegistry> {
+    FACE_REGISTRY.get_or_init(|| std::sync::Mutex::new(FaceRegistry::new()))
 }
 
 /// A span of highlighted text in a buffer.

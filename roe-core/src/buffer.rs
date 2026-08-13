@@ -14,6 +14,8 @@
 use crate::syntax::{FaceId, HighlightSpan, SpanStore};
 use crate::undo::{EditOp, UndoManager};
 use crate::ModeId;
+use compio::buf::BufResult;
+use compio::io::AsyncReadAtExt;
 use std::ops::Range;
 use std::sync::{Arc, RwLock};
 
@@ -33,7 +35,7 @@ pub struct BufferInner {
     pub(crate) transient_mark: bool,
     /// Syntax highlighting spans (auto-adjusted on edits)
     pub(crate) spans: SpanStore,
-    /// Major mode name (e.g., "julia-mode", "fundamental-mode")
+    /// Major mode name (e.g., "rust-mode", "fundamental-mode")
     pub(crate) major_mode: Option<String>,
     /// Whether to show the gutter (line numbers, status) for this buffer
     pub(crate) show_gutter: bool,
@@ -62,7 +64,9 @@ impl BufferInner {
 
     /// Create a new buffer inner and load content from a file
     pub async fn from_file(file_path: &str, modes: &[ModeId]) -> Result<Self, std::io::Error> {
-        let content = tokio::fs::read_to_string(file_path).await?;
+        let mut file = compio::fs::File::open(file_path).await?;
+        let BufResult(result, content) = file.read_to_string_at(String::new(), 0).await;
+        result?;
         let buffer_inner = Self {
             object: file_path.to_string(),
             modes: modes.to_vec(),

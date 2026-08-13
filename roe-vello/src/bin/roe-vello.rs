@@ -14,10 +14,8 @@
 //! Roe editor with Vello/GPU rendering backend.
 
 use roe_core::{
-    buffer_host, command_registry, editor,
-    julia_runtime::{clear_current_buffer, set_current_buffer},
-    kill_ring, mode, Buffer, BufferId, ConfigurableBindings, Editor, Frame, KeyState, Mode, ModeId,
-    Window, WindowId,
+    buffer_host, command_registry, editor, kill_ring, mode, Buffer, BufferId,
+    ConfigurableBindings, Editor, Frame, KeyState, Mode, ModeId, Window, WindowId,
 };
 use slotmap::SlotMap;
 use std::collections::HashMap;
@@ -30,20 +28,10 @@ const DEFAULT_LINES: u16 = 40;
 fn parse_args() -> EditorConfig {
     let args: Vec<String> = std::env::args().collect();
     let mut file_paths = Vec::new();
-    let mut init_file = None;
     let mut i = 1; // Skip program name
 
     while i < args.len() {
         match args[i].as_str() {
-            "--init" | "-i" => {
-                if i + 1 < args.len() {
-                    init_file = Some(args[i + 1].clone());
-                    i += 2;
-                } else {
-                    eprintln!("Error: --init requires a file path");
-                    std::process::exit(1);
-                }
-            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -60,10 +48,7 @@ fn parse_args() -> EditorConfig {
         }
     }
 
-    EditorConfig {
-        file_paths,
-        init_file,
-    }
+    EditorConfig { file_paths }
 }
 
 fn print_help() {
@@ -73,13 +58,11 @@ fn print_help() {
     println!("    roe-vello [OPTIONS] [FILES...]");
     println!();
     println!("OPTIONS:");
-    println!("    -i, --init <FILE>    Specify Julia init file (default: init.jl)");
     println!("    -h, --help           Print this help message");
     println!();
     println!("EXAMPLES:");
     println!("    roe-vello                      # Start with welcome screen");
     println!("    roe-vello file.txt             # Open file.txt");
-    println!("    roe-vello --init myconfig.jl   # Use custom init file");
 }
 
 fn create_welcome_screen_content() -> String {
@@ -109,77 +92,12 @@ fn create_welcome_screen_content() -> String {
 
 struct EditorConfig {
     file_paths: Vec<String>,
-    init_file: Option<String>,
 }
 
 async fn create_editor(config: EditorConfig) -> Editor {
-    // Initialize Julia runtime
-    let julia_runtime = match roe_core::julia_runtime::create_shared_runtime() {
-        Ok(rt) => {
-            eprintln!("[roe-vello] Julia runtime initialized successfully");
-            Some(rt)
-        }
-        Err(e) => {
-            eprintln!("[roe-vello] Warning: Failed to initialize Julia runtime: {e}");
-            eprintln!("[roe-vello] Keybindings will not be available!");
-            None
-        }
-    };
-
-    // Load Julia configuration and keybindings
-    let mut bindings = ConfigurableBindings::new();
-    if let Some(ref julia_runtime) = julia_runtime {
-        let config_path = if let Some(init_file) = &config.init_file {
-            std::path::PathBuf::from(init_file)
-        } else {
-            roe_core::julia_runtime::RoeJuliaRuntime::default_config_path()
-        };
-        eprintln!("[roe-vello] Loading config from: {:?}", config_path);
-
-        let runtime = julia_runtime.lock().await;
-
-        // Load the Roe module first
-        if let Some(roe_module_path) =
-            roe_core::julia_runtime::RoeJuliaRuntime::bundled_roe_module_path()
-        {
-            eprintln!("[roe-vello] Loading Roe module from: {:?}", roe_module_path);
-            if let Err(e) = runtime.load_roe_module(roe_module_path.clone()).await {
-                eprintln!("[roe-vello] Fatal: Failed to load Roe module: {e}");
-                eprintln!("[roe-vello] The editor cannot start without the Roe module.");
-                std::process::exit(1);
-            }
-        } else {
-            eprintln!("[roe-vello] Fatal: Could not find Roe Julia module (jl/roe.jl)");
-            eprintln!("[roe-vello] Make sure to run from the roe directory or install properly.");
-            std::process::exit(1);
-        }
-        drop(runtime);
-
-        // Load user config
-        let mut runtime = julia_runtime.lock().await;
-        if let Err(e) = runtime.load_config(Some(config_path)).await {
-            eprintln!("[roe-vello] Warning: Failed to load config: {e}");
-        }
-        drop(runtime);
-
-        // Query keybindings from Julia
-        let runtime = julia_runtime.lock().await;
-        match runtime.list_keybindings().await {
-            Ok(julia_bindings) => {
-                eprintln!(
-                    "[roe-vello] Loaded {} keybindings from Julia",
-                    julia_bindings.len()
-                );
-                for (key_seq, action) in julia_bindings {
-                    bindings.add_binding(&key_seq, &action);
-                }
-            }
-            Err(e) => {
-                eprintln!("[roe-vello] Warning: Failed to query keybindings: {e}");
-            }
-        }
-        drop(runtime);
-    }
+    // Default keybindings ship in Rust; the scripting runtime (mica) will be
+    // able to extend them once integrated.
+    let bindings = ConfigurableBindings::new();
 
     let mut buffers: SlotMap<BufferId, Buffer> = SlotMap::default();
     let mut buffer_hosts: HashMap<BufferId, buffer_host::BufferHostClient> = HashMap::new();
@@ -204,8 +122,8 @@ async fn create_editor(config: EditorConfig) -> Editor {
             .expect("MessagesMode should exist");
         let mode_list = vec![(welcome_mode_id, "welcome".to_string(), welcome_mode)];
 
-        let (buffer_client, _buffer_handle) =
-            buffer_host::create_buffer_host(buffer, mode_list, buffer_id, julia_runtime.clone());
+        let buffer_client =
+            buffer_host::create_buffer_host(buffer, mode_list, buffer_id);
         buffer_hosts.insert(buffer_id, buffer_client);
     } else {
         // Create buffers for all specified files
@@ -224,20 +142,6 @@ async fn create_editor(config: EditorConfig) -> Editor {
                 }
             };
 
-            // Get and apply major mode for this file
-            if let Some(ref jr) = julia_runtime {
-                let runtime = jr.lock().await;
-                if let Ok(major_mode) = runtime.get_major_mode_for_file(&file_path).await {
-                    buffer.set_major_mode(major_mode.clone());
-
-                    // Call the major mode's init hook
-                    set_current_buffer(buffer.clone());
-                    let _ = runtime.call_major_mode_init(&major_mode).await;
-                    clear_current_buffer();
-                }
-                drop(runtime);
-            }
-
             let buffer_id = buffers.insert(buffer.clone());
 
             if first_buffer_id.is_none() {
@@ -247,12 +151,8 @@ async fn create_editor(config: EditorConfig) -> Editor {
             let file_mode = modes.remove(file_mode_id).expect("FileMode should exist");
             let mode_list = vec![(file_mode_id, "file".to_string(), file_mode)];
 
-            let (buffer_client, _buffer_handle) = buffer_host::create_buffer_host(
-                buffer,
-                mode_list,
-                buffer_id,
-                julia_runtime.clone(),
-            );
+            let buffer_client =
+                buffer_host::create_buffer_host(buffer, mode_list, buffer_id);
             buffer_hosts.insert(buffer_id, buffer_client);
         }
     }
@@ -298,7 +198,6 @@ async fn create_editor(config: EditorConfig) -> Editor {
         current_key_chord: Vec::new(),
         mouse_drag_state: None,
         messages_buffer_id: None,
-        julia_runtime,
         file_watcher,
         last_search_term: String::new(),
     };
@@ -319,22 +218,19 @@ async fn create_editor(config: EditorConfig) -> Editor {
         }
     }
 
-    // Register Julia commands
-    if let Some(ref julia_runtime) = editor.julia_runtime {
-        command_registry::register_julia_commands(&mut editor.command_registry, julia_runtime)
-            .await;
-    }
-
     editor
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = parse_args();
-    let mut editor = create_editor(config).await;
+
+    let runtime =
+        compio::runtime::Runtime::new().expect("Failed to create compio runtime");
+
+    let mut editor = runtime.block_on(create_editor(config));
 
     // Run with Vello renderer
-    roe_vello::run_vello(&mut editor)?;
+    roe_vello::run_vello(&mut editor, runtime)?;
 
     Ok(())
 }

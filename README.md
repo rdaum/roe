@@ -7,9 +7,11 @@ file-oriented, (b) it uses the default GNU Emacs keybinding set, and (c) it's fu
 an embedded scripting language. Unlike the current trend toward "modal" editors, this is a direct
 manipulation editor and proud of it.
 
-Roe uses Julia as its extension language (where Emacs uses Elisp). Keybindings, commands, and
-interactive modes can all be defined in Julia. The core editor is implemented in Rust for
-performance, while Julia provides the high-level customization layer.
+The editor is written in Rust on top of the [compio](https://github.com/compio-rs/compio) async
+runtime. Its scripting layer is being migrated from Julia to [Mica](https://github.com/rdaum/mica),
+a relation-first live programming environment; until that integration lands, the built-in
+keybindings and commands are defined in Rust (`roe-core/src/keys.rs` and
+`roe-core/src/command_registry.rs`).
 
 ## Screenshot
 
@@ -22,29 +24,26 @@ Roe supports two rendering backends:
 - **Terminal** (`roe`): Lightweight, runs in your terminal
 - **Vello/GPU** (`roe-vello`): Native window with GPU-accelerated rendering via Vello/wgpu
 
-Both renderers share the same core editor, keybindings, and Julia integration.
+Both renderers share the same core editor and keybindings.
 
 ## Features
 
-- **Emacs-style keybindings**: Familiar keyboard shortcuts for Emacs users, fully customizable
-- **Julia scripting**: Define commands, keybindings, and interactive modes in Julia
-- **Buffer-oriented editing**: Beyond embedding a Lisp and having macros, one of the core pieces
-  that differentiates an "emacs" from other editors is working with "buffers" not just files and
-  having buffer interaction as a fundamental tool use. Windows are views into buffers, and not all
-  buffers need to be backed by files.
+- **Emacs-style keybindings**: Familiar keyboard shortcuts for Emacs users, customizable
+- **Buffer-oriented editing**: Beyond embedding a scripting language and having macros, one of the
+  core pieces that differentiates an "emacs" from other editors is working with "buffers" not just
+  files and having buffer interaction as a fundamental tool use. Windows are views into buffers, and
+  not all buffers need to be backed by files.
 - **Window management**: Split windows horizontally/vertically, switch between them, same as emacs.
 - **Mouse support**: Even in console mode, click to position cursor, drag window borders to resize,
   click to switch windows, etc.
 - **Modular architecture**: Has an extensible mode system for different editing behaviors
-- **Syntax highlighting**: Major modes with syntax highlighting and auto-indentation for Julia,
-  Rust, and Markdown
 - **Dual rendering**: Terminal or GPU-accelerated native window
 
 ## Key Bindings
 
-Keybindings are defined in Julia and can be customized in your `.roe.jl` configuration file. The
-defaults follow GNU Emacs conventions. Use `define_key("C-x C-s", "save-buffer")` syntax to add or
-override bindings.
+Keybindings follow GNU Emacs conventions and are defined in Rust (`roe-core/src/keys.rs`); they can
+be overridden at runtime via the `Bindings` interface. Once the Mica scripting runtime is
+integrated, bindings and commands will be definable from scripts.
 
 ### Cursor Movement
 
@@ -133,9 +132,6 @@ override bindings.
 ## Building and Running
 
 ```bash
-# Set up Julia (downloads and configures Julia distribution)
-./scripts/setup-julia.sh
-
 # Build the project
 cargo build --release
 
@@ -148,53 +144,14 @@ cargo build --release
 
 ## Configuration
 
-Roe loads configuration from `.roe.jl` in the current directory on startup. Example configuration:
-
-```julia
-# Configuration is defined as a Dict named roe_config
-roe_config = Dict(
-    # Font settings (Vello renderer only)
-    "font" => Dict(
-        "family" => "JetBrains Mono",  # Any installed font
-        "size" => 14
-    ),
-
-    # Color scheme (optional - defaults are used if not specified)
-    # "colors" => Dict(
-    #     "background" => "#1e1e1e",
-    #     "foreground" => "#d4d4d4",
-    #     "selection" => "#264f78",
-    #     "modeline" => "#007acc",
-    #     "cursor" => "#aeafad"
-    # )
-)
-```
-
-### Keybindings
-
-Custom keybindings can also be defined in Julia:
-
-```julia
-using Roe
-
-# Custom keybindings
-define_key("C-s", "save-buffer")      # Quick save
-define_key("C-q", "quit")             # Quick quit
-define_key("F5", "my-build-command")  # Custom command
-
-# Define a custom command
-define_command("insert-date", "Insert current date") do ctx
-    InsertAction(ctx.cursor_pos, string(Dates.today()))
-end
-```
-
-See `jl/keybindings.jl` for the full list of default keybindings.
+Configuration (fonts, colours, custom keybindings) will be provided by the Mica scripting runtime
+once it is integrated; for now the editor runs with its built-in defaults.
 
 ## Architecture
 
 Roe is built with a clean separation of concerns:
 
-- **roe-core**: Core editor logic, buffer management, window system, Julia integration
+- **roe-core**: Core editor logic, buffer management, window system
 - **roe-terminal**: Terminal renderer using crossterm
 - **roe-vello**: GPU renderer using Vello/wgpu with Parley for text layout
 
@@ -223,19 +180,11 @@ This is a work-in-progress editor. Currently implemented:
 - **Dual rendering**:
   - Terminal UI with efficient incremental rendering via crossterm
   - GPU-accelerated native window via Vello/wgpu with configurable fonts
-- **Julia scripting**: Full integration with Julia for customization:
-  - Customizable keybindings via `define_key()`
-  - User-defined commands via `define_command()`
-  - Interactive modes written in Julia (file selector, buffer switcher, Julia REPL)
-  - FFI access to buffer contents from Julia
-  - Theme/font configuration via Julia config file
-- **Syntax highlighting & major modes**:
-  - Julia mode with JuliaSyntax.jl-based highlighting and smart indentation
-  - Rust mode with TreeSitter-based highlighting
-  - Markdown mode with highlighting and list/blockquote continuation
 
 ## Next steps / not yet implemented
 
+- **Scripting integration**: Wire up Mica as the extension language (replacing the former Julia
+  integration) for commands, keybindings, modes, syntax highlighting, and configuration
 - **Macro system**: Record and playback keystroke sequences
 - **Search and replace**: Interactive search, query-replace functionality
 - **LSP integration**: Language server protocol support for modern development features

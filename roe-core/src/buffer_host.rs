@@ -16,7 +16,10 @@ use crate::keys::KeyAction;
 use crate::mode::{ActionPosition, Mode, ModeAction, ModeResult};
 use crate::renderer::DirtyRegion;
 use crate::{BufferId, ModeId};
-use tokio::sync::{mpsc, oneshot};
+use compio::buf::BufResult;
+use compio::io::AsyncWriteAtExt;
+use futures::channel::{mpsc, oneshot};
+use futures::StreamExt;
 
 /// Message sent to a mode actor
 pub enum ModeMessage {
@@ -35,7 +38,7 @@ pub enum ModeMessage {
 /// Persistent mode actor that runs in its own task
 pub struct ModeActor {
     mode_impl: Box<dyn Mode>,
-    receiver: mpsc::Receiver<ModeMessage>,
+    receiver: mpsc::UnboundedReceiver<ModeMessage>,
     #[allow(dead_code)] // Used for potential future mode operations
     buffer: Buffer, // Shared buffer access
     #[allow(dead_code)] // Used for identification in potential future operations
@@ -45,7 +48,7 @@ pub struct ModeActor {
 impl ModeActor {
     pub fn new(
         mode_impl: Box<dyn Mode>,
-        receiver: mpsc::Receiver<ModeMessage>,
+        receiver: mpsc::UnboundedReceiver<ModeMessage>,
         buffer: Buffer,
         mode_id: ModeId,
     ) -> Self {
@@ -58,9 +61,9 @@ impl ModeActor {
     }
 
     /// Spawn the mode actor as a persistent task
-    pub fn spawn(mut self) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            while let Some(message) = self.receiver.recv().await {
+    pub fn spawn(mut self) -> compio::runtime::JoinHandle<()> {
+        compio::runtime::spawn(async move {
+            while let Some(message) = self.receiver.next().await {
                 match message {
                     ModeMessage::KeyAction { action, reply } => {
                         let result = self.mode_impl.perform(&action);
@@ -80,14 +83,14 @@ impl ModeActor {
 
 /// Client handle to communicate with a mode actor
 pub struct ModeClient {
-    sender: mpsc::Sender<ModeMessage>,
+    sender: mpsc::UnboundedSender<ModeMessage>,
     #[allow(dead_code)] // Used for identification in potential future operations
     mode_id: ModeId,
     name: String,
 }
 
 impl ModeClient {
-    pub fn new(sender: mpsc::Sender<ModeMessage>, mode_id: ModeId, name: String) -> Self {
+    pub fn new(sender: mpsc::UnboundedSender<ModeMessage>, mode_id: ModeId, name: String) -> Self {
         Self {
             sender,
             mode_id,
@@ -104,8 +107,7 @@ impl ModeClient {
         };
 
         self.sender
-            .send(message)
-            .await
+            .unbounded_send(message)
             .map_err(|_| format!("Mode {} disconnected", self.name))?;
 
         reply_rx
@@ -122,8 +124,7 @@ impl ModeClient {
         };
 
         self.sender
-            .send(message)
-            .await
+            .unbounded_send(message)
             .map_err(|_| format!("Mode {} disconnected", self.name))?;
 
         reply_rx
@@ -243,13 +244,13 @@ pub struct BufferMessage {
 /// Client-side interface for communicating with BufferHost
 #[derive(Clone)]
 pub struct BufferHostClient {
-    sender: mpsc::Sender<BufferMessage>,
+    sender: mpsc::UnboundedSender<BufferMessage>,
     #[allow(dead_code)] // Used for identification in potential future operations
     buffer_id: BufferId,
 }
 
 impl BufferHostClient {
-    pub fn new(sender: mpsc::Sender<BufferMessage>, buffer_id: BufferId) -> Self {
+    pub fn new(sender: mpsc::UnboundedSender<BufferMessage>, buffer_id: BufferId) -> Self {
         Self { sender, buffer_id }
     }
 
@@ -269,8 +270,7 @@ impl BufferHostClient {
         };
 
         self.sender
-            .send(message)
-            .await
+            .unbounded_send(message)
             .map_err(|_| "BufferHost disconnected".to_string())?;
 
         reply_rx
@@ -284,7 +284,7 @@ impl BufferHostClient {
         event: crate::mode::MouseEvent,
         cursor_pos: usize,
     ) -> Result<BufferResponse, String> {
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
 
         let message = BufferMessage {
             request: BufferRequest::HandleMouse { event, cursor_pos },
@@ -292,8 +292,7 @@ impl BufferHostClient {
         };
 
         self.sender
-            .send(message)
-            .await
+            .unbounded_send(message)
             .map_err(|_| "BufferHost disconnected".to_string())?;
 
         reply_rx
@@ -306,29 +305,22 @@ impl BufferHostClient {
 pub struct BufferHost {
     buffer: Buffer,
     mode_clients: Vec<ModeClient>,
-    receiver: mpsc::Receiver<BufferMessage>,
+    receiver: mpsc::UnboundedReceiver<BufferMessage>,
     buffer_id: BufferId,
-    mode_handles: Vec<tokio::task::JoinHandle<()>>, // Keep track of spawned mode tasks
-    julia_runtime:
-        Option<std::sync::Arc<tokio::sync::Mutex<crate::julia_runtime::RoeJuliaRuntime>>>,
 }
 
 impl BufferHost {
     pub fn new(
         buffer: Buffer,
         modes: Vec<(ModeId, String, Box<dyn Mode>)>,
-        receiver: mpsc::Receiver<BufferMessage>,
+        receiver: mpsc::UnboundedReceiver<BufferMessage>,
         buffer_id: BufferId,
-        julia_runtime: Option<
-            std::sync::Arc<tokio::sync::Mutex<crate::julia_runtime::RoeJuliaRuntime>>,
-        >,
     ) -> Self {
         let mut mode_clients = Vec::new();
-        let mut mode_handles = Vec::new();
 
         // Spawn each mode as a persistent actor
         for (mode_id, name, mode_impl) in modes {
-            let (sender, mode_receiver) = mpsc::channel(32);
+            let (sender, mode_receiver) = mpsc::unbounded();
 
             let mode_actor = ModeActor::new(
                 mode_impl,
@@ -337,9 +329,8 @@ impl BufferHost {
                 mode_id,
             );
 
-            // Spawn the mode actor
-            let handle = mode_actor.spawn();
-            mode_handles.push(handle);
+            // Spawn the mode actor; it runs until all senders are dropped.
+            mode_actor.spawn().detach();
 
             mode_clients.push(ModeClient::new(sender, mode_id, name));
         }
@@ -349,25 +340,21 @@ impl BufferHost {
             mode_clients,
             receiver,
             buffer_id,
-            mode_handles,
-            julia_runtime,
         }
     }
 
     /// Spawn the BufferHost as an async task
-    pub fn spawn(mut self) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            while let Some(message) = self.receiver.recv().await {
+    pub fn spawn(mut self) -> compio::runtime::JoinHandle<()> {
+        compio::runtime::spawn(async move {
+            while let Some(message) = self.receiver.next().await {
                 let response = self.handle_request(message.request).await;
 
                 // Send reply (ignore if receiver dropped)
                 let _ = message.reply.send(response);
             }
 
-            // Clean up mode tasks when BufferHost shuts down
-            for handle in self.mode_handles {
-                handle.abort();
-            }
+            // Mode actors exit on their own when the clients (and their
+            // channel senders) are dropped along with this host.
         })
     }
 
@@ -735,35 +722,6 @@ impl BufferHost {
                         buffer_id: self.buffer_id,
                     });
                 }
-                ModeAction::EvalJulia(expression) => {
-                    if let Some(ref julia_runtime) = self.julia_runtime {
-                        let result = {
-                            let runtime = julia_runtime.lock().await;
-                            runtime.eval_expression(&expression).await
-                        };
-
-                        let formatted_output = match result {
-                            Ok(output) => format!("{output}\njulia> "),
-                            Err(e) => format!("Error: {e}\njulia> "),
-                        };
-
-                        let buffer_len = self.buffer.buffer_len_chars();
-                        let output_len = formatted_output.len();
-                        self.buffer.insert_pos(formatted_output, buffer_len);
-                        new_cursor_pos = Some(buffer_len + output_len);
-                        dirty_regions.push(DirtyRegion::Buffer {
-                            buffer_id: self.buffer_id,
-                        });
-                    } else {
-                        let error_msg = "Error: Julia runtime not available\njulia> ";
-                        let buffer_len = self.buffer.buffer_len_chars();
-                        self.buffer.insert_pos(error_msg.to_string(), buffer_len);
-                        new_cursor_pos = Some(buffer_len + error_msg.len());
-                        dirty_regions.push(DirtyRegion::Buffer {
-                            buffer_id: self.buffer_id,
-                        });
-                    }
-                }
                 ModeAction::UpdateIsearch {
                     target_buffer_id,
                     target_window_id,
@@ -841,7 +799,15 @@ impl BufferHost {
 
         let content = self.buffer.with_read(|b| b.buffer.to_string());
 
-        match tokio::fs::write(&file_path, content.as_bytes()).await {
+        let result: std::io::Result<()> = async {
+            let mut file = compio::fs::File::create(&file_path).await?;
+            let BufResult(res, _buf) = file.write_all_at(content.into_bytes(), 0).await;
+            res?;
+            Ok(())
+        }
+        .await;
+
+        match result {
             Ok(()) => BufferResponse::Saved(file_path),
             Err(e) => BufferResponse::Error(format!("Save failed: {e}")),
         }
@@ -872,15 +838,13 @@ pub fn create_buffer_host(
     buffer: Buffer,
     modes: Vec<(ModeId, String, Box<dyn Mode>)>,
     buffer_id: BufferId,
-    julia_runtime: Option<
-        std::sync::Arc<tokio::sync::Mutex<crate::julia_runtime::RoeJuliaRuntime>>,
-    >,
-) -> (BufferHostClient, tokio::task::JoinHandle<()>) {
-    let (sender, receiver) = mpsc::channel(100);
+) -> BufferHostClient {
+    let (sender, receiver) = mpsc::unbounded();
 
     let client = BufferHostClient::new(sender, buffer_id);
-    let host = BufferHost::new(buffer, modes, receiver, buffer_id, julia_runtime);
-    let handle = host.spawn();
+    let host = BufferHost::new(buffer, modes, receiver, buffer_id);
+    // Detach: the host runs until its client senders are dropped.
+    host.spawn().detach();
 
-    (client, handle)
+    client
 }

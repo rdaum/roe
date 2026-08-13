@@ -17,14 +17,14 @@ use crate::buffer_switch_mode::{BufferSwitchMode, BufferSwitchPurpose};
 use crate::command_mode::CommandMode;
 use crate::command_registry::CommandRegistry;
 use crate::file_selector_mode::FileSelectorMode;
-use crate::julia_runtime::{clear_current_buffer, set_current_buffer};
 use crate::keys::KeyAction::ChordNext;
 use crate::keys::{Bindings, CursorDirection, KeyAction, KeyState, LogicalKey};
 use crate::kill_ring::KillRing;
-use crate::mode::{ActionPosition, MessagesMode, Mode, ModeAction, ModeResult};
+use crate::mode::{ActionPosition, MessagesMode, Mode};
 use crate::renderer::{DirtyRegion, ModelineComponent};
-use crate::scripted_mode::ScriptedMode;
 use crate::{BufferId, ModeId, WindowId};
+use compio::buf::BufResult;
+use compio::io::AsyncWriteAtExt;
 use slotmap::SlotMap;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -229,9 +229,6 @@ pub struct Editor {
     pub mouse_drag_state: Option<MouseDragState>,
     /// Messages buffer for collecting echo messages and logs
     pub messages_buffer_id: Option<BufferId>,
-    /// Julia runtime for scripting and configuration
-    pub julia_runtime:
-        Option<std::sync::Arc<tokio::sync::Mutex<crate::julia_runtime::RoeJuliaRuntime>>>,
     /// File watcher for detecting external changes
     pub file_watcher: crate::file_watcher::FileWatcher,
     /// Last search term used in isearch (for prepopulating next search)
@@ -242,7 +239,7 @@ pub struct Editor {
 /// in the active window.
 impl Editor {}
 
-/// Operations that can be performed on a buffer from Julia commands
+/// Operations that can be performed on a buffer by scripted commands
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum BufferOperation {
     /// Insert text at a position
@@ -307,7 +304,7 @@ pub enum ChromeAction {
         mode_name: String,
         initial_content: String,
     },
-    /// Execute buffer operations (from Julia commands)
+    /// Execute buffer operations (from scripted commands)
     BufferOps(Vec<BufferOperation>),
     /// Dump messages buffer to a file
     DumpMessages(String),
@@ -393,87 +390,27 @@ impl Editor {
                     .map(|(id, buffer)| (id, buffer.object()))
                     .collect();
 
-                // Try to use Julia-based buffer switcher if runtime is available
-                if let Some(ref runtime) = self.julia_runtime {
-                    let mut scripted_mode =
-                        ScriptedMode::new("julia-buffer-switcher".to_string(), runtime.clone());
+                // Use the Rust BufferSwitchMode for buffer selection
+                let mut buffer_switch_mode =
+                    BufferSwitchMode::new_with_purpose(BufferSwitchPurpose::Switch);
 
-                    // Build buffer ID map and JSON for Julia
-                    let buffer_id_map: Vec<BufferId> =
-                        buffer_list.iter().map(|(id, _)| *id).collect();
-                    let buffers_json = buffer_list
-                        .iter()
-                        .enumerate()
-                        .map(|(i, (_, name))| {
-                            format!(
-                                r#"{{"index":{},"name":"{}"}}"#,
-                                i,
-                                name.replace('"', "\\\"")
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    let buffers_json = format!("[{}]", buffers_json);
-
-                    scripted_mode.set_buffer_id_map(buffer_id_map);
-                    scripted_mode.set_init_param("buffers", &buffers_json);
-                    scripted_mode.set_init_param("purpose", "switch");
-
-                    // For switch mode, pre-select the previous buffer
-                    let current_buffer_id = self.windows[self.active_window].active_buffer;
-                    if let Some(previous_buffer_id) = self.get_previous_buffer(current_buffer_id) {
-                        if let Some(idx) = buffer_list
-                            .iter()
-                            .position(|(id, _)| *id == previous_buffer_id)
-                        {
-                            scripted_mode.set_init_param("preselect", &idx.to_string());
-                        }
-                    }
-
-                    // Trigger init immediately
-                    let init_result = scripted_mode.perform(&KeyAction::Unbound);
-                    let content = match init_result {
-                        ModeResult::Consumed(actions) | ModeResult::Annotated(actions) => actions
-                            .into_iter()
-                            .find_map(|action| {
-                                if let ModeAction::InsertText(_, text) = action {
-                                    Some(text)
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or_else(|| "Loading buffer switcher...\n".to_string()),
-                        ModeResult::Ignored => "Loading buffer switcher...\n".to_string(),
-                    };
-
-                    (
-                        Box::new(scripted_mode) as Box<dyn Mode>,
-                        "julia-buffer-switcher".to_string(),
-                        content,
-                    )
+                let current_buffer_id = self.windows[self.active_window].active_buffer;
+                if let Some(previous_buffer_id) = self.get_previous_buffer(current_buffer_id) {
+                    buffer_switch_mode.init_with_buffer_and_preselect(
+                        command_buffer_id,
+                        buffer_list,
+                        previous_buffer_id,
+                    );
                 } else {
-                    // Fall back to Rust BufferSwitchMode if no Julia runtime
-                    let mut buffer_switch_mode =
-                        BufferSwitchMode::new_with_purpose(BufferSwitchPurpose::Switch);
-
-                    let current_buffer_id = self.windows[self.active_window].active_buffer;
-                    if let Some(previous_buffer_id) = self.get_previous_buffer(current_buffer_id) {
-                        buffer_switch_mode.init_with_buffer_and_preselect(
-                            command_buffer_id,
-                            buffer_list,
-                            previous_buffer_id,
-                        );
-                    } else {
-                        buffer_switch_mode.init_with_buffer(command_buffer_id, buffer_list);
-                    }
-
-                    let content = buffer_switch_mode.generate_buffer_content();
-                    (
-                        Box::new(buffer_switch_mode) as Box<dyn Mode>,
-                        "buffer-switch".to_string(),
-                        content,
-                    )
+                    buffer_switch_mode.init_with_buffer(command_buffer_id, buffer_list);
                 }
+
+                let content = buffer_switch_mode.generate_buffer_content();
+                (
+                    Box::new(buffer_switch_mode) as Box<dyn Mode>,
+                    "buffer-switch".to_string(),
+                    content,
+                )
             }
             CommandType::KillBuffer => {
                 // Show all buffers except command window buffers (including the current one being created)
@@ -494,134 +431,34 @@ impl Editor {
                     .map(|(id, buffer)| (id, buffer.object()))
                     .collect();
 
-                // Try to use Julia-based buffer switcher if runtime is available
-                if let Some(ref runtime) = self.julia_runtime {
-                    let mut scripted_mode =
-                        ScriptedMode::new("julia-buffer-switcher".to_string(), runtime.clone());
+                // Use the Rust BufferSwitchMode for buffer killing
+                let mut buffer_switch_mode =
+                    BufferSwitchMode::new_with_purpose(BufferSwitchPurpose::Kill);
+                let current_buffer_id = self.windows[self.active_window].active_buffer;
+                buffer_switch_mode.init_with_buffer_and_preselect(
+                    command_buffer_id,
+                    buffer_list,
+                    current_buffer_id,
+                );
 
-                    // Build buffer ID map and JSON for Julia
-                    let buffer_id_map: Vec<BufferId> =
-                        buffer_list.iter().map(|(id, _)| *id).collect();
-                    let buffers_json = buffer_list
-                        .iter()
-                        .enumerate()
-                        .map(|(i, (_, name))| {
-                            format!(
-                                r#"{{"index":{},"name":"{}"}}"#,
-                                i,
-                                name.replace('"', "\\\"")
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    let buffers_json = format!("[{}]", buffers_json);
-
-                    scripted_mode.set_buffer_id_map(buffer_id_map);
-                    scripted_mode.set_init_param("buffers", &buffers_json);
-                    scripted_mode.set_init_param("purpose", "kill");
-
-                    // For kill mode, pre-select the current buffer
-                    let current_buffer_id = self.windows[self.active_window].active_buffer;
-                    if let Some(idx) = buffer_list
-                        .iter()
-                        .position(|(id, _)| *id == current_buffer_id)
-                    {
-                        scripted_mode.set_init_param("preselect", &idx.to_string());
-                    }
-
-                    // Trigger init immediately
-                    let init_result = scripted_mode.perform(&KeyAction::Unbound);
-                    let content = match init_result {
-                        ModeResult::Consumed(actions) | ModeResult::Annotated(actions) => actions
-                            .into_iter()
-                            .find_map(|action| {
-                                if let ModeAction::InsertText(_, text) = action {
-                                    Some(text)
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or_else(|| "Loading buffer switcher...\n".to_string()),
-                        ModeResult::Ignored => "Loading buffer switcher...\n".to_string(),
-                    };
-
-                    (
-                        Box::new(scripted_mode) as Box<dyn Mode>,
-                        "julia-buffer-switcher".to_string(),
-                        content,
-                    )
-                } else {
-                    // Fall back to Rust BufferSwitchMode if no Julia runtime
-                    let mut buffer_switch_mode =
-                        BufferSwitchMode::new_with_purpose(BufferSwitchPurpose::Kill);
-                    let current_buffer_id = self.windows[self.active_window].active_buffer;
-                    buffer_switch_mode.init_with_buffer_and_preselect(
-                        command_buffer_id,
-                        buffer_list,
-                        current_buffer_id,
-                    );
-
-                    let content = buffer_switch_mode.generate_buffer_content();
-                    (
-                        Box::new(buffer_switch_mode) as Box<dyn Mode>,
-                        "buffer-kill".to_string(),
-                        content,
-                    )
-                }
+                let content = buffer_switch_mode.generate_buffer_content();
+                (
+                    Box::new(buffer_switch_mode) as Box<dyn Mode>,
+                    "buffer-kill".to_string(),
+                    content,
+                )
             }
             CommandType::OpenFile(open_type) => {
-                // Try to use Julia-based file selector if runtime is available
-                if let Some(ref runtime) = self.julia_runtime {
-                    // Create ScriptedMode that delegates to Julia
-                    let mut scripted_mode =
-                        ScriptedMode::new("julia-file-selector".to_string(), runtime.clone());
+                // Use the Rust FileSelectorMode for file selection
+                let mut file_selector_mode = FileSelectorMode::new(open_type);
+                file_selector_mode.init_with_buffer(command_buffer_id);
 
-                    // Set open_type in the mode so it can pass it to Julia
-                    let open_type_str = match open_type {
-                        OpenType::New => "new",
-                        OpenType::Visit => "visit",
-                    };
-                    scripted_mode.set_init_param("open_type", open_type_str);
-
-                    // Trigger init immediately to get initial content (avoids delay on first keypress)
-                    // Send an Unbound action which will be converted to "init" on first call
-                    let init_result = scripted_mode.perform(&KeyAction::Unbound);
-
-                    // Extract the content from the init result
-                    let content = match init_result {
-                        ModeResult::Consumed(actions) | ModeResult::Annotated(actions) => {
-                            // Look for InsertText action to get the content
-                            actions
-                                .into_iter()
-                                .find_map(|action| {
-                                    if let ModeAction::InsertText(_, text) = action {
-                                        Some(text)
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .unwrap_or_else(|| "Loading file selector...\n".to_string())
-                        }
-                        ModeResult::Ignored => "Loading file selector...\n".to_string(),
-                    };
-
-                    (
-                        Box::new(scripted_mode) as Box<dyn Mode>,
-                        "julia-file-selector".to_string(),
-                        content,
-                    )
-                } else {
-                    // Fall back to Rust FileSelectorMode if no Julia runtime
-                    let mut file_selector_mode = FileSelectorMode::new(open_type);
-                    file_selector_mode.init_with_buffer(command_buffer_id);
-
-                    let content = file_selector_mode.generate_buffer_content();
-                    (
-                        Box::new(file_selector_mode) as Box<dyn Mode>,
-                        "file-selector".to_string(),
-                        content,
-                    )
-                }
+                let content = file_selector_mode.generate_buffer_content();
+                (
+                    Box::new(file_selector_mode) as Box<dyn Mode>,
+                    "file-selector".to_string(),
+                    content,
+                )
             }
             CommandType::ISearch { .. } => {
                 // ISearch has its own create_isearch_window function
@@ -644,11 +481,10 @@ impl Editor {
                 .expect("Mode should exist in SlotMap"),
         )];
 
-        let (buffer_client, _buffer_handle) = crate::buffer_host::create_buffer_host(
+        let buffer_client = crate::buffer_host::create_buffer_host(
             command_buffer,
             mode_list,
             command_buffer_id,
-            self.julia_runtime.clone(),
         );
 
         // Insert the BufferHost using the buffer ID as the key for easy lookup/cleanup
@@ -738,7 +574,7 @@ impl Editor {
         if !initial_matches.is_empty() {
             // Apply highlights to target buffer
             if let Some(buffer) = self.buffers.get(target_buffer_id) {
-                let face_registry = crate::julia_runtime::face_registry();
+                let face_registry = crate::syntax::face_registry();
                 if let Ok(registry) = face_registry.lock() {
                     let match_face_id = registry.get_id("isearch-match");
                     let current_face_id = registry.get_id("isearch-current");
@@ -801,11 +637,10 @@ impl Editor {
             Box::new(isearch_mode) as Box<dyn Mode>,
         )];
 
-        let (buffer_client, _buffer_handle) = crate::buffer_host::create_buffer_host(
+        let buffer_client = crate::buffer_host::create_buffer_host(
             command_buffer,
             mode_list,
             command_buffer_id,
-            self.julia_runtime.clone(),
         );
 
         self.buffer_hosts.insert(command_buffer_id, buffer_client);
@@ -937,11 +772,10 @@ impl Editor {
                     .remove(messages_mode_id)
                     .expect("Messages mode should exist in SlotMap"),
             )];
-            let (buffer_client, _buffer_handle) = crate::buffer_host::create_buffer_host(
+            let buffer_client = crate::buffer_host::create_buffer_host(
                 messages_buffer,
                 mode_list,
                 messages_buffer_id,
-                self.julia_runtime.clone(),
             );
             self.buffer_hosts.insert(messages_buffer_id, buffer_client);
 
@@ -978,7 +812,6 @@ impl Editor {
     ) -> Option<BufferId> {
         // Create the appropriate mode based on mode_name
         let mode_box: Box<dyn Mode> = match mode_name.as_str() {
-            "julia-repl" => Box::new(crate::mode::JuliaReplMode::new()),
             "scratch" => Box::new(crate::mode::ScratchMode {}),
             "messages" => Box::new(crate::mode::MessagesMode {}),
             _ => return None, // Unknown mode
@@ -999,12 +832,8 @@ impl Editor {
                 .remove(mode_id)
                 .expect("Mode should exist in SlotMap"),
         )];
-        let (buffer_client, _buffer_handle) = crate::buffer_host::create_buffer_host(
-            buffer,
-            mode_list,
-            buffer_id,
-            self.julia_runtime.clone(),
-        );
+        let buffer_client =
+            crate::buffer_host::create_buffer_host(buffer, mode_list, buffer_id);
         self.buffer_hosts.insert(buffer_id, buffer_client);
 
         Some(buffer_id)
@@ -1943,18 +1772,11 @@ impl Editor {
                             window.cursor
                         };
                         if let Some(buffer_host) = self.buffer_hosts.get(&buffer_id).cloned() {
-                            let response_result = tokio::task::block_in_place(|| {
-                                tokio::runtime::Handle::current().block_on(async {
-                                    buffer_host.handle_key(mode_key_action, cursor_pos).await
-                                })
-                            });
+                            let response_result =
+                                buffer_host.handle_key(mode_key_action, cursor_pos).await;
                             match response_result {
                                 Ok(response) => {
-                                    return Ok(tokio::task::block_in_place(|| {
-                                        tokio::runtime::Handle::current().block_on(async {
-                                            self.handle_buffer_response(response).await
-                                        })
-                                    }));
+                                    return Ok(self.handle_buffer_response(response).await);
                                 }
                                 Err(err) => {
                                     return Ok(vec![ChromeAction::Echo(format!(
@@ -1999,18 +1821,11 @@ impl Editor {
                             self.buffer_hosts.get(&isearch_buffer_id).cloned()
                         {
                             let cursor_pos = self.windows[command_window_id].cursor;
-                            let response_result = tokio::task::block_in_place(|| {
-                                tokio::runtime::Handle::current().block_on(async {
-                                    buffer_host.handle_key(key_action.clone(), cursor_pos).await
-                                })
-                            });
+                            let response_result =
+                                buffer_host.handle_key(key_action.clone(), cursor_pos).await;
                             match response_result {
                                 Ok(response) => {
-                                    return Ok(tokio::task::block_in_place(|| {
-                                        tokio::runtime::Handle::current().block_on(async {
-                                            self.handle_buffer_response(response).await
-                                        })
-                                    }));
+                                    return Ok(self.handle_buffer_response(response).await);
                                 }
                                 Err(err) => {
                                     return Ok(vec![ChromeAction::Echo(format!(
@@ -2025,7 +1840,7 @@ impl Editor {
                         let context = self.create_command_context();
                         if let Some(command) = self.command_registry.get_command(command_name) {
                             match command.execute(context).await {
-                                Ok(actions) => return Ok(self.process_chrome_actions(actions)),
+                                Ok(actions) => return Ok(self.process_chrome_actions(actions).await),
                                 Err(error_msg) => {
                                     return Ok(vec![ChromeAction::Echo(format!(
                                         "Error: {error_msg}"
@@ -2052,7 +1867,7 @@ impl Editor {
                     let context = self.create_command_context();
                     if let Some(command) = self.command_registry.get_command(command_name) {
                         match command.execute(context).await {
-                            Ok(actions) => return Ok(self.process_chrome_actions(actions)),
+                            Ok(actions) => return Ok(self.process_chrome_actions(actions).await),
                             Err(error_msg) => {
                                 return Ok(vec![ChromeAction::Echo(format!("Error: {error_msg}"))]);
                             }
@@ -2085,17 +1900,10 @@ impl Editor {
         };
 
         let chrome_actions = if let Some(buffer_host) = self.buffer_hosts.get(&buffer_id).cloned() {
-            // Use async runtime to handle the async BufferHost call
-            let response_result = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current()
-                    .block_on(async { buffer_host.handle_key(key_action, cursor_pos).await })
-            });
+            let response_result = buffer_host.handle_key(key_action, cursor_pos).await;
 
             match response_result {
-                Ok(response) => tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current()
-                        .block_on(async { self.handle_buffer_response(response).await })
-                }),
+                Ok(response) => self.handle_buffer_response(response).await,
                 Err(err) => vec![ChromeAction::Echo(format!("Buffer error: {err}"))],
             }
         } else {
@@ -2184,7 +1992,8 @@ impl Editor {
                                 Ok(command_actions) => {
                                     // Process actions through unified system
                                     let mut processed_actions =
-                                        self.process_chrome_actions(command_actions);
+                                        Box::pin(self.process_chrome_actions(command_actions))
+                                            .await;
                                     actions.append(&mut processed_actions);
                                 }
                                 Err(error_msg) => {
@@ -2293,12 +2102,11 @@ impl Editor {
                                             .remove(scratch_mode_id)
                                             .expect("Scratch mode should exist"),
                                     )];
-                                    let (buffer_client, _buffer_handle) =
+                                    let buffer_client =
                                         buffer_host::create_buffer_host(
                                             scratch_buffer,
                                             mode_list,
                                             scratch_buffer_id,
-                                            self.julia_runtime.clone(),
                                         );
                                     self.buffer_hosts.insert(scratch_buffer_id, buffer_client);
 
@@ -2419,7 +2227,7 @@ impl Editor {
                                 });
 
                                 // Add spans for all matches
-                                let face_registry = crate::julia_runtime::face_registry();
+                                let face_registry = crate::syntax::face_registry();
                                 if let Ok(registry) = face_registry.lock() {
                                     let match_face_id = registry.get_id("isearch-match");
                                     let current_face_id = registry.get_id("isearch-current");
@@ -3084,8 +2892,16 @@ impl Editor {
         let file_path_clone = file_path.clone();
 
         // Start async save operation without blocking
-        tokio::spawn(async move {
-            match tokio::fs::write(&file_path_clone, content.as_bytes()).await {
+        compio::runtime::spawn(async move {
+            let result: std::io::Result<()> = async {
+                let mut file = compio::fs::File::create(&file_path_clone).await?;
+                let BufResult(res, _buf) = file.write_all_at(content.into_bytes(), 0).await;
+                res?;
+                Ok(())
+            }
+            .await;
+
+            match result {
                 Ok(()) => {
                     // TODO: Send success message back to editor
                     eprintln!("Saved {file_path_clone}");
@@ -3095,7 +2911,8 @@ impl Editor {
                     eprintln!("Error saving {file_path_clone}: {err}");
                 }
             }
-        });
+        })
+        .detach();
 
         vec![ChromeAction::Echo(format!("Saving {file_path}..."))]
     }
@@ -3187,18 +3004,8 @@ impl Editor {
             }
         };
 
-        // Apply major mode based on file extension
-        if let Some(ref julia_runtime) = self.julia_runtime {
-            let file_path_str = file_path.to_string_lossy().to_string();
-            let runtime = julia_runtime.lock().await;
-            if let Ok(major_mode) = runtime.get_major_mode_for_file(&file_path_str).await {
-                buffer.set_major_mode(major_mode.clone());
-                // Set the buffer as current for the init hook
-                set_current_buffer(buffer.clone());
-                let _ = runtime.call_major_mode_init(&major_mode).await;
-                clear_current_buffer();
-            }
-        }
+        // Major mode selection based on file extension will be re-added when
+        // the scripting runtime (mica) is integrated.
 
         let buffer_id = self.buffers.insert(buffer.clone());
 
@@ -3216,12 +3023,8 @@ impl Editor {
         let mode_list = vec![(file_mode_id, "file".to_string(), file_mode)];
 
         // Create BufferHost and client
-        let (buffer_client, _buffer_handle) = crate::buffer_host::create_buffer_host(
-            buffer,
-            mode_list,
-            buffer_id,
-            self.julia_runtime.clone(),
-        );
+        let buffer_client =
+            crate::buffer_host::create_buffer_host(buffer, mode_list, buffer_id);
         self.buffer_hosts.insert(buffer_id, buffer_client);
 
         // Switch the window to the new buffer
@@ -3237,7 +3040,7 @@ impl Editor {
 
     /// Create a CommandContext from the current editor state
     /// Process ChromeActions and handle those that need editor state changes
-    pub fn process_chrome_actions(&mut self, actions: Vec<ChromeAction>) -> Vec<ChromeAction> {
+    pub async fn process_chrome_actions(&mut self, actions: Vec<ChromeAction>) -> Vec<ChromeAction> {
         let mut result_actions = Vec::new();
 
         for action in actions {
@@ -3321,19 +3124,12 @@ impl Editor {
 
                     if let Some(buffer_host) = self.buffer_hosts.get(&buffer_id).cloned() {
                         // Use async runtime to handle the async BufferHost call
-                        let response_result = tokio::task::block_in_place(|| {
-                            tokio::runtime::Handle::current().block_on(async {
-                                buffer_host.handle_key(KeyAction::Save, cursor_pos).await
-                            })
-                        });
+                        let response_result =
+                            buffer_host.handle_key(KeyAction::Save, cursor_pos).await;
 
                         match response_result {
                             Ok(response) => {
-                                let save_actions = tokio::task::block_in_place(|| {
-                                    tokio::runtime::Handle::current().block_on(async {
-                                        self.handle_buffer_response(response).await
-                                    })
-                                });
+                                let save_actions = self.handle_buffer_response(response).await;
                                 result_actions.extend(save_actions);
                             }
                             Err(e) => {
@@ -3345,7 +3141,7 @@ impl Editor {
                     }
                 }
                 ChromeAction::BufferOps(ops) => {
-                    // Apply buffer operations from Julia commands
+                    // Apply buffer operations from scripted commands
                     let buffer_id = self.windows[self.active_window].active_buffer;
                     if let Some(buffer) = self.buffers.get(buffer_id) {
                         for op in ops {
@@ -3730,14 +3526,14 @@ mod tests {
             current_key_chord: vec![],
             mouse_drag_state: None,
             messages_buffer_id: None,
-            julia_runtime: None,
             file_watcher: crate::file_watcher::FileWatcher::new(),
             last_search_term: String::new(),
         }
     }
 
-    #[tokio::test]
-    async fn test_cursor_move_right() {
+    #[test]
+    fn test_cursor_move_right() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
         let mut editor = test_editor();
         let window = &editor.windows[editor.active_window];
         let initial_cursor = window.cursor;
@@ -3753,10 +3549,12 @@ mod tests {
         // Cursor should have moved
         let window = &editor.windows[editor.active_window];
         assert_eq!(window.cursor, initial_cursor + 1);
+        });
     }
 
-    #[tokio::test]
-    async fn test_cursor_move_down() {
+    #[test]
+    fn test_cursor_move_down() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
         let mut editor = test_editor();
 
         // Move cursor down
@@ -3772,10 +3570,12 @@ mod tests {
         let buffer = &editor.buffers[window.active_buffer];
         let (_, line) = buffer.to_column_line(window.cursor);
         assert_eq!(line, 1);
+        });
     }
 
-    #[tokio::test]
-    async fn test_cursor_move_beyond_buffer() {
+    #[test]
+    fn test_cursor_move_beyond_buffer() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
         let mut editor = test_editor();
         let buffer_len = {
             let window = &editor.windows[editor.active_window];
@@ -3793,10 +3593,12 @@ mod tests {
         // Cursor should stay at end
         let window = &editor.windows[editor.active_window];
         assert_eq!(window.cursor, buffer_len);
+        });
     }
 
-    #[tokio::test]
-    async fn test_cursor_position_calculation() {
+    #[test]
+    fn test_cursor_position_calculation() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
         let mut editor = test_editor();
 
         // Move to a specific position
@@ -3816,6 +3618,7 @@ mod tests {
         } else {
             panic!("Expected CursorMove action");
         }
+        });
     }
 
     #[test]

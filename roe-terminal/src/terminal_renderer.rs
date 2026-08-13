@@ -23,14 +23,15 @@ use roe_core::editor::{BorderInfo, ChromeAction, DragType, Frame, MouseDragState
 use roe_core::gutter::{
     calculate_gutter_width, format_line_number, get_line_status, GutterConfig, LineStatus,
 };
-use roe_core::julia_runtime::face_registry;
+use roe_core::syntax::face_registry;
 use roe_core::keys::{KeyModifier, LogicalKey, Side};
 use roe_core::renderer::{DirtyRegion, DirtyTracker, ModelineComponent, Renderer};
 use roe_core::syntax::Color as SyntaxColor;
 use roe_core::{Editor, HighlightSpan, WindowId};
 use std::collections::HashSet;
 use std::io::Write;
-use tokio::time::{interval, Duration};
+use compio::time::interval;
+use std::time::Duration;
 
 pub const ECHO_AREA_HEIGHT: u16 = 1;
 pub const BG_COLOR: Color = Color::Black;
@@ -64,20 +65,6 @@ pub const GUTTER_SEPARATOR_COLOR: Color = Color::DarkGrey;
 pub const GUTTER_MODIFIED_COLOR: Color = Color::Yellow;
 pub const GUTTER_SAVED_COLOR: Color = Color::Green;
 pub const GUTTER_CONFLICT_COLOR: Color = Color::Red;
-
-/// Parse a hex color string (e.g., "#272822") to crossterm Color
-fn parse_hex_color(hex: &str) -> Color {
-    if hex.starts_with('#') && hex.len() == 7 {
-        if let Ok(r) = u8::from_str_radix(&hex[1..3], 16) {
-            if let Ok(g) = u8::from_str_radix(&hex[3..5], 16) {
-                if let Ok(b) = u8::from_str_radix(&hex[5..7], 16) {
-                    return Color::Rgb { r, g, b };
-                }
-            }
-        }
-    }
-    Color::White // fallback
-}
 
 /// Convert a syntax color to crossterm Color
 fn syntax_color_to_crossterm(color: &SyntaxColor, default: Color) -> Color {
@@ -115,7 +102,7 @@ fn char_to_byte(s: &str, char_pos: usize) -> usize {
         .unwrap_or(s.len())
 }
 
-/// Cached theme colors loaded from Julia at startup
+/// Cached theme colors used by the terminal renderer
 #[derive(Clone)]
 pub struct CachedTheme {
     pub bg_color: Color,
@@ -141,69 +128,6 @@ impl Default for CachedTheme {
             active_border_color: ACTIVE_BORDER_COLOR,
         }
     }
-}
-
-/// Load theme colors from Julia runtime at startup
-pub async fn load_julia_theme(editor: &Editor) -> CachedTheme {
-    let mut theme = CachedTheme::default();
-    let mut loaded_colors = Vec::new();
-
-    if let Some(ref julia_runtime) = editor.julia_runtime {
-        // Load colours/colors from Julia config (supporting both Canadian and American spelling)
-
-        // Try "colours" first (Canadian), then "colors" (American)
-        let bg_result = {
-            let runtime = julia_runtime.lock().await;
-            match runtime.get_config("colours.background").await {
-                Ok(Some(value)) => Ok(Some(value)),
-                _ => runtime.get_config("colors.background").await,
-            }
-        };
-        if let Ok(Some(bg)) = bg_result {
-            if let Some(color_str) = bg.as_string() {
-                loaded_colors.push(format!("bg:{color_str}"));
-                let parsed_color = parse_hex_color(&color_str);
-                theme.bg_color = parsed_color;
-            }
-        }
-
-        let fg_result = {
-            let runtime = julia_runtime.lock().await;
-            match runtime.get_config("colours.foreground").await {
-                Ok(Some(value)) => Ok(Some(value)),
-                _ => runtime.get_config("colors.foreground").await,
-            }
-        };
-        if let Ok(Some(fg)) = fg_result {
-            if let Some(color_str) = fg.as_string() {
-                loaded_colors.push(format!("fg:{color_str}"));
-                let parsed_color = parse_hex_color(&color_str);
-                theme.fg_color = parsed_color;
-            }
-        }
-
-        let sel_result = {
-            let runtime = julia_runtime.lock().await;
-            match runtime.get_config("colours.selection").await {
-                Ok(Some(value)) => Ok(Some(value)),
-                _ => runtime.get_config("colors.selection").await,
-            }
-        };
-        if let Ok(Some(sel)) = sel_result {
-            if let Some(color_str) = sel.as_string() {
-                loaded_colors.push(format!("sel:{color_str}"));
-                let parsed_color = parse_hex_color(&color_str);
-                theme.selection_color = parsed_color;
-            }
-        }
-
-        // Note: loaded_colors is used for tracking what was loaded
-        let _ = loaded_colors;
-    }
-
-    // Return the configured theme
-
-    theme
 }
 
 /// Terminal-specific renderer using crossterm
@@ -252,7 +176,7 @@ impl<W: Write> TerminalRenderer<W> {
             None
         };
 
-        // Check if gutter should be shown (controlled by major mode / Julia)
+        // Check if gutter should be shown (controlled by major mode)
         let show_gutter = buffer.show_gutter();
 
         // Calculate gutter width
@@ -305,7 +229,7 @@ impl<W: Write> TerminalRenderer<W> {
         let start_column = window.start_column as usize;
 
         // Get buffer content for byte<->char position conversion
-        // (spans use byte positions for tree-sitter/Julia compatibility)
+        // (spans use byte positions for highlighting compatibility)
         let buffer_content = buffer.content();
         let line_start_byte = char_to_byte(&buffer_content, line_start_char);
         let line_end_byte = char_to_byte(&buffer_content, line_end_char);
@@ -1077,7 +1001,7 @@ pub fn draw_window(
     let total_content_width = window.width_chars.saturating_sub(2);
     let content_height = window.height_chars.saturating_sub(2);
 
-    // Check if gutter should be shown (controlled by major mode / Julia)
+    // Check if gutter should be shown (controlled by major mode)
     let show_gutter = buffer.show_gutter();
 
     // Calculate gutter width and get modified lines
@@ -1563,55 +1487,33 @@ pub async fn event_loop_with_renderer<W: Write>(
                     // Handled in Editor::process_chrome_actions
                 }
                 ChromeAction::BufferChanged {
-                    buffer_id,
-                    start,
-                    old_end,
-                    new_end,
+                    buffer_id: _,
+                    start: _,
+                    old_end: _,
+                    new_end: _,
                 } => {
-                    // Call major mode after-change hook for syntax highlighting
-                    let Some(buffer) = editor.buffers.get(buffer_id) else {
-                        continue;
-                    };
-                    let Some(major_mode) = buffer.major_mode() else {
-                        continue;
-                    };
-                    let Some(ref julia_runtime) = editor.julia_runtime else {
-                        continue;
-                    };
-
-                    roe_core::julia_runtime::set_current_buffer(buffer.clone());
-                    let runtime = julia_runtime.lock().await;
-                    let _ = runtime
-                        .call_major_mode_after_change(
-                            &major_mode,
-                            start as i64,
-                            old_end as i64,
-                            new_end as i64,
-                        )
-                        .await;
-                    roe_core::julia_runtime::clear_current_buffer();
+                    // Major mode after-change hooks will be dispatched here once
+                    // the scripting runtime (mica) is integrated.
                 }
                 ChromeAction::ExecuteCommand(command_name) => {
                     // Execute another command via the command registry
                     let context = editor.create_command_context();
-                    if editor.julia_runtime.is_some() {
-                        match roe_core::command_mode::CommandMode::execute_command(
-                            &command_name,
-                            &editor.command_registry,
-                            context,
-                        )
-                        .await
-                        {
-                            Ok(command_actions) => {
-                                // Process through editor to handle BufferOps etc.
-                                let processed = editor.process_chrome_actions(command_actions);
-                                for a in processed {
-                                    actions.push_back(a);
-                                }
+                    match roe_core::command_mode::CommandMode::execute_command(
+                        &command_name,
+                        &editor.command_registry,
+                        context,
+                    )
+                    .await
+                    {
+                        Ok(command_actions) => {
+                            // Process through editor to handle BufferOps etc.
+                            let processed = editor.process_chrome_actions(command_actions).await;
+                            for a in processed {
+                                actions.push_back(a);
                             }
-                            Err(error_msg) => {
-                                editor.set_echo_message(format!("Command error: {error_msg}"));
-                            }
+                        }
+                        Err(error_msg) => {
+                            editor.set_echo_message(format!("Command error: {error_msg}"));
                         }
                     }
                 }

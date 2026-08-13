@@ -253,8 +253,8 @@ impl KeyState {
 
 pub struct DefaultBindings {}
 
-/// Configurable keybindings loaded from Julia
-/// All bindings are defined in Julia - no hardcoded defaults in Rust
+/// Configurable keybindings, initialized with Emacs-style defaults.
+/// Bindings may be extended or overridden at runtime.
 pub struct ConfigurableBindings {
     /// Map from key sequences to actions
     bindings: std::collections::HashMap<Vec<LogicalKey>, KeyAction>,
@@ -262,12 +262,135 @@ pub struct ConfigurableBindings {
 
 impl ConfigurableBindings {
     pub fn new() -> Self {
-        Self {
+        let mut bindings = Self {
             bindings: std::collections::HashMap::new(),
-        }
+        };
+        bindings.register_default_bindings();
+        bindings
     }
 
-    /// Load bindings from Julia key sequence strings and action strings
+    /// Register the default Emacs-style keybindings.
+    fn register_default_bindings(&mut self) {
+        // Basic cursor movement
+        self.add_binding("Left", ":cursor-left");
+        self.add_binding("Right", ":cursor-right");
+        self.add_binding("Up", ":cursor-up");
+        self.add_binding("Down", ":cursor-down");
+        self.add_binding("Home", ":cursor-line-start");
+        self.add_binding("End", ":cursor-line-end");
+        self.add_binding("PageUp", ":cursor-page-up");
+        self.add_binding("PageDown", ":cursor-page-down");
+
+        // Emacs cursor movement
+        self.add_binding("C-p", ":cursor-up");
+        self.add_binding("C-n", ":cursor-down");
+        self.add_binding("C-f", ":cursor-right");
+        self.add_binding("C-b", ":cursor-left");
+        self.add_binding("C-a", ":cursor-line-start");
+        self.add_binding("C-e", ":cursor-line-end");
+        self.add_binding("C-v", ":cursor-page-down");
+        self.add_binding("M-v", ":cursor-page-up");
+
+        // Word movement
+        self.add_binding("M-f", ":cursor-word-forward");
+        self.add_binding("M-b", ":cursor-word-backward");
+        self.add_binding("C-Left", ":cursor-word-backward");
+        self.add_binding("C-Right", ":cursor-word-forward");
+
+        // Paragraph movement
+        self.add_binding("M-{", ":cursor-paragraph-backward");
+        self.add_binding("M-}", ":cursor-paragraph-forward");
+
+        // Buffer start/end
+        self.add_binding("C-Home", ":cursor-buffer-start");
+        self.add_binding("C-End", ":cursor-buffer-end");
+        self.add_binding("M-<", ":cursor-buffer-start");
+        self.add_binding("M->", ":cursor-buffer-end");
+
+        // Basic text manipulation
+        self.add_binding("Backspace", ":backspace");
+        self.add_binding("Delete", ":delete");
+        self.add_binding("C-d", ":delete");
+        self.add_binding("Enter", ":enter");
+        self.add_binding("Tab", ":tab");
+
+        // Kill/yank
+        self.add_binding("C-k", ":kill-line");
+        self.add_binding("C-w", ":kill-region");
+        self.add_binding("M-w", ":copy-region");
+        self.add_binding("C-y", ":yank");
+
+        // Kill word
+        self.add_binding("M-d", ":kill-word");
+        self.add_binding("M-Backspace", ":backward-kill-word");
+        self.add_binding("C-Backspace", ":backward-kill-word");
+
+        // Mark
+        self.add_binding("C-Space", ":set-mark");
+
+        // Cancel/escape
+        self.add_binding("C-g", ":cancel");
+        self.add_binding("Escape", ":escape");
+
+        // Display
+        self.add_binding("C-l", ":redraw");
+
+        // Undo/redo
+        self.add_binding("C-/", ":undo");
+        self.add_binding("C-_", ":undo");
+        self.add_binding("C-x u", ":undo");
+        self.add_binding("M-/", ":redo");
+        // Terminal sends Ctrl+/ as Ctrl+7 (ASCII control code limitation)
+        self.add_binding("C-7", ":undo");
+
+        // Search
+        self.add_binding("C-s", "isearch-forward");
+        self.add_binding("C-r", "isearch-backward");
+
+        // Commands (C-x prefix)
+        self.add_binding("C-x C-c", "quit");
+        self.add_binding("C-x C-s", "save-buffer");
+        self.add_binding("C-x C-f", "find-file");
+        self.add_binding("C-x C-v", "visit-file");
+
+        // Window management
+        self.add_binding("C-x 2", "split-window-horizontally");
+        self.add_binding("C-x 3", "split-window-vertically");
+        self.add_binding("C-x o", "other-window");
+        self.add_binding("C-x 0", "delete-window");
+        self.add_binding("C-x 1", "delete-other-windows");
+
+        // Buffer management
+        self.add_binding("C-x b", "switch-to-buffer");
+        self.add_binding("C-x k", "kill-buffer");
+
+        // M-x command mode
+        self.add_binding("M-x", "command-mode");
+
+        // Page up/down with Meta
+        self.add_binding("M-Up", ":cursor-page-up");
+        self.add_binding("M-Down", ":cursor-page-down");
+
+        // CUA-style shift-arrow selection
+        self.add_binding("S-Left", ":cursor-left-select");
+        self.add_binding("S-Right", ":cursor-right-select");
+        self.add_binding("S-Up", ":cursor-up-select");
+        self.add_binding("S-Down", ":cursor-down-select");
+        self.add_binding("S-Home", ":cursor-line-start-select");
+        self.add_binding("S-End", ":cursor-line-end-select");
+        self.add_binding("S-PageUp", ":cursor-page-up-select");
+        self.add_binding("S-PageDown", ":cursor-page-down-select");
+
+        // Shift+Ctrl for word selection
+        self.add_binding("C-S-Left", ":cursor-word-backward-select");
+        self.add_binding("C-S-Right", ":cursor-word-forward-select");
+
+        // Shift+Ctrl for buffer start/end selection
+        self.add_binding("C-S-Home", ":cursor-buffer-start-select");
+        self.add_binding("C-S-End", ":cursor-buffer-end-select");
+    }
+
+    /// Add or override a binding from key sequence and action strings
     /// key_sequence: "C-x C-c", "M-x", "C-p", etc.
     /// action: "quit" (command name) or ":cursor-up" (direct action)
     pub fn add_binding(&mut self, key_sequence: &str, action: &str) {

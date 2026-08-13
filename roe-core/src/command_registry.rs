@@ -11,7 +11,7 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
-use crate::editor::{BufferOperation, ChromeAction, OpenType};
+use crate::editor::{ChromeAction, OpenType};
 use crate::{Buffer, BufferId, WindowId};
 use std::future::Future;
 use std::pin::Pin;
@@ -37,7 +37,6 @@ pub const CMD_VISIT_FILE: &str = "visit-file";
 pub const CMD_MESSAGES: &str = "messages";
 pub const CMD_SHOW_MESSAGES: &str = "show-messages";
 pub const CMD_KEYBOARD_QUIT: &str = "keyboard-quit";
-pub const CMD_JULIA_REPL: &str = "julia-repl";
 pub const CMD_DUMP_MESSAGES: &str = "dump-messages";
 pub const CMD_ISEARCH_FORWARD: &str = "isearch-forward";
 pub const CMD_ISEARCH_BACKWARD: &str = "isearch-backward";
@@ -369,20 +368,6 @@ pub fn create_default_registry() -> CommandRegistry {
         sync_handler(|_context| Ok(vec![ChromeAction::FileWatcherStatus])),
     ));
 
-    // Julia commands
-    registry.register_command(Command::new(
-        CMD_JULIA_REPL,
-        "Open Julia REPL buffer",
-        CommandCategory::Global,
-        sync_handler(|_context| {
-            Ok(vec![ChromeAction::NewBufferWithMode {
-                buffer_name: "*Julia REPL*".to_string(),
-                mode_name: "julia-repl".to_string(),
-                initial_content: "julia> ".to_string(),
-            }])
-        }),
-    ));
-
     // Search commands
     registry.register_command(Command::new(
         CMD_ISEARCH_FORWARD,
@@ -399,113 +384,6 @@ pub fn create_default_registry() -> CommandRegistry {
     ));
 
     registry
-}
-
-/// Create an async command handler that calls a Julia command
-pub fn julia_handler(
-    runtime: crate::julia_runtime::SharedJuliaRuntime,
-    command_name: String,
-) -> CommandHandler {
-    Box::new(move |context: CommandContext| {
-        let runtime = runtime.clone();
-        let name = command_name.clone();
-        Box::pin(async move {
-            // Get mark position (-1 if not set)
-            let mark_pos = context.buffer.get_mark().map(|m| m as i64).unwrap_or(-1);
-
-            // Convert CommandContext to JuliaCommandContext
-            let julia_context = crate::julia_runtime::JuliaCommandContext {
-                buffer_name: context.buffer_name.clone(),
-                buffer_modified: context.buffer_modified,
-                cursor_pos: context.cursor_pos,
-                current_line: context.current_line,
-                current_column: context.current_column,
-                line_count: context.buffer.buffer_len_lines(),
-                char_count: context.buffer.buffer_len_chars(),
-                mark_pos,
-            };
-
-            // Call the Julia command (pass buffer for direct access)
-            let runtime_guard = runtime.lock().await;
-            match runtime_guard
-                .call_command(&name, julia_context, context.buffer.clone())
-                .await
-            {
-                Ok(result) => convert_julia_result(result),
-                Err(e) => Err(format!("Julia command error: {:?}", e)),
-            }
-        })
-    })
-}
-
-/// Convert JuliaCommandResult to ChromeActions
-fn convert_julia_result(
-    result: crate::julia_runtime::JuliaCommandResult,
-) -> Result<Vec<ChromeAction>, String> {
-    use crate::julia_runtime::{JuliaBufferOp, JuliaCommandResult};
-
-    match result {
-        JuliaCommandResult::Echo(msg) => Ok(vec![ChromeAction::Echo(msg)]),
-        JuliaCommandResult::Error(msg) => Err(msg),
-        JuliaCommandResult::None => Ok(vec![]),
-        JuliaCommandResult::BufferOps(ops) => {
-            let buffer_ops: Vec<BufferOperation> = ops
-                .into_iter()
-                .map(|op| match op {
-                    JuliaBufferOp::Insert { pos, text } => BufferOperation::Insert { pos, text },
-                    JuliaBufferOp::Delete { start, end } => BufferOperation::Delete { start, end },
-                    JuliaBufferOp::Replace { start, end, text } => {
-                        BufferOperation::Replace { start, end, text }
-                    }
-                    JuliaBufferOp::SetCursor(pos) => BufferOperation::SetCursor(pos),
-                    JuliaBufferOp::SetMark(pos) => BufferOperation::SetMark(pos),
-                    JuliaBufferOp::ClearMark => BufferOperation::ClearMark,
-                    JuliaBufferOp::SetContent(content) => BufferOperation::SetContent(content),
-                    JuliaBufferOp::IndentLine { line, indent } => {
-                        BufferOperation::IndentLine { line, indent }
-                    }
-                })
-                .collect();
-            Ok(vec![ChromeAction::BufferOps(buffer_ops)])
-        }
-        JuliaCommandResult::Multi(results) => {
-            let mut actions = Vec::new();
-            for r in results {
-                match convert_julia_result(r) {
-                    Ok(mut a) => actions.append(&mut a),
-                    Err(e) => return Err(e),
-                }
-            }
-            Ok(actions)
-        }
-        JuliaCommandResult::ExecuteCommand(command) => {
-            Ok(vec![ChromeAction::ExecuteCommand(command)])
-        }
-    }
-}
-
-/// Register all Julia commands from the runtime into the registry
-pub async fn register_julia_commands(
-    registry: &mut CommandRegistry,
-    runtime: &crate::julia_runtime::SharedJuliaRuntime,
-) {
-    let runtime_guard = runtime.lock().await;
-    match runtime_guard.list_commands().await {
-        Ok(commands) => {
-            drop(runtime_guard); // Release the lock before registering
-            for (name, description) in commands {
-                registry.register_command(Command::new(
-                    name.clone(),
-                    description,
-                    CommandCategory::Script("julia".to_string()),
-                    julia_handler(runtime.clone(), name),
-                ));
-            }
-        }
-        Err(e) => {
-            eprintln!("Failed to list Julia commands: {:?}", e);
-        }
-    }
 }
 
 #[cfg(test)]

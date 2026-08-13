@@ -2,8 +2,6 @@ target/
 .target
 .vscode/
 .cargo
-julia/
-.julia-packages-installed
 
 /.idea/.gitignore
 /.idea/modules.xml

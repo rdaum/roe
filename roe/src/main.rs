@@ -18,10 +18,8 @@ use crossterm::event::{
 use crossterm::execute;
 use crossterm::terminal::disable_raw_mode;
 use roe_core::{
-    buffer_host, command_registry, editor,
-    julia_runtime::{clear_current_buffer, set_current_buffer},
-    kill_ring, mode, Buffer, BufferId, ConfigurableBindings, Editor, Frame, KeyState, Mode, ModeId,
-    Renderer, Window, WindowId,
+    buffer_host, command_registry, editor, kill_ring, mode, Buffer, BufferId,
+    ConfigurableBindings, Editor, Frame, KeyState, Mode, ModeId, Renderer, Window, WindowId,
 };
 use roe_terminal::{TerminalRenderer, ECHO_AREA_HEIGHT};
 use slotmap::SlotMap;
@@ -32,21 +30,10 @@ use std::io::Write;
 fn parse_args() -> EditorConfig {
     let args: Vec<String> = std::env::args().collect();
     let mut file_paths = Vec::new();
-    let mut init_file = None;
     let mut i = 1; // Skip program name
 
     while i < args.len() {
         match args[i].as_str() {
-            "--init" | "-i" => {
-                // Next argument should be the init file path
-                if i + 1 < args.len() {
-                    init_file = Some(args[i + 1].clone());
-                    i += 2;
-                } else {
-                    eprintln!("Error: --init requires a file path");
-                    std::process::exit(1);
-                }
-            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -64,10 +51,7 @@ fn parse_args() -> EditorConfig {
         }
     }
 
-    EditorConfig {
-        file_paths,
-        init_file,
-    }
+    EditorConfig { file_paths }
 }
 
 /// Print help message
@@ -78,15 +62,12 @@ fn print_help() {
     println!("    roe [OPTIONS] [FILES...]");
     println!();
     println!("OPTIONS:");
-    println!("    -i, --init <FILE>    Specify Julia init file (default: init.jl)");
     println!("    -h, --help           Print this help message");
     println!();
     println!("EXAMPLES:");
     println!("    roe                          # Start with welcome screen");
     println!("    roe file.txt                 # Open file.txt");
     println!("    roe file1.txt file2.txt      # Open multiple files");
-    println!("    roe --init myconfig.jl       # Use custom init file");
-    println!("    roe -i ~/.config/init.jl main.rs   # Custom init + file");
 }
 
 /// Generate welcome screen content with ASCII art logo and getting started text
@@ -125,7 +106,6 @@ fn create_welcome_screen_content() -> String {
 // Configuration for the editor
 struct EditorConfig {
     file_paths: Vec<String>,
-    init_file: Option<String>,
 }
 
 // Everything to run in raw_mode
@@ -138,50 +118,9 @@ async fn terminal_main<W: Write>(stdout: W, config: EditorConfig) -> Result<(), 
 
     let tsize = crossterm::terminal::size()?;
 
-    // Initialize Julia runtime with Arc for sharing
-    let julia_runtime = roe_core::julia_runtime::create_shared_runtime().ok();
-
-    // Load Julia configuration and keybindings early, before creating Editor
-    let mut bindings = ConfigurableBindings::new();
-    if let Some(ref julia_runtime) = julia_runtime {
-        let config_path = if let Some(init_file) = &config.init_file {
-            std::path::PathBuf::from(init_file)
-        } else {
-            roe_core::julia_runtime::RoeJuliaRuntime::default_config_path()
-        };
-
-        let runtime = julia_runtime.lock().await;
-
-        // Load the Roe module first (provides command infrastructure and default keybindings)
-        if let Some(roe_module_path) =
-            roe_core::julia_runtime::RoeJuliaRuntime::bundled_roe_module_path()
-        {
-            if let Err(e) = runtime.load_roe_module(roe_module_path.clone()).await {
-                eprintln!("Fatal: Failed to load Roe Julia module: {}", e);
-                eprintln!("The editor cannot start without the Roe module.");
-                std::process::exit(1);
-            }
-        } else {
-            eprintln!("Fatal: Could not find Roe Julia module (jl/roe.jl)");
-            eprintln!("Make sure to run from the roe directory or install properly.");
-            std::process::exit(1);
-        }
-        drop(runtime);
-
-        // Load user config (may override default keybindings)
-        let mut runtime = julia_runtime.lock().await;
-        let _ = runtime.load_config(Some(config_path)).await;
-        drop(runtime);
-
-        // Query keybindings from Julia and populate ConfigurableBindings
-        let runtime = julia_runtime.lock().await;
-        if let Ok(julia_bindings) = runtime.list_keybindings().await {
-            for (key_seq, action) in julia_bindings {
-                bindings.add_binding(&key_seq, &action);
-            }
-        }
-        drop(runtime);
-    }
+    // Default keybindings ship in Rust; the scripting runtime (mica) will be
+    // able to extend them once integrated.
+    let bindings = ConfigurableBindings::new();
 
     let mut buffers: SlotMap<BufferId, Buffer> = SlotMap::default();
     let mut buffer_hosts: HashMap<BufferId, buffer_host::BufferHostClient> = HashMap::new();
@@ -207,8 +146,8 @@ async fn terminal_main<W: Write>(stdout: W, config: EditorConfig) -> Result<(), 
             .expect("MessagesMode should exist in modes SlotMap");
         let mode_list = vec![(welcome_mode_id, "welcome".to_string(), welcome_mode)];
 
-        let (buffer_client, _buffer_handle) =
-            buffer_host::create_buffer_host(buffer, mode_list, buffer_id, julia_runtime.clone());
+        let buffer_client =
+            buffer_host::create_buffer_host(buffer, mode_list, buffer_id);
         buffer_hosts.insert(buffer_id, buffer_client);
     } else {
         // Create buffers for all specified files
@@ -230,20 +169,6 @@ async fn terminal_main<W: Write>(stdout: W, config: EditorConfig) -> Result<(), 
                 }
             };
 
-            // Get and apply major mode for this file
-            if let Some(ref jr) = julia_runtime {
-                let runtime = jr.lock().await;
-                if let Ok(major_mode) = runtime.get_major_mode_for_file(&file_path).await {
-                    buffer.set_major_mode(major_mode.clone());
-
-                    // Call the major mode's init hook
-                    set_current_buffer(buffer.clone());
-                    let _ = runtime.call_major_mode_init(&major_mode).await;
-                    clear_current_buffer();
-                }
-                drop(runtime);
-            }
-
             let buffer_id = buffers.insert(buffer.clone());
 
             // Remember the first buffer for the initial window
@@ -258,12 +183,8 @@ async fn terminal_main<W: Write>(stdout: W, config: EditorConfig) -> Result<(), 
             let mode_list = vec![(file_mode_id, "file".to_string(), file_mode)];
 
             // Create BufferHost and client
-            let (buffer_client, _buffer_handle) = buffer_host::create_buffer_host(
-                buffer,
-                mode_list,
-                buffer_id,
-                julia_runtime.clone(),
-            );
+            let buffer_client =
+                buffer_host::create_buffer_host(buffer, mode_list, buffer_id);
             buffer_hosts.insert(buffer_id, buffer_client);
         }
     }
@@ -360,7 +281,6 @@ async fn terminal_main<W: Write>(stdout: W, config: EditorConfig) -> Result<(), 
         current_key_chord: Vec::new(),
         mouse_drag_state: None,
         messages_buffer_id: None,
-        julia_runtime,
         file_watcher,
         last_search_term: String::new(),
     };
@@ -384,21 +304,11 @@ async fn terminal_main<W: Write>(stdout: W, config: EditorConfig) -> Result<(), 
         }
     }
 
-    // Register Julia commands into the command registry
-    // (Julia runtime and config were already loaded earlier for keybindings)
-    if let Some(ref julia_runtime) = editor.julia_runtime {
-        command_registry::register_julia_commands(&mut editor.command_registry, julia_runtime)
-            .await;
-    }
+    // Theme configuration will come from the scripting runtime (mica) once
+    // integrated; use defaults for now.
+    let theme = roe_terminal::terminal_renderer::CachedTheme::default();
 
-    // Load Julia theme and create terminal renderer with it
-    let julia_theme = if editor.julia_runtime.is_some() {
-        roe_terminal::terminal_renderer::load_julia_theme(&editor).await
-    } else {
-        roe_terminal::terminal_renderer::CachedTheme::default()
-    };
-
-    let mut renderer = TerminalRenderer::new_with_theme(stdout, julia_theme);
+    let mut renderer = TerminalRenderer::new_with_theme(stdout, theme);
 
     // Initial full render
     renderer.render_full(&editor)?;
@@ -430,8 +340,7 @@ fn exit_state(device: &mut impl Write) -> Result<(), std::io::Error> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<(), std::io::Error> {
+fn main() -> Result<(), std::io::Error> {
     // Set panic handler to clean up terminal state while preserving panic info
     std::panic::set_hook(Box::new(|panic_info| {
         let _ = exit_state(&mut std::io::stdout());
@@ -456,8 +365,9 @@ async fn main() -> Result<(), std::io::Error> {
     execute!(stdout, crossterm::cursor::EnableBlinking)?;
     execute!(stdout, EnableMouseCapture)?;
 
-    // Run the application
-    let result = terminal_main(&mut stdout, config).await;
+    let result = compio::runtime::Runtime::new()
+        .expect("Failed to create compio runtime")
+        .block_on(terminal_main(&mut stdout, config));
 
     // Always clean up terminal state, regardless of success or failure
     if let Err(cleanup_err) = exit_state(&mut stdout) {
