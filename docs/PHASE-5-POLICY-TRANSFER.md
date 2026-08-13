@@ -56,9 +56,12 @@ to realize Mica's decision.
 selection, cancellation, command argument acquisition, history, and filtering. The generic
 argument path is exercised by `select-window`: its declared `:window`/`:logical_view` argument
 opens a completion prompt, validates the chosen logical view, and invokes the declared command
-implementation. Prompt position, label, completion selector, and candidate value type remain Mica
-data; the exercised command deliberately uses a nonzero position so the bridge cannot silently
-special-case position zero. Command, buffer, view, and file candidates are computed in Mica and capped at 256
+implementation. `ArgumentCandidateKind` makes each provider declare its value kind; acquisition
+rejects a provider/argument mismatch, acceptance validates the logical identity, and the host
+decodes the candidate from Mica's emitted kind instead of guessing from the raw value. Prompt
+position, label, completion selector, and candidate value type therefore remain Mica data; the
+exercised command deliberately uses a nonzero position so the bridge cannot silently special-case
+position zero. Command, buffer, view, and file candidates are computed in Mica and capped at 256
 entries. Search state and selection live in Mica; the native `text_search` request returns at most
 1,024 character-indexed matches.
 
@@ -111,7 +114,9 @@ Both shipped binaries expose the native bootstrap surface before their normal ev
 `--mica-check`, `--mica-replace`, `--mica-export`, `--mica-restore-first-wave`, package
 enable/disable, and `--mica-inspect`. Inspection reports endpoint/session identities and the
 bounded live-object state. These options do not depend on user Mica policy, so invalid replacement
-can be diagnosed and repaired from either frontend.
+can be diagnosed and repaired from either frontend. Exporting the built-in first-wave unit ensures
+that unit is loaded before fileout, including at process startup, and missing CLI operands produce
+a usage error with exit status 2 rather than a panic.
 
 Durable user/workspace state is intentionally not enabled in Phase 5. It was optional in the
 roadmap, and enabling it requires an explicit schema revision, migration, backup, and recovery
@@ -145,9 +150,12 @@ The only renderer conformance surface is the revisioned `SessionOutput` presenta
 - Messages: 65,536 characters, retaining the newest diagnostics.
 - Directory results: the lexically first 256 paths, retained with bounded memory during enumeration.
 
-Authority is checked at the endpoint, service, logical-buffer, and native-resource layers. Native
-failures are returned through typed completion/lifecycle results. Cancellation, endpoint close,
-replacement failure, queue pressure, and failed watcher cleanup have focused tests.
+Authority is checked at the endpoint, service, logical-buffer, and native-resource layers. In
+particular, `copy_region` requires Mica `text_read` plus logical-buffer authority and native
+`TextRead` in addition to clipboard-write authority. Native failures are returned through typed
+completion/lifecycle results; failed task diagnostics include task, selector, endpoint/session,
+and failure class without buffer contents. Cancellation, endpoint close, replacement failure,
+queue pressure, and failed watcher cleanup have focused tests.
 
 ## Delivery history
 
@@ -178,6 +186,7 @@ closed those gaps and passed the deletion gate.
 | `8c088ba` | Exercise both frontend realizations with the production Mica session stream. |
 | `03731c9` | Authorize and test relational layout dragging through Mica. |
 | `d91b014` | Close recovery, argument, hook, syntax, authority, and retention gaps from re-review. |
+| `4789b37` | Close final copy authority, argument typing, export, diagnostics, and CLI gaps. |
 
 ## Verification and measurements
 
