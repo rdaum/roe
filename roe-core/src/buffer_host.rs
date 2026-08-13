@@ -706,14 +706,20 @@ mod tests {
         let mut buffers: SlotMap<BufferId, ()> = SlotMap::with_key();
         let buffer_id = buffers.insert(());
         let client = create_buffer_host(Buffer::new(&[]), vec![], buffer_id);
-        let _active_operation = client
-            .take_host()
-            .expect("first operation should acquire the host");
+        {
+            let _active_operation = client
+                .take_host()
+                .expect("first operation should acquire the host");
 
-        let error = client
+            let error = client
+                .take_host()
+                .err()
+                .expect("overlapping borrow must be rejected");
+            assert_eq!(error, HostError::Busy { buffer_id });
+        }
+
+        client
             .take_host()
-            .err()
-            .expect("overlapping borrow must be rejected");
-        assert_eq!(error, HostError::Busy { buffer_id });
+            .expect("dropping a cancelled operation must return the host");
     }
 }
