@@ -3510,6 +3510,60 @@ mod tests {
                     .all(|event| !matches!(event, LifecycleEvent::Error(_)))
             );
 
+            let control =
+                LogicalKey::Modifier(crate::keys::KeyModifier::Control(crate::keys::Side::Left));
+            session
+                .dispatch(session.envelope(InputEvent::Keys(vec![
+                    control,
+                    LogicalKey::AlphaNumeric('x'),
+                    LogicalKey::AlphaNumeric('2'),
+                ])))
+                .await
+                .unwrap();
+            let top = session
+                .editor
+                .windows
+                .iter()
+                .min_by_key(|(_, window)| window.y)
+                .map(|(_, window)| window.clone())
+                .unwrap();
+            let border_row = top.y + top.height_chars - 1;
+            let before = ratio_at_path(&session.editor.window_tree, &[]).unwrap();
+            for event in [
+                PointerEvent {
+                    column: 40,
+                    row: border_row,
+                    kind: PointerKind::Down,
+                    button: PointerButton::Primary,
+                },
+                PointerEvent {
+                    column: 40,
+                    row: border_row + 8,
+                    kind: PointerKind::Move,
+                    button: PointerButton::Primary,
+                },
+                PointerEvent {
+                    column: 40,
+                    row: border_row + 8,
+                    kind: PointerKind::Up,
+                    button: PointerButton::Primary,
+                },
+            ] {
+                let output = session
+                    .dispatch(session.envelope(InputEvent::Pointer(event)))
+                    .await
+                    .unwrap();
+                assert!(
+                    output
+                        .lifecycle
+                        .iter()
+                        .all(|event| !matches!(event, LifecycleEvent::Error(_))),
+                    "layout pointer lifecycle: {:?}",
+                    output.lifecycle
+                );
+            }
+            assert!(ratio_at_path(&session.editor.window_tree, &[]).unwrap() > before);
+
             session
                 .dispatch(session.envelope(InputEvent::Close))
                 .await
