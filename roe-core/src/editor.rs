@@ -348,6 +348,8 @@ impl Editor {
         command_type: CommandType,
         position: CommandWindowPosition,
         height: u16,
+        command_candidates: Option<Vec<String>>,
+        buffer_candidates: Option<Vec<(BufferId, String)>>,
     ) -> WindowId {
         // Create a new buffer for command input
         let command_buffer = Buffer::new(&[]);
@@ -369,13 +371,14 @@ impl Editor {
         let (mode_box, mode_name, initial_content) = match command_type {
             CommandType::Execute => {
                 // Create CommandMode for M-x
-                let mut command_names: Vec<String> = self
-                    .command_registry
-                    .all_commands()
-                    .iter()
-                    .filter(|cmd| cmd.name != crate::command_registry::CMD_COMMAND_MODE) // Exclude command-mode
-                    .map(|cmd| cmd.name.clone())
-                    .collect();
+                let mut command_names: Vec<String> = command_candidates.unwrap_or_else(|| {
+                    self.command_registry
+                        .all_commands()
+                        .iter()
+                        .filter(|cmd| cmd.name != crate::command_registry::CMD_COMMAND_MODE)
+                        .map(|cmd| cmd.name.clone())
+                        .collect()
+                });
                 command_names.sort(); // Sort alphabetically
                 let mut command_mode = CommandMode::new();
                 command_mode.init_with_buffer(command_buffer_id, command_names);
@@ -399,12 +402,13 @@ impl Editor {
                 // Also exclude the command buffer we're about to create
                 command_buffer_ids.insert(command_buffer_id);
 
-                let buffer_list: Vec<(BufferId, String)> = self
-                    .buffers
-                    .iter()
-                    .filter(|(id, _)| !command_buffer_ids.contains(id))
-                    .map(|(id, buffer)| (id, buffer.object()))
-                    .collect();
+                let buffer_list: Vec<(BufferId, String)> = buffer_candidates.unwrap_or_else(|| {
+                    self.buffers
+                        .iter()
+                        .filter(|(id, _)| !command_buffer_ids.contains(id))
+                        .map(|(id, buffer)| (id, buffer.object()))
+                        .collect()
+                });
 
                 // Use the Rust BufferSwitchMode for buffer selection
                 let mut buffer_switch_mode =
@@ -440,12 +444,13 @@ impl Editor {
                 // Also exclude the command buffer we're about to create
                 command_buffer_ids.insert(command_buffer_id);
 
-                let buffer_list: Vec<(BufferId, String)> = self
-                    .buffers
-                    .iter()
-                    .filter(|(id, _)| !command_buffer_ids.contains(id))
-                    .map(|(id, buffer)| (id, buffer.object()))
-                    .collect();
+                let buffer_list: Vec<(BufferId, String)> = buffer_candidates.unwrap_or_else(|| {
+                    self.buffers
+                        .iter()
+                        .filter(|(id, _)| !command_buffer_ids.contains(id))
+                        .map(|(id, buffer)| (id, buffer.object()))
+                        .collect()
+                });
 
                 // Use the Rust BufferSwitchMode for buffer killing
                 let mut buffer_switch_mode =
@@ -1991,28 +1996,10 @@ impl Editor {
                                 self.close_command_window(command_window_id);
                                 actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
                             }
-                            // Execute the command using the command registry
-                            let context = self.create_command_context();
-                            match crate::command_mode::CommandMode::execute_command(
-                                &command_name,
-                                &self.command_registry,
-                                context,
-                            )
-                            .await
-                            {
-                                Ok(command_actions) => {
-                                    // Process actions through unified system
-                                    let mut processed_actions =
-                                        Box::pin(self.process_chrome_actions(command_actions))
-                                            .await;
-                                    actions.append(&mut processed_actions);
-                                }
-                                Err(error_msg) => {
-                                    actions.push(ChromeAction::Echo(format!(
-                                        "Command error: {error_msg}"
-                                    )));
-                                }
-                            }
+                            // The session host resolves this name through the
+                            // Mica-owned discovery result. Editor no longer
+                            // invokes the Rust command registry here.
+                            actions.push(ChromeAction::ExecuteCommand(command_name));
                         }
                         EditorAction::SwitchToBuffer(target_buffer_id) => {
                             // Close the buffer switch window after selection
@@ -3088,6 +3075,8 @@ impl Editor {
                         CommandType::Execute,
                         CommandWindowPosition::Bottom,
                         window_height,
+                        None,
+                        None,
                     );
 
                     result_actions.push(ChromeAction::Echo("Command selection".to_string()));
@@ -3105,6 +3094,8 @@ impl Editor {
                         CommandType::BufferSwitch,
                         CommandWindowPosition::Bottom,
                         window_height,
+                        None,
+                        None,
                     );
 
                     result_actions.push(ChromeAction::Echo("Buffer selection".to_string()));
@@ -3122,6 +3113,8 @@ impl Editor {
                         CommandType::KillBuffer,
                         CommandWindowPosition::Bottom,
                         window_height,
+                        None,
+                        None,
                     );
 
                     result_actions.push(ChromeAction::Echo("Kill buffer selection".to_string()));
@@ -3139,6 +3132,8 @@ impl Editor {
                         CommandType::OpenFile(open_type),
                         CommandWindowPosition::Bottom,
                         window_height,
+                        None,
+                        None,
                     );
 
                     let message = match open_type {

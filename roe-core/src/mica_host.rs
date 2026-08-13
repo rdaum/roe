@@ -51,6 +51,8 @@ pub enum MicaKeyResult {
 pub struct MicaEventBatch {
     pub effects: Vec<MicaPresentationEffect>,
     pub host_actions: Vec<String>,
+    pub command_candidates: Vec<(String, String)>,
+    pub buffer_candidates: Vec<(BufferId, String)>,
     pub errors: Vec<String>,
     pub cancelled_tasks: Vec<TaskId>,
     pub ready_subscriptions: Vec<u64>,
@@ -60,6 +62,9 @@ impl MicaEventBatch {
     fn extend(&mut self, mut other: Self) {
         self.effects.append(&mut other.effects);
         self.host_actions.append(&mut other.host_actions);
+        self.command_candidates
+            .append(&mut other.command_candidates);
+        self.buffer_candidates.append(&mut other.buffer_candidates);
         self.errors.append(&mut other.errors);
         self.cancelled_tasks.append(&mut other.cancelled_tasks);
         self.ready_subscriptions
@@ -785,6 +790,14 @@ end
                         } else if let Some(action) = self.host_action(effect.target, &effect.value)
                         {
                             batch.host_actions.push(action);
+                        } else if let Some(candidate) =
+                            self.command_candidate(effect.target, &effect.value)
+                        {
+                            batch.command_candidates.push(candidate);
+                        } else if let Some(candidate) =
+                            self.buffer_candidate(effect.target, &effect.value)
+                        {
+                            batch.buffer_candidates.push(candidate);
                         }
                     }
                     DriverEvent::TaskCompleted {
@@ -840,6 +853,12 @@ end
                     batch.effects.push(effect);
                 } else if let Some(action) = self.host_action(effect.target, &effect.value) {
                     batch.host_actions.push(action);
+                } else if let Some(candidate) = self.command_candidate(effect.target, &effect.value)
+                {
+                    batch.command_candidates.push(candidate);
+                } else if let Some(candidate) = self.buffer_candidate(effect.target, &effect.value)
+                {
+                    batch.buffer_candidates.push(candidate);
                 }
             }
             DriverEvent::TaskAborted { task_id, error } => batch.errors.push(format!(
@@ -897,6 +916,35 @@ end
             .as_symbol()?
             .name()
             .map(str::to_owned)
+    }
+
+    fn command_candidate(&self, target: Identity, value: &Value) -> Option<(String, String)> {
+        if target != self.session
+            || map_value(value, "kind")?.as_symbol()? != sym("command_candidate")
+        {
+            return None;
+        }
+        let name = map_value(value, "name")?.with_str(str::to_owned)?;
+        let action = map_value(value, "action")?
+            .as_symbol()?
+            .name()
+            .map(str::to_owned)?;
+        Some((name, action))
+    }
+
+    fn buffer_candidate(&self, target: Identity, value: &Value) -> Option<(BufferId, String)> {
+        if target != self.session
+            || map_value(value, "kind")?.as_symbol()? != sym("buffer_candidate")
+        {
+            return None;
+        }
+        let logical = map_value(value, "buffer")?.as_identity()?;
+        let buffer = self
+            .buffer_ids
+            .iter()
+            .find_map(|(buffer, identity)| (*identity == logical).then_some(*buffer))?;
+        let name = map_value(value, "name")?.with_str(str::to_owned)?;
+        Some((buffer, name))
     }
 
     pub async fn close(&mut self) -> Result<MicaEventBatch, MicaHostError> {
