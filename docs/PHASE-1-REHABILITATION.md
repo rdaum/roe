@@ -20,6 +20,7 @@ Phase 1 was implemented on 2026-08-13 in these reviewable changes:
 | `94209ec` | Kept the terminal idle regression probe in its pseudo-terminal foreground process group. |
 | `02cc6de` | Made interactive visit-file replacement transactional across open failures and shared buffers. |
 | `5e36d1d` | Coalesced graphical wakeups, guaranteed raw-mode restoration attempts, and surfaced filesystem/watcher failures. |
+| `8acd256` | Made interactive watches transactional/owned, returned graphical failures, traced mutation/redraw, and implemented explicit native shutdown. |
 
 ## Toolchain and dependencies
 
@@ -56,7 +57,7 @@ in-process `BufferHost` service per buffer.
 | -------- | --------------------- | --------------------- | -------- |
 | Buffer host | Direct serialized call; no queue | An overlapping request returns typed `HostError::Busy`. `HostLease::drop` returns the service even when an awaiting caller is cancelled. | Dropping the last client drops its modes and buffer host; no task exists to join. |
 | Mode chain | Major/minor modes run synchronously in declared order inside the host request; no queue | A mode consumes, annotates, or ignores the current request. | Modes are owned by and dropped with the host. |
-| File notifications | Bounded FIFO of 256 path/buffer hints plus one latest-value backend-error slot | Notify uses nonblocking `try_send`; a full queue drops the newest hint and logs the overload. Events carry no file contents; delivery rereads current disk state. Backend failures replace the one prior undelivered error. | Dropping `FileWatcher` drops the notify watcher, sender, receiver, wake handle, and error slot. |
+| File notifications | Bounded FIFO of 256 path/buffer hints plus one latest-value backend-error slot | Notify uses nonblocking `try_send`; a full queue drops the newest hint and logs the overload. Events carry no file contents; delivery rereads current disk state. Backend failures replace the one prior undelivered error. Backend parent watches are reference-counted and published only after `watch` succeeds. | Killing/replacing a buffer unregisters it. Session shutdown releases all associations/backend watches, then drops notify and its delivery state. |
 | Winit wake | At most one outstanding `HostEvent::Wake` | An atomic pending bit coalesces any number of native wake requests until Winit acknowledges the queued event. A failed send clears the bit for retry. | Dropping the event loop closes its platform transport; later send failure is observed and does not remain pending. |
 | Frontend input | Platform event order; no host mailbox | Terminal polls input after each Compio tick. Winit dispatches platform/user events on its UI thread. | Each frontend stops accepting input by leaving its event loop. |
 
@@ -69,6 +70,11 @@ Buffer storage remains `Arc<RwLock<BufferInner>>` because renderer snapshots and
 share buffers. Mutations are serialized by the frontend and direct buffer host, snapshots own their
 text outside the lock, and poison failures remain internal-invariant assertions. Phase 2 will hide
 this ownership behind the native-kernel API instead of exposing shared buffers to Mica.
+
+Phase 1 extracted the fallible interactive-open transaction and Vello render operation from their
+dispatch paths. The remaining large `key_event`, editor-action, and Winit `window_event` matches are
+ordered protocol dispatch tables whose state-machine boundary changes in Phase 2; splitting each
+case into a generic manager here would add indirection without creating independent ownership.
 
 ## Event-loop progress and wakeup
 
@@ -107,8 +113,10 @@ Ordinary external failures no longer use internal assertions:
   canonicalization;
 - file-selector current-directory/listing failures are rendered in its command buffer, and notify
   backend failures occupy a bounded latest-value slot that the editor echoes on its next wake;
-- Winit window/surface and Vello renderer/render failures are logged and exit or return through the
-  frontend boundary rather than panicking; and
+- interactive opens register their buffer only after the backend directory watch succeeds; shared
+  parent watches remain live until their last buffer owner leaves;
+- Winit window/event-loop, surface, logical-presentation, and Vello renderer/render failures are
+  typed `FrontendError` values returned from `run_vello` rather than log-only exits or panics; and
 - file-selector directory failures and watcher initialization failures retain resource context in
   tracing.
 
@@ -125,9 +133,11 @@ restores terminal modes. Cleanup retains the first device error but attempts eve
 that ordering; the controlled workflow compares `stty -g` before and after SIGTERM.
 
 Vello exits through Winit, after which the application, renderer surfaces, file watcher, editor
-hosts, and Compio runtime are dropped by ownership. There are no detached Roe tasks to survive
-either frontend. Explicit editor-endpoint closure and Mica-driver shutdown order do not exist yet;
-they become mechanical `HostSession` lifecycle operations in Phases 2 and 3.
+hosts, and Compio runtime are dropped by ownership. Both frontends explicitly stop their input loop,
+call `Editor::shutdown_native_work` to clear the wake target, unwatch every buffer, drop buffer/mode
+endpoints, and report shutdown warnings before releasing platform/renderer resources. Terminal raw
+mode is restored last by `TerminalSession`. There are no detached Roe tasks to drain. Phase 3 adds
+Mica-driver shutdown between native-work cancellation and renderer/platform release.
 
 ## Verification
 
@@ -139,18 +149,19 @@ The Phase 1 acceptance commands and results on the Phase 0 host are:
 | `cargo +1.88.0 check --workspace --all-targets` | Passes on the declared MSRV after selecting `compio-buf 0.8.1`. |
 | `cargo outdated --workspace -R` | Reports all dependencies up to date under the documented stable/compatibility policy. |
 | `./scripts/check-security.sh` | Passes with no vulnerabilities and only the two documented advisory exceptions. |
-| `./scripts/test-phase0-terminal-workflows.sh` | Passes production terminal workflows, idle watcher delivery, visible save failure, and terminal restoration after SIGTERM. |
+| `./scripts/test-phase0-terminal-workflows.sh` | Passes production terminal workflows, startup and interactively opened idle watcher delivery, visible save failure, and terminal restoration after SIGTERM. |
 | `cargo build --release --bin roe-vello` | Passes the renewed Vello/WGPU stack release build. |
 | `./scripts/measure-phase0-baseline.sh` | Completes, including the one-second production terminal idle probe. |
 
-The workspace suite contains 140 tests: one terminal-binary cleanup test, 130 in `roe-core`, four
+The workspace suite contains 142 tests: one terminal-binary cleanup test, 132 in `roe-core`, four
 terminal renderer tests, three Vello lifecycle tests, and one shared renderer-conformance test for
 each frontend. New focused evidence covers overlapping host requests, host cancellation safety,
 bounded file-notification overload and backend errors, real notify wakeup, coalesced graphical
 wakeups, no-input Compio progress, raw-mode cleanup after device failure, visible file-selector
 errors, clipboard failure preservation/reporting, non-`NotFound` open errors, Unicode invariants,
-and external save failure behavior. Visit-file tests cover both rollback on open failure and
-retention of a replaced buffer that is still displayed in another window.
+external save failure behavior, transactional backend watch failure, and shared-directory watch
+ownership. Visit-file tests cover rollback on open failure, idle external updates, explicit native
+shutdown, and retention of a replaced buffer still displayed in another window.
 
 The same-host coarse sample measured 1,025 ns per edit round trip, 266 microseconds per terminal
 full redraw, 30.208 ms to the first welcome frame, and 3,596 KiB maximum RSS during the one-second
