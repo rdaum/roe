@@ -11,8 +11,11 @@ would repeat the actor/mailbox problems repaired in Phase 1.
 ## Decision
 
 Roe pins Mica revision `a13f479229b761bf45b7ef71802cd4ca6e588dd4` with `default-features = false`.
-One `CompioTaskDriver` lives for the process-long Compio runtime. Initial Phase 4 resource policy is
-explicit:
+One `CompioTaskDriver` lives for the process-long Compio runtime. That revision's public crates
+require Rust 1.95; Phase 4 therefore raises Roe's declared MSRV from 1.88 to 1.95 in the same
+reviewed dependency-cutover commit and replaces the 1.88 CI/check gate with 1.95. The integration
+must not mask the mismatch with an unverified transitive pin or local path override. Initial Phase 4
+resource policy is explicit:
 
 | Resource                     | Initial budget |
 | ---------------------------- | -------------- |

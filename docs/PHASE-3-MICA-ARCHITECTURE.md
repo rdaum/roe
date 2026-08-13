@@ -4,6 +4,10 @@ This document records the Phase 3 design required by [ROE-MICA-ROADMAP.md](../RO
 The design is grounded in the Phase 2 session/kernel boundary and Mica's public `mica-driver` API at
 exact revision `a13f479229b761bf45b7ef71802cd4ca6e588dd4`.
 
+The pinned driver and its public dependency graph declare Rust 1.95. Roe's 1.88 check correctly
+rejects them, so Phase 4 includes an explicit workspace/CI MSRV cutover to 1.95 alongside the Mica
+dependency. No production Mica dependency is added during this design-only phase.
+
 The ownership decisions are split into reviewable ADRs:
 
 - [ADR 0001](adr/0001-mica-owns-editor-policy.md): Mica owns logical editor policy; Rust owns
