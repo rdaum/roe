@@ -1,20 +1,19 @@
-use roe_core::command_registry;
 use roe_core::editor::{WindowNode, WindowType};
 use roe_core::file_watcher::FileWatcher;
-use roe_core::keys::{DefaultBindings, KeyState};
+use roe_core::keys::LogicalKey;
 use roe_core::kill_ring::KillRing;
-use roe_core::mode::{Mode, ScratchMode};
-use roe_core::{Buffer, BufferId, Editor, Frame, ModeId, Renderer, Window, WindowId};
+use roe_core::native_kernel::CapabilityGrants;
+use roe_core::session::{HostSession, InputEvent};
+use roe_core::{Buffer, BufferId, Editor, Frame, Window, WindowId};
 use roe_terminal::TerminalRenderer;
 use slotmap::SlotMap;
-use std::collections::HashMap;
 use std::hint::black_box;
 use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-const EDIT_ITERATIONS: usize = 10_000;
+const EDIT_ITERATIONS: usize = 100;
 const REDRAW_ITERATIONS: usize = 100;
 const FIXTURE_LINES: usize = 2_000;
 
@@ -35,12 +34,8 @@ impl Write for CountingWriter {
 }
 
 fn fixture() -> Editor {
-    let scratch_mode = Box::new(ScratchMode {});
-    let mut modes: SlotMap<ModeId, Box<dyn Mode>> = SlotMap::default();
-    let scratch_mode_id = modes.insert(scratch_mode);
-
     let mut buffers: SlotMap<BufferId, Buffer> = SlotMap::default();
-    let buffer = Buffer::new(&[scratch_mode_id]);
+    let buffer = Buffer::new();
     buffer.set_object("*baseline*".to_string());
     let mut content = String::with_capacity(FIXTURE_LINES * 64);
     for line in 0..FIXTURE_LINES {
@@ -68,25 +63,18 @@ fn fixture() -> Editor {
     Editor {
         frame: Frame::new(120, 40),
         buffers,
-        buffer_hosts: HashMap::new(),
         windows,
-        modes,
         active_window: window_id,
-        key_state: KeyState::new(),
-        bindings: Box::new(DefaultBindings {}),
         window_tree: WindowNode::new_leaf(window_id),
         kill_ring: KillRing::without_clipboard(60),
-        command_registry: command_registry::create_default_registry(),
         previous_active_window: None,
         buffer_history: Vec::new(),
         echo_message: String::new(),
         echo_message_time: None,
         clock: Arc::new(roe_core::native_services::SystemClock),
-        current_key_chord: Vec::new(),
         mouse_drag_state: None,
         messages_buffer_id: None,
         file_watcher: FileWatcher::new(),
-        last_search_term: String::new(),
     }
 }
 
@@ -103,18 +91,31 @@ fn resident_memory_kib() -> Option<usize> {
 }
 
 fn main() -> io::Result<()> {
+    compio::runtime::Runtime::new()?.block_on(run())
+}
+
+async fn run() -> io::Result<()> {
     let process_started = Instant::now();
     let editor = fixture();
     let fixture_construction = process_started.elapsed();
+    let mut session = HostSession::open_with_mica(editor, CapabilityGrants::editor_default())
+        .map_err(io::Error::other)?;
+    let initial = session.initial_output().await;
+    let ready = process_started.elapsed();
     let post_fixture_rss_kib = resident_memory_kib();
 
-    let buffer_id = editor.windows[editor.active_window].active_buffer;
-    let buffer = &editor.buffers[buffer_id];
-    let edit_position = buffer.buffer_len_chars() / 2;
     let editing_started = Instant::now();
     for _ in 0..EDIT_ITERATIONS {
-        buffer.insert_pos("x".to_string(), edit_position);
-        black_box(buffer.delete_pos(edit_position, 1));
+        let inserted = session
+            .dispatch(session.envelope(InputEvent::Text("x".to_owned())))
+            .await
+            .map_err(io::Error::other)?;
+        black_box(inserted);
+        let deleted = session
+            .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Backspace])))
+            .await
+            .map_err(io::Error::other)?;
+        black_box(deleted);
     }
     let editing_elapsed = editing_started.elapsed();
 
@@ -123,9 +124,15 @@ fn main() -> io::Result<()> {
         bytes: rendered_bytes.clone(),
     };
     let mut renderer = TerminalRenderer::new(writer);
+    renderer.apply_session_presentation(initial.presentation.as_ref().unwrap())?;
     let redraw_started = Instant::now();
     for _ in 0..REDRAW_ITERATIONS {
-        renderer.render_full(&editor)?;
+        let output = session
+            .dispatch(session.envelope(InputEvent::RequestSnapshot { after: None }))
+            .await
+            .map_err(io::Error::other)?;
+        renderer.apply_session_presentation(output.presentation.as_ref().unwrap())?;
+        renderer.render_session()?;
     }
     let redraw_elapsed = redraw_started.elapsed();
 
@@ -134,6 +141,7 @@ fn main() -> io::Result<()> {
         "fixture_construction_us={}",
         fixture_construction.as_micros()
     );
+    println!("mica_session_ready_us={}", ready.as_micros());
     if let Some(rss_kib) = post_fixture_rss_kib {
         println!("post_fixture_rss_kib={rss_kib}");
     } else {
@@ -141,12 +149,12 @@ fn main() -> io::Result<()> {
     }
     println!("edit_iterations={EDIT_ITERATIONS}");
     println!(
-        "edit_round_trip_ns_per_iteration={}",
+        "mica_edit_insert_delete_ns_per_iteration={}",
         editing_elapsed.as_nanos() / EDIT_ITERATIONS as u128
     );
     println!("redraw_iterations={REDRAW_ITERATIONS}");
     println!(
-        "terminal_full_redraw_us_per_iteration={}",
+        "mica_terminal_snapshot_redraw_us_per_iteration={}",
         redraw_elapsed.as_micros() / REDRAW_ITERATIONS as u128
     );
     println!(
