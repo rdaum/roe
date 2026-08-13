@@ -112,6 +112,7 @@ pub enum MicaKeyResult {
 pub enum MicaPromptTarget {
     Selector(String),
     Buffer(BufferId),
+    View(WindowId),
     Path(String),
 }
 
@@ -964,8 +965,22 @@ end
         editor: &Editor,
         resource_ids: &HashMap<BufferId, ResourceId>,
     ) -> Result<(), MicaHostError> {
-        let live_buffers: HashSet<_> = editor.buffers.keys().collect();
-        let live_views: HashSet<_> = editor.windows.keys().collect();
+        let live_buffers: HashSet<_> = editor
+            .buffers
+            .keys()
+            .filter(|buffer| !editor.is_command_buffer(*buffer))
+            .collect();
+        let live_views: HashSet<_> = editor
+            .windows
+            .iter()
+            .filter_map(|(view, window)| {
+                (!matches!(
+                    window.window_type,
+                    crate::editor::WindowType::Command { .. }
+                ))
+                .then_some(view)
+            })
+            .collect();
         let stale_buffers: Vec<_> = self
             .buffer_ids
             .keys()
@@ -1055,7 +1070,17 @@ end
             self.resource_ids.remove(&buffer_id);
         }
 
-        let active = editor.active_window;
+        let active = if matches!(
+            editor.windows[editor.active_window].window_type,
+            crate::editor::WindowType::Command { .. }
+        ) {
+            editor
+                .previous_active_window
+                .filter(|view| live_views.contains(view))
+                .ok_or(MicaHostError::MissingIdentity)?
+        } else {
+            editor.active_window
+        };
         let window = editor
             .windows
             .get(active)
@@ -1063,21 +1088,23 @@ end
         let mut retract = Vec::new();
         let mut assert = Vec::new();
 
-        if !self.buffer_ids.contains_key(&window.active_buffer) {
+        for buffer_id in &live_buffers {
+            if self.buffer_ids.contains_key(buffer_id) {
+                continue;
+            }
             let logical = self.driver.allocate_ephemeral_identity()?;
             let native = self.driver.allocate_ephemeral_identity()?;
             let resource = *resource_ids
-                .get(&window.active_buffer)
+                .get(buffer_id)
                 .ok_or(MicaHostError::MissingIdentity)?;
             let buffer = editor
                 .buffers
-                .get(window.active_buffer)
+                .get(*buffer_id)
                 .ok_or(MicaHostError::MissingIdentity)?;
-            self.buffer_ids.insert(window.active_buffer, logical);
-            self.buffer_names
-                .insert(window.active_buffer, buffer.object());
-            self.native_ids.insert(window.active_buffer, native);
-            self.resource_ids.insert(window.active_buffer, resource);
+            self.buffer_ids.insert(*buffer_id, logical);
+            self.buffer_names.insert(*buffer_id, buffer.object());
+            self.native_ids.insert(*buffer_id, native);
+            self.resource_ids.insert(*buffer_id, resource);
             self.bridge.add_resource(logical, resource);
             assert.extend([
                 (sym("roe/LogicalBuffer"), [Value::identity(logical)].into()),
@@ -1110,6 +1137,12 @@ end
         let buffer = self.buffer_ids[&window.active_buffer];
 
         for (window_id, candidate) in &editor.windows {
+            if matches!(
+                candidate.window_type,
+                crate::editor::WindowType::Command { .. }
+            ) {
+                continue;
+            }
             if self.view_ids.contains_key(&window_id) {
                 continue;
             }
@@ -1138,6 +1171,53 @@ end
             ]);
         }
 
+        for (window_id, candidate) in &editor.windows {
+            if matches!(
+                candidate.window_type,
+                crate::editor::WindowType::Command { .. }
+            ) {
+                continue;
+            }
+            let Some(view) = self.view_ids.get(&window_id).copied() else {
+                continue;
+            };
+            let Some(logical_buffer) = self.buffer_ids.get(&candidate.active_buffer).copied()
+            else {
+                continue;
+            };
+            if self.view_buffers.get(&window_id).copied() != Some(candidate.active_buffer) {
+                if let Some(previous) = self
+                    .view_buffers
+                    .get(&window_id)
+                    .and_then(|previous| self.buffer_ids.get(previous))
+                    .copied()
+                {
+                    retract.push((
+                        sym("roe/ViewBuffer"),
+                        [Value::identity(view), Value::identity(previous)].into(),
+                    ));
+                }
+                assert.push((
+                    sym("roe/ViewBuffer"),
+                    [Value::identity(view), Value::identity(logical_buffer)].into(),
+                ));
+                self.view_buffers.insert(window_id, candidate.active_buffer);
+            }
+            if self.view_cursors.get(&window_id).copied() != Some(candidate.cursor) {
+                if let Some(previous) = self.view_cursors.get(&window_id).copied() {
+                    retract.push((
+                        sym("roe/ViewCursor"),
+                        [Value::identity(view), int_value(previous)].into(),
+                    ));
+                }
+                assert.push((
+                    sym("roe/ViewCursor"),
+                    [Value::identity(view), int_value(candidate.cursor)].into(),
+                ));
+                self.view_cursors.insert(window_id, candidate.cursor);
+            }
+        }
+
         if let std::collections::hash_map::Entry::Vacant(entry) = self.view_ids.entry(active) {
             let view = self.driver.allocate_ephemeral_identity()?;
             entry.insert(view);
@@ -1158,26 +1238,6 @@ end
                 .into(),
             ));
         }
-        if self.view_buffers.get(&active).copied() != Some(window.active_buffer)
-            && let Some(previous) = self.view_buffers.get(&active).copied()
-        {
-            retract.push((
-                sym("roe/ViewBuffer"),
-                [
-                    Value::identity(view),
-                    Value::identity(self.buffer_ids[&previous]),
-                ]
-                .into(),
-            ));
-        }
-        if self.view_cursors.get(&active).copied() != Some(window.cursor)
-            && let Some(previous) = self.view_cursors.get(&active).copied()
-        {
-            retract.push((
-                sym("roe/ViewCursor"),
-                [Value::identity(view), int_value(previous)].into(),
-            ));
-        }
         assert.extend([
             (
                 sym("roe/ActiveView"),
@@ -1195,8 +1255,6 @@ end
         self.driver.retract_volatile_tuples_named(retract)?;
         self.driver.assert_volatile_tuples_named(assert)?;
         self.active_view = active;
-        self.view_buffers.insert(active, window.active_buffer);
-        self.view_cursors.insert(active, window.cursor);
         self.synchronize_layout(editor)?;
         Ok(())
     }
@@ -1544,6 +1602,13 @@ end
                     .iter()
                     .find_map(|(buffer, identity)| (*identity == logical).then_some(*buffer))?;
                 MicaPromptTarget::Buffer(buffer)
+            } else if kind == "command_argument" {
+                let logical = raw.as_identity()?;
+                let view = self
+                    .view_ids
+                    .iter()
+                    .find_map(|(view, identity)| (*identity == logical).then_some(*view))?;
+                MicaPromptTarget::View(view)
             } else {
                 MicaPromptTarget::Path(raw.with_str(str::to_owned)?)
             };

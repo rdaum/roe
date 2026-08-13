@@ -50,6 +50,8 @@ pub enum OpenType {
 pub enum CommandType {
     /// M-x command execution
     Execute,
+    /// Generic Mica interactive argument acquisition
+    Argument,
     /// C-x b buffer switching
     BufferSwitch,
     /// C-x k buffer killing

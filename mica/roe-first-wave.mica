@@ -77,6 +77,7 @@ make_identity(:roe/execute_command)
 make_identity(:roe/isearch_forward)
 make_identity(:roe/isearch_backward)
 make_identity(:roe/redraw)
+make_identity(:roe/select_window)
 
 assert roe/KeyPrefix("C-x")
 
@@ -322,6 +323,38 @@ assert roe/KeyBinding(#roe/global_map, "C-l", #roe/redraw, 1000)
 assert roe/PackageCommand(#roe/core_package, #roe/redraw)
 assert RoleCanInvoke(#roe/editor_role, :roe/redraw)
 
+assert roe/Command(#roe/select_window)
+assert roe/CommandSelector(#roe/select_window, :roe/select_window)
+assert roe/CommandImplementation(#roe/select_window, :roe/select_window_value)
+assert roe/CommandSummary(#roe/select_window, "Select a logical view using interactive completion")
+assert roe/CommandName(#roe/select_window, "select-window")
+assert roe/CommandArgument(#roe/select_window, 0, :window, :logical_view)
+assert roe/ArgumentPrompt(#roe/select_window, 0, "Window")
+assert roe/ArgumentCompletion(#roe/select_window, 0, :visible_views)
+assert roe/PackageCommand(#roe/core_package, #roe/select_window)
+assert RoleCanInvoke(#roe/editor_role, :roe/select_window)
+assert RoleCanInvoke(#roe/editor_role, :roe/select_window_value)
+
+verb roe/select_window(actor, session)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  let acquisition = invoke(:roe/acquire_argument, {:actor -> actor, :session -> session, :command -> #roe/select_window, :position -> 0, :supplied -> nothing})
+  acquisition[:kind] == :argument_required || return :argument_unavailable
+  assert roe/PromptState(session, :command_argument, "", 0, nothing, #roe/select_window)
+  return roe/refresh_prompt(actor, session)
+end
+
+verb roe/select_window_value(actor, session, value)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  roe/SessionLeafView(session, value) || return :invalid_view
+  let current = one roe/ActiveView(session, ?view)
+  if current != nothing && current != value
+    retract roe/ActiveView(session, current)
+  end
+  assert roe/ActiveView(session, value)
+  emit(session, {:kind -> :host_action, :action -> :other_window, :view -> value})
+  return :ok
+end
+
 verb roe/save_buffer(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor
   let view = one roe/ActiveView(session, ?view)
@@ -469,6 +502,18 @@ verb roe/prompt_candidates(actor, session, prompt_kind, query)
         end
       end
     end
+  elseif prompt_kind == :command_argument
+    let state = one roe/PromptState(session, ?kind, ?state_query, ?selected, ?target, ?command)
+    if state != nothing
+      let completion = one roe/ArgumentCompletion(state[:command], 0, ?selector)
+      for found in roe/ArgumentCandidate(completion, actor, session, ?candidate, ?label)
+        if query == "" || string_contains(lower(found[:label]), lower(query))
+          if roe/list_length(candidates) < 256
+            candidates = [@candidates, [found[:label], found[:candidate]]]
+          end
+        end
+      end
+    end
   end
   return sort(candidates)
 end
@@ -547,6 +592,12 @@ verb roe/prompt_key(actor, session, sequence)
       roe/CanRequestService(actor, :file_read) || return :file_read_denied
       emit(session, {:kind -> :host_action, :action -> :visit_file_selected, :path -> chosen[1]})
       return :ok
+    elseif state[:prompt_kind] == :command_argument
+      let accepted = invoke(:roe/accept_argument_candidate, {:actor -> actor, :session -> session, :command -> state[:aux], :position -> 0, :candidate -> chosen[1]})
+      accepted[:kind] == :argument_value || return :invalid_argument
+      let implementation = one roe/CommandImplementation(state[:aux], ?selector)
+      implementation != nothing || return :missing_implementation
+      return invoke(implementation, {:actor -> actor, :session -> session, :value -> accepted[:value]})
     end
   elseif string_len(sequence) == 1
     query = string_concat(query, sequence)

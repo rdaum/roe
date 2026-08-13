@@ -1013,6 +1013,7 @@ impl HostSession {
             if !self.editor.update_mica_prompt_window(&content, cursor) {
                 let command_type = match update.kind.as_str() {
                     "command" => CommandType::Execute,
+                    "command_argument" => CommandType::Argument,
                     "switch_buffer" => CommandType::BufferSwitch,
                     "kill_buffer" => CommandType::KillBuffer,
                     "find_file" => CommandType::OpenFile(crate::editor::OpenType::New),
@@ -2183,7 +2184,10 @@ fn mica_prompt_content(update: &MicaPromptUpdate) -> (String, usize) {
     for (index, (name, target)) in update.candidates.iter().take(8).enumerate() {
         debug_assert!(matches!(
             target,
-            MicaPromptTarget::Selector(_) | MicaPromptTarget::Buffer(_) | MicaPromptTarget::Path(_)
+            MicaPromptTarget::Selector(_)
+                | MicaPromptTarget::Buffer(_)
+                | MicaPromptTarget::View(_)
+                | MicaPromptTarget::Path(_)
         ));
         content.push('\n');
         content.push_str(if index == update.selected { "> " } else { "  " });
@@ -3052,6 +3056,56 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(snapshot(&selected).views.len(), 2);
+
+            let original = session
+                .editor
+                .windows
+                .keys()
+                .find(|window| *window != session.editor.active_window)
+                .unwrap();
+            let other = session.editor.active_window;
+            let other_buffer = session
+                .editor
+                .create_buffer("*argument-target*".to_owned(), "target".to_owned());
+            session.editor.windows[other].active_buffer = other_buffer;
+            session.editor.active_window = original;
+            let _ = session.synchronize_identities();
+
+            session
+                .dispatch(
+                    session.envelope(InputEvent::Keys(vec![meta, LogicalKey::AlphaNumeric('x')])),
+                )
+                .await
+                .unwrap();
+            session
+                .dispatch(session.envelope(InputEvent::Text("select-window".to_owned())))
+                .await
+                .unwrap();
+            let argument_prompt = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Enter])))
+                .await
+                .unwrap();
+            let argument_view = snapshot(&argument_prompt)
+                .views
+                .iter()
+                .find(|view| view.command_view)
+                .unwrap_or_else(|| panic!("argument prompt missing: {argument_prompt:#?}"));
+            assert!(
+                argument_view.visible_text.contains("*argument-target*"),
+                "unexpected argument prompt: {argument_view:#?}"
+            );
+            session
+                .dispatch(session.envelope(InputEvent::Text("argument-target".to_owned())))
+                .await
+                .unwrap();
+            let selected_argument = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Enter])))
+                .await
+                .unwrap();
+            assert_eq!(
+                snapshot(&selected_argument).active_view,
+                session.view_ids[&other]
+            );
 
             session
                 .dispatch(session.envelope(InputEvent::Close))
