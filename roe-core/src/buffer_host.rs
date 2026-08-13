@@ -85,7 +85,7 @@ pub struct BufferChange {
 }
 
 /// Response from BufferHost
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum BufferResponse {
     /// Actions completed with regions that need redrawing
     ActionsCompleted {
@@ -96,10 +96,8 @@ pub enum BufferResponse {
     },
     /// File operation completed
     Saved(String),
-    /// File loaded
-    Loaded(String),
     /// Operation failed
-    Error(String),
+    Error(NativeOperationError),
     /// Request processed but no significant change
     NoChange,
 }
@@ -108,6 +106,16 @@ pub enum BufferResponse {
 pub enum HostError {
     #[error("buffer host {buffer_id:?} is already processing an operation")]
     Busy { buffer_id: BufferId },
+}
+
+#[derive(Debug, Error)]
+pub enum NativeOperationError {
+    #[error("failed to save {path}: {source}")]
+    Save {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Cloneable handle to an in-process, serially borrowed buffer service.
@@ -650,7 +658,10 @@ impl BufferHost {
 
         match result {
             Ok(()) => BufferResponse::Saved(file_path),
-            Err(e) => BufferResponse::Error(format!("Save failed: {e}")),
+            Err(source) => BufferResponse::Error(NativeOperationError::Save {
+                path: file_path,
+                source,
+            }),
         }
     }
 }

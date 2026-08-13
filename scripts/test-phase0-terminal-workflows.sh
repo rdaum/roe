@@ -62,6 +62,16 @@ tmux -L "$tmux_socket" send-keys -t one-file C-x C-s
 finish_session one-file
 [[ "$(sed -n '1p' "$one_file")" == 'Zalpha' ]]
 
+# An ordinary save failure is reported in the UI and leaves the session usable.
+failed_save_path="/proc/roe-phase1-save-$$"
+start_session failed-save "$failed_save_path"
+tmux -L "$tmux_socket" send-keys -t failed-save -l Z
+tmux -L "$tmux_socket" send-keys -t failed-save C-x C-s
+sleep 0.2
+failed_save_pane="$(tmux -L "$tmux_socket" capture-pane -p -t failed-save)"
+[[ "$failed_save_pane" == *"failed to save"* ]]
+finish_session failed-save
+
 # Movement, a multibyte region kill, undo, yank, and insertion must all retain
 # character-index cursor semantics. Display access is removed above so this
 # cannot touch the user's system clipboard.
@@ -158,15 +168,14 @@ tmux -L "$tmux_socket" send-keys -t command-select C-x C-s
 finish_session command-select
 [[ "$(sed -n '1p' "$command_file")" == 'commandM' ]]
 
-# Record the current notify/event-loop behavior. The delivered event remains
-# unapplied while idle and is processed when the next terminal event arrives.
+# A delivered notify event must be processed while the terminal remains idle.
 watch_file="$probe_dir/watch.txt"
 printf 'before\n' >"$watch_file"
 start_session watcher "$watch_file"
 printf 'after\n' >"$watch_file"
 sleep 1.2
 watcher_pane="$(tmux -L "$tmux_socket" capture-pane -p -t watcher)"
-[[ "$watcher_pane" == *before* ]]
+[[ "$watcher_pane" == *after* ]]
 tmux -L "$tmux_socket" send-keys -t watcher -l X
 tmux -L "$tmux_socket" send-keys -t watcher C-x C-s
 finish_session watcher

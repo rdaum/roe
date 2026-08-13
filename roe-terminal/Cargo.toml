@@ -11,7 +11,6 @@ description = "Terminal rendering for Roe (Ryan's Own Emacs)"
 [dependencies]
 compio = { workspace = true }
 crossterm = { workspace = true }
-futures = { workspace = true }
 roe-core = { path = "../roe-core" }
 slotmap = { workspace = true }
 tracing = { workspace = true }

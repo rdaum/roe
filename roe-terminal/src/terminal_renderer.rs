@@ -13,13 +13,11 @@
 
 use compio::time::interval;
 use crossterm::event::{
-    Event, EventStream, KeyCode, KeyModifiers, ModifierKeyCode, MouseButton, MouseEvent,
-    MouseEventKind,
+    Event, KeyCode, KeyModifiers, ModifierKeyCode, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::style::{Color, Print, Stylize};
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::{cursor, queue};
-use futures::{StreamExt, future::FutureExt, select};
 use roe_core::editor::{BorderInfo, ChromeAction, DragType, Frame, MouseDragState, Window};
 use roe_core::gutter::{
     GutterConfig, LineStatus, calculate_gutter_width, format_line_number, get_line_status,
@@ -1309,21 +1307,13 @@ pub async fn event_loop_with_renderer<W: Write>(
     editor: &mut Editor,
     shutdown_requested: &AtomicBool,
 ) -> Result<(), std::io::Error> {
-    let mut event_stream = EventStream::new();
-    let mut echo_timer = interval(Duration::from_millis(500)); // Check every 500ms
+    // Compio owns progress. Crossterm is polled non-blockingly after each tick,
+    // so timers, watcher notifications, signals, and later host completions do
+    // not depend on incidental keyboard input to wake the runtime.
+    let mut event_tick = interval(Duration::from_millis(20));
 
     loop {
-        // Get the next event asynchronously
-        let event = select! {
-            event = event_stream.next().fuse() => {
-                match event {
-                    Some(Ok(event)) => Some(event),
-                    Some(Err(e)) => return Err(e),
-                    None => continue, // Stream ended, shouldn't happen but handle gracefully
-                }
-            }
-            _ = echo_timer.tick().fuse() => None, // Timer tick, check for expired echo
-        };
+        event_tick.tick().await;
 
         // Always poll for file changes and expired echo (every event, not just timer)
         {
@@ -1356,16 +1346,16 @@ pub async fn event_loop_with_renderer<W: Write>(
             }
         }
 
-        // Handle timer tick - just continue to next iteration
-        if event.is_none() {
-            if shutdown_requested.load(Ordering::Acquire) {
-                tracing::info!("terminal shutdown requested");
-                return Ok(());
-            }
+        if shutdown_requested.load(Ordering::Acquire) {
+            tracing::info!("terminal shutdown requested");
+            return Ok(());
+        }
+
+        if !crossterm::event::poll(Duration::ZERO)? {
             continue;
         }
 
-        let event = event.expect("Event stream should provide valid events");
+        let event = crossterm::event::read()?;
         let keys = match event {
             Event::Key(keystroke) => {
                 let key = crossterm_key_translate(&keystroke.code, keystroke.modifiers);

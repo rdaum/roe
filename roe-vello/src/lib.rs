@@ -31,12 +31,14 @@ use roe_core::editor::{
 use roe_core::gutter::{
     GutterConfig, LineStatus, calculate_gutter_width, format_line_number, get_line_status,
 };
+use roe_core::native_services::FrontendWake;
 use roe_core::renderer::{DirtyRegion, Renderer};
 use roe_core::syntax::Color as SyntaxColor;
 use roe_core::syntax::face_registry;
 use roe_core::{Editor, WindowId};
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use text::TextRenderer;
 use vello::kurbo::{Affine, Rect};
 use vello::peniko::{BlendMode, Color, Fill};
@@ -46,13 +48,28 @@ use vello::{AaConfig, RenderParams, RendererOptions, Scene};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseButton, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
 use winit::window::{CursorIcon, Window};
 
 /// Default window dimensions
 const DEFAULT_WIDTH: u32 = 1200;
 const DEFAULT_HEIGHT: u32 = 800;
+
+#[derive(Debug, Clone, Copy)]
+enum HostEvent {
+    Wake,
+}
+
+struct WinitWake(EventLoopProxy<HostEvent>);
+
+impl FrontendWake for WinitWake {
+    fn wake(&self) {
+        if self.0.send_event(HostEvent::Wake).is_err() {
+            tracing::debug!("Vello event loop already closed");
+        }
+    }
+}
 
 /// Convert a syntax color to Vello Color
 fn syntax_color_to_vello(color: &SyntaxColor, default: Color) -> Color {
@@ -164,16 +181,43 @@ impl<'a> RoeVelloApp<'a> {
         }
     }
 
-    fn create_window(&mut self, event_loop: &ActiveEventLoop) -> Arc<Window> {
+    fn drive_background(&mut self) {
+        self.runtime.enter(|| {
+            self.runtime.poll_with(Some(Duration::ZERO));
+            self.runtime.run();
+        });
+
+        let file_change_actions = self.editor.poll_file_changes();
+        for action in file_change_actions {
+            match action {
+                ChromeAction::Echo(message) => {
+                    self.editor.set_echo_message(message);
+                    self.redraw_state.invalidate(DirtyRegion::FullScreen);
+                }
+                ChromeAction::MarkDirty(region) => self.redraw_state.invalidate(region),
+                ChromeAction::BufferChanged { .. } => {
+                    tracing::trace!("external buffer change delivered");
+                }
+                _ => {}
+            }
+        }
+
+        if self.redraw_state.needs_redraw()
+            && let Some(state) = self.state.as_ref()
+        {
+            state.window.request_redraw();
+        }
+    }
+
+    fn create_window(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+    ) -> Result<Arc<Window>, winit::error::OsError> {
         let attrs = Window::default_attributes()
             .with_title("Roe - Ryan's Own Emacs")
             .with_inner_size(LogicalSize::new(DEFAULT_WIDTH, DEFAULT_HEIGHT));
 
-        Arc::new(
-            event_loop
-                .create_window(attrs)
-                .expect("Failed to create window"),
-        )
+        event_loop.create_window(attrs).map(Arc::new)
     }
 
     fn render(&mut self) {
@@ -203,9 +247,10 @@ impl<'a> RoeVelloApp<'a> {
         let lines = (logical_height as f32 / line_height).floor() as u16;
         self.editor
             .handle_resize(cols.max(1), lines.saturating_sub(1).max(1)); // -1 for echo area
-        self.redraw_state
-            .render_full(self.editor)
-            .expect("Vello logical presentation capture is infallible");
+        if let Err(error) = self.redraw_state.render_full(self.editor) {
+            tracing::error!(%error, "failed to capture Vello presentation");
+            return;
+        }
 
         // Build the scene in logical coordinates, then scale for physical rendering
         self.scene.reset();
@@ -241,7 +286,7 @@ impl<'a> RoeVelloApp<'a> {
             self.renderers.resize_with(dev_id + 1, || None);
         }
         if self.renderers[dev_id].is_none() {
-            let renderer = vello::Renderer::new(
+            let renderer = match vello::Renderer::new(
                 &device_handle.device,
                 RendererOptions {
                     use_cpu: false,
@@ -249,27 +294,41 @@ impl<'a> RoeVelloApp<'a> {
                     num_init_threads: None,
                     pipeline_cache: None,
                 },
-            )
-            .expect("Failed to create Vello renderer");
+            ) {
+                Ok(renderer) => renderer,
+                Err(error) => {
+                    tracing::error!(%error, "failed to create Vello renderer");
+                    self.editor
+                        .set_echo_message(format!("Renderer unavailable: {error}"));
+                    return;
+                }
+            };
             self.renderers[dev_id] = Some(renderer);
         }
 
-        let renderer = self.renderers[dev_id].as_mut().unwrap();
+        let Some(renderer) = self.renderers[dev_id].as_mut() else {
+            tracing::error!(device_id = dev_id, "renderer slot unexpectedly empty");
+            return;
+        };
 
-        renderer
-            .render_to_texture(
-                &device_handle.device,
-                &device_handle.queue,
-                &self.scene,
-                &state.surface.target_view,
-                &RenderParams {
-                    base_color: self.theme.bg_color,
-                    width,
-                    height,
-                    antialiasing_method: AaConfig::Msaa16,
-                },
-            )
-            .expect("Failed to render to texture");
+        if let Err(error) = renderer.render_to_texture(
+            &device_handle.device,
+            &device_handle.queue,
+            &self.scene,
+            &state.surface.target_view,
+            &RenderParams {
+                base_color: self.theme.bg_color,
+                width,
+                height,
+                antialiasing_method: AaConfig::Msaa16,
+            },
+        ) {
+            tracing::error!(%error, "failed to render Vello scene");
+            self.editor
+                .set_echo_message(format!("Renderer failed: {error}"));
+            self.redraw_state.invalidate(DirtyRegion::FullScreen);
+            return;
+        }
 
         self.redraw_state.redraw_complete();
 
@@ -1415,21 +1474,34 @@ impl<'a> RoeVelloApp<'a> {
     }
 }
 
-impl<'a> ApplicationHandler for RoeVelloApp<'a> {
+impl<'a> ApplicationHandler<HostEvent> for RoeVelloApp<'a> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_some() {
             return;
         }
 
-        let window = self.create_window(event_loop);
+        let window = match self.create_window(event_loop) {
+            Ok(window) => window,
+            Err(error) => {
+                tracing::error!(%error, "failed to create Vello window");
+                event_loop.exit();
+                return;
+            }
+        };
         let size = window.inner_size();
-        let surface = pollster::block_on(self.render_cx.create_surface(
+        let surface = match pollster::block_on(self.render_cx.create_surface(
             window.clone(),
             size.width,
             size.height,
             wgpu::PresentMode::AutoVsync,
-        ))
-        .expect("Failed to create surface");
+        )) {
+            Ok(surface) => surface,
+            Err(error) => {
+                tracing::error!(%error, "failed to create Vello surface");
+                event_loop.exit();
+                return;
+            }
+        };
 
         self.state = Some(RenderState { window, surface });
         self.request_redraw(DirtyRegion::FullScreen);
@@ -1460,30 +1532,6 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
                     self.request_redraw(DirtyRegion::FullScreen);
                 }
                 WindowEvent::RedrawRequested => {
-                    // Poll for external file changes
-                    let file_change_actions = self.editor.poll_file_changes();
-                    for action in file_change_actions {
-                        match action {
-                            ChromeAction::Echo(msg) => {
-                                self.editor.set_echo_message(msg);
-                                self.redraw_state.invalidate(DirtyRegion::FullScreen);
-                            }
-                            ChromeAction::MarkDirty(region) => {
-                                self.redraw_state.invalidate(region);
-                            }
-                            ChromeAction::BufferChanged {
-                                buffer_id: _,
-                                start: _,
-                                old_end: _,
-                                new_end: _,
-                            } => {
-                                // Major mode after-change hooks will be dispatched here once
-                                // the scripting runtime (mica) is integrated.
-                            }
-                            _ => {}
-                        }
-                    }
-
                     if self.redraw_state.needs_redraw() {
                         self.render();
                     }
@@ -1748,6 +1796,17 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
             }
         });
     }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: HostEvent) {
+        self.drive_background();
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.drive_background();
+        event_loop.set_control_flow(ControlFlow::WaitUntil(
+            Instant::now() + Duration::from_millis(20),
+        ));
+    }
 }
 
 /// Update window layout based on incremental mouse drag
@@ -1820,8 +1879,14 @@ pub fn run_vello(
     // integrated; use defaults for now.
     let theme = VelloTheme::default();
 
-    let event_loop = EventLoop::new()?;
-    event_loop.set_control_flow(ControlFlow::Wait);
+    let event_loop = EventLoop::<HostEvent>::with_user_event().build()?;
+    let wake_proxy = event_loop.create_proxy();
+    editor
+        .file_watcher
+        .set_wake_handler(Arc::new(WinitWake(wake_proxy)));
+    event_loop.set_control_flow(ControlFlow::WaitUntil(
+        Instant::now() + Duration::from_millis(20),
+    ));
 
     let mut app = RoeVelloApp::new(editor, theme, runtime);
     event_loop.run_app(&mut app)?;

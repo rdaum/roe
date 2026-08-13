@@ -212,14 +212,19 @@ async fn terminal_main<W: Write>(
             });
             let file_mode_id = modes.insert(file_mode);
 
-            // Try to load the file, create empty buffer if it doesn't exist
+            // Load an existing file, or create a new buffer only when it is absent.
             let buffer = match Buffer::from_file(&file_path, &[file_mode_id]).await {
                 Ok(buffer) => buffer,
-                Err(_) => {
-                    // File doesn't exist, create empty buffer with FileMode
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     let buffer = Buffer::new(&[file_mode_id]);
                     buffer.set_object(file_path.clone());
                     buffer
+                }
+                Err(error) => {
+                    return Err(std::io::Error::new(
+                        error.kind(),
+                        format!("failed to open {file_path}: {error}"),
+                    ));
                 }
             };
 

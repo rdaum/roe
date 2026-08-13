@@ -23,12 +23,16 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use similar::{ChangeTag, TextDiff};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::BufferId;
-use crate::native_services::{Clock, SystemClock};
+use crate::native_services::{Clock, FrontendWake, SystemClock};
+
+/// File notifications are hints to reread current disk state. A bounded FIFO
+/// protects the host from notify storms without retaining file contents.
+const EVENT_QUEUE_CAPACITY: usize = 256;
 
 /// Represents a change to a specific line range
 #[derive(Debug, Clone)]
@@ -112,11 +116,12 @@ pub struct FileWatcher {
     /// The notify watcher instance
     watcher: Option<RecommendedWatcher>,
     /// Sender for file change events
-    event_tx: Sender<FileChangeEvent>,
+    event_tx: SyncSender<FileChangeEvent>,
     /// Receiver for file change events (polled by editor)
     event_rx: Receiver<FileChangeEvent>,
     /// Map of file paths to buffer IDs (Arc for sharing with callback)
     path_to_buffer: Arc<RwLock<HashMap<PathBuf, BufferId>>>,
+    wake_handler: Arc<RwLock<Option<Arc<dyn FrontendWake>>>>,
     clock: Arc<dyn Clock>,
     /// Sync state per buffer
     sync_states: HashMap<BufferId, BufferSyncState>,
@@ -128,12 +133,13 @@ impl FileWatcher {
     }
 
     pub fn with_clock(clock: Arc<dyn Clock>) -> Self {
-        let (event_tx, event_rx) = channel();
+        let (event_tx, event_rx) = sync_channel(EVENT_QUEUE_CAPACITY);
         Self {
             watcher: None,
             event_tx,
             event_rx,
             path_to_buffer: Arc::new(RwLock::new(HashMap::new())),
+            wake_handler: Arc::new(RwLock::new(None)),
             clock,
             sync_states: HashMap::new(),
         }
@@ -143,6 +149,7 @@ impl FileWatcher {
     pub fn init(&mut self) -> Result<(), notify::Error> {
         let tx = self.event_tx.clone();
         let path_to_buffer = self.path_to_buffer.clone();
+        let wake_handler = self.wake_handler.clone();
 
         let watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
             let Ok(event) = res else { return };
@@ -156,9 +163,7 @@ impl FileWatcher {
             }
 
             for path in &event.paths {
-                let Ok(canonical) = path.canonicalize() else {
-                    continue;
-                };
+                let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
                 let Ok(map) = path_to_buffer.read() else {
                     continue;
                 };
@@ -166,15 +171,39 @@ impl FileWatcher {
                     continue;
                 };
 
-                let _ = tx.send(FileChangeEvent {
+                let change = FileChangeEvent {
                     buffer_id: *buffer_id,
                     file_path: canonical,
-                });
+                };
+                match tx.try_send(change) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(change)) => {
+                        tracing::warn!(
+                            buffer_id = ?change.buffer_id,
+                            path = %change.file_path.display(),
+                            capacity = EVENT_QUEUE_CAPACITY,
+                            "file notification queue is full; dropping redundant hint"
+                        );
+                    }
+                    Err(TrySendError::Disconnected(_)) => return,
+                }
+
+                if let Ok(handler) = wake_handler.read()
+                    && let Some(handler) = handler.as_ref()
+                {
+                    handler.wake();
+                }
             }
         })?;
 
         self.watcher = Some(watcher);
         Ok(())
+    }
+
+    pub fn set_wake_handler(&mut self, handler: Arc<dyn FrontendWake>) {
+        if let Ok(mut current) = self.wake_handler.write() {
+            *current = Some(handler);
+        }
     }
 
     /// Start watching a file for a buffer
@@ -562,6 +591,7 @@ mod tests {
     use super::*;
     use slotmap::SlotMap;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct TestClock {
@@ -571,6 +601,14 @@ mod tests {
     impl Clock for TestClock {
         fn now(&self) -> Instant {
             *self.now.lock().unwrap()
+        }
+    }
+
+    struct CountingWake(AtomicUsize);
+
+    impl FrontendWake for CountingWake {
+        fn wake(&self) {
+            self.0.fetch_add(1, Ordering::Release);
         }
     }
 
@@ -624,6 +662,8 @@ mod tests {
         let mut ids: SlotMap<BufferId, ()> = SlotMap::with_key();
         let buffer_id = ids.insert(());
         let mut watcher = FileWatcher::new();
+        let wake_count = Arc::new(CountingWake(AtomicUsize::new(0)));
+        watcher.set_wake_handler(wake_count.clone());
         watcher
             .watch_file(buffer_id, &path, "before".to_string())
             .unwrap();
@@ -648,6 +688,44 @@ mod tests {
             delivered,
             "notify did not deliver the file change within 2s"
         );
+        assert!(
+            wake_count.0.load(Ordering::Acquire) > 0,
+            "notify delivery did not wake the frontend"
+        );
+    }
+
+    #[test]
+    fn file_notification_queue_has_explicit_overload_behavior() {
+        let mut watcher = FileWatcher::new();
+        let mut ids: SlotMap<BufferId, ()> = SlotMap::with_key();
+        let buffer_id = ids.insert(());
+        watcher.sync_states.insert(
+            buffer_id,
+            BufferSyncState::new(
+                PathBuf::from("/virtual/file"),
+                String::new(),
+                watcher.clock.now(),
+            ),
+        );
+
+        for index in 0..EVENT_QUEUE_CAPACITY {
+            watcher
+                .event_tx
+                .try_send(FileChangeEvent {
+                    buffer_id,
+                    file_path: PathBuf::from(format!("/virtual/{index}")),
+                })
+                .expect("events through the documented capacity must fit");
+        }
+
+        assert!(matches!(
+            watcher.event_tx.try_send(FileChangeEvent {
+                buffer_id,
+                file_path: PathBuf::from("/virtual/overflow"),
+            }),
+            Err(TrySendError::Full(_))
+        ));
+        assert_eq!(watcher.poll_events().len(), EVENT_QUEUE_CAPACITY);
     }
 
     #[test]

@@ -94,7 +94,7 @@ struct EditorConfig {
     file_paths: Vec<String>,
 }
 
-async fn create_editor(config: EditorConfig) -> Editor {
+async fn create_editor(config: EditorConfig) -> std::io::Result<Editor> {
     // Default keybindings ship in Rust; the scripting runtime (mica) will be
     // able to extend them once integrated.
     let bindings = ConfigurableBindings::new();
@@ -134,10 +134,16 @@ async fn create_editor(config: EditorConfig) -> Editor {
 
             let buffer = match Buffer::from_file(&file_path, &[file_mode_id]).await {
                 Ok(buffer) => buffer,
-                Err(_) => {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     let buffer = Buffer::new(&[file_mode_id]);
                     buffer.set_object(file_path.clone());
                     buffer
+                }
+                Err(error) => {
+                    return Err(std::io::Error::new(
+                        error.kind(),
+                        format!("failed to open {file_path}: {error}"),
+                    ));
                 }
             };
 
@@ -221,7 +227,7 @@ async fn create_editor(config: EditorConfig) -> Editor {
         }
     }
 
-    editor
+    Ok(editor)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -233,7 +239,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("starting Vello frontend");
     let runtime = compio::runtime::Runtime::new()?;
 
-    let mut editor = runtime.block_on(create_editor(config));
+    let mut editor = runtime.block_on(create_editor(config))?;
 
     // Run with Vello renderer
     roe_vello::run_vello(&mut editor, runtime)?;

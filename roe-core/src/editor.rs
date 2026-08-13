@@ -19,13 +19,11 @@ use crate::command_registry::CommandRegistry;
 use crate::file_selector_mode::FileSelectorMode;
 use crate::keys::KeyAction::ChordNext;
 use crate::keys::{Bindings, CursorDirection, KeyAction, KeyState, LogicalKey};
-use crate::kill_ring::KillRing;
+use crate::kill_ring::{ClipboardError, KillRing};
 use crate::mode::{ActionPosition, MessagesMode, Mode};
 use crate::native_services::Clock;
 use crate::renderer::{DirtyRegion, ModelineComponent};
 use crate::{BufferId, ModeId, WindowId};
-use compio::buf::BufResult;
-use compio::io::AsyncWriteAtExt;
 use slotmap::SlotMap;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -334,6 +332,16 @@ pub enum ChromeAction {
 }
 
 impl Editor {
+    fn with_clipboard_error(
+        mut actions: Vec<ChromeAction>,
+        error: Option<ClipboardError>,
+    ) -> Vec<ChromeAction> {
+        if let Some(error) = error {
+            actions.push(ChromeAction::Echo(error.to_string()));
+        }
+        actions
+    }
+
     /// Create a command window and associated buffer
     pub fn create_command_window(
         &mut self,
@@ -2340,9 +2348,6 @@ impl Editor {
             BufferResponse::Saved(file_path) => {
                 vec![ChromeAction::Echo(format!("Saved: {file_path}"))]
             }
-            BufferResponse::Loaded(file_path) => {
-                vec![ChromeAction::Echo(format!("Loaded: {file_path}"))]
-            }
             BufferResponse::Error(error) => {
                 vec![ChromeAction::Echo(format!("Error: {error}"))]
             }
@@ -2578,24 +2583,28 @@ impl Editor {
                 }
 
                 // Add to kill-ring
-                if count < 0 {
-                    self.kill_ring.kill_prepend(deleted.clone());
+                let clipboard_error = if count < 0 {
+                    let error = self.kill_ring.kill_prepend(deleted.clone());
                     // Adjust cursor for backward kill
                     let length = deleted.chars().count();
                     window.cursor = window.cursor.saturating_sub(length);
+                    error
                 } else {
-                    self.kill_ring.kill(deleted.clone());
-                }
+                    self.kill_ring.kill(deleted.clone())
+                };
 
                 let new_cursor = buffer.to_column_line(window.cursor);
                 let window_cursor = window.absolute_cursor_position(new_cursor.0, new_cursor.1);
-                vec![
-                    ChromeAction::Echo(format!("Killed: {deleted}")),
-                    ChromeAction::MarkDirty(DirtyRegion::Buffer {
-                        buffer_id: window.active_buffer,
-                    }),
-                    ChromeAction::CursorMove(window_cursor),
-                ]
+                Self::with_clipboard_error(
+                    vec![
+                        ChromeAction::Echo(format!("Killed: {deleted}")),
+                        ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                            buffer_id: window.active_buffer,
+                        }),
+                        ChromeAction::CursorMove(window_cursor),
+                    ],
+                    clipboard_error,
+                )
             }
             ActionPosition::Absolute(l, c) => {
                 let Some(deleted) = buffer.delete_col_line((*l, *c), count) else {
@@ -2606,21 +2615,24 @@ impl Editor {
                 }
 
                 // Add to kill-ring
-                if count < 0 {
-                    self.kill_ring.kill_prepend(deleted.clone());
+                let clipboard_error = if count < 0 {
+                    self.kill_ring.kill_prepend(deleted.clone())
                 } else {
-                    self.kill_ring.kill(deleted.clone());
-                }
+                    self.kill_ring.kill(deleted.clone())
+                };
 
                 let new_cursor = buffer.to_column_line(window.cursor);
                 let window_cursor = window.absolute_cursor_position(new_cursor.0, new_cursor.1);
-                vec![
-                    ChromeAction::Echo(format!("Killed: {deleted}")),
-                    ChromeAction::MarkDirty(DirtyRegion::Buffer {
-                        buffer_id: window.active_buffer,
-                    }),
-                    ChromeAction::CursorMove(window_cursor),
-                ]
+                Self::with_clipboard_error(
+                    vec![
+                        ChromeAction::Echo(format!("Killed: {deleted}")),
+                        ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                            buffer_id: window.active_buffer,
+                        }),
+                        ChromeAction::CursorMove(window_cursor),
+                    ],
+                    clipboard_error,
+                )
             }
             ActionPosition::End => {
                 vec![ChromeAction::Echo("End kill not implemented".to_string())]
@@ -2651,16 +2663,19 @@ impl Editor {
 
         match text_to_kill {
             Some(killed) if !killed.is_empty() => {
-                self.kill_ring.kill(killed.clone());
+                let clipboard_error = self.kill_ring.kill(killed.clone());
                 let new_cursor = buffer.to_column_line(window.cursor);
                 let window_cursor = window.absolute_cursor_position(new_cursor.0, new_cursor.1);
-                vec![
-                    ChromeAction::Echo(format!("Killed line: {}", killed.replace('\n', "\\n"))),
-                    ChromeAction::MarkDirty(DirtyRegion::Buffer {
-                        buffer_id: window.active_buffer,
-                    }),
-                    ChromeAction::CursorMove(window_cursor),
-                ]
+                Self::with_clipboard_error(
+                    vec![
+                        ChromeAction::Echo(format!("Killed line: {}", killed.replace('\n', "\\n"))),
+                        ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                            buffer_id: window.active_buffer,
+                        }),
+                        ChromeAction::CursorMove(window_cursor),
+                    ],
+                    clipboard_error,
+                )
             }
             _ => {
                 vec![ChromeAction::Echo("Nothing to kill".to_string())]
@@ -2692,16 +2707,19 @@ impl Editor {
 
         match text_to_kill {
             Some(killed) if !killed.is_empty() => {
-                self.kill_ring.kill(killed.clone());
+                let clipboard_error = self.kill_ring.kill(killed.clone());
                 window.cursor = word_start;
                 let new_cursor = buffer.to_column_line(window.cursor);
                 let window_cursor = window.absolute_cursor_position(new_cursor.0, new_cursor.1);
-                vec![
-                    ChromeAction::MarkDirty(DirtyRegion::Buffer {
-                        buffer_id: window.active_buffer,
-                    }),
-                    ChromeAction::CursorMove(window_cursor),
-                ]
+                Self::with_clipboard_error(
+                    vec![
+                        ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                            buffer_id: window.active_buffer,
+                        }),
+                        ChromeAction::CursorMove(window_cursor),
+                    ],
+                    clipboard_error,
+                )
             }
             _ => {
                 vec![ChromeAction::Echo("Nothing to kill".to_string())]
@@ -2733,16 +2751,19 @@ impl Editor {
 
         match text_to_kill {
             Some(killed) if !killed.is_empty() => {
-                self.kill_ring.kill(killed.clone());
+                let clipboard_error = self.kill_ring.kill(killed.clone());
                 // Cursor stays at current_pos
                 let new_cursor = buffer.to_column_line(window.cursor);
                 let window_cursor = window.absolute_cursor_position(new_cursor.0, new_cursor.1);
-                vec![
-                    ChromeAction::MarkDirty(DirtyRegion::Buffer {
-                        buffer_id: window.active_buffer,
-                    }),
-                    ChromeAction::CursorMove(window_cursor),
-                ]
+                Self::with_clipboard_error(
+                    vec![
+                        ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                            buffer_id: window.active_buffer,
+                        }),
+                        ChromeAction::CursorMove(window_cursor),
+                    ],
+                    clipboard_error,
+                )
             }
             _ => {
                 vec![ChromeAction::Echo("Nothing to kill".to_string())]
@@ -2770,20 +2791,23 @@ impl Editor {
         }
 
         // Add to kill-ring
-        self.kill_ring.kill(deleted.clone());
+        let clipboard_error = self.kill_ring.kill(deleted.clone());
 
         // Update cursor to the start of the deleted region
         window.cursor = new_cursor_pos;
         let new_cursor = buffer.to_column_line(window.cursor);
         let window_cursor = window.absolute_cursor_position(new_cursor.0, new_cursor.1);
 
-        vec![
-            ChromeAction::Echo(format!("Killed region: {}", deleted.replace('\n', "\\n"))),
-            ChromeAction::MarkDirty(DirtyRegion::Buffer {
-                buffer_id: window.active_buffer,
-            }),
-            ChromeAction::CursorMove(window_cursor),
-        ]
+        Self::with_clipboard_error(
+            vec![
+                ChromeAction::Echo(format!("Killed region: {}", deleted.replace('\n', "\\n"))),
+                ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                    buffer_id: window.active_buffer,
+                }),
+                ChromeAction::CursorMove(window_cursor),
+            ],
+            clipboard_error,
+        )
     }
 
     /// Copy region to kill-ring without deleting
@@ -2802,20 +2826,23 @@ impl Editor {
         }
 
         // Add to kill-ring without deleting
-        self.kill_ring.kill(region_text.clone());
+        let clipboard_error = self.kill_ring.kill(region_text.clone());
 
         // Clear the mark after copying to stop region highlighting
         buffer.clear_mark();
 
-        vec![
-            ChromeAction::Echo(format!(
-                "Copied region: {}",
-                region_text.replace('\n', "\\n")
-            )),
-            ChromeAction::MarkDirty(DirtyRegion::Buffer {
-                buffer_id: window.active_buffer,
-            }),
-        ]
+        Self::with_clipboard_error(
+            vec![
+                ChromeAction::Echo(format!(
+                    "Copied region: {}",
+                    region_text.replace('\n', "\\n")
+                )),
+                ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                    buffer_id: window.active_buffer,
+                }),
+            ],
+            clipboard_error,
+        )
     }
 
     /// Set mark at cursor position
@@ -2850,63 +2877,6 @@ impl Editor {
         } else {
             vec![ChromeAction::Echo("No mark to clear".to_string())]
         }
-    }
-
-    /// Save the current buffer to file
-    pub fn save_buffer(&mut self) -> Vec<ChromeAction> {
-        // Extract all needed data from buffer first to avoid borrow conflicts
-        let (buffer_id, file_path, content) = {
-            let window = &self.windows[self.active_window];
-            let buffer = &self.buffers[window.active_buffer];
-
-            // Insert undo boundary - save breaks undo groups
-            buffer.undo_boundary();
-
-            // Get file path from buffer's object name
-            let file_path = if let Some(mode_id) = buffer.modes().first() {
-                if self.modes.get(*mode_id).is_some() {
-                    buffer.object()
-                } else {
-                    return vec![ChromeAction::Echo("No mode found for save".to_string())];
-                }
-            } else {
-                return vec![ChromeAction::Echo("No mode found for save".to_string())];
-            };
-
-            let content = buffer.with_read(|b| b.buffer.to_string());
-            (window.active_buffer, file_path, content)
-        };
-
-        // Now we can call mutable methods on self
-        self.mark_buffer_saving(buffer_id);
-        self.update_buffer_base(buffer_id);
-
-        let file_path_clone = file_path.clone();
-
-        // Start async save operation without blocking
-        compio::runtime::spawn(async move {
-            let result: std::io::Result<()> = async {
-                let mut file = compio::fs::File::create(&file_path_clone).await?;
-                let BufResult(res, _buf) = file.write_all_at(content.into_bytes(), 0).await;
-                res?;
-                Ok(())
-            }
-            .await;
-
-            match result {
-                Ok(()) => {
-                    // TODO: Send success message back to editor
-                    eprintln!("Saved {file_path_clone}");
-                }
-                Err(err) => {
-                    // TODO: Send error message back to editor
-                    eprintln!("Error saving {file_path_clone}: {err}");
-                }
-            }
-        })
-        .detach();
-
-        vec![ChromeAction::Echo(format!("Saving {file_path}..."))]
     }
 
     /// Ensure the cursor is visible in the window, scrolling if necessary.
@@ -2951,16 +2921,24 @@ impl Editor {
 
     /// Yank (paste) from kill-ring
     pub fn yank(&mut self, position: &ActionPosition) -> Vec<ChromeAction> {
-        let text = match self.kill_ring.yank() {
-            Some(text) => text.to_string(),
-            None => return vec![ChromeAction::Echo("Kill ring is empty".to_string())],
+        let text = self.kill_ring.yank().map(str::to_string);
+        let clipboard_error = self.kill_ring.take_clipboard_error();
+        let Some(text) = text else {
+            return vec![ChromeAction::Echo(clipboard_error.map_or_else(
+                || "Kill ring is empty".to_string(),
+                |error| error.to_string(),
+            ))];
         };
 
         // Break the kill sequence since we're doing a yank
         self.kill_ring.break_kill_sequence();
 
         // Insert the yanked text
-        self.insert_text(text, position)
+        let mut actions = self.insert_text(text, position);
+        if let Some(error) = clipboard_error {
+            actions.push(ChromeAction::Echo(error.to_string()));
+        }
+        actions
     }
 
     /// Yank from specific kill-ring index
@@ -2988,11 +2966,14 @@ impl Editor {
         // Try to load the file
         let buffer = match Buffer::from_file(&file_path.to_string_lossy(), &[]).await {
             Ok(buffer) => buffer,
-            Err(_) => {
-                // File doesn't exist, create empty buffer
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A missing file is the normal create-new-file path.
                 let buffer = Buffer::new(&[]);
                 buffer.set_object(file_path.to_string_lossy().to_string());
                 buffer
+            }
+            Err(error) => {
+                return Err(format!("Failed to open {}: {error}", file_path.display()));
             }
         };
 
@@ -3319,7 +3300,13 @@ impl Editor {
             // Read the new file content
             let new_content = match std::fs::read_to_string(&event.file_path) {
                 Ok(content) => content,
-                Err(_) => continue, // File might have been deleted
+                Err(error) => {
+                    actions.push(ChromeAction::Echo(format!(
+                        "External file change unavailable for {}: {error}",
+                        event.file_path.display()
+                    )));
+                    continue;
+                }
             };
 
             // Get the buffer and sync state
@@ -3580,6 +3567,26 @@ mod tests {
         *clock.now.lock().unwrap() = start + Duration::from_secs(ECHO_TIMEOUT_SECS);
         assert!(editor.check_and_clear_expired_echo());
         assert!(editor.echo_message.is_empty());
+    }
+
+    #[test]
+    fn open_file_reports_non_not_found_io_errors() {
+        let _runtime_guard = COMPIO_RUNTIME_LOCK.lock().unwrap();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut editor = test_editor();
+            let directory =
+                std::env::temp_dir().join(format!("roe-open-error-{}", std::process::id()));
+            let _ = std::fs::remove_dir(&directory);
+            std::fs::create_dir(&directory).unwrap();
+
+            let error = editor
+                .open_file_in_window(directory.clone(), editor.active_window)
+                .await
+                .expect_err("a directory must not be treated as a new empty file");
+
+            assert!(error.contains("Failed to open"), "{error}");
+            std::fs::remove_dir(directory).unwrap();
+        });
     }
 
     #[test]

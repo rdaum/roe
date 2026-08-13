@@ -93,41 +93,45 @@ impl FileSelectorMode {
         self.all_paths.clear();
 
         // Always add ".." to go up a directory (unless we're at root)
-        if self.current_dir.parent().is_some() {
+        if let Some(parent) = self.current_dir.parent() {
             self.all_items.push("../".to_string());
-            self.all_paths.push(
-                self.current_dir
-                    .parent()
-                    .expect("Directory should have a parent")
-                    .to_path_buf(),
-            );
+            self.all_paths.push(parent.to_path_buf());
         }
 
         // Read directory contents
-        if let Ok(entries) = self.file_system.read_directory(&self.current_dir) {
-            let mut dirs = Vec::new();
-            let mut files = Vec::new();
+        match self.file_system.read_directory(&self.current_dir) {
+            Ok(entries) => {
+                let mut dirs = Vec::new();
+                let mut files = Vec::new();
 
-            for entry in entries {
-                if entry.is_directory {
-                    dirs.push((format!("{}/", entry.name), entry.path));
-                } else {
-                    files.push((entry.name, entry.path));
+                for entry in entries {
+                    if entry.is_directory {
+                        dirs.push((format!("{}/", entry.name), entry.path));
+                    } else {
+                        files.push((entry.name, entry.path));
+                    }
+                }
+
+                // Sort directories and files separately
+                dirs.sort_by(|a, b| a.0.cmp(&b.0));
+                files.sort_by(|a, b| a.0.cmp(&b.0));
+
+                // Add directories first, then files
+                for (name, path) in dirs {
+                    self.all_items.push(name);
+                    self.all_paths.push(path);
+                }
+                for (name, path) in files {
+                    self.all_items.push(name);
+                    self.all_paths.push(path);
                 }
             }
-
-            // Sort directories and files separately
-            dirs.sort_by(|a, b| a.0.cmp(&b.0));
-            files.sort_by(|a, b| a.0.cmp(&b.0));
-
-            // Add directories first, then files
-            for (name, path) in dirs {
-                self.all_items.push(name);
-                self.all_paths.push(path);
-            }
-            for (name, path) in files {
-                self.all_items.push(name);
-                self.all_paths.push(path);
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    path = %self.current_dir.display(),
+                    "failed to read file-selector directory"
+                );
             }
         }
     }
