@@ -56,7 +56,9 @@ to realize Mica's decision.
 selection, cancellation, command argument acquisition, history, and filtering. The generic
 argument path is exercised by `select-window`: its declared `:window`/`:logical_view` argument
 opens a completion prompt, validates the chosen logical view, and invokes the declared command
-implementation. Command, buffer, view, and file candidates are computed in Mica and capped at 256
+implementation. Prompt position, label, completion selector, and candidate value type remain Mica
+data; the exercised command deliberately uses a nonzero position so the bridge cannot silently
+special-case position zero. Command, buffer, view, and file candidates are computed in Mica and capped at 256
 entries. Search state and selection live in Mica; the native `text_search` request returns at most
 1,024 character-indexed matches.
 
@@ -75,8 +77,10 @@ The host publishes logical buffers but does not assign `fundamental`; Mica deriv
 default unless an explicit buffer major mode overrides it.
 `roe/publish_policy` emits a reset followed by a bounded projection of effective mode, face,
 syntax, and configuration facts. `roe/dispatch_key` emits ordered effective hooks after editing.
-Higher-precedence hooks run first. Tab width comes from `EffectiveConfiguration`; word editing
-interprets the highest-precedence Mica character-class rule and visibly rejects unsupported or
+Higher-precedence hook selectors run first and execute inside Mica; the built-in invalidation hook
+emits only the renderer-neutral invalidation mechanism it needs. Tab width comes from
+`EffectiveConfiguration`; word movement and deletion interpret the highest-precedence Mica
+character-class rule and visibly reject unsupported or
 ambiguous rules rather than using a Rust fallback; search highlighting consumes Mica face
 attributes. Hook invalidation reaches the common presentation stream, not either renderer
 directly.
@@ -102,6 +106,12 @@ authority. `HostSession` exposes check-before-replace, named-unit replacement, f
 first-wave restore, and package enable/disable operations. Malformed replacement leaves the last
 working unit live; a valid replacement atomically resets projected policy and removes stale
 settings.
+
+Both shipped binaries expose the native bootstrap surface before their normal event loops through
+`--mica-check`, `--mica-replace`, `--mica-export`, `--mica-restore-first-wave`, package
+enable/disable, and `--mica-inspect`. Inspection reports endpoint/session identities and the
+bounded live-object state. These options do not depend on user Mica policy, so invalid replacement
+can be diagnosed and repaired from either frontend.
 
 Durable user/workspace state is intentionally not enabled in Phase 5. It was optional in the
 roadmap, and enabling it requires an explicit schema revision, migration, backup, and recovery
@@ -131,6 +141,9 @@ The only renderer conformance surface is the revisioned `SessionOutput` presenta
 - Search matches: 1,024.
 - Effective policy facts per publication: 256; overflow produces a visible lifecycle error.
 - Native resources: fixed-capacity, generation-checked slots with explicit invalidation.
+- Logical views: 64, with native minimum-geometry and topology validation before split/delete commit.
+- Messages: 65,536 characters, retaining the newest diagnostics.
+- Directory results: the lexically first 256 paths, retained with bounded memory during enumeration.
 
 Authority is checked at the endpoint, service, logical-buffer, and native-resource layers. Native
 failures are returned through typed completion/lifecycle results. Cancellation, endpoint close,
@@ -164,12 +177,13 @@ closed those gaps and passed the deletion gate.
 | `1c89b1f` | Make default modes, binding precedence, hook order, and syntax policy authoritative. |
 | `8c088ba` | Exercise both frontend realizations with the production Mica session stream. |
 | `03731c9` | Authorize and test relational layout dragging through Mica. |
+| `d91b014` | Close recovery, argument, hook, syntax, authority, and retention gaps from re-review. |
 
 ## Verification and measurements
 
 | Evidence | Result |
 | -------- | ------ |
-| `./scripts/check.sh` | Formatting, all-target checks, strict Clippy, dependency policy, and 156 tests pass. |
+| `./scripts/check.sh` | Formatting, all-target checks, strict Clippy, dependency policy, and 157 tests pass. |
 | `cargo test -p roe-core mica_ -- --test-threads=1` | 14 focused Mica authority, precedence, syntax, prompt, lifecycle, replacement, and shutdown tests pass. |
 | `./scripts/test-phase0-terminal-workflows.sh` | Release terminal workflows pass through the production Mica session. |
 | `cargo test -p roe-vello production_mica_session_builds_a_vello_scene_without_a_display` | A real Mica session produces the headless Vello scene before and after an edit. |
