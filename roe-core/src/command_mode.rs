@@ -11,11 +11,11 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
-use crate::command_registry::{CommandContext, CommandRegistry, CMD_COMMAND_MODE};
+use crate::BufferId;
+use crate::command_registry::{CMD_COMMAND_MODE, CommandContext, CommandRegistry};
 use crate::editor::ChromeAction;
 use crate::keys::KeyAction;
 use crate::mode::{ActionPosition, Mode, ModeAction, ModeResult};
-use crate::BufferId;
 
 /// Interactive command completion and execution mode
 /// This mode manages a command window buffer that displays completions

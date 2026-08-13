@@ -29,11 +29,11 @@ use roe_core::editor::{
     BorderInfo, ChromeAction, DragType, MouseDragState, SplitDirection, WindowNode,
 };
 use roe_core::gutter::{
-    calculate_gutter_width, format_line_number, get_line_status, GutterConfig, LineStatus,
+    GutterConfig, LineStatus, calculate_gutter_width, format_line_number, get_line_status,
 };
 use roe_core::renderer::{DirtyRegion, Renderer};
-use roe_core::syntax::face_registry;
 use roe_core::syntax::Color as SyntaxColor;
+use roe_core::syntax::face_registry;
 use roe_core::{Editor, WindowId};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -639,48 +639,48 @@ impl<'a> RoeVelloApp<'a> {
             let visible_char_count = visible_text.chars().count();
             if let Some(ref registry) = face_registry_guard {
                 for span in &syntax_spans {
-                    if let Some(face) = registry.get(span.face_id) {
-                        if let Some(ref bg_color) = face.background {
-                            let span_start_in_line = span.start.saturating_sub(line_start_char);
-                            let span_end_in_line = span
-                                .end
-                                .saturating_sub(line_start_char)
-                                .min(line_char_count);
+                    if let Some(face) = registry.get(span.face_id)
+                        && let Some(ref bg_color) = face.background
+                    {
+                        let span_start_in_line = span.start.saturating_sub(line_start_char);
+                        let span_end_in_line = span
+                            .end
+                            .saturating_sub(line_start_char)
+                            .min(line_char_count);
 
-                            // Adjust for horizontal scroll
-                            if span_end_in_line <= start_column
-                                || span_start_in_line >= start_column + visible_char_count
-                            {
-                                continue; // Span is not visible
-                            }
-
-                            let visible_start = span_start_in_line.saturating_sub(start_column);
-                            let visible_end = span_end_in_line
-                                .saturating_sub(start_column)
-                                .min(visible_char_count);
-
-                            if visible_start >= visible_end {
-                                continue;
-                            }
-
-                            // Draw background rectangle
-                            let bg_x = text_x + (visible_start as f32 * char_width as f32);
-                            let bg_w = (visible_end - visible_start) as f32 * char_width as f32;
-                            let bg_rect = Rect::new(
-                                bg_x as f64,
-                                text_y as f64,
-                                (bg_x + bg_w) as f64,
-                                (text_y + line_height as f32) as f64,
-                            );
-                            let vello_bg = syntax_color_to_vello(bg_color, self.theme.bg_color);
-                            self.scene.fill(
-                                vello::peniko::Fill::NonZero,
-                                Affine::IDENTITY,
-                                vello_bg,
-                                None,
-                                &bg_rect,
-                            );
+                        // Adjust for horizontal scroll
+                        if span_end_in_line <= start_column
+                            || span_start_in_line >= start_column + visible_char_count
+                        {
+                            continue; // Span is not visible
                         }
+
+                        let visible_start = span_start_in_line.saturating_sub(start_column);
+                        let visible_end = span_end_in_line
+                            .saturating_sub(start_column)
+                            .min(visible_char_count);
+
+                        if visible_start >= visible_end {
+                            continue;
+                        }
+
+                        // Draw background rectangle
+                        let bg_x = text_x + (visible_start as f32 * char_width as f32);
+                        let bg_w = (visible_end - visible_start) as f32 * char_width as f32;
+                        let bg_rect = Rect::new(
+                            bg_x as f64,
+                            text_y as f64,
+                            (bg_x + bg_w) as f64,
+                            (text_y + line_height as f32) as f64,
+                        );
+                        let vello_bg = syntax_color_to_vello(bg_color, self.theme.bg_color);
+                        self.scene.fill(
+                            vello::peniko::Fill::NonZero,
+                            Affine::IDENTITY,
+                            vello_bg,
+                            None,
+                            &bg_rect,
+                        );
                     }
                 }
             }

@@ -14,8 +14,8 @@
 //! Roe editor with Vello/GPU rendering backend.
 
 use roe_core::{
-    buffer_host, command_registry, editor, kill_ring, mode, Buffer, BufferId, ConfigurableBindings,
-    Editor, Frame, KeyState, Mode, ModeId, Window, WindowId,
+    Buffer, BufferId, ConfigurableBindings, Editor, Frame, KeyState, Mode, ModeId, Window,
+    WindowId, buffer_host, command_registry, editor, kill_ring, mode,
 };
 use slotmap::SlotMap;
 use std::collections::HashMap;

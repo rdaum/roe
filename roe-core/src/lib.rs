@@ -48,8 +48,8 @@ new_key_type! {
 pub use buffer::Buffer;
 pub use editor::{Editor, Frame, Window};
 pub use gutter::{
-    calculate_gutter_width, format_line_number, get_line_status, GutterConfig, GutterLine,
-    LineStatus,
+    GutterConfig, GutterLine, LineStatus, calculate_gutter_width, format_line_number,
+    get_line_status,
 };
 pub use keys::{Bindings, ConfigurableBindings, KeyState};
 pub use mode::{FileMode, Mode};

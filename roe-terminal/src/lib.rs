@@ -13,4 +13,4 @@
 
 pub mod terminal_renderer;
 
-pub use terminal_renderer::{TerminalRenderer, ECHO_AREA_HEIGHT};
+pub use terminal_renderer::{ECHO_AREA_HEIGHT, TerminalRenderer};

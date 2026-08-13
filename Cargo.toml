@@ -9,7 +9,7 @@ resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 rust-version = "1.88"
 authors = ["Ryan Daum <ryan.daum@gmail.com>"]
 license = "GPL-3.0-only"

@@ -11,10 +11,10 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
+use crate::BufferId;
 use crate::keys::KeyAction;
 use crate::mode::{Mode, ModeAction, ModeResult};
 use crate::selection_menu::{MenuItem, SelectionMenu};
-use crate::BufferId;
 
 /// Purpose of the buffer selection mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

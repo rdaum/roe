@@ -192,19 +192,19 @@ impl KillRing {
         self.last_was_kill = false;
 
         // Check system clipboard for external content
-        if let Some(clipboard_text) = self.get_from_clipboard() {
-            if !clipboard_text.is_empty() {
-                // Check if this differs from our most recent entry
-                let is_new = self.entries.last() != Some(&clipboard_text);
+        if let Some(clipboard_text) = self.get_from_clipboard()
+            && !clipboard_text.is_empty()
+        {
+            // Check if this differs from our most recent entry
+            let is_new = self.entries.last() != Some(&clipboard_text);
 
-                if is_new {
-                    // External clipboard content - add to ring
-                    self.entries.push(clipboard_text);
+            if is_new {
+                // External clipboard content - add to ring
+                self.entries.push(clipboard_text);
 
-                    // Maintain ring size limit
-                    if self.entries.len() > self.max_size {
-                        self.entries.remove(0);
-                    }
+                // Maintain ring size limit
+                if self.entries.len() > self.max_size {
+                    self.entries.remove(0);
                 }
             }
         }

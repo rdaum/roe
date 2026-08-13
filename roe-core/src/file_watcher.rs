@@ -23,12 +23,12 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use similar::{ChangeTag, TextDiff};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use crate::native_services::{Clock, SystemClock};
 use crate::BufferId;
+use crate::native_services::{Clock, SystemClock};
 
 /// Represents a change to a specific line range
 #[derive(Debug, Clone)]
@@ -203,10 +203,10 @@ impl FileWatcher {
         );
 
         // Start watching the parent directory
-        if let Some(ref mut watcher) = self.watcher {
-            if let Some(parent) = canonical.parent() {
-                watcher.watch(parent, RecursiveMode::NonRecursive)?;
-            }
+        if let Some(ref mut watcher) = self.watcher
+            && let Some(parent) = canonical.parent()
+        {
+            watcher.watch(parent, RecursiveMode::NonRecursive)?;
         }
 
         Ok(())
@@ -220,10 +220,10 @@ impl FileWatcher {
                 map.remove(&state.file_path);
             }
 
-            if let Some(ref mut watcher) = self.watcher {
-                if let Some(parent) = state.file_path.parent() {
-                    let _ = watcher.unwatch(parent);
-                }
+            if let Some(ref mut watcher) = self.watcher
+                && let Some(parent) = state.file_path.parent()
+            {
+                let _ = watcher.unwatch(parent);
             }
         }
     }
@@ -234,10 +234,10 @@ impl FileWatcher {
         let now = self.clock.now();
         while let Ok(event) = self.event_rx.try_recv() {
             // Check if we should ignore this event
-            if let Some(state) = self.sync_states.get(&event.buffer_id) {
-                if !state.should_ignore(now) {
-                    events.push(event);
-                }
+            if let Some(state) = self.sync_states.get(&event.buffer_id)
+                && !state.should_ignore(now)
+            {
+                events.push(event);
             }
         }
         events
@@ -277,16 +277,16 @@ impl FileWatcher {
             "inactive"
         };
 
-        let watched_files: Vec<String> = if let Ok(map) = self.path_to_buffer.read() {
-            map.keys()
-                .map(|p| {
-                    p.file_name()
-                        .map(|n| n.to_string_lossy().to_string())
+        let watched_files: Vec<String> = match self.path_to_buffer.read() {
+            Ok(map) => map
+                .keys()
+                .map(|path| {
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().to_string())
                         .unwrap_or_default()
                 })
-                .collect()
-        } else {
-            vec![]
+                .collect(),
+            Err(_) => vec![],
         };
 
         format!(

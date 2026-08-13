@@ -18,8 +18,8 @@
 //! the entire scene each frame (which is efficient with GPU rendering).
 //! The dirty tracking is still useful to know when to request redraws.
 
-use roe_core::renderer::{DirtyRegion, DirtyTracker, PresentationSnapshot, Renderer};
 use roe_core::Editor;
+use roe_core::renderer::{DirtyRegion, DirtyTracker, PresentationSnapshot, Renderer};
 
 use crate::theme::VelloTheme;
 

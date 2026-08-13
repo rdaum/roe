@@ -11,9 +11,9 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
+use crate::ModeId;
 use crate::syntax::{FaceId, HighlightSpan, SpanStore};
 use crate::undo::{EditOp, UndoManager};
-use crate::ModeId;
 use compio::buf::BufResult;
 use compio::io::AsyncReadAtExt;
 use std::ops::Range;

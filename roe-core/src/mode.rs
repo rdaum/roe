@@ -11,7 +11,7 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
-use crate::command_registry::{sync_handler, Command, CommandCategory};
+use crate::command_registry::{Command, CommandCategory, sync_handler};
 use crate::keys::KeyAction;
 
 /// Mouse event information for modes

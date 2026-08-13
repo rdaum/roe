@@ -27,7 +27,7 @@
 //! in the SpanStore. Renderers query the SpanStore when drawing to get the
 //! appropriate face for each character.
 
-use slotmap::{new_key_type, SlotMap};
+use slotmap::{SlotMap, new_key_type};
 use std::collections::HashMap;
 use std::ops::Range;
 

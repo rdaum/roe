@@ -19,17 +19,17 @@ use crossterm::event::{
 use crossterm::style::{Color, Print, Stylize};
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::{cursor, queue};
-use futures::{future::FutureExt, select, StreamExt};
+use futures::{StreamExt, future::FutureExt, select};
 use roe_core::editor::{BorderInfo, ChromeAction, DragType, Frame, MouseDragState, Window};
 use roe_core::gutter::{
-    calculate_gutter_width, format_line_number, get_line_status, GutterConfig, LineStatus,
+    GutterConfig, LineStatus, calculate_gutter_width, format_line_number, get_line_status,
 };
 use roe_core::keys::{KeyModifier, LogicalKey, Side};
 use roe_core::renderer::{
     DirtyRegion, DirtyTracker, ModelineComponent, PresentationSnapshot, Renderer,
 };
-use roe_core::syntax::face_registry;
 use roe_core::syntax::Color as SyntaxColor;
+use roe_core::syntax::face_registry;
 use roe_core::{Editor, HighlightSpan, WindowId};
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -324,21 +324,22 @@ impl<W: Write> TerminalRenderer<W> {
         }
 
         // Handle region extending past line content (fill with selection color)
-        if let Some((region_start, region_end)) = region_bounds {
-            if region_start < line_end_char && region_end > line_end_char {
-                let chars_rendered = chars_to_render.len();
-                let remaining_width = content_width as usize - chars_rendered;
-                if remaining_width > 0 {
-                    let highlighted_spaces = " ".repeat(remaining_width);
-                    queue!(
-                        &mut self.device,
-                        Print(
-                            highlighted_spaces
-                                .on(self.theme.selection_color)
-                                .with(Color::Black)
-                        )
-                    )?;
-                }
+        if let Some((region_start, region_end)) = region_bounds
+            && region_start < line_end_char
+            && region_end > line_end_char
+        {
+            let chars_rendered = chars_to_render.len();
+            let remaining_width = content_width as usize - chars_rendered;
+            if remaining_width > 0 {
+                let highlighted_spaces = " ".repeat(remaining_width);
+                queue!(
+                    &mut self.device,
+                    Print(
+                        highlighted_spaces
+                            .on(self.theme.selection_color)
+                            .with(Color::Black)
+                    )
+                )?;
             }
         }
 
@@ -358,22 +359,21 @@ impl<W: Write> TerminalRenderer<W> {
             .rev()
             .find(|span| buffer_pos >= span.start && buffer_pos < span.end);
 
-        if let Some(span) = matching_span {
-            if let Some(ref registry) = face_registry_guard {
-                if let Some(face) = registry.get(span.face_id) {
-                    let fg = face
-                        .foreground
-                        .as_ref()
-                        .map(|c| syntax_color_to_crossterm(c, self.theme.fg_color))
-                        .unwrap_or(self.theme.fg_color);
-                    let bg = face
-                        .background
-                        .as_ref()
-                        .map(|c| syntax_color_to_crossterm(c, self.theme.bg_color))
-                        .unwrap_or(self.theme.bg_color);
-                    return (fg, bg);
-                }
-            }
+        if let Some(span) = matching_span
+            && let Some(registry) = face_registry_guard
+            && let Some(face) = registry.get(span.face_id)
+        {
+            let fg = face
+                .foreground
+                .as_ref()
+                .map(|c| syntax_color_to_crossterm(c, self.theme.fg_color))
+                .unwrap_or(self.theme.fg_color);
+            let bg = face
+                .background
+                .as_ref()
+                .map(|c| syntax_color_to_crossterm(c, self.theme.bg_color))
+                .unwrap_or(self.theme.bg_color);
+            return (fg, bg);
         }
 
         // Default colors
@@ -970,22 +970,21 @@ fn get_syntax_colors_standalone(
         .rev()
         .find(|span| buffer_pos >= span.start && buffer_pos < span.end);
 
-    if let Some(span) = matching_span {
-        if let Some(ref registry) = face_registry_guard {
-            if let Some(face) = registry.get(span.face_id) {
-                let fg = face
-                    .foreground
-                    .as_ref()
-                    .map(|c| syntax_color_to_crossterm(c, theme.fg_color))
-                    .unwrap_or(theme.fg_color);
-                let bg = face
-                    .background
-                    .as_ref()
-                    .map(|c| syntax_color_to_crossterm(c, theme.bg_color))
-                    .unwrap_or(theme.bg_color);
-                return (fg, bg);
-            }
-        }
+    if let Some(span) = matching_span
+        && let Some(registry) = face_registry_guard
+        && let Some(face) = registry.get(span.face_id)
+    {
+        let fg = face
+            .foreground
+            .as_ref()
+            .map(|c| syntax_color_to_crossterm(c, theme.fg_color))
+            .unwrap_or(theme.fg_color);
+        let bg = face
+            .background
+            .as_ref()
+            .map(|c| syntax_color_to_crossterm(c, theme.bg_color))
+            .unwrap_or(theme.bg_color);
+        return (fg, bg);
     }
 
     // Default colors
@@ -1166,17 +1165,18 @@ pub fn draw_window(
         }
 
         // Handle region extending past line content
-        if let Some((region_start, region_end)) = region_bounds {
-            if region_start < line_end_char && region_end > line_end_char {
-                let chars_rendered = visible_chars.len();
-                let remaining_width = content_width as usize - chars_rendered;
-                if remaining_width > 0 {
-                    let highlighted_spaces = " ".repeat(remaining_width);
-                    queue!(
-                        device,
-                        Print(highlighted_spaces.on(Color::Yellow).with(Color::Black))
-                    )?;
-                }
+        if let Some((region_start, region_end)) = region_bounds
+            && region_start < line_end_char
+            && region_end > line_end_char
+        {
+            let chars_rendered = visible_chars.len();
+            let remaining_width = content_width as usize - chars_rendered;
+            if remaining_width > 0 {
+                let highlighted_spaces = " ".repeat(remaining_width);
+                queue!(
+                    device,
+                    Print(highlighted_spaces.on(Color::Yellow).with(Color::Black))
+                )?;
             }
         }
     }

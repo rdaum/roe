@@ -11,11 +11,11 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
+use crate::BufferId;
 use crate::editor::OpenType;
 use crate::keys::KeyAction;
 use crate::mode::{ActionPosition, Mode, ModeAction, ModeResult};
 use crate::native_services::{FileSystem, SystemFileSystem};
-use crate::BufferId;
 use std::path::PathBuf;
 use std::sync::Arc;
 

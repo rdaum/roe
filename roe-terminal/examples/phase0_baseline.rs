@@ -10,8 +10,8 @@ use slotmap::SlotMap;
 use std::collections::HashMap;
 use std::hint::black_box;
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 const EDIT_ITERATIONS: usize = 10_000;

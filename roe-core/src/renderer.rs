@@ -277,20 +277,20 @@ impl DirtyTracker {
             return true;
         }
 
-        if let Some(lines) = self.dirty_lines.get(&buffer_id) {
-            if line < lines.len() {
-                return lines[line].is_some();
-            }
+        if let Some(lines) = self.dirty_lines.get(&buffer_id)
+            && line < lines.len()
+        {
+            return lines[line].is_some();
         }
         false
     }
 
     /// Get the dirty span for a line, if any
     pub fn get_line_dirty_span(&self, buffer_id: BufferId, line: usize) -> Option<&LineSpan> {
-        if let Some(lines) = self.dirty_lines.get(&buffer_id) {
-            if line < lines.len() {
-                return lines[line].as_ref();
-            }
+        if let Some(lines) = self.dirty_lines.get(&buffer_id)
+            && line < lines.len()
+        {
+            return lines[line].as_ref();
         }
         None
     }

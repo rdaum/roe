@@ -1,7 +1,7 @@
 use roe_core::keys::DefaultBindings;
 use roe_core::renderer::{DirtyRegion, ModelineComponent, Renderer};
 use roe_core::{
-    command_registry, Buffer, BufferId, Editor, Frame, KeyState, Mode, ModeId, Window, WindowId,
+    Buffer, BufferId, Editor, Frame, KeyState, Mode, ModeId, Window, WindowId, command_registry,
 };
 use slotmap::SlotMap;
 use std::collections::HashMap;

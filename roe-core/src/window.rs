@@ -37,8 +37,8 @@ impl Window {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::editor::WindowType;
     use crate::BufferId;
+    use crate::editor::WindowType;
 
     fn test_window() -> Window {
         Window {

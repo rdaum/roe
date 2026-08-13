@@ -162,17 +162,17 @@ impl UndoManager {
         }
 
         // Check time gap
-        if let Some(last_time) = self.last_edit_time {
-            if last_time.elapsed() > Duration::from_millis(GROUP_TIMEOUT_MS) {
-                return true;
-            }
+        if let Some(last_time) = self.last_edit_time
+            && last_time.elapsed() > Duration::from_millis(GROUP_TIMEOUT_MS)
+        {
+            return true;
         }
 
         // Check edit type change
-        if let (Some(pending_type), Some(new_type)) = (self.pending_edit_type, new_edit_type) {
-            if pending_type != new_type {
-                return true;
-            }
+        if let (Some(pending_type), Some(new_type)) = (self.pending_edit_type, new_edit_type)
+            && pending_type != new_type
+        {
+            return true;
         }
 
         false
@@ -185,16 +185,16 @@ impl UndoManager {
             return;
         }
 
-        if let Some(ops) = self.pending_group.take() {
-            if !ops.is_empty() {
-                if ops.len() == 1 {
-                    // Single op - no need for Group wrapper
-                    self.undo_stack.push(ops.into_iter().next().unwrap());
-                } else {
-                    self.undo_stack.push(EditOp::Group(ops));
-                }
-                self.trim_history();
+        if let Some(ops) = self.pending_group.take()
+            && !ops.is_empty()
+        {
+            if ops.len() == 1 {
+                // Single op - no need for Group wrapper
+                self.undo_stack.push(ops.into_iter().next().unwrap());
+            } else {
+                self.undo_stack.push(EditOp::Group(ops));
             }
+            self.trim_history();
         }
         self.pending_edit_type = None;
     }
@@ -260,17 +260,17 @@ impl UndoManager {
             return;
         }
 
-        if let Some(ops) = self.pending_group.take() {
-            if !ops.is_empty() {
-                self.redo_stack.clear();
-                if ops.len() == 1 {
-                    // Single op - no need for Group wrapper
-                    self.undo_stack.push(ops.into_iter().next().unwrap());
-                } else {
-                    self.undo_stack.push(EditOp::Group(ops));
-                }
-                self.trim_history();
+        if let Some(ops) = self.pending_group.take()
+            && !ops.is_empty()
+        {
+            self.redo_stack.clear();
+            if ops.len() == 1 {
+                // Single op - no need for Group wrapper
+                self.undo_stack.push(ops.into_iter().next().unwrap());
+            } else {
+                self.undo_stack.push(EditOp::Group(ops));
             }
+            self.trim_history();
         }
         self.explicit_group = false;
         self.pending_edit_type = None;

@@ -394,10 +394,10 @@ impl ConfigurableBindings {
     /// key_sequence: "C-x C-c", "M-x", "C-p", etc.
     /// action: "quit" (command name) or ":cursor-up" (direct action)
     pub fn add_binding(&mut self, key_sequence: &str, action: &str) {
-        if let Some(keys) = Self::parse_key_sequence(key_sequence) {
-            if let Some(key_action) = Self::parse_action(action) {
-                self.bindings.insert(keys, key_action);
-            }
+        if let Some(keys) = Self::parse_key_sequence(key_sequence)
+            && let Some(key_action) = Self::parse_action(action)
+        {
+            self.bindings.insert(keys, key_action);
         }
     }
 
@@ -415,10 +415,10 @@ impl ConfigurableBindings {
                 // First part: include all keys (modifier + base key)
                 keys.extend(parsed_keys.clone());
                 // If this part has a modifier, remember it for chord continuation
-                if parsed_keys.len() > 1 {
-                    if let LogicalKey::Modifier(_) = &parsed_keys[0] {
-                        chord_modifier = Some(parsed_keys[0]);
-                    }
+                if parsed_keys.len() > 1
+                    && let LogicalKey::Modifier(_) = &parsed_keys[0]
+                {
+                    chord_modifier = Some(parsed_keys[0]);
                 }
             } else {
                 // Subsequent parts in a chord
@@ -443,11 +443,7 @@ impl ConfigurableBindings {
             }
         }
 
-        if keys.is_empty() {
-            None
-        } else {
-            Some(keys)
-        }
+        if keys.is_empty() { None } else { Some(keys) }
     }
 
     /// Parse a single key like "C-x", "M-f", "a", "F5", "Left", "C-S-/"
@@ -512,12 +508,11 @@ impl ConfigurableBindings {
             "space" | "spc" => Some(LogicalKey::AlphaNumeric(' ')),
             _ => {
                 // Try function keys F1-F12
-                if s.to_lowercase().starts_with('f') {
-                    if let Ok(n) = s[1..].parse::<u8>() {
-                        if (1..=12).contains(&n) {
-                            return Some(LogicalKey::Function(n));
-                        }
-                    }
+                if s.to_lowercase().starts_with('f')
+                    && let Ok(n) = s[1..].parse::<u8>()
+                    && (1..=12).contains(&n)
+                {
+                    return Some(LogicalKey::Function(n));
                 }
                 None
             }
@@ -693,19 +688,18 @@ impl Bindings for ConfigurableBindings {
         }
 
         // Handle single alphanumeric keys as self-insert
-        if keys.len() == 1 {
-            if let LogicalKey::AlphaNumeric(c) = keys[0] {
-                return KeyAction::AlphaNumeric(c);
-            }
+        if keys.len() == 1
+            && let LogicalKey::AlphaNumeric(c) = keys[0]
+        {
+            return KeyAction::AlphaNumeric(c);
         }
 
         // Handle Shift+alpha for uppercase
-        if keys.len() == 2 {
-            if let (LogicalKey::Modifier(KeyModifier::Shift(_)), LogicalKey::AlphaNumeric(c)) =
+        if keys.len() == 2
+            && let (LogicalKey::Modifier(KeyModifier::Shift(_)), LogicalKey::AlphaNumeric(c)) =
                 (&keys[0], &keys[1])
-            {
-                return KeyAction::AlphaNumeric(c.to_ascii_uppercase());
-            }
+        {
+            return KeyAction::AlphaNumeric(c.to_ascii_uppercase());
         }
 
         KeyAction::Unbound
@@ -796,111 +790,111 @@ impl Bindings for DefaultBindings {
                 (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric(a))
                     if a == 'c' || a == 'x' =>
                 {
-                    return KeyAction::ChordNext
+                    return KeyAction::ChordNext;
                 }
                 // M-x command mode
                 (LogicalKey::Modifier(KeyModifier::Meta(_)), LogicalKey::AlphaNumeric('x')) => {
-                    return KeyAction::Command(CMD_COMMAND_MODE.to_string())
+                    return KeyAction::Command(CMD_COMMAND_MODE.to_string());
                 }
                 // M-w copy region (like C-w but without deleting)
                 (LogicalKey::Modifier(KeyModifier::Meta(_)), LogicalKey::AlphaNumeric('w')) => {
-                    return KeyAction::KillRegion(false)
+                    return KeyAction::KillRegion(false);
                 }
                 // M-f forward word
                 (LogicalKey::Modifier(KeyModifier::Meta(_)), LogicalKey::AlphaNumeric('f')) => {
-                    return KeyAction::Cursor(CursorDirection::WordForward)
+                    return KeyAction::Cursor(CursorDirection::WordForward);
                 }
                 // M-b backward word
                 (LogicalKey::Modifier(KeyModifier::Meta(_)), LogicalKey::AlphaNumeric('b')) => {
-                    return KeyAction::Cursor(CursorDirection::WordBackward)
+                    return KeyAction::Cursor(CursorDirection::WordBackward);
                 }
                 // C-left backward word
                 (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::Left) => {
-                    return KeyAction::Cursor(CursorDirection::WordBackward)
+                    return KeyAction::Cursor(CursorDirection::WordBackward);
                 }
                 // C-right forward word
                 (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::Right) => {
-                    return KeyAction::Cursor(CursorDirection::WordForward)
+                    return KeyAction::Cursor(CursorDirection::WordForward);
                 }
                 // M-v page up
                 (LogicalKey::Modifier(KeyModifier::Meta(_)), LogicalKey::AlphaNumeric('v')) => {
-                    return KeyAction::Cursor(CursorDirection::PageUp)
+                    return KeyAction::Cursor(CursorDirection::PageUp);
                 }
                 // M-up page up
                 (LogicalKey::Modifier(KeyModifier::Meta(_)), LogicalKey::Up) => {
-                    return KeyAction::Cursor(CursorDirection::PageUp)
+                    return KeyAction::Cursor(CursorDirection::PageUp);
                 }
                 // M-down page down
                 (LogicalKey::Modifier(KeyModifier::Meta(_)), LogicalKey::Down) => {
-                    return KeyAction::Cursor(CursorDirection::PageDown)
+                    return KeyAction::Cursor(CursorDirection::PageDown);
                 }
                 // M-{ backward paragraph
                 (LogicalKey::Modifier(KeyModifier::Meta(_)), LogicalKey::AlphaNumeric('{')) => {
-                    return KeyAction::Cursor(CursorDirection::ParagraphBackward)
+                    return KeyAction::Cursor(CursorDirection::ParagraphBackward);
                 }
                 // M-} forward paragraph
                 (LogicalKey::Modifier(KeyModifier::Meta(_)), LogicalKey::AlphaNumeric('}')) => {
-                    return KeyAction::Cursor(CursorDirection::ParagraphForward)
+                    return KeyAction::Cursor(CursorDirection::ParagraphForward);
                 }
                 // Ctrl-End is buffer-end
                 (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::End) => {
-                    return KeyAction::Cursor(CursorDirection::BufferEnd)
+                    return KeyAction::Cursor(CursorDirection::BufferEnd);
                 }
                 // Ctrl-Home is buffer-start
                 (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::Home) => {
-                    return KeyAction::Cursor(CursorDirection::BufferStart)
+                    return KeyAction::Cursor(CursorDirection::BufferStart);
                 }
                 // Ctrl-P
                 (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric('p')) => {
-                    return KeyAction::Cursor(CursorDirection::Up)
+                    return KeyAction::Cursor(CursorDirection::Up);
                 }
                 // Ctrl-N
                 (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric('n')) => {
-                    return KeyAction::Cursor(CursorDirection::Down)
+                    return KeyAction::Cursor(CursorDirection::Down);
                 }
                 // Ctrl-F
                 (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric('f')) => {
-                    return KeyAction::Cursor(CursorDirection::Right)
+                    return KeyAction::Cursor(CursorDirection::Right);
                 }
                 // Ctrl-B
                 (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric('b')) => {
-                    return KeyAction::Cursor(CursorDirection::Left)
+                    return KeyAction::Cursor(CursorDirection::Left);
                 }
                 // Ctrl-V is page-down
                 (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric('v')) => {
-                    return KeyAction::Cursor(CursorDirection::PageDown)
+                    return KeyAction::Cursor(CursorDirection::PageDown);
                 }
                 // Ctrl-A is start of line
                 (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric('a')) => {
-                    return KeyAction::Cursor(CursorDirection::LineStart)
+                    return KeyAction::Cursor(CursorDirection::LineStart);
                 }
                 // Ctrl-E is end of line
                 (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric('e')) => {
-                    return KeyAction::Cursor(CursorDirection::LineEnd)
+                    return KeyAction::Cursor(CursorDirection::LineEnd);
                 }
                 // Ctrl-K is kill-line
                 (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric('k')) => {
-                    return KeyAction::KillLine(false)
+                    return KeyAction::KillLine(false);
                 }
                 // Ctrl-Y is yank
                 (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric('y')) => {
-                    return KeyAction::Yank(None)
+                    return KeyAction::Yank(None);
                 }
                 // Ctrl-W is kill-region
                 (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric('w')) => {
-                    return KeyAction::KillRegion(true)
+                    return KeyAction::KillRegion(true);
                 }
                 // Ctrl-/ is undo
                 (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric('/')) => {
-                    return KeyAction::Undo
+                    return KeyAction::Undo;
                 }
                 // Ctrl-Space is set mark (C-SPC)
                 (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric(' ')) => {
-                    return KeyAction::MarkStart
+                    return KeyAction::MarkStart;
                 }
                 // Ctrl-G is cancel
                 (LogicalKey::Modifier(KeyModifier::Control(_)), LogicalKey::AlphaNumeric('g')) => {
-                    return KeyAction::Cancel
+                    return KeyAction::Cancel;
                 }
                 //
                 (_, _) => {}
@@ -923,7 +917,7 @@ impl Bindings for DefaultBindings {
                     LogicalKey::AlphaNumeric(a),
                     LogicalKey::AlphaNumeric(b),
                 ) if *a == 'x' && *b == 's' => {
-                    return KeyAction::Command(CMD_SAVE_BUFFER.to_string())
+                    return KeyAction::Command(CMD_SAVE_BUFFER.to_string());
                 }
                 // C-x C-f find-file
                 (
@@ -931,7 +925,7 @@ impl Bindings for DefaultBindings {
                     LogicalKey::AlphaNumeric(a),
                     LogicalKey::AlphaNumeric(b),
                 ) if *a == 'x' && *b == 'f' => {
-                    return KeyAction::Command(CMD_FIND_FILE.to_string())
+                    return KeyAction::Command(CMD_FIND_FILE.to_string());
                 }
                 // C-x C-v visit-file
                 (
@@ -939,7 +933,7 @@ impl Bindings for DefaultBindings {
                     LogicalKey::AlphaNumeric(a),
                     LogicalKey::AlphaNumeric(b),
                 ) if *a == 'x' && *b == 'v' => {
-                    return KeyAction::Command(CMD_VISIT_FILE.to_string())
+                    return KeyAction::Command(CMD_VISIT_FILE.to_string());
                 }
                 // C-x 2 split horizontally
                 (
@@ -947,7 +941,7 @@ impl Bindings for DefaultBindings {
                     LogicalKey::AlphaNumeric(a),
                     LogicalKey::AlphaNumeric(b),
                 ) if *a == 'x' && *b == '2' => {
-                    return KeyAction::Command(CMD_SPLIT_HORIZONTAL.to_string())
+                    return KeyAction::Command(CMD_SPLIT_HORIZONTAL.to_string());
                 }
                 // C-x 3 split vertically
                 (
@@ -955,7 +949,7 @@ impl Bindings for DefaultBindings {
                     LogicalKey::AlphaNumeric(a),
                     LogicalKey::AlphaNumeric(b),
                 ) if *a == 'x' && *b == '3' => {
-                    return KeyAction::Command(CMD_SPLIT_VERTICAL.to_string())
+                    return KeyAction::Command(CMD_SPLIT_VERTICAL.to_string());
                 }
                 // C-x o switch window
                 (
@@ -963,7 +957,7 @@ impl Bindings for DefaultBindings {
                     LogicalKey::AlphaNumeric(a),
                     LogicalKey::AlphaNumeric(b),
                 ) if *a == 'x' && *b == 'o' => {
-                    return KeyAction::Command(CMD_OTHER_WINDOW.to_string())
+                    return KeyAction::Command(CMD_OTHER_WINDOW.to_string());
                 }
                 // C-x 0 delete window
                 (
@@ -971,7 +965,7 @@ impl Bindings for DefaultBindings {
                     LogicalKey::AlphaNumeric(a),
                     LogicalKey::AlphaNumeric(b),
                 ) if *a == 'x' && *b == '0' => {
-                    return KeyAction::Command(CMD_DELETE_WINDOW.to_string())
+                    return KeyAction::Command(CMD_DELETE_WINDOW.to_string());
                 }
                 // C-x 1 delete other windows
                 (
@@ -979,7 +973,7 @@ impl Bindings for DefaultBindings {
                     LogicalKey::AlphaNumeric(a),
                     LogicalKey::AlphaNumeric(b),
                 ) if *a == 'x' && *b == '1' => {
-                    return KeyAction::Command(CMD_DELETE_OTHER_WINDOWS.to_string())
+                    return KeyAction::Command(CMD_DELETE_OTHER_WINDOWS.to_string());
                 }
                 // C-x b switch buffer
                 (
@@ -987,7 +981,7 @@ impl Bindings for DefaultBindings {
                     LogicalKey::AlphaNumeric(a),
                     LogicalKey::AlphaNumeric(b),
                 ) if *a == 'x' && *b == 'b' => {
-                    return KeyAction::Command(CMD_SWITCH_BUFFER.to_string())
+                    return KeyAction::Command(CMD_SWITCH_BUFFER.to_string());
                 }
                 // C-x k kill buffer
                 (
@@ -995,7 +989,7 @@ impl Bindings for DefaultBindings {
                     LogicalKey::AlphaNumeric(a),
                     LogicalKey::AlphaNumeric(b),
                 ) if *a == 'x' && *b == 'k' => {
-                    return KeyAction::Command(CMD_KILL_BUFFER.to_string())
+                    return KeyAction::Command(CMD_KILL_BUFFER.to_string());
                 }
                 // Ctrl-Shift-W is kill-region non-destructive
                 (

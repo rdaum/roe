@@ -18,10 +18,10 @@ use crossterm::event::{
 use crossterm::execute;
 use crossterm::terminal::disable_raw_mode;
 use roe_core::{
-    buffer_host, command_registry, editor, kill_ring, mode, Buffer, BufferId, ConfigurableBindings,
-    Editor, Frame, KeyState, Mode, ModeId, Renderer, Window, WindowId,
+    Buffer, BufferId, ConfigurableBindings, Editor, Frame, KeyState, Mode, ModeId, Renderer,
+    Window, WindowId, buffer_host, command_registry, editor, kill_ring, mode,
 };
-use roe_terminal::{TerminalRenderer, ECHO_AREA_HEIGHT};
+use roe_terminal::{ECHO_AREA_HEIGHT, TerminalRenderer};
 use slotmap::SlotMap;
 use std::collections::HashMap;
 use std::io::Write;

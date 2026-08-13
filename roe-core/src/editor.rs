@@ -607,24 +607,23 @@ impl Editor {
                 }
 
                 // Move cursor to current match if any
-                if let Some(current_idx) = initial_current {
-                    if let Some((start_char, _)) = initial_matches.get(current_idx) {
-                        if let Some(window) = self.windows.get_mut(target_window_id) {
-                            window.cursor = *start_char;
+                if let Some(current_idx) = initial_current
+                    && let Some((start_char, _)) = initial_matches.get(current_idx)
+                    && let Some(window) = self.windows.get_mut(target_window_id)
+                {
+                    window.cursor = *start_char;
 
-                            // Ensure cursor is visible by scrolling if needed
-                            let (col, line) = buffer.to_column_line(*start_char);
-                            let content_height = window.height_chars.saturating_sub(3);
-                            let content_width = window.width_chars.saturating_sub(4);
-                            Self::ensure_cursor_visible_static(
-                                window,
-                                col,
-                                line,
-                                content_width,
-                                content_height,
-                            );
-                        }
-                    }
+                    // Ensure cursor is visible by scrolling if needed
+                    let (col, line) = buffer.to_column_line(*start_char);
+                    let content_height = window.height_chars.saturating_sub(3);
+                    let content_width = window.width_chars.saturating_sub(4);
+                    Self::ensure_cursor_visible_static(
+                        window,
+                        col,
+                        line,
+                        content_width,
+                        content_height,
+                    );
                 }
             }
         }
@@ -678,34 +677,22 @@ impl Editor {
 
     /// Close command window and clean up its buffer
     pub fn close_command_window(&mut self, window_id: WindowId) -> bool {
-        if let Some(window) = self.windows.get(window_id) {
-            if matches!(window.window_type, WindowType::Command { .. }) {
-                let buffer_id = window.active_buffer;
-                self.windows.remove(window_id);
-                self.buffers.remove(buffer_id);
+        if let Some(window) = self.windows.get(window_id)
+            && matches!(window.window_type, WindowType::Command { .. })
+        {
+            let buffer_id = window.active_buffer;
+            self.windows.remove(window_id);
+            self.buffers.remove(buffer_id);
 
-                // Clean up the buffer host - this is critical for proper state cleanup
-                self.buffer_hosts.remove(&buffer_id);
+            // Clean up the buffer host - this is critical for proper state cleanup
+            self.buffer_hosts.remove(&buffer_id);
 
-                // Restore the previous active window if it still exists
-                if let Some(prev_window_id) = self.previous_active_window {
-                    if self.windows.contains_key(prev_window_id) {
-                        self.active_window = prev_window_id;
-                    } else {
-                        // Previous window was deleted, find any normal window
-                        if let Some(normal_window_id) = self.windows.iter().find_map(|(id, w)| {
-                            if matches!(w.window_type, WindowType::Normal) {
-                                Some(id)
-                            } else {
-                                None
-                            }
-                        }) {
-                            self.active_window = normal_window_id;
-                        }
-                    }
-                    self.previous_active_window = None; // Clear the saved window
+            // Restore the previous active window if it still exists
+            if let Some(prev_window_id) = self.previous_active_window {
+                if self.windows.contains_key(prev_window_id) {
+                    self.active_window = prev_window_id;
                 } else {
-                    // No previous window saved, find any normal window
+                    // Previous window was deleted, find any normal window
                     if let Some(normal_window_id) = self.windows.iter().find_map(|(id, w)| {
                         if matches!(w.window_type, WindowType::Normal) {
                             Some(id)
@@ -716,14 +703,26 @@ impl Editor {
                         self.active_window = normal_window_id;
                     }
                 }
-
-                // Record buffer access for the restored active window
-                let restored_buffer_id = self.windows[self.active_window].active_buffer;
-                self.record_buffer_access(restored_buffer_id);
-
-                self.calculate_window_layout();
-                return true;
+                self.previous_active_window = None; // Clear the saved window
+            } else {
+                // No previous window saved, find any normal window
+                if let Some(normal_window_id) = self.windows.iter().find_map(|(id, w)| {
+                    if matches!(w.window_type, WindowType::Normal) {
+                        Some(id)
+                    } else {
+                        None
+                    }
+                }) {
+                    self.active_window = normal_window_id;
+                }
             }
+
+            // Record buffer access for the restored active window
+            let restored_buffer_id = self.windows[self.active_window].active_buffer;
+            self.record_buffer_access(restored_buffer_id);
+
+            self.calculate_window_layout();
+            return true;
         }
         false
     }
@@ -871,13 +870,12 @@ impl Editor {
     /// Check if echo message should be auto-cleared and clear it if needed
     /// Returns true if the message was cleared
     pub fn check_and_clear_expired_echo(&mut self) -> bool {
-        if let Some(echo_time) = self.echo_message_time {
-            if self.clock.now().saturating_duration_since(echo_time)
+        if let Some(echo_time) = self.echo_message_time
+            && self.clock.now().saturating_duration_since(echo_time)
                 >= Duration::from_secs(ECHO_TIMEOUT_SECS)
-            {
-                self.clear_echo_message();
-                return true;
-            }
+        {
+            self.clear_echo_message();
+            return true;
         }
         false
     }
@@ -1801,7 +1799,7 @@ impl Editor {
                     return Ok(vec![ChromeAction::Echo(unbound_message)]);
                 }
             }
-            KeyAction::Command(ref command_name) => {
+            KeyAction::Command(command_name) => {
                 // If there's an isearch window and the command is isearch-forward/backward,
                 // switch to the isearch window and dispatch the command to it
                 if let Some(command_window_id) = self.find_command_window() {
@@ -1842,7 +1840,7 @@ impl Editor {
                         if let Some(command) = self.command_registry.get_command(command_name) {
                             match command.execute(context).await {
                                 Ok(actions) => {
-                                    return Ok(self.process_chrome_actions(actions).await)
+                                    return Ok(self.process_chrome_actions(actions).await);
                                 }
                                 Err(error_msg) => {
                                     return Ok(vec![ChromeAction::Echo(format!(
@@ -1902,15 +1900,17 @@ impl Editor {
             window.cursor
         };
 
-        let chrome_actions = if let Some(buffer_host) = self.buffer_hosts.get(&buffer_id).cloned() {
-            let response_result = buffer_host.handle_key(key_action, cursor_pos).await;
+        let buffer_host = self.buffer_hosts.get(&buffer_id).cloned();
+        let chrome_actions = match buffer_host {
+            Some(buffer_host) => {
+                let response_result = buffer_host.handle_key(key_action, cursor_pos).await;
 
-            match response_result {
-                Ok(response) => self.handle_buffer_response(response).await,
-                Err(err) => vec![ChromeAction::Echo(format!("Buffer error: {err}"))],
+                match response_result {
+                    Ok(response) => self.handle_buffer_response(response).await,
+                    Err(err) => vec![ChromeAction::Echo(format!("Buffer error: {err}"))],
+                }
             }
-        } else {
-            vec![ChromeAction::Echo("No buffer host available".to_string())]
+            None => vec![ChromeAction::Echo("No buffer host available".to_string())],
         };
 
         // If echo was cleared due to timeout, add an echo action to trigger redraw
@@ -2259,31 +2259,27 @@ impl Editor {
                                 }
 
                                 // Move cursor to current match if any
-                                if let Some(current_idx) = current_match {
-                                    if let Some((start_char, _)) = matches.get(current_idx) {
-                                        if let Some(window) = self.windows.get_mut(target_window_id)
-                                        {
-                                            window.cursor = *start_char;
+                                if let Some(current_idx) = current_match
+                                    && let Some((start_char, _)) = matches.get(current_idx)
+                                    && let Some(window) = self.windows.get_mut(target_window_id)
+                                {
+                                    window.cursor = *start_char;
 
-                                            // Ensure cursor is visible by scrolling if needed
-                                            let (col, line) = buffer.to_column_line(*start_char);
-                                            let content_height =
-                                                window.height_chars.saturating_sub(3);
-                                            let content_width =
-                                                window.width_chars.saturating_sub(4);
-                                            Self::ensure_cursor_visible_static(
-                                                window,
-                                                col,
-                                                line,
-                                                content_width,
-                                                content_height,
-                                            );
+                                    // Ensure cursor is visible by scrolling if needed
+                                    let (col, line) = buffer.to_column_line(*start_char);
+                                    let content_height = window.height_chars.saturating_sub(3);
+                                    let content_width = window.width_chars.saturating_sub(4);
+                                    Self::ensure_cursor_visible_static(
+                                        window,
+                                        col,
+                                        line,
+                                        content_width,
+                                        content_height,
+                                    );
 
-                                            actions.push(ChromeAction::CursorMove(
-                                                window.absolute_cursor_position(col, line),
-                                            ));
-                                        }
-                                    }
+                                    actions.push(ChromeAction::CursorMove(
+                                        window.absolute_cursor_position(col, line),
+                                    ));
                                 }
 
                                 actions.push(ChromeAction::MarkDirty(DirtyRegion::Buffer {
@@ -3120,22 +3116,24 @@ impl Editor {
                     let buffer_id = self.windows[self.active_window].active_buffer;
                     let cursor_pos = self.windows[self.active_window].cursor;
 
-                    if let Some(buffer_host) = self.buffer_hosts.get(&buffer_id).cloned() {
-                        // Use async runtime to handle the async BufferHost call
-                        let response_result =
-                            buffer_host.handle_key(KeyAction::Save, cursor_pos).await;
+                    let buffer_host = self.buffer_hosts.get(&buffer_id).cloned();
+                    match buffer_host {
+                        Some(buffer_host) => {
+                            let response_result =
+                                buffer_host.handle_key(KeyAction::Save, cursor_pos).await;
 
-                        match response_result {
-                            Ok(response) => {
-                                let save_actions = self.handle_buffer_response(response).await;
-                                result_actions.extend(save_actions);
-                            }
-                            Err(e) => {
-                                result_actions.push(ChromeAction::Echo(format!("Save error: {e}")));
+                            match response_result {
+                                Ok(response) => {
+                                    let save_actions = self.handle_buffer_response(response).await;
+                                    result_actions.extend(save_actions);
+                                }
+                                Err(error) => result_actions
+                                    .push(ChromeAction::Echo(format!("Save error: {error}"))),
                             }
                         }
-                    } else {
-                        result_actions.push(ChromeAction::Echo("No buffer to save".to_string()));
+                        None => {
+                            result_actions.push(ChromeAction::Echo("No buffer to save".to_string()))
+                        }
                     }
                 }
                 ChromeAction::BufferOps(ops) => {
@@ -3312,7 +3310,7 @@ impl Editor {
     /// Poll for external file changes and handle them with CRDT-lite merge
     /// Returns actions to update the UI if any changes were applied
     pub fn poll_file_changes(&mut self) -> Vec<ChromeAction> {
-        use crate::file_watcher::{merge_changes, MergeResult};
+        use crate::file_watcher::{MergeResult, merge_changes};
 
         let mut actions = Vec::new();
         let events = self.file_watcher.poll_events();
@@ -3555,9 +3553,11 @@ mod tests {
             let actions = editor.key_event(vec![LogicalKey::Right]).await.unwrap();
 
             // Should get a CursorMove action
-            assert!(actions
-                .iter()
-                .any(|action| matches!(action, ChromeAction::CursorMove(_))));
+            assert!(
+                actions
+                    .iter()
+                    .any(|action| matches!(action, ChromeAction::CursorMove(_)))
+            );
 
             // Cursor should have moved
             let window = &editor.windows[editor.active_window];
@@ -3636,9 +3636,11 @@ mod tests {
             let actions = editor.key_event(vec![LogicalKey::Down]).await.unwrap();
 
             // Should get a CursorMove action
-            assert!(actions
-                .iter()
-                .any(|action| matches!(action, ChromeAction::CursorMove(_))));
+            assert!(
+                actions
+                    .iter()
+                    .any(|action| matches!(action, ChromeAction::CursorMove(_)))
+            );
 
             // Cursor should have moved to next line
             let window = &editor.windows[editor.active_window];
@@ -4193,9 +4195,11 @@ mod tests {
 
         // Should have a killed message and refresh
         assert!(actions.iter().any(|a| matches!(a, ChromeAction::Echo(_))));
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, ChromeAction::MarkDirty(_))));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, ChromeAction::MarkDirty(_)))
+        );
 
         // Check that text was killed and kill-ring has content
         assert!(!editor.kill_ring.is_empty());
@@ -4242,9 +4246,11 @@ mod tests {
         let actions = editor.yank(&crate::mode::ActionPosition::cursor());
 
         // Should have inserted text
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, ChromeAction::MarkDirty(_))));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, ChromeAction::MarkDirty(_)))
+        );
 
         // Check buffer content
         let window = &editor.windows[editor.active_window];
@@ -4327,9 +4333,11 @@ mod tests {
         let actions = editor.yank(&crate::mode::ActionPosition::cursor());
 
         // Should get an error message
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, ChromeAction::Echo(msg) if msg.contains("empty"))));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, ChromeAction::Echo(msg) if msg.contains("empty")))
+        );
     }
 
     #[test]
@@ -4342,9 +4350,11 @@ mod tests {
         let actions = editor.set_mark();
 
         // Should get confirmation message
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, ChromeAction::Echo(msg) if msg.contains("Mark set"))));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, ChromeAction::Echo(msg) if msg.contains("Mark set")))
+        );
 
         // Check that mark was set in buffer
         let window = &editor.windows[editor.active_window];
@@ -4367,9 +4377,11 @@ mod tests {
         let actions = editor.clear_mark();
 
         // Should get confirmation message
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, ChromeAction::Echo(msg) if msg.contains("Mark cleared"))));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, ChromeAction::Echo(msg) if msg.contains("Mark cleared")))
+        );
 
         // Check that mark was cleared
         let window = &editor.windows[editor.active_window];
@@ -4385,9 +4397,11 @@ mod tests {
         let actions = editor.clear_mark();
 
         // Should get error message
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, ChromeAction::Echo(msg) if msg.contains("No mark to clear"))));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, ChromeAction::Echo(msg) if msg.contains("No mark to clear")))
+        );
     }
 
     #[test]
@@ -4408,9 +4422,11 @@ mod tests {
 
         // Should have killed message and refresh
         assert!(actions.iter().any(|a| matches!(a, ChromeAction::Echo(_))));
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, ChromeAction::MarkDirty(_))));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, ChromeAction::MarkDirty(_)))
+        );
 
         // Check that text was killed and added to kill-ring
         assert!(!editor.kill_ring.is_empty());
@@ -4437,9 +4453,11 @@ mod tests {
         let actions = editor.kill_region();
 
         // Should get error message
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, ChromeAction::Echo(msg) if msg.contains("No mark set"))));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, ChromeAction::Echo(msg) if msg.contains("No mark set")))
+        );
 
         // Buffer should be unchanged
         let window = &editor.windows[editor.active_window];
@@ -4464,9 +4482,11 @@ mod tests {
         let actions = editor.kill_region();
 
         // Should get empty region message
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, ChromeAction::Echo(msg) if msg.contains("Empty region"))));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, ChromeAction::Echo(msg) if msg.contains("Empty region")))
+        );
 
         // Buffer should be unchanged
         let window = &editor.windows[editor.active_window];
@@ -4531,9 +4551,11 @@ mod tests {
         let actions = editor.yank(&crate::mode::ActionPosition::cursor());
 
         // Should have refresh action
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, ChromeAction::MarkDirty(_))));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, ChromeAction::MarkDirty(_)))
+        );
 
         // Check buffer content - should have yanked text at end
         let window = &editor.windows[editor.active_window];

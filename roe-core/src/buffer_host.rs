@@ -18,8 +18,8 @@ use crate::renderer::DirtyRegion;
 use crate::{BufferId, ModeId};
 use compio::buf::BufResult;
 use compio::io::AsyncWriteAtExt;
-use futures::channel::{mpsc, oneshot};
 use futures::StreamExt;
+use futures::channel::{mpsc, oneshot};
 
 /// Message sent to a mode actor
 pub enum ModeMessage {
@@ -63,7 +63,11 @@ impl ModeActor {
     /// Spawn the mode actor as a persistent task
     pub fn spawn(mut self) -> compio::runtime::JoinHandle<()> {
         compio::runtime::spawn(async move {
-            while let Some(message) = self.receiver.next().await {
+            loop {
+                let next_message = self.receiver.next().await;
+                let Some(message) = next_message else {
+                    break;
+                };
                 match message {
                     ModeMessage::KeyAction { action, reply } => {
                         let result = self.mode_impl.perform(&action);
@@ -346,7 +350,11 @@ impl BufferHost {
     /// Spawn the BufferHost as an async task
     pub fn spawn(mut self) -> compio::runtime::JoinHandle<()> {
         compio::runtime::spawn(async move {
-            while let Some(message) = self.receiver.next().await {
+            loop {
+                let next_message = self.receiver.next().await;
+                let Some(message) = next_message else {
+                    break;
+                };
                 let response = self.handle_request(message.request).await;
 
                 // Send reply (ignore if receiver dropped)
