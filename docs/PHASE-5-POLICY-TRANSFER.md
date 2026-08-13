@@ -189,7 +189,7 @@ closed those gaps and passed the deletion gate.
 | `cargo test -p roe-vello production_mica_session_builds_a_vello_scene_without_a_display` | A real Mica session produces the headless Vello scene before and after an edit. |
 | `cargo test -p roe-vello --test session_conformance` | Terminal and Vello consume the same real full/delta Mica session stream. |
 | `cargo build --release --bin roe-vello` | The production Vello frontend builds with the Mica session path; a display-host smoke remains an open platform obligation. |
-| `./scripts/measure-phase0-baseline.sh` | Completes against the production Mica path. In the recorded run: 196.171 ms Mica-session readiness, 2.397 ms per Mica insert/delete pair, 271 us per snapshot/redraw, 33,332 KiB idle terminal RSS, and 0 KiB measured RSS growth across the edit/redraw workload. |
+| `./scripts/measure-phase0-baseline.sh` | Completes against the production Mica path. In the recorded run: 183.949 ms Mica-session readiness, 2.230 ms per Mica insert/delete pair, 442 us per snapshot/redraw, 33,728 KiB idle terminal RSS, and 0 KiB measured RSS growth across the edit/redraw workload. |
 
 The measurements are coarse regression evidence, not optimization claims. Unlike the earlier
 Phase 0 harness, the editing metric includes two complete Mica dispatch transactions and the redraw
