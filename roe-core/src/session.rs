@@ -507,7 +507,14 @@ impl HostSession {
                         invalidations.push(Invalidation::EchoArea);
                         lifecycle.push(LifecycleEvent::Error(message));
                     }
-                    Some(Ok(MicaKeyResult::Unbound)) | None => {
+                    Some(Ok(MicaKeyResult::Unbound)) => {
+                        self.editor.set_echo_message(format!(
+                            "{} is undefined",
+                            normalized_key_sequence(&keys)
+                        ));
+                        invalidations.push(Invalidation::EchoArea);
+                    }
+                    None => {
                         if let Some(character) = text_character_from_keys(&keys) {
                             match self
                                 .editor
@@ -553,18 +560,31 @@ impl HostSession {
                                     &mut invalidations,
                                 )
                                 .await;
-                                Some(dispatch.key)
+                                Some(Ok(dispatch.key))
                             }
-                            Err(error) => {
-                                lifecycle.push(LifecycleEvent::Error(error.to_string()));
-                                None
-                            }
+                            Err(error) => Some(Err(error)),
                         }
                     } else {
                         None
                     };
-                    if matches!(mica_result, Some(MicaKeyResult::Handled)) {
-                        continue;
+                    match mica_result {
+                        Some(Ok(MicaKeyResult::Handled)) => continue,
+                        Some(Ok(result)) => {
+                            let message =
+                                format!("Mica rejected text input {character:?}: {result:?}");
+                            self.editor.set_echo_message(message.clone());
+                            invalidations.push(Invalidation::EchoArea);
+                            lifecycle.push(LifecycleEvent::Error(message));
+                            continue;
+                        }
+                        Some(Err(error)) => {
+                            let message = error.to_string();
+                            self.editor.set_echo_message(message.clone());
+                            invalidations.push(Invalidation::EchoArea);
+                            lifecycle.push(LifecycleEvent::Error(message));
+                            continue;
+                        }
+                        None => {}
                     }
                     match self
                         .editor
