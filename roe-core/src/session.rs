@@ -39,6 +39,8 @@ pub const MAX_NATIVE_RESULT_BYTES: usize = 1_048_576;
 pub const MAX_SESSION_VIEWS: usize = 64;
 pub const MAX_FRAME_COLUMNS: u16 = 1_000;
 pub const MAX_FRAME_ROWS: u16 = 1_000;
+const MICA_PROMPT_HEIGHT: u16 = 10;
+const MICA_PROMPT_CANDIDATE_ROWS: usize = MICA_PROMPT_HEIGHT as usize - 3;
 
 static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
 
@@ -1231,8 +1233,12 @@ impl HostSession {
                         continue;
                     }
                 };
-                self.editor
-                    .create_mica_prompt_window(command_type, 10, content, cursor);
+                self.editor.create_mica_prompt_window(
+                    command_type,
+                    MICA_PROMPT_HEIGHT,
+                    content,
+                    cursor,
+                );
             }
             invalidations.push(Invalidation::Full);
         }
@@ -2507,7 +2513,22 @@ fn mica_prompt_content(update: &MicaPromptUpdate) -> (String, usize) {
         format!("{}: ", update.prompt)
     };
     let mut content = format!("{prefix}{}", update.query);
-    for (index, (name, target)) in update.candidates.iter().take(8).enumerate() {
+    let first_candidate = update
+        .selected
+        .saturating_sub(MICA_PROMPT_CANDIDATE_ROWS.saturating_sub(1))
+        .min(
+            update
+                .candidates
+                .len()
+                .saturating_sub(MICA_PROMPT_CANDIDATE_ROWS),
+        );
+    for (index, (name, target)) in update
+        .candidates
+        .iter()
+        .enumerate()
+        .skip(first_candidate)
+        .take(MICA_PROMPT_CANDIDATE_ROWS)
+    {
         debug_assert!(matches!(
             target,
             MicaPromptTarget::Selector(_)
@@ -2940,6 +2961,40 @@ mod tests {
             messages_buffer_id: None,
             file_watcher: crate::file_watcher::FileWatcher::new(),
         }
+    }
+
+    #[test]
+    fn mica_prompt_content_keeps_the_selected_candidate_visible() {
+        let update = MicaPromptUpdate {
+            kind: "command".to_owned(),
+            value_kind: None,
+            prompt: String::new(),
+            query: String::new(),
+            selected: 9,
+            candidates: (0..12)
+                .map(|index| {
+                    (
+                        format!("command-{index}"),
+                        MicaPromptTarget::Selector(format!("roe/command_{index}")),
+                    )
+                })
+                .collect(),
+        };
+
+        let (content, cursor) = mica_prompt_content(&update);
+        let lines: Vec<_> = content.lines().collect();
+        assert_eq!(cursor, "M-x ".chars().count());
+        assert_eq!(lines.len(), MICA_PROMPT_HEIGHT.saturating_sub(2) as usize);
+        assert_eq!(lines[1], "  command-3");
+        assert_eq!(lines[7], "> command-9");
+        assert!(!content.contains("command-2\n"));
+
+        let mut at_top = update;
+        at_top.selected = 0;
+        let (content, _) = mica_prompt_content(&at_top);
+        assert!(content.contains("\n> command-0\n"));
+        assert!(content.contains("\n  command-6"));
+        assert!(!content.contains("command-7"));
     }
 
     fn test_session_with_grants(grants: CapabilityGrants) -> HostSession {
