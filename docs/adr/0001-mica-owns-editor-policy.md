@@ -23,10 +23,11 @@ The checked prototype is [`mica/roe-model.mica`](../../mica/roe-model.mica). It 
 ordinary Mica source with no Roe-specific runtime builtin.
 
 `Delegates` is durable type/policy description only. Endpoint-created actor, session, frame, view,
-and buffer identities are classified by their explicit volatile relations (`EditorSession`,
-`SessionActor`, `Frame`, `View`, and `LogicalBuffer`); opening an endpoint never requires asserting
-a durable delegation edge. Command behaviors validate the volatile actor/session association before
-changing session state, in addition to the endpoint's relational read/write/invoke/effect grants.
+and buffer identities are classified by their explicit volatile relations (`ActorRole`,
+`EditorSession`, `SessionActor`, `Frame`, `View`, and `LogicalBuffer`); opening an endpoint never
+requires asserting a durable delegation or grant edge. Command behaviors validate the volatile
+actor/session association before changing session state, in addition to the endpoint's derived
+read/write/invoke/effect grants.
 
 ## State classes
 

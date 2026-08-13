@@ -29,7 +29,7 @@ non-installed fixture state and invokes the complete workflow:
 
 ```text
 normalized "C-x o"
-  -> roe/SessionKeymap + roe/EffectiveBinding
+  -> roe/EffectiveSessionKeymap + roe/EffectiveBinding
   -> roe/CommandSelector(:roe/other_window)
   -> invoke(:roe/other_window, actor + session)
   -> retract/assert roe/ActiveView
@@ -50,7 +50,10 @@ host-managed session, logical-object, and native-association relation is declare
 Mica source, which is required by `open_endpoint_with_context_and_volatile_tuples_named` and the
 volatile assertion/retraction APIs. Durable `Delegates` facts classify durable policy identities
 only; ephemeral identities are classified by explicit volatile relations and do not need a
-delegation edge.
+delegation edge. In particular, endpoint open atomically supplies volatile
+`ActorRole(actor, #roe/editor_role)` and per-buffer `CanUseBuffer` rows. Durable `RoleCan*` policy
+derives the exact `CanRead`/`CanWrite`/`CanInvoke`/`CanEffect` rows that the public driver scans
+afresh when it builds each endpoint invocation request.
 
 ## Identity and invalidation rules
 
@@ -122,10 +125,13 @@ cargo run --manifest-path ../mica/Cargo.toml -p mica-runner --bin mica -- \
 ```
 
 The runner opens a real non-root driver endpoint for `#roe/demo_actor`; the task returns
-`#roe/demo_view_b` and emits `presentation_invalidated` for that view. The fixture composes a local
-map inheriting the global binding with a competing lower-precedence map, so the result also checks
-inheritance, composition, and precedence. Roe's workspace checks remain unchanged because Phase 3
-adds no runtime dependency or production path.
+`#roe/demo_view_b` and emits `presentation_invalidated` for that view. Both leaves belong to a valid
+split tree, and `other_window` refuses any successor outside the recursively derived
+`SessionLeafView` set. Phase 4 projects that tree plus the selected active leaf into
+`NativeOperation::ValidateLayout` before accepting a presentation update. The fixture composes a
+local map inheriting the global binding with a competing lower-precedence minor-mode map, so the
+result also checks inheritance, mode composition, package activation, and precedence. Roe's
+workspace checks remain unchanged because Phase 3 adds no runtime dependency or production path.
 
 The remaining policy composition is exercised through the same non-root endpoint:
 
@@ -136,9 +142,10 @@ cargo run --manifest-path ../mica/Cargo.toml -p mica-runner --bin mica -- \
   'return roe/demo_policy_probe(#roe/demo_actor, #roe/demo_session)'
 ```
 
-The result is `:ok` only when command arguments, prompt/completion metadata, authority-filtered
-discovery, major/minor hooks and syntax, face inheritance/override, and configuration
-inheritance/override all resolve through their derived relations.
+The result is `:ok` only when interactive argument acquisition returns a prompt/completion request,
+both visible-view completion candidates resolve through the recursive tree, command discovery is
+authority-filtered, the minor-mode keymap composes, disabled-package bindings and hooks disappear,
+and major/minor hooks and syntax plus face/configuration inheritance and override all resolve.
 
 Phase 3 exit criteria are met: the checked ontology represents a real workflow without Rust policy,
 every native association has an invalidation rule, effects/requests/subscriptions have distinct

@@ -22,6 +22,7 @@ make_identity(:roe/other_window)
 make_identity(:roe/fundamental_mode)
 make_identity(:roe/default_face)
 make_identity(:roe/core_package)
+make_identity(:roe/editor_role)
 
 make_relation(:Delegates, 3)
 
@@ -33,12 +34,13 @@ make_functional_relation(:roe/CommandSummary, 2, [0])
 make_relation(:roe/CommandArgument, 4)
 make_relation(:roe/ArgumentPrompt, 3)
 make_relation(:roe/ArgumentCompletion, 3)
+make_relation(:roe/ArgumentCandidate, 5)
 make_relation(:roe/Keymap, 1)
 make_relation(:roe/KeymapParent, 2)
 make_relation(:roe/KeyBinding, 4)
 make_relation(:roe/MajorMode, 1)
 make_relation(:roe/MinorMode, 1)
-make_relation(:roe/ModeKeymap, 2)
+make_relation(:roe/ModeKeymap, 3)
 make_relation(:roe/ModeHook, 3)
 make_relation(:roe/Face, 1)
 make_relation(:roe/FaceParent, 2)
@@ -49,6 +51,9 @@ make_relation(:roe/ConfigurationParent, 2)
 make_relation(:roe/Package, 1)
 make_functional_relation(:roe/PackageUnit, 2, [0])
 make_functional_relation(:roe/PackageEnabled, 2, [0])
+make_relation(:roe/PackageCommand, 2)
+make_relation(:roe/PackageKeymap, 2)
+make_relation(:roe/PackageMode, 2)
 
 // Session-volatile logical state. Phase 4 asserts and retracts these tuples at
 // endpoint open/close using the public mica-driver volatile-tuple API.
@@ -75,6 +80,7 @@ make_functional_relation(:roe/ViewMark, 2, [0], :volatile)
 make_relation(:roe/ViewSelection, 3, :volatile)
 make_relation(:roe/SessionKeymap, 3, :volatile)
 make_relation(:roe/NextView, 2, :volatile)
+make_relation(:roe/ActorRole, 2, :volatile)
 
 // Ephemeral host associations and native-cached observations. The host owns
 // their invalidation and never persists them in a named unit or durable store.
@@ -83,18 +89,29 @@ make_functional_relation(:roe/NativeResourceGeneration, 2, [0], :volatile)
 make_functional_relation(:roe/NativeBufferRevision, 2, [0], :volatile)
 make_functional_relation(:roe/PresentationRevision, 2, [0], :volatile)
 
-// Authority policy is durable description. Effective grants are rebuilt for
-// each endpoint; no integer capability token appears in these relations.
+// Durable roles describe authority. ActorRole and buffer grants are endpoint
+// volatile; the effective Can* relations are derived before every invocation.
+make_relation(:RoleCanRead, 2)
+make_relation(:RoleCanWrite, 2)
+make_relation(:RoleCanInvoke, 2)
+make_relation(:RoleCanEffect, 1)
+make_relation(:roe/RoleCanRequestService, 2)
 make_relation(:CanRead, 2)
 make_relation(:CanWrite, 2)
 make_relation(:CanInvoke, 2)
 make_relation(:CanEffect, 1)
-make_relation(:roe/CanUseBuffer, 2)
+make_relation(:roe/CanUseBuffer, 2, :volatile)
 make_relation(:roe/CanRequestService, 2)
 
 // Derived editor facts.
+make_relation(:roe/EnabledCommand, 1)
+make_relation(:roe/EnabledKeymap, 1)
+make_relation(:roe/EnabledMode, 1)
 make_relation(:roe/EffectiveBinding, 4)
+make_relation(:roe/EffectiveSessionKeymap, 3)
 make_relation(:roe/DiscoverableCommand, 2)
+make_relation(:roe/ViewInTree, 2)
+make_relation(:roe/SessionLeafView, 2)
 make_relation(:roe/VisibleBuffer, 2)
 make_relation(:roe/EffectiveMajorMode, 2)
 make_relation(:roe/EffectiveModeHook, 3)
@@ -104,38 +121,113 @@ make_relation(:roe/EffectiveSyntaxRule, 5)
 make_relation(:roe/LocalConfiguration, 2)
 make_relation(:roe/EffectiveConfiguration, 3)
 
+CanRead(actor, relation) :-
+  roe/ActorRole(actor, role),
+  RoleCanRead(role, relation)
+
+CanWrite(actor, relation) :-
+  roe/ActorRole(actor, role),
+  RoleCanWrite(role, relation)
+
+CanInvoke(actor, selector) :-
+  roe/ActorRole(actor, role),
+  RoleCanInvoke(role, selector)
+
+CanEffect(actor) :-
+  roe/ActorRole(actor, role),
+  RoleCanEffect(role)
+
+roe/CanRequestService(actor, service) :-
+  roe/ActorRole(actor, role),
+  roe/RoleCanRequestService(role, service)
+
+roe/EnabledCommand(command) :-
+  roe/PackageEnabled(package, true),
+  roe/PackageCommand(package, command)
+
+roe/EnabledKeymap(keymap) :-
+  roe/PackageEnabled(package, true),
+  roe/PackageKeymap(package, keymap)
+
+roe/EnabledMode(mode) :-
+  roe/PackageEnabled(package, true),
+  roe/PackageMode(package, mode)
+
 roe/EffectiveBinding(keymap, sequence, command, precedence) :-
+  roe/EnabledKeymap(keymap),
+  roe/EnabledCommand(command),
   roe/KeyBinding(keymap, sequence, command, precedence)
 
 roe/EffectiveBinding(keymap, sequence, command, precedence) :-
+  roe/EnabledKeymap(keymap),
   roe/KeymapParent(keymap, parent),
   roe/EffectiveBinding(parent, sequence, command, precedence)
 
+roe/EffectiveSessionKeymap(session, keymap, precedence) :-
+  roe/SessionKeymap(session, keymap, precedence),
+  roe/EnabledKeymap(keymap)
+
+roe/EffectiveSessionKeymap(session, keymap, precedence) :-
+  roe/ActiveView(session, view),
+  roe/ViewBuffer(view, buffer),
+  roe/BufferMajorMode(buffer, mode),
+  roe/EnabledMode(mode),
+  roe/ModeKeymap(mode, keymap, precedence),
+  roe/EnabledKeymap(keymap)
+
+roe/EffectiveSessionKeymap(session, keymap, precedence) :-
+  roe/ActiveView(session, view),
+  roe/ViewBuffer(view, buffer),
+  roe/BufferMinorMode(buffer, mode),
+  roe/EnabledMode(mode),
+  roe/ModeKeymap(mode, keymap, precedence),
+  roe/EnabledKeymap(keymap)
+
 roe/DiscoverableCommand(actor, command) :-
+  roe/EnabledCommand(command),
   roe/Command(command),
   roe/CommandSelector(command, selector),
   CanInvoke(actor, selector)
 
-roe/VisibleBuffer(session, buffer) :-
-  roe/SessionFrame(session, frame),
-  roe/FrameRootView(frame, view),
-  roe/ViewBuffer(view, buffer)
+roe/ViewInTree(root, root) :-
+  roe/View(root)
 
-roe/VisibleBuffer(session, buffer) :-
+roe/ViewInTree(root, view) :-
+  roe/ViewFirstChild(root, child),
+  roe/ViewInTree(child, view)
+
+roe/ViewInTree(root, view) :-
+  roe/ViewSecondChild(root, child),
+  roe/ViewInTree(child, view)
+
+roe/SessionLeafView(session, view) :-
   roe/SessionFrame(session, frame),
   roe/FrameRootView(frame, root),
-  roe/ViewParent(view, root),
+  roe/ViewInTree(root, view),
   roe/ViewBuffer(view, buffer)
 
+roe/VisibleBuffer(session, buffer) :-
+  roe/SessionLeafView(session, view),
+  roe/ViewBuffer(view, buffer)
+
+roe/ArgumentCandidate(:visible_views, actor, session, view, name) :-
+  roe/SessionActor(session, actor),
+  roe/SessionLeafView(session, view),
+  roe/ViewBuffer(view, buffer),
+  roe/BufferName(buffer, name)
+
 roe/EffectiveMajorMode(buffer, mode) :-
-  roe/BufferMajorMode(buffer, mode)
+  roe/BufferMajorMode(buffer, mode),
+  roe/EnabledMode(mode)
 
 roe/EffectiveModeHook(buffer, hook, precedence) :-
   roe/BufferMajorMode(buffer, mode),
+  roe/EnabledMode(mode),
   roe/ModeHook(mode, hook, precedence)
 
 roe/EffectiveModeHook(buffer, hook, precedence) :-
   roe/BufferMinorMode(buffer, mode),
+  roe/EnabledMode(mode),
   roe/ModeHook(mode, hook, precedence)
 
 roe/LocalFaceAttribute(face, attribute) :-
@@ -151,10 +243,12 @@ roe/EffectiveFaceAttribute(face, attribute, value) :-
 
 roe/EffectiveSyntaxRule(buffer, mode, kind, pattern, precedence) :-
   roe/BufferMajorMode(buffer, mode),
+  roe/EnabledMode(mode),
   roe/SyntaxRule(mode, kind, pattern, precedence)
 
 roe/EffectiveSyntaxRule(buffer, mode, kind, pattern, precedence) :-
   roe/BufferMinorMode(buffer, mode),
+  roe/EnabledMode(mode),
   roe/SyntaxRule(mode, kind, pattern, precedence)
 
 roe/LocalConfiguration(scope, key) :-
@@ -177,15 +271,55 @@ assert Delegates(#roe/core_package, #roe/package, 0)
 assert roe/Command(#roe/other_window)
 assert roe/CommandSelector(#roe/other_window, :roe/other_window)
 assert roe/CommandSummary(#roe/other_window, "Select the next logical view")
+assert roe/CommandArgument(#roe/other_window, 0, :window, :logical_view)
+assert roe/ArgumentPrompt(#roe/other_window, 0, "Window")
+assert roe/ArgumentCompletion(#roe/other_window, 0, :visible_views)
 assert roe/Keymap(#roe/global_map)
 assert roe/KeyBinding(#roe/global_map, "C-x o", #roe/other_window, 100)
 assert roe/MajorMode(#roe/fundamental_mode)
-assert roe/ModeKeymap(#roe/fundamental_mode, #roe/global_map)
+assert roe/ModeKeymap(#roe/fundamental_mode, #roe/global_map, 50)
 assert roe/Face(#roe/default_face)
 assert roe/FaceAttribute(#roe/default_face, :foreground, "inherit")
 assert roe/Package(#roe/core_package)
 assert roe/PackageUnit(#roe/core_package, :roe/core)
 assert roe/PackageEnabled(#roe/core_package, true)
+assert roe/PackageCommand(#roe/core_package, #roe/other_window)
+assert roe/PackageKeymap(#roe/core_package, #roe/global_map)
+assert roe/PackageMode(#roe/core_package, #roe/fundamental_mode)
+
+assert RoleCanRead(#roe/editor_role, :roe/ActiveView)
+assert RoleCanRead(#roe/editor_role, :roe/SessionActor)
+assert RoleCanRead(#roe/editor_role, :roe/EffectiveSessionKeymap)
+assert RoleCanRead(#roe/editor_role, :roe/EffectiveBinding)
+assert RoleCanRead(#roe/editor_role, :roe/CommandSelector)
+assert RoleCanRead(#roe/editor_role, :roe/CommandArgument)
+assert RoleCanRead(#roe/editor_role, :roe/ArgumentPrompt)
+assert RoleCanRead(#roe/editor_role, :roe/ArgumentCompletion)
+assert RoleCanRead(#roe/editor_role, :roe/ArgumentCandidate)
+assert RoleCanRead(#roe/editor_role, :roe/DiscoverableCommand)
+assert RoleCanRead(#roe/editor_role, :roe/NextView)
+assert RoleCanRead(#roe/editor_role, :roe/SessionLeafView)
+assert RoleCanRead(#roe/editor_role, :roe/EffectiveModeHook)
+assert RoleCanRead(#roe/editor_role, :roe/EffectiveFaceAttribute)
+assert RoleCanRead(#roe/editor_role, :roe/EffectiveSyntaxRule)
+assert RoleCanRead(#roe/editor_role, :roe/EffectiveConfiguration)
+assert RoleCanWrite(#roe/editor_role, :roe/ActiveView)
+assert RoleCanInvoke(#roe/editor_role, :roe/dispatch_key)
+assert RoleCanInvoke(#roe/editor_role, :roe/other_window)
+assert RoleCanInvoke(#roe/editor_role, :roe/acquire_argument)
+assert RoleCanInvoke(#roe/editor_role, :roe/accept_argument_candidate)
+assert RoleCanEffect(#roe/editor_role)
+assert roe/RoleCanRequestService(#roe/editor_role, :text_read)
+assert roe/RoleCanRequestService(#roe/editor_role, :text_write)
+assert roe/RoleCanRequestService(#roe/editor_role, :layout_validate)
+assert roe/RoleCanRequestService(#roe/editor_role, :file_read)
+assert roe/RoleCanRequestService(#roe/editor_role, :file_write)
+assert roe/RoleCanRequestService(#roe/editor_role, :clipboard_read)
+assert roe/RoleCanRequestService(#roe/editor_role, :clipboard_write)
+assert roe/RoleCanRequestService(#roe/editor_role, :clock_read)
+assert roe/RoleCanRequestService(#roe/editor_role, :process_spawn)
+assert roe/RoleCanRequestService(#roe/editor_role, :watch_register)
+assert roe/RoleCanRequestService(#roe/editor_role, :watch_unregister)
 
 verb roe/other_window(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor
@@ -197,6 +331,7 @@ verb roe/other_window(actor, session)
   if next == nothing
     return :no_next_view
   end
+  roe/SessionLeafView(session, next) || return :invalid_next_view
   retract roe/ActiveView(session, current)
   assert roe/ActiveView(session, next)
   emit(session, {:kind -> :presentation_invalidated, :view -> next})
@@ -207,7 +342,7 @@ verb roe/dispatch_key(actor, session, sequence @ #string)
   let selected = nothing
   let selected_precedence = -2147483648
   let ambiguous = false
-  for active in roe/SessionKeymap(session, ?keymap, ?session_precedence)
+  for active in roe/EffectiveSessionKeymap(session, ?keymap, ?session_precedence)
     for binding in roe/EffectiveBinding(active[:keymap], sequence, ?command, ?precedence)
       let precedence = active[:session_precedence] + binding[:precedence]
       if selected == nothing || precedence > selected_precedence
@@ -230,4 +365,40 @@ verb roe/dispatch_key(actor, session, sequence @ #string)
     return :missing_selector
   end
   return invoke(selector, {:actor -> actor, :session -> session})
+end
+
+// Return either a supplied value or the declarative prompt/completion request
+// that a Mica-owned minibuffer will realize in Phase 5.
+verb roe/acquire_argument(actor, session, command, position, supplied)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  roe/DiscoverableCommand(actor, command) || return :not_discoverable
+  if supplied != nothing
+    return {:kind -> :argument_value, :value -> supplied}
+  end
+  let argument = one roe/CommandArgument(command, position, ?name, ?value_kind)
+  if argument == nothing
+    return :missing_argument
+  end
+  let prompt = one roe/ArgumentPrompt(command, position, ?prompt)
+  if prompt == nothing
+    return :missing_prompt
+  end
+  let completion = one roe/ArgumentCompletion(command, position, ?selector)
+  return {:kind -> :argument_required, :name -> argument[:name], :value_kind -> argument[:value_kind], :prompt -> prompt, :completion -> completion}
+end
+
+// Validate a completion against the command's declared provider rather than
+// accepting an arbitrary UI-supplied logical identity.
+verb roe/accept_argument_candidate(actor, session, command, position, candidate)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  roe/DiscoverableCommand(actor, command) || return :not_discoverable
+  let completion = one roe/ArgumentCompletion(command, position, ?selector)
+  if completion == nothing
+    return :missing_completion
+  end
+  let selected = one roe/ArgumentCandidate(completion, actor, session, candidate, ?label)
+  if selected == nothing
+    return :invalid_candidate
+  end
+  return {:kind -> :argument_value, :value -> candidate, :label -> selected}
 end
