@@ -59,6 +59,7 @@ make_relation(:roe/ConfigurationParent, 2)
 make_relation(:roe/Package, 1)
 make_functional_relation(:roe/PackageUnit, 2, [0])
 make_functional_relation(:roe/PackageEnabled, 2, [0])
+make_relation(:roe/PackageDisabled, 1, :volatile)
 make_relation(:roe/PackageCommand, 2)
 make_relation(:roe/PackageKeymap, 2)
 make_relation(:roe/PackageMode, 2)
@@ -154,14 +155,17 @@ roe/CanRequestService(actor, service) :-
 
 roe/EnabledCommand(command) :-
   roe/PackageEnabled(package, true),
+  not roe/PackageDisabled(package),
   roe/PackageCommand(package, command)
 
 roe/EnabledKeymap(keymap) :-
   roe/PackageEnabled(package, true),
+  not roe/PackageDisabled(package),
   roe/PackageKeymap(package, keymap)
 
 roe/EnabledMode(mode) :-
   roe/PackageEnabled(package, true),
+  not roe/PackageDisabled(package),
   roe/PackageMode(package, mode)
 
 roe/EffectiveBinding(keymap, sequence, command, precedence) :-

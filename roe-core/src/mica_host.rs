@@ -374,6 +374,7 @@ pub struct MicaHost {
     view_cursors: HashMap<WindowId, usize>,
     layout_nodes: HashMap<Vec<usize>, Identity>,
     layout_tuples: Vec<LayoutFact>,
+    disabled_packages: HashSet<Identity>,
     active_view: WindowId,
     pending_key_prefix: Option<String>,
     prompt_active: bool,
@@ -582,6 +583,7 @@ impl MicaHost {
             view_cursors,
             layout_nodes,
             layout_tuples,
+            disabled_packages: HashSet::new(),
             active_view,
             pending_key_prefix: None,
             prompt_active: false,
@@ -665,11 +667,44 @@ impl MicaHost {
         Ok(self.wait_for_task(submitted.task_id).await?.events)
     }
 
-    pub async fn replace_first_wave(&self, source: String) -> Result<(), MicaHostError> {
+    pub async fn check_source(&self, source: String) -> Result<(), MicaHostError> {
+        self.driver.check_filein(source, None).await?;
+        Ok(())
+    }
+
+    pub async fn replace_unit(&self, unit: &str, source: String) -> Result<(), MicaHostError> {
         self.driver.check_filein(source.clone(), None).await?;
         self.driver
-            .filein_unit(sym("roe/first-wave"), source, FileinMode::Replace, None)
+            .filein_unit(sym(unit), source, FileinMode::Replace, None)
             .await?;
+        Ok(())
+    }
+
+    pub async fn export_unit(&self, unit: &str) -> Result<String, MicaHostError> {
+        Ok(self.driver.fileout_unit(sym(unit)).await?)
+    }
+
+    pub async fn restore_first_wave(&self) -> Result<(), MicaHostError> {
+        self.replace_unit("roe/first-wave", FIRST_WAVE_SOURCE.to_owned())
+            .await
+    }
+
+    pub fn set_package_enabled(
+        &mut self,
+        package: &str,
+        enabled: bool,
+    ) -> Result<(), MicaHostError> {
+        let package = self.driver.named_identity(sym(package))?;
+        let tuple = vec![(
+            sym("roe/PackageDisabled"),
+            [Value::identity(package)].into(),
+        )];
+        if enabled {
+            self.driver.retract_volatile_tuples_named(tuple)?;
+            self.disabled_packages.remove(&package);
+        } else if self.disabled_packages.insert(package) {
+            self.driver.assert_volatile_tuples_named(tuple)?;
+        }
         Ok(())
     }
 

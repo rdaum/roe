@@ -758,12 +758,55 @@ impl HostSession {
         Ok(outputs)
     }
 
-    pub async fn replace_mica_first_wave(&mut self, source: String) -> Result<(), MicaHostError> {
+    pub async fn check_mica_source(&self, source: String) -> Result<(), MicaHostError> {
         self.mica
             .as_ref()
             .ok_or(MicaHostError::Closed)?
-            .replace_first_wave(source)
+            .check_source(source)
             .await
+    }
+
+    pub async fn replace_mica_unit(
+        &mut self,
+        unit: &str,
+        source: String,
+    ) -> Result<(), MicaHostError> {
+        self.mica
+            .as_ref()
+            .ok_or(MicaHostError::Closed)?
+            .replace_unit(unit, source)
+            .await
+    }
+
+    pub async fn export_mica_unit(&self, unit: &str) -> Result<String, MicaHostError> {
+        self.mica
+            .as_ref()
+            .ok_or(MicaHostError::Closed)?
+            .export_unit(unit)
+            .await
+    }
+
+    pub async fn restore_mica_first_wave(&mut self) -> Result<(), MicaHostError> {
+        self.mica
+            .as_ref()
+            .ok_or(MicaHostError::Closed)?
+            .restore_first_wave()
+            .await
+    }
+
+    pub fn set_mica_package_enabled(
+        &mut self,
+        package: &str,
+        enabled: bool,
+    ) -> Result<(), MicaHostError> {
+        self.mica
+            .as_mut()
+            .ok_or(MicaHostError::Closed)?
+            .set_package_enabled(package, enabled)
+    }
+
+    pub async fn replace_mica_first_wave(&mut self, source: String) -> Result<(), MicaHostError> {
+        self.replace_mica_unit("roe/first-wave", source).await
     }
 
     async fn apply_mica_events(
@@ -2671,6 +2714,11 @@ mod tests {
                 .replace_mica_first_wave(replacement.clone())
                 .await
                 .unwrap();
+            assert!(session
+                .export_mica_unit("roe/first-wave")
+                .await
+                .unwrap()
+                .contains("v2:"));
 
             let replaced = session
                 .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Function(12)])))
@@ -2693,6 +2741,36 @@ mod tests {
                 "hellov2:42\nv2:42\n"
             );
 
+            session
+                .set_mica_package_enabled("roe/core_package", false)
+                .unwrap();
+            let disabled = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Function(12)])))
+                .await
+                .unwrap();
+            assert_eq!(
+                snapshot(&disabled).views[0].visible_text,
+                "hellov2:42\nv2:42\n"
+            );
+            assert_eq!(snapshot(&disabled).echo_area, "F12 is undefined");
+            session
+                .set_mica_package_enabled("roe/core_package", true)
+                .unwrap();
+
+            let without_yellow = replacement.replace(
+                "assert roe/FaceAttribute(#roe/isearch_current_face, :background, \"#ffff00\")\n",
+                "",
+            );
+            session
+                .replace_mica_first_wave(without_yellow)
+                .await
+                .unwrap();
+            session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Function(1)])))
+                .await
+                .unwrap();
+            assert!(!session.mica_faces["isearch-current"].contains_key("background"));
+
             let start = original.find("verb roe/insert_current_time").unwrap();
             let end = start + original[start..].find("\nend\n").unwrap() + "\nend\n".len();
             let failing = format!(
@@ -2713,17 +2791,14 @@ mod tests {
                 .echo_area
                 .contains("intentional command failure"));
 
-            session
-                .replace_mica_first_wave(replacement)
-                .await
-                .unwrap();
+            session.restore_mica_first_wave().await.unwrap();
             let recovered = session
                 .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Function(12)])))
                 .await
                 .unwrap();
             assert_eq!(
                 snapshot(&recovered).views[0].visible_text,
-                "hellov2:42\nv2:42\nv2:42\n"
+                "hellov2:42\nv2:42\n42\n"
             );
             session
                 .dispatch(session.envelope(InputEvent::Close))
