@@ -22,6 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const WATCH_EVENT_CAPACITY: usize = 256;
 pub const MAX_NATIVE_RESOURCES: usize = 1_024;
+pub const MAX_DIRECTORY_ENTRIES: usize = 256;
 
 /// Wall-clock source for native time requests. Tests inject this boundary so
 /// Mica command policy remains deterministic without gaining a clock builtin.
@@ -437,11 +438,16 @@ impl NativeKernel {
             }
             NativeOperation::ListDirectory { path } => {
                 self.require(Capability::FileRead)?;
-                let mut entries = std::fs::read_dir(path)?
-                    .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-                    .collect::<Vec<_>>();
-                entries.sort();
-                Ok(NativeResult::DirectoryEntries(entries))
+                let mut entries = BTreeSet::new();
+                for entry in std::fs::read_dir(path)?.flatten() {
+                    entries.insert(entry.path());
+                    if entries.len() > MAX_DIRECTORY_ENTRIES {
+                        entries.pop_last();
+                    }
+                }
+                Ok(NativeResult::DirectoryEntries(
+                    entries.into_iter().collect(),
+                ))
             }
             NativeOperation::WriteFile { path, contents } => {
                 self.require(Capability::FileWrite)?;
@@ -823,12 +829,42 @@ pub fn validate_layout(layout: &LogicalLayout) -> Result<(), KernelError> {
     }
     let mut views = HashSet::new();
     validate_layout_node(&layout.root, &mut views)?;
+    if views.len() > 64 {
+        return Err(KernelError::InvalidLayout(
+            "layout exceeds the 64-view limit".to_owned(),
+        ));
+    }
+    let (minimum_columns, minimum_rows) = minimum_layout_size(&layout.root);
+    if layout.columns < minimum_columns || layout.rows < minimum_rows {
+        return Err(KernelError::InvalidLayout(format!(
+            "layout requires at least {minimum_columns}x{minimum_rows} cells"
+        )));
+    }
     if !views.contains(&layout.active) {
         return Err(KernelError::InvalidLayout(
             "active view is not present in the layout".to_string(),
         ));
     }
     Ok(())
+}
+
+fn minimum_layout_size(node: &LayoutNode) -> (u16, u16) {
+    match node {
+        LayoutNode::View(_) => (4, 4),
+        LayoutNode::Split {
+            axis,
+            first,
+            second,
+            ..
+        } => {
+            let first = minimum_layout_size(first);
+            let second = minimum_layout_size(second);
+            match axis {
+                SplitAxis::Horizontal => (first.0.max(second.0), first.1.saturating_add(second.1)),
+                SplitAxis::Vertical => (first.0.saturating_add(second.0), first.1.max(second.1)),
+            }
+        }
+    }
 }
 
 fn validate_layout_node(node: &LayoutNode, views: &mut HashSet<ViewId>) -> Result<(), KernelError> {

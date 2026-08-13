@@ -27,6 +27,7 @@ use crate::native_kernel::{
 use crate::{BufferId, Editor, WindowId};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -35,6 +36,7 @@ pub const MAX_KEYS_PER_INPUT: usize = 64;
 pub const MAX_TEXT_CHARS_PER_INPUT: usize = 65_536;
 pub const MAX_PRESENTATION_CHARS: usize = 1_000_000;
 pub const MAX_NATIVE_RESULT_BYTES: usize = 1_048_576;
+pub const MAX_SESSION_VIEWS: usize = 64;
 pub const MAX_FRAME_COLUMNS: u16 = 1_000;
 pub const MAX_FRAME_ROWS: u16 = 1_000;
 
@@ -104,6 +106,18 @@ pub enum RecoveryOperation {
     ExportUnit { unit: String },
     RestoreFirstWave,
     SetPackageEnabled { package: String, enabled: bool },
+    Inspect,
+}
+
+/// File-oriented bootstrap recovery commands shared by both shipped frontends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartupRecoveryOperation {
+    CheckFile(PathBuf),
+    ReplaceUnit { unit: String, path: PathBuf },
+    ExportUnit { unit: String, path: PathBuf },
+    RestoreFirstWave,
+    SetPackageEnabled { package: String, enabled: bool },
+    Inspect,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -844,7 +858,9 @@ impl HostSession {
                 request_id,
                 operation,
             } => {
-                let mut result = if matches!(
+                let mut result = if self.mica.is_some() {
+                    Err("direct native requests are disabled in a Mica-owned session".to_owned())
+                } else if matches!(
                     operation,
                     NativeOperation::CloseResource { resource }
                         if self.buffer_resources.values().any(|current| *current == resource)
@@ -910,6 +926,13 @@ impl HostSession {
                         self.set_mica_package_enabled(&package, enabled)
                             .map(|()| None)
                             .map_err(|error| error.to_string()),
+                    ),
+                    RecoveryOperation::Inspect => (
+                        "inspect",
+                        self.mica
+                            .as_ref()
+                            .map(|mica| Some(mica.recovery_diagnostics()))
+                            .ok_or_else(|| "Mica recovery host is unavailable".to_owned()),
                     ),
                 };
                 lifecycle.push(LifecycleEvent::RecoveryResult {
@@ -1054,6 +1077,69 @@ impl HostSession {
 
     pub async fn replace_mica_first_wave(&mut self, source: String) -> Result<(), MicaHostError> {
         self.replace_mica_unit("roe/first-wave", source).await
+    }
+
+    pub async fn execute_startup_recovery(
+        &mut self,
+        operations: &[StartupRecoveryOperation],
+    ) -> Result<Vec<String>, String> {
+        let mut reports = Vec::new();
+        for operation in operations {
+            match operation {
+                StartupRecoveryOperation::CheckFile(path) => {
+                    let source = std::fs::read_to_string(path)
+                        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+                    self.check_mica_source(source).await.map_err(|error| {
+                        format!("Mica check failed for {}: {error}", path.display())
+                    })?;
+                    reports.push(format!("Mica source check passed: {}", path.display()));
+                }
+                StartupRecoveryOperation::ReplaceUnit { unit, path } => {
+                    let source = std::fs::read_to_string(path)
+                        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+                    self.replace_mica_unit(unit, source)
+                        .await
+                        .map_err(|error| format!("Mica replacement of {unit} failed: {error}"))?;
+                    reports.push(format!("Replaced Mica unit {unit} from {}", path.display()));
+                }
+                StartupRecoveryOperation::ExportUnit { unit, path } => {
+                    let source = self
+                        .export_mica_unit(unit)
+                        .await
+                        .map_err(|error| format!("Mica export of {unit} failed: {error}"))?;
+                    std::fs::write(path, source)
+                        .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
+                    reports.push(format!("Exported Mica unit {unit} to {}", path.display()));
+                }
+                StartupRecoveryOperation::RestoreFirstWave => {
+                    self.restore_mica_first_wave()
+                        .await
+                        .map_err(|error| format!("Mica first-wave restore failed: {error}"))?;
+                    reports.push("Restored the built-in Mica first wave".to_owned());
+                }
+                StartupRecoveryOperation::SetPackageEnabled { package, enabled } => {
+                    self.set_mica_package_enabled(package, *enabled)
+                        .map_err(|error| format!("Mica package update failed: {error}"))?;
+                    reports.push(format!(
+                        "Mica package {package} {}",
+                        if *enabled { "enabled" } else { "disabled" }
+                    ));
+                }
+                StartupRecoveryOperation::Inspect => {
+                    let diagnostics = self
+                        .mica
+                        .as_ref()
+                        .ok_or_else(|| "Mica recovery host is unavailable".to_owned())?
+                        .recovery_diagnostics();
+                    reports.push(format!("Mica recovery diagnostics: {diagnostics}"));
+                }
+            }
+        }
+        Ok(reports)
+    }
+
+    pub fn set_recovery_message(&mut self, message: String) {
+        self.editor.set_echo_message(message);
     }
 
     async fn apply_mica_events(
@@ -1245,6 +1331,23 @@ impl HostSession {
                     .await;
                 continue;
             }
+            if matches!(
+                action.name.as_str(),
+                "cursor_word_forward" | "cursor_word_backward"
+            ) {
+                match self.mica_word_boundary(action.name == "cursor_word_forward") {
+                    Ok(position) => {
+                        let actions = self.editor.move_cursor_to(position);
+                        self.resolve_actions(actions, lifecycle, invalidations)
+                            .await;
+                    }
+                    Err(message) => {
+                        self.editor.set_echo_message(message.clone());
+                        lifecycle.push(LifecycleEvent::Error(message));
+                    }
+                }
+                continue;
+            }
             if matches!(action.name.as_str(), "kill_word" | "backward_kill_word") {
                 let action_name = action.name.clone();
                 match self.mica_kill_word(action.name == "kill_word") {
@@ -1287,11 +1390,25 @@ impl HostSession {
                         )));
                         continue;
                     }
-                    if let Some(view) = action.view {
-                        self.editor.active_window = view;
+                    if self.editor.windows.len() >= MAX_SESSION_VIEWS {
+                        lifecycle.push(LifecycleEvent::Overloaded {
+                            detail: format!("logical view limit of {MAX_SESSION_VIEWS} reached"),
+                        });
+                        continue;
                     }
-                    self.editor.split_horizontal();
-                    invalidations.push(Invalidation::Full);
+                    let target = action.view;
+                    if self.realize_layout_change(
+                        |editor| {
+                            if let Some(view) = target {
+                                editor.active_window = view;
+                            }
+                            editor.split_horizontal();
+                            true
+                        },
+                        lifecycle,
+                    ) {
+                        invalidations.push(Invalidation::Full);
+                    }
                 }
                 "split_vertical" => {
                     if let Err(error) = self.kernel.lock().unwrap().authorize(Capability::Layout) {
@@ -1300,11 +1417,25 @@ impl HostSession {
                         )));
                         continue;
                     }
-                    if let Some(view) = action.view {
-                        self.editor.active_window = view;
+                    if self.editor.windows.len() >= MAX_SESSION_VIEWS {
+                        lifecycle.push(LifecycleEvent::Overloaded {
+                            detail: format!("logical view limit of {MAX_SESSION_VIEWS} reached"),
+                        });
+                        continue;
                     }
-                    self.editor.split_vertical();
-                    invalidations.push(Invalidation::Full);
+                    let target = action.view;
+                    if self.realize_layout_change(
+                        |editor| {
+                            if let Some(view) = target {
+                                editor.active_window = view;
+                            }
+                            editor.split_vertical();
+                            true
+                        },
+                        lifecycle,
+                    ) {
+                        invalidations.push(Invalidation::Full);
+                    }
                 }
                 "other_window" => {
                     if let Some(view) = action.view {
@@ -1323,10 +1454,16 @@ impl HostSession {
                         )));
                         continue;
                     }
-                    if let Some(view) = action.view {
-                        self.editor.active_window = view;
-                    }
-                    if self.editor.delete_window() {
+                    let target = action.view;
+                    if self.realize_layout_change(
+                        |editor| {
+                            if let Some(view) = target {
+                                editor.active_window = view;
+                            }
+                            editor.delete_window()
+                        },
+                        lifecycle,
+                    ) {
                         invalidations.push(Invalidation::Full);
                     }
                 }
@@ -1337,10 +1474,16 @@ impl HostSession {
                         )));
                         continue;
                     }
-                    if let Some(view) = action.view {
-                        self.editor.active_window = view;
-                    }
-                    if self.editor.delete_other_windows() {
+                    let target = action.view;
+                    if self.realize_layout_change(
+                        |editor| {
+                            if let Some(view) = target {
+                                editor.active_window = view;
+                            }
+                            editor.delete_other_windows()
+                        },
+                        lifecycle,
+                    ) {
                         invalidations.push(Invalidation::Full);
                     }
                 }
@@ -1537,6 +1680,31 @@ impl HostSession {
         let buffer_id = window.active_buffer;
         let cursor = window.cursor;
         let text: Vec<char> = self.editor.buffers[buffer_id].content().chars().collect();
+        let syntax = self.mica_word_syntax(buffer_id)?;
+        let is_word = |character: char| syntax.contains(character);
+        let boundary = word_boundary(&text, cursor, forward, is_word);
+        let count = if forward {
+            isize::try_from(boundary.saturating_sub(cursor)).unwrap_or(isize::MAX)
+        } else {
+            -isize::try_from(cursor.saturating_sub(boundary)).unwrap_or(isize::MAX)
+        };
+        Ok(self
+            .editor
+            .kill_text(&crate::editor::ActionPosition::Cursor, count))
+    }
+
+    fn mica_word_boundary(&self, forward: bool) -> Result<usize, String> {
+        let window = &self.editor.windows[self.editor.active_window];
+        let buffer_id = window.active_buffer;
+        let cursor = window.cursor;
+        let text: Vec<char> = self.editor.buffers[buffer_id].content().chars().collect();
+        let syntax = self.mica_word_syntax(buffer_id)?;
+        Ok(word_boundary(&text, cursor, forward, |character| {
+            syntax.contains(character)
+        }))
+    }
+
+    fn mica_word_syntax(&self, buffer_id: BufferId) -> Result<SyntaxClass, String> {
         let word_rules: Vec<_> = self
             .mica_syntax
             .get(&buffer_id)
@@ -1561,38 +1729,53 @@ impl HostSession {
                 "Mica word syntax is ambiguous at precedence {precedence}"
             ));
         }
-        let syntax = SyntaxClass::parse(patterns[0])?;
-        let is_word = |character: char| syntax.contains(character);
-        let boundary = if forward {
-            let mut position = cursor.min(text.len());
-            while position < text.len() && !is_word(text[position]) {
-                position += 1;
-            }
-            while position < text.len() && is_word(text[position]) {
-                position += 1;
-            }
-            while position < text.len() && !is_word(text[position]) {
-                position += 1;
-            }
-            position
+        SyntaxClass::parse(patterns[0])
+    }
+
+    fn realize_layout_change(
+        &mut self,
+        change: impl FnOnce(&mut Editor) -> bool,
+        lifecycle: &mut Vec<LifecycleEvent>,
+    ) -> bool {
+        let previous_tree = self.editor.window_tree.clone();
+        let previous_windows = self.editor.windows.clone();
+        let previous_active = self.editor.active_window;
+        let previous_prior = self.editor.previous_active_window;
+        let previous_view_ids = self.view_ids.clone();
+        let previous_next_view_id = self.next_view_id;
+        if !change(&mut self.editor) {
+            return false;
+        }
+        for window in self.editor.windows.keys() {
+            self.view_ids.entry(window).or_insert_with(|| {
+                let id = ViewId(self.next_view_id);
+                self.next_view_id += 1;
+                id
+            });
+        }
+        let validation = logical_layout(&self.editor.window_tree, &self.editor, &self.view_ids)
+            .and_then(|layout| {
+                self.kernel
+                    .lock()
+                    .unwrap()
+                    .execute(NativeOperation::ValidateLayout { layout })
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            });
+        if let Err(error) = validation {
+            self.editor.window_tree = previous_tree;
+            self.editor.windows = previous_windows;
+            self.editor.active_window = previous_active;
+            self.editor.previous_active_window = previous_prior;
+            self.view_ids = previous_view_ids;
+            self.next_view_id = previous_next_view_id;
+            lifecycle.push(LifecycleEvent::Error(format!(
+                "Mica layout decision failed native validation: {error}"
+            )));
+            false
         } else {
-            let mut position = cursor.min(text.len());
-            while position > 0 && !is_word(text[position - 1]) {
-                position -= 1;
-            }
-            while position > 0 && is_word(text[position - 1]) {
-                position -= 1;
-            }
-            position
-        };
-        let count = if forward {
-            isize::try_from(boundary.saturating_sub(cursor)).unwrap_or(isize::MAX)
-        } else {
-            -isize::try_from(cursor.saturating_sub(boundary)).unwrap_or(isize::MAX)
-        };
-        Ok(self
-            .editor
-            .kill_text(&crate::editor::ActionPosition::Cursor, count))
+            true
+        }
     }
 
     fn write_kill_ring_to_native(
@@ -2307,7 +2490,7 @@ fn text_character_from_keys(keys: &[LogicalKey]) -> Option<char> {
 }
 
 fn mica_prompt_content(update: &MicaPromptUpdate) -> (String, usize) {
-    let prefix = match update.kind.as_str() {
+    let default_prefix = match update.kind.as_str() {
         "command" => "M-x ",
         "switch_buffer" => "Switch to buffer: ",
         "kill_buffer" => "Kill buffer: ",
@@ -2317,6 +2500,11 @@ fn mica_prompt_content(update: &MicaPromptUpdate) -> (String, usize) {
         "isearch_backward" => "I-search backward: ",
         _ => "Prompt: ",
     };
+    let prefix = if update.prompt.is_empty() {
+        default_prefix.to_owned()
+    } else {
+        format!("{}: ", update.prompt)
+    };
     let mut content = format!("{prefix}{}", update.query);
     for (index, (name, target)) in update.candidates.iter().take(8).enumerate() {
         debug_assert!(matches!(
@@ -2325,6 +2513,7 @@ fn mica_prompt_content(update: &MicaPromptUpdate) -> (String, usize) {
                 | MicaPromptTarget::Buffer(_)
                 | MicaPromptTarget::View(_)
                 | MicaPromptTarget::Path(_)
+                | MicaPromptTarget::Opaque(_)
         ));
         content.push('\n');
         content.push_str(if index == update.selected { "> " } else { "  " });
@@ -2334,6 +2523,36 @@ fn mica_prompt_content(update: &MicaPromptUpdate) -> (String, usize) {
         content,
         prefix.chars().count() + update.query.chars().count(),
     )
+}
+
+fn word_boundary(
+    text: &[char],
+    cursor: usize,
+    forward: bool,
+    is_word: impl Fn(char) -> bool,
+) -> usize {
+    if forward {
+        let mut position = cursor.min(text.len());
+        while position < text.len() && !is_word(text[position]) {
+            position += 1;
+        }
+        while position < text.len() && is_word(text[position]) {
+            position += 1;
+        }
+        while position < text.len() && !is_word(text[position]) {
+            position += 1;
+        }
+        position
+    } else {
+        let mut position = cursor.min(text.len());
+        while position > 0 && !is_word(text[position - 1]) {
+            position -= 1;
+        }
+        while position > 0 && is_word(text[position - 1]) {
+            position -= 1;
+        }
+        position
+    }
 }
 
 fn capability_list(grants: &CapabilityGrants) -> Vec<Capability> {
@@ -2842,6 +3061,14 @@ mod tests {
                 .unwrap();
             session.editor.buffers[buffer].load_str("foo-bar baz");
             session.editor.windows[window].cursor = 0;
+            let moved = session
+                .dispatch(
+                    session.envelope(InputEvent::Keys(vec![meta, LogicalKey::AlphaNumeric('f')])),
+                )
+                .await
+                .unwrap();
+            assert_eq!(snapshot(&moved).views[0].cursor, 8);
+            session.editor.windows[window].cursor = 0;
             let replaced = session
                 .dispatch(
                     session.envelope(InputEvent::Keys(vec![meta, LogicalKey::AlphaNumeric('d')])),
@@ -2889,7 +3116,7 @@ mod tests {
             .unwrap();
             let original = include_str!("../../mica/roe-first-wave.mica");
             let ordered = format!(
-                "{original}\nassert roe/NativeBinding(\"x\", :cursor_right, 6000)\nassert roe/KeyBinding(#roe/global_map, \"x\", #roe/redraw, 7000)\nassert roe/ModeHook(#roe/fundamental_mode, :low_hook, 10)\nassert roe/ModeHook(#roe/fundamental_mode, :high_hook, 50)\n"
+                "{original}\nassert roe/NativeBinding(\"x\", :cursor_right, 6000)\nassert roe/KeyBinding(#roe/global_map, \"x\", #roe/redraw, 7000)\nassert roe/ModeHook(#roe/fundamental_mode, :low_hook, 10)\nassert roe/ModeHook(#roe/fundamental_mode, :high_hook, 50)\nassert RoleCanInvoke(#roe/editor_role, :low_hook)\nassert RoleCanInvoke(#roe/editor_role, :high_hook)\nverb low_hook(actor, session, view, buffer)\n  emit(session, {{:kind -> :host_action, :action -> :low_hook, :view -> view}})\n  return :ok\nend\nverb high_hook(actor, session, view, buffer)\n  emit(session, {{:kind -> :host_action, :action -> :high_hook, :view -> view}})\n  return :ok\nend\n"
             );
             session.replace_mica_first_wave(ordered).await.unwrap();
 
@@ -3332,7 +3559,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("argument prompt missing: {argument_prompt:#?}"));
             assert!(
                 argument_view.visible_text.contains("*argument-target*"),
-                "unexpected argument prompt: {argument_view:#?}"
+                "unexpected argument prompt: {argument_view:#?}; lifecycle={:?}",
+                argument_prompt.lifecycle
             );
             session
                 .dispatch(session.envelope(InputEvent::Text("argument-target".to_owned())))

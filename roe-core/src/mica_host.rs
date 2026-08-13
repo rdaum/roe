@@ -114,11 +114,13 @@ pub enum MicaPromptTarget {
     Buffer(BufferId),
     View(WindowId),
     Path(String),
+    Opaque(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MicaPromptUpdate {
     pub kind: String,
+    pub prompt: String,
     pub query: String,
     pub selected: usize,
     pub candidates: Vec<(String, MicaPromptTarget)>,
@@ -409,6 +411,20 @@ pub struct MicaHost {
 }
 
 impl MicaHost {
+    pub fn recovery_diagnostics(&self) -> String {
+        format!(
+            "endpoint={} actor={} session={} first_wave_loaded={} buffers={} views={} disabled_packages={} closed={}",
+            self.driver.format_value(&Value::identity(self.endpoint)),
+            self.driver.format_value(&Value::identity(self.actor)),
+            self.driver.format_value(&Value::identity(self.session)),
+            self.first_wave_loaded,
+            self.buffer_ids.len(),
+            self.view_ids.len(),
+            self.disabled_packages.len(),
+            self.closed
+        )
+    }
+
     pub fn open(
         editor: &Editor,
         kernel: Arc<Mutex<NativeKernel>>,
@@ -1320,7 +1336,9 @@ end
                         error,
                     } if aborted == task_id => {
                         key = Some(MicaKeyResult::Failed(format!(
-                            "Mica command aborted: {}",
+                            "Mica task {task_id} endpoint={} session={} failure_class=aborted: {}",
+                            self.driver.format_value(&Value::identity(self.endpoint)),
+                            self.driver.format_value(&Value::identity(self.session)),
                             self.driver.format_value(&error)
                         )));
                     }
@@ -1329,7 +1347,9 @@ end
                         error,
                     } if failed == task_id => {
                         key = Some(MicaKeyResult::Failed(format!(
-                            "Mica command failed: {error}"
+                            "Mica task {task_id} endpoint={} session={} failure_class=failed: {error}",
+                            self.driver.format_value(&Value::identity(self.endpoint)),
+                            self.driver.format_value(&Value::identity(self.session))
                         )));
                     }
                     DriverEvent::TaskCancelled {
@@ -1337,7 +1357,9 @@ end
                         reason,
                     } if cancelled == task_id => {
                         key = Some(MicaKeyResult::Failed(format!(
-                            "Mica command cancelled: {reason:?}"
+                            "Mica task {task_id} endpoint={} session={} failure_class=cancelled: {reason:?}",
+                            self.driver.format_value(&Value::identity(self.endpoint)),
+                            self.driver.format_value(&Value::identity(self.session))
                         )));
                     }
                     event => self.record_background_event(event, &mut batch),
@@ -1565,6 +1587,9 @@ end
             .as_symbol()?
             .name()?
             .to_owned();
+        let prompt = map_value(value, "prompt")
+            .and_then(|value| value.with_str(str::to_owned))
+            .unwrap_or_default();
         let query = map_value(value, "query")?.with_str(str::to_owned)?;
         let selected = usize::try_from(map_value(value, "selected")?.as_int()?).ok()?;
         let values = map_value(value, "candidates")?;
@@ -1583,12 +1608,29 @@ end
                     .find_map(|(buffer, identity)| (*identity == logical).then_some(*buffer))?;
                 MicaPromptTarget::Buffer(buffer)
             } else if kind == "command_argument" {
-                let logical = raw.as_identity()?;
-                let view = self
-                    .view_ids
-                    .iter()
-                    .find_map(|(view, identity)| (*identity == logical).then_some(*view))?;
-                MicaPromptTarget::View(view)
+                if let Some(logical) = raw.as_identity() {
+                    if let Some(view) = self
+                        .view_ids
+                        .iter()
+                        .find_map(|(view, identity)| (*identity == logical).then_some(*view))
+                    {
+                        MicaPromptTarget::View(view)
+                    } else if let Some(buffer) = self
+                        .buffer_ids
+                        .iter()
+                        .find_map(|(buffer, identity)| (*identity == logical).then_some(*buffer))
+                    {
+                        MicaPromptTarget::Buffer(buffer)
+                    } else {
+                        MicaPromptTarget::Opaque(self.driver.format_value(&raw))
+                    }
+                } else if let Some(selector) = raw.as_symbol().and_then(Symbol::name) {
+                    MicaPromptTarget::Selector(selector.to_owned())
+                } else if let Some(path) = raw.with_str(str::to_owned) {
+                    MicaPromptTarget::Path(path)
+                } else {
+                    MicaPromptTarget::Opaque(self.driver.format_value(&raw))
+                }
             } else {
                 MicaPromptTarget::Path(raw.with_str(str::to_owned)?)
             };
@@ -1596,6 +1638,7 @@ end
         }
         Some(MicaPromptUpdate {
             kind,
+            prompt,
             query,
             selected,
             candidates,
@@ -1810,6 +1853,10 @@ fn build_layout_tuples(
     views: &HashMap<WindowId, Identity>,
     nodes: &mut HashMap<Vec<usize>, Identity>,
 ) -> Result<Vec<LayoutFact>, MicaHostError> {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "recursive layout construction carries explicit bounded accumulators"
+    )]
     fn visit(
         driver: &CompioTaskDriver,
         node: &WindowNode,
@@ -1818,6 +1865,7 @@ fn build_layout_tuples(
         nodes: &mut HashMap<Vec<usize>, Identity>,
         tuples: &mut Vec<LayoutFact>,
         leaves: &mut Vec<Identity>,
+        live_paths: &mut HashSet<Vec<usize>>,
     ) -> Result<Identity, MicaHostError> {
         match node {
             WindowNode::Leaf { window_id } => {
@@ -1831,6 +1879,7 @@ fn build_layout_tuples(
                 first,
                 second,
             } => {
+                live_paths.insert(path.clone());
                 let identity = if let Some(identity) = nodes.get(path).copied() {
                     identity
                 } else {
@@ -1840,10 +1889,14 @@ fn build_layout_tuples(
                 };
                 tuples.push(LayoutFact::View(identity));
                 path.push(0);
-                let first = visit(driver, first, path, views, nodes, tuples, leaves)?;
+                let first = visit(
+                    driver, first, path, views, nodes, tuples, leaves, live_paths,
+                )?;
                 path.pop();
                 path.push(1);
-                let second = visit(driver, second, path, views, nodes, tuples, leaves)?;
+                let second = visit(
+                    driver, second, path, views, nodes, tuples, leaves, live_paths,
+                )?;
                 path.pop();
                 tuples.extend([
                     LayoutFact::First(identity, first),
@@ -1864,6 +1917,7 @@ fn build_layout_tuples(
 
     let mut tuples = Vec::new();
     let mut leaves = Vec::new();
+    let mut live_paths = HashSet::new();
     let root = visit(
         driver,
         root,
@@ -1872,7 +1926,9 @@ fn build_layout_tuples(
         nodes,
         &mut tuples,
         &mut leaves,
+        &mut live_paths,
     )?;
+    nodes.retain(|path, _| live_paths.contains(path));
     tuples.push(LayoutFact::Root(frame, root));
     if leaves.len() > 1 {
         for index in 0..leaves.len() {

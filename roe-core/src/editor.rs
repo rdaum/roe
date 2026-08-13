@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 /// How long echo messages remain visible (in seconds)
 const ECHO_TIMEOUT_SECS: u64 = 3;
+const MAX_MESSAGES_CHARS: usize = 65_536;
 
 /// Type of window - normal editing window or special command window
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -361,6 +362,29 @@ impl Editor {
         actions
     }
 
+    /// Realize an exact character cursor chosen by external editor policy.
+    pub fn move_cursor_to(&mut self, position: usize) -> Vec<ChromeAction> {
+        let window = &mut self.windows[self.active_window];
+        let buffer = &self.buffers[window.active_buffer];
+        buffer.undo_boundary();
+        buffer.clear_transient_mark();
+        window.cursor = position.min(buffer.buffer_len_chars());
+        let (column, line) = buffer.to_column_line(window.cursor);
+        Self::ensure_cursor_visible_static(
+            window,
+            column,
+            line,
+            window.width_chars.saturating_sub(4),
+            window.height_chars.saturating_sub(3),
+        );
+        vec![
+            ChromeAction::CursorMove(window.absolute_cursor_position(column, line)),
+            ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                buffer_id: window.active_buffer,
+            }),
+        ]
+    }
+
     fn undo_or_redo(&mut self, redo: bool) -> Vec<ChromeAction> {
         let window = &mut self.windows[self.active_window];
         let buffer = &self.buffers[window.active_buffer];
@@ -671,6 +695,10 @@ impl Editor {
             // Append message to end of buffer
             let buffer_len = buffer.buffer_len_chars();
             buffer.insert_pos(formatted_message, buffer_len);
+            let excess = buffer.buffer_len_chars().saturating_sub(MAX_MESSAGES_CHARS);
+            if excess > 0 {
+                buffer.delete_pos(0, isize::try_from(excess).unwrap_or(isize::MAX));
+            }
         }
     }
 

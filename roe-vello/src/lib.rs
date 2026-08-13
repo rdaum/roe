@@ -32,7 +32,7 @@ use roe_core::native_services::FrontendWake;
 use roe_core::renderer::DirtyRegion;
 use roe_core::session::{
     HostSession, InputEvent, LifecycleEvent, PointerButton, PointerEvent, PointerKind,
-    PresentationColor, PresentedView, SessionOutput, StyleDefinition,
+    PresentationColor, PresentedView, SessionOutput, StartupRecoveryOperation, StyleDefinition,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -69,6 +69,8 @@ pub enum FrontendError {
     Session(#[source] roe_core::session::SessionError),
     #[error("failed to start Mica editor host: {0}")]
     MicaHost(#[source] roe_core::mica_host::MicaHostError),
+    #[error("Mica recovery failed: {0}")]
+    Recovery(String),
     #[error("Vello renderer state is inconsistent: {0}")]
     InvalidState(&'static str),
     #[error("Vello event loop failed: {0}")]
@@ -224,6 +226,7 @@ impl<'a> RoeVelloApp<'a> {
         theme: VelloTheme,
         runtime: compio::runtime::Runtime,
         wake_state: Arc<WakeState>,
+        recovery: &[StartupRecoveryOperation],
     ) -> Result<Self, FrontendError> {
         let font_size = theme.font_size;
         let font_family = if theme.font_family.is_empty() {
@@ -234,6 +237,12 @@ impl<'a> RoeVelloApp<'a> {
 
         let mut session = HostSession::open_with_mica(editor, CapabilityGrants::editor_default())
             .map_err(FrontendError::MicaHost)?;
+        let reports = runtime
+            .block_on(session.execute_startup_recovery(recovery))
+            .map_err(FrontendError::Recovery)?;
+        if let Some(report) = reports.last() {
+            session.set_recovery_message(report.clone());
+        }
         let initial = runtime.block_on(session.initial_output());
         let mut redraw_state = VelloRenderer::with_theme(theme.clone());
         if let Some(update) = initial.presentation.as_ref() {
@@ -1220,9 +1229,14 @@ impl<'a> ApplicationHandler<HostEvent> for RoeVelloApp<'a> {
 }
 
 /// Run the editor with the Vello renderer
-pub fn run_vello(
+pub fn run_vello(editor: Editor, runtime: compio::runtime::Runtime) -> Result<(), FrontendError> {
+    run_vello_with_recovery(editor, runtime, Vec::new())
+}
+
+pub fn run_vello_with_recovery(
     mut editor: Editor,
     runtime: compio::runtime::Runtime,
+    recovery: Vec<StartupRecoveryOperation>,
 ) -> Result<(), FrontendError> {
     // Mica owns face/configuration description; Vello retains native font,
     // scene, device, and surface realization.
@@ -1241,7 +1255,7 @@ pub fn run_vello(
         Instant::now() + Duration::from_millis(20),
     ));
 
-    let mut app = RoeVelloApp::new(editor, theme, runtime, wake_state)?;
+    let mut app = RoeVelloApp::new(editor, theme, runtime, wake_state, &recovery)?;
     let event_loop_result = event_loop.run_app(&mut app);
     let fatal_error = app.fatal_error.take();
     let close = app.session.envelope(InputEvent::Close);
@@ -1375,6 +1389,7 @@ mod lifecycle_tests {
             VelloTheme::default(),
             runtime,
             Arc::new(WakeState::default()),
+            &[],
         )
         .unwrap();
         app.build_session_scene(DEFAULT_WIDTH, DEFAULT_HEIGHT)

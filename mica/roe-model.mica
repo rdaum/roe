@@ -306,7 +306,7 @@ assert roe/MajorMode(#roe/fundamental_mode)
 assert roe/ModeName(#roe/fundamental_mode, "fundamental")
 assert roe/DefaultMajorMode(#roe/core_configuration, #roe/fundamental_mode)
 assert roe/ModeKeymap(#roe/fundamental_mode, #roe/global_map, 50)
-assert roe/ModeHook(#roe/fundamental_mode, :invalidate_syntax, 100)
+assert roe/ModeHook(#roe/fundamental_mode, :roe/invalidate_syntax_hook, 100)
 assert roe/Face(#roe/default_face)
 assert roe/FaceName(#roe/default_face, "default")
 assert roe/FaceAttribute(#roe/default_face, :foreground, "inherit")
@@ -373,6 +373,7 @@ assert RoleCanWrite(#roe/editor_role, :roe/FileCandidate)
 assert RoleCanInvoke(#roe/editor_role, :roe/dispatch_key)
 assert RoleCanInvoke(#roe/editor_role, :roe/run_native_action)
 assert RoleCanInvoke(#roe/editor_role, :roe/emit_edit_hooks)
+assert RoleCanInvoke(#roe/editor_role, :roe/invalidate_syntax_hook)
 assert RoleCanInvoke(#roe/editor_role, :roe/other_window)
 assert RoleCanInvoke(#roe/editor_role, :roe/acquire_argument)
 assert RoleCanInvoke(#roe/editor_role, :roe/accept_argument_candidate)
@@ -481,6 +482,9 @@ end
 verb roe/run_native_action(actor, session, action)
   if roe/NativeEditingAction(action)
     roe/CanRequestService(actor, :text_write) || return :text_write_denied
+    let view = one roe/ActiveView(session, ?view)
+    let buffer = one roe/ViewBuffer(view, ?buffer)
+    roe/CanUseBuffer(actor, buffer) || return :buffer_denied
   end
   if action == :kill_line || action == :kill_region || action == :copy_region || action == :kill_word || action == :backward_kill_word
     roe/CanRequestService(actor, :clipboard_write) || return :clipboard_write_denied
@@ -518,8 +522,14 @@ verb roe/emit_edit_hooks(actor, session)
     hooks = [@hooks, [0 - hook[:precedence], hook[:hook]]]
   end
   for hook in sort(hooks)
-    emit(session, {:kind -> :host_action, :action -> hook[1], :view -> view})
+    invoke(hook[1], {:actor -> actor, :session -> session, :view -> view, :buffer -> buffer})
   end
+  return :ok
+end
+
+verb roe/invalidate_syntax_hook(actor, session, view, buffer)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  emit(session, {:kind -> :host_action, :action -> :invalidate_syntax, :view -> view, :buffer -> buffer})
   return :ok
 end
 

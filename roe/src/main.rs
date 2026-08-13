@@ -18,7 +18,7 @@ use crossterm::event::{
 use crossterm::execute;
 use crossterm::terminal::disable_raw_mode;
 use roe_core::native_kernel::CapabilityGrants;
-use roe_core::session::{HostSession, InputEvent, LifecycleEvent};
+use roe_core::session::{HostSession, InputEvent, LifecycleEvent, StartupRecoveryOperation};
 use roe_core::{Buffer, BufferId, Editor, Frame, Window, WindowId, editor, kill_ring};
 use roe_terminal::{ECHO_AREA_HEIGHT, TerminalRenderer};
 use slotmap::SlotMap;
@@ -30,6 +30,7 @@ use std::sync::atomic::AtomicBool;
 fn parse_args() -> EditorConfig {
     let args: Vec<String> = std::env::args().collect();
     let mut file_paths = Vec::new();
+    let mut recovery = Vec::new();
     let mut i = 1; // Skip program name
 
     while i < args.len() {
@@ -37,6 +38,54 @@ fn parse_args() -> EditorConfig {
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
+            }
+            "--mica-check" => {
+                i += 1;
+                recovery.push(StartupRecoveryOperation::CheckFile(
+                    args.get(i).expect("--mica-check requires FILE").into(),
+                ));
+                i += 1;
+            }
+            "--mica-replace" => {
+                let unit = args
+                    .get(i + 1)
+                    .expect("--mica-replace requires UNIT FILE")
+                    .clone();
+                let path = args
+                    .get(i + 2)
+                    .expect("--mica-replace requires UNIT FILE")
+                    .into();
+                recovery.push(StartupRecoveryOperation::ReplaceUnit { unit, path });
+                i += 3;
+            }
+            "--mica-export" => {
+                let unit = args
+                    .get(i + 1)
+                    .expect("--mica-export requires UNIT FILE")
+                    .clone();
+                let path = args
+                    .get(i + 2)
+                    .expect("--mica-export requires UNIT FILE")
+                    .into();
+                recovery.push(StartupRecoveryOperation::ExportUnit { unit, path });
+                i += 3;
+            }
+            "--mica-restore-first-wave" => {
+                recovery.push(StartupRecoveryOperation::RestoreFirstWave);
+                i += 1;
+            }
+            "--mica-enable-package" | "--mica-disable-package" => {
+                let enabled = args[i] == "--mica-enable-package";
+                let package = args
+                    .get(i + 1)
+                    .expect("package option requires PACKAGE")
+                    .clone();
+                recovery.push(StartupRecoveryOperation::SetPackageEnabled { package, enabled });
+                i += 2;
+            }
+            "--mica-inspect" => {
+                recovery.push(StartupRecoveryOperation::Inspect);
+                i += 1;
             }
             arg if arg.starts_with('-') => {
                 eprintln!("Error: Unknown option '{arg}'");
@@ -51,7 +100,10 @@ fn parse_args() -> EditorConfig {
         }
     }
 
-    EditorConfig { file_paths }
+    EditorConfig {
+        file_paths,
+        recovery,
+    }
 }
 
 /// Print help message
@@ -63,6 +115,12 @@ fn print_help() {
     println!();
     println!("OPTIONS:");
     println!("    -h, --help           Print this help message");
+    println!("    --mica-check FILE    Validate Mica source before entering the editor");
+    println!("    --mica-replace UNIT FILE  Replace a named Mica unit");
+    println!("    --mica-export UNIT FILE   Export a named Mica unit");
+    println!("    --mica-restore-first-wave Restore built-in editor policy");
+    println!("    --mica-enable-package PACKAGE / --mica-disable-package PACKAGE");
+    println!("    --mica-inspect       Show recovery host diagnostics");
     println!();
     println!("EXAMPLES:");
     println!("    roe                          # Start with welcome screen");
@@ -106,6 +164,7 @@ fn create_welcome_screen_content() -> String {
 // Configuration for the editor
 struct EditorConfig {
     file_paths: Vec<String>,
+    recovery: Vec<StartupRecoveryOperation>,
 }
 
 struct TerminalSession<W: Write> {
@@ -172,10 +231,14 @@ async fn terminal_main<W: Write>(
     let tsize = crossterm::terminal::size()?;
 
     let mut buffers: SlotMap<BufferId, Buffer> = SlotMap::default();
+    let EditorConfig {
+        file_paths,
+        recovery,
+    } = config;
 
     let mut first_buffer_id = None;
 
-    if config.file_paths.is_empty() {
+    if file_paths.is_empty() {
         // No files specified, create welcome screen buffer
         let buffer = Buffer::new();
         buffer.set_object("*Welcome*".to_string());
@@ -185,7 +248,7 @@ async fn terminal_main<W: Write>(
         first_buffer_id = Some(buffer_id);
     } else {
         // Create buffers for all specified files
-        for file_path in config.file_paths {
+        for file_path in file_paths {
             // Load an existing file, or create a new buffer only when it is absent.
             let buffer = match Buffer::from_file(&file_path).await {
                 Ok(buffer) => buffer,
@@ -327,6 +390,14 @@ async fn terminal_main<W: Write>(
     let mut renderer = TerminalRenderer::new_with_theme(stdout, theme);
     let mut session = HostSession::open_with_mica(editor, CapabilityGrants::editor_default())
         .map_err(|error| std::io::Error::other(format!("failed to start Mica host: {error}")))?;
+
+    let recovery_reports = session
+        .execute_startup_recovery(&recovery)
+        .await
+        .map_err(std::io::Error::other)?;
+    if let Some(report) = recovery_reports.last() {
+        session.set_recovery_message(report.clone());
+    }
 
     let initial = session.initial_output().await;
     if let Some(update) = initial.presentation.as_ref() {

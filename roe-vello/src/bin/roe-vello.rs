@@ -13,6 +13,7 @@
 
 //! Roe editor with Vello/GPU rendering backend.
 
+use roe_core::session::StartupRecoveryOperation;
 use roe_core::{Buffer, BufferId, Editor, Frame, Window, WindowId, editor, kill_ring};
 use slotmap::SlotMap;
 
@@ -24,6 +25,7 @@ const DEFAULT_LINES: u16 = 40;
 fn parse_args() -> EditorConfig {
     let args: Vec<String> = std::env::args().collect();
     let mut file_paths = Vec::new();
+    let mut recovery = Vec::new();
     let mut i = 1; // Skip program name
 
     while i < args.len() {
@@ -31,6 +33,54 @@ fn parse_args() -> EditorConfig {
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
+            }
+            "--mica-check" => {
+                i += 1;
+                recovery.push(StartupRecoveryOperation::CheckFile(
+                    args.get(i).expect("--mica-check requires FILE").into(),
+                ));
+                i += 1;
+            }
+            "--mica-replace" => {
+                let unit = args
+                    .get(i + 1)
+                    .expect("--mica-replace requires UNIT FILE")
+                    .clone();
+                let path = args
+                    .get(i + 2)
+                    .expect("--mica-replace requires UNIT FILE")
+                    .into();
+                recovery.push(StartupRecoveryOperation::ReplaceUnit { unit, path });
+                i += 3;
+            }
+            "--mica-export" => {
+                let unit = args
+                    .get(i + 1)
+                    .expect("--mica-export requires UNIT FILE")
+                    .clone();
+                let path = args
+                    .get(i + 2)
+                    .expect("--mica-export requires UNIT FILE")
+                    .into();
+                recovery.push(StartupRecoveryOperation::ExportUnit { unit, path });
+                i += 3;
+            }
+            "--mica-restore-first-wave" => {
+                recovery.push(StartupRecoveryOperation::RestoreFirstWave);
+                i += 1;
+            }
+            "--mica-enable-package" | "--mica-disable-package" => {
+                let enabled = args[i] == "--mica-enable-package";
+                let package = args
+                    .get(i + 1)
+                    .expect("package option requires PACKAGE")
+                    .clone();
+                recovery.push(StartupRecoveryOperation::SetPackageEnabled { package, enabled });
+                i += 2;
+            }
+            "--mica-inspect" => {
+                recovery.push(StartupRecoveryOperation::Inspect);
+                i += 1;
             }
             arg if arg.starts_with('-') => {
                 eprintln!("Error: Unknown option '{arg}'");
@@ -44,7 +94,10 @@ fn parse_args() -> EditorConfig {
         }
     }
 
-    EditorConfig { file_paths }
+    EditorConfig {
+        file_paths,
+        recovery,
+    }
 }
 
 fn print_help() {
@@ -55,6 +108,9 @@ fn print_help() {
     println!();
     println!("OPTIONS:");
     println!("    -h, --help           Print this help message");
+    println!("    --mica-check FILE / --mica-replace UNIT FILE / --mica-export UNIT FILE");
+    println!("    --mica-restore-first-wave / --mica-enable-package PACKAGE");
+    println!("    --mica-disable-package PACKAGE / --mica-inspect");
     println!();
     println!("EXAMPLES:");
     println!("    roe-vello                      # Start with welcome screen");
@@ -88,6 +144,7 @@ fn create_welcome_screen_content() -> String {
 
 struct EditorConfig {
     file_paths: Vec<String>,
+    recovery: Vec<StartupRecoveryOperation>,
 }
 
 async fn create_editor(config: EditorConfig) -> std::io::Result<Editor> {
@@ -200,10 +257,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("starting Vello frontend");
     let runtime = compio::runtime::Runtime::new()?;
 
+    let recovery = config.recovery.clone();
     let editor = runtime.block_on(create_editor(config))?;
 
     // Run with Vello renderer
-    roe_vello::run_vello(editor, runtime)?;
+    roe_vello::run_vello_with_recovery(editor, runtime, recovery)?;
     tracing::info!("Vello frontend stopped");
 
     Ok(())

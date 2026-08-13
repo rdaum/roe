@@ -328,18 +328,23 @@ assert roe/CommandSelector(#roe/select_window, :roe/select_window)
 assert roe/CommandImplementation(#roe/select_window, :roe/select_window_value)
 assert roe/CommandSummary(#roe/select_window, "Select a logical view using interactive completion")
 assert roe/CommandName(#roe/select_window, "select-window")
-assert roe/CommandArgument(#roe/select_window, 0, :window, :logical_view)
-assert roe/ArgumentPrompt(#roe/select_window, 0, "Window")
-assert roe/ArgumentCompletion(#roe/select_window, 0, :visible_views)
+assert roe/CommandArgument(#roe/select_window, 2, :window, :logical_view)
+assert roe/ArgumentPrompt(#roe/select_window, 2, "Window")
+assert roe/ArgumentCompletion(#roe/select_window, 2, :visible_views)
 assert roe/PackageCommand(#roe/core_package, #roe/select_window)
 assert RoleCanInvoke(#roe/editor_role, :roe/select_window)
 assert RoleCanInvoke(#roe/editor_role, :roe/select_window_value)
+assert RoleCanInvoke(#roe/editor_role, :roe/begin_argument_prompt)
 
 verb roe/select_window(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor
-  let acquisition = invoke(:roe/acquire_argument, {:actor -> actor, :session -> session, :command -> #roe/select_window, :position -> 0, :supplied -> nothing})
+  return roe/begin_argument_prompt(actor, session, #roe/select_window, 2)
+end
+
+verb roe/begin_argument_prompt(actor, session, command, position)
+  let acquisition = invoke(:roe/acquire_argument, {:actor -> actor, :session -> session, :command -> command, :position -> position, :supplied -> nothing})
   acquisition[:kind] == :argument_required || return :argument_unavailable
-  assert roe/PromptState(session, :command_argument, "", 0, nothing, #roe/select_window)
+  assert roe/PromptState(session, :command_argument, "", 0, nothing, [command, position, acquisition[:value_kind], acquisition[:prompt]])
   return roe/refresh_prompt(actor, session)
 end
 
@@ -505,7 +510,7 @@ verb roe/prompt_candidates(actor, session, prompt_kind, query)
   elseif prompt_kind == :command_argument
     let state = one roe/PromptState(session, ?kind, ?state_query, ?selected, ?target, ?command)
     if state != nothing
-      let completion = one roe/ArgumentCompletion(state[:command], 0, ?selector)
+      let completion = one roe/ArgumentCompletion(state[:command][0], state[:command][1], ?selector)
       for found in roe/ArgumentCandidate(completion, actor, session, ?candidate, ?label)
         if query == "" || string_contains(lower(found[:label]), lower(query))
           if roe/list_length(candidates) < 256
@@ -532,7 +537,11 @@ verb roe/refresh_prompt(actor, session)
     retract roe/PromptState(session, state[:prompt_kind], state[:query], state[:selected], state[:target], state[:aux])
     assert roe/PromptState(session, state[:prompt_kind], state[:query], selected, state[:target], state[:aux])
   end
-  emit(session, {:kind -> :prompt_update, :prompt_kind -> state[:prompt_kind], :query -> state[:query], :selected -> selected, :candidates -> candidates})
+  let prompt = ""
+  if state[:prompt_kind] == :command_argument
+    prompt = state[:aux][3]
+  end
+  emit(session, {:kind -> :prompt_update, :prompt_kind -> state[:prompt_kind], :prompt -> prompt, :query -> state[:query], :selected -> selected, :candidates -> candidates})
   return :ok
 end
 
@@ -593,9 +602,9 @@ verb roe/prompt_key(actor, session, sequence)
       emit(session, {:kind -> :host_action, :action -> :visit_file_selected, :path -> chosen[1]})
       return :ok
     elseif state[:prompt_kind] == :command_argument
-      let accepted = invoke(:roe/accept_argument_candidate, {:actor -> actor, :session -> session, :command -> state[:aux], :position -> 0, :candidate -> chosen[1]})
+      let accepted = invoke(:roe/accept_argument_candidate, {:actor -> actor, :session -> session, :command -> state[:aux][0], :position -> state[:aux][1], :candidate -> chosen[1]})
       accepted[:kind] == :argument_value || return :invalid_argument
-      let implementation = one roe/CommandImplementation(state[:aux], ?selector)
+      let implementation = one roe/CommandImplementation(state[:aux][0], ?selector)
       implementation != nothing || return :missing_implementation
       return invoke(implementation, {:actor -> actor, :session -> session, :value -> accepted[:value]})
     end
