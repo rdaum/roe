@@ -1,86 +1,107 @@
-use roe_core::native_kernel::{ResourceId, TextSelection, ViewId};
-use roe_core::session::{
-    Invalidation, PresentationDelta, PresentationSnapshot, PresentationUpdate, PresentedView,
-    Revision, SessionEpoch, ViewGeometry, ViewScroll,
-};
+use roe_core::editor::{WindowNode, WindowType};
+use roe_core::file_watcher::FileWatcher;
+use roe_core::keys::LogicalKey;
+use roe_core::kill_ring::KillRing;
+use roe_core::native_kernel::CapabilityGrants;
+use roe_core::native_services::SystemClock;
+use roe_core::session::{HostSession, InputEvent, PresentationUpdate};
+use roe_core::{Buffer, BufferId, Editor, Frame, Window, WindowId};
 use roe_terminal::TerminalRenderer;
 use roe_vello::VelloRenderer;
+use slotmap::SlotMap;
+use std::sync::Arc;
 
-fn snapshot(revision: u64, text: &str) -> PresentationSnapshot {
-    PresentationSnapshot {
-        epoch: SessionEpoch(41),
-        revision: Revision(revision),
-        columns: 80,
-        rows: 23,
-        active_view: ViewId(1),
-        views: vec![PresentedView {
-            id: ViewId(1),
-            resource: ResourceId {
-                slot: 0,
-                generation: 1,
-            },
-            name: "*session*".to_string(),
-            visible_text: text.to_string(),
-            visible_start_char: 0,
-            visible_end_char: text.chars().count(),
-            total_lines: 1,
-            max_line_chars: text.chars().count(),
-            cursor: text.chars().count(),
-            selection: Some(TextSelection {
-                anchor: 0,
-                active: text.chars().count(),
-            }),
-            geometry: ViewGeometry {
-                x: 0,
-                y: 0,
-                columns: 80,
-                rows: 23,
-            },
-            scroll: ViewScroll {
-                start_line: 0,
-                start_column: 0,
-            },
-            active: true,
-            command_view: false,
-            show_gutter: false,
-            modeline: "*session* (fundamental) 1:1".to_string(),
-            styled_ranges: Vec::new(),
-        }],
-        styles: Vec::new(),
-        echo_area: String::new(),
+fn editor_fixture() -> Editor {
+    let mut buffers: SlotMap<BufferId, Buffer> = SlotMap::default();
+    let buffer = Buffer::new();
+    buffer.set_object("*conformance*".to_owned());
+    buffer.load_str("one λ");
+    let buffer_id = buffers.insert(buffer);
+    let mut windows: SlotMap<WindowId, Window> = SlotMap::default();
+    let window_id = windows.insert(Window {
+        x: 0,
+        y: 0,
+        width_chars: 80,
+        height_chars: 23,
+        active_buffer: buffer_id,
+        start_line: 0,
+        start_column: 0,
+        cursor: 5,
+        window_type: WindowType::Normal,
+    });
+    Editor {
+        frame: Frame::new(80, 23),
+        buffers,
+        windows,
+        active_window: window_id,
+        window_tree: WindowNode::new_leaf(window_id),
+        kill_ring: KillRing::without_clipboard(60),
+        previous_active_window: None,
+        buffer_history: vec![buffer_id],
+        echo_message: String::new(),
+        echo_message_time: None,
+        clock: Arc::new(SystemClock),
+        mouse_drag_state: None,
+        messages_buffer_id: None,
+        file_watcher: FileWatcher::new(),
     }
 }
 
 #[test]
-fn terminal_and_vello_consume_the_same_revisioned_session_stream() {
-    let full = PresentationUpdate::Full(snapshot(1, "one"));
-    let delta = PresentationUpdate::Delta(PresentationDelta {
-        epoch: SessionEpoch(41),
-        base_revision: Revision(1),
-        revision: Revision(2),
-        invalidations: vec![Invalidation::Full],
-        snapshot: snapshot(2, "two"),
+fn terminal_and_vello_consume_the_same_production_mica_session_stream() {
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mut session =
+            HostSession::open_with_mica(editor_fixture(), CapabilityGrants::editor_default())
+                .unwrap();
+        let mut outputs = vec![session.initial_output().await];
+        outputs.push(
+            session
+                .dispatch(session.envelope(InputEvent::Text("x".to_owned())))
+                .await
+                .unwrap(),
+        );
+        outputs.push(
+            session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Backspace])))
+                .await
+                .unwrap(),
+        );
+        outputs.push(
+            session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Function(12)])))
+                .await
+                .unwrap(),
+        );
+
+        assert!(matches!(
+            outputs[0].presentation,
+            Some(PresentationUpdate::Full(_))
+        ));
+        assert!(
+            outputs[1..]
+                .iter()
+                .all(|output| matches!(output.presentation, Some(PresentationUpdate::Delta(_))))
+        );
+
+        let mut terminal = TerminalRenderer::new(Vec::new());
+        let mut vello = VelloRenderer::new();
+        for output in outputs {
+            let update = output.presentation.as_ref().unwrap();
+            terminal.apply_session_presentation(update).unwrap();
+            terminal.render_session().unwrap();
+            vello.apply_session_presentation(update).unwrap();
+            assert_eq!(
+                terminal.session_presentation().current(),
+                vello.session_presentation().current()
+            );
+        }
+
+        let current = terminal.session_presentation().current().unwrap();
+        assert!(current.views[0].visible_text.starts_with("one λ"));
+        assert!(current.views[0].visible_text.len() > "one λ".len());
+        session
+            .dispatch(session.envelope(InputEvent::Close))
+            .await
+            .unwrap();
     });
-
-    let mut terminal = TerminalRenderer::new(Vec::new());
-    let mut vello = VelloRenderer::new();
-    terminal.apply_session_presentation(&full).unwrap();
-    vello.apply_session_presentation(&full).unwrap();
-    terminal.apply_session_presentation(&delta).unwrap();
-    vello.apply_session_presentation(&delta).unwrap();
-
-    assert_eq!(
-        terminal.session_presentation().current(),
-        vello.session_presentation().current()
-    );
-
-    let gap = PresentationUpdate::Delta(PresentationDelta {
-        epoch: SessionEpoch(41),
-        base_revision: Revision(4),
-        revision: Revision(5),
-        invalidations: vec![Invalidation::Full],
-        snapshot: snapshot(5, "gap"),
-    });
-    assert!(terminal.apply_session_presentation(&gap).is_err());
-    assert!(vello.apply_session_presentation(&gap).is_err());
 }

@@ -118,6 +118,7 @@ async fn run() -> io::Result<()> {
         black_box(deleted);
     }
     let editing_elapsed = editing_started.elapsed();
+    let post_edit_rss_kib = resident_memory_kib();
 
     let rendered_bytes = Arc::new(AtomicUsize::new(0));
     let writer = CountingWriter {
@@ -135,6 +136,7 @@ async fn run() -> io::Result<()> {
         renderer.render_session()?;
     }
     let redraw_elapsed = redraw_started.elapsed();
+    let post_workload_rss_kib = resident_memory_kib();
 
     println!("fixture_lines={FIXTURE_LINES}");
     println!(
@@ -146,6 +148,11 @@ async fn run() -> io::Result<()> {
         println!("post_fixture_rss_kib={rss_kib}");
     } else {
         println!("post_fixture_rss_kib=unavailable");
+    }
+    if let Some(rss_kib) = post_edit_rss_kib {
+        println!("post_mica_edit_rss_kib={rss_kib}");
+    } else {
+        println!("post_mica_edit_rss_kib=unavailable");
     }
     println!("edit_iterations={EDIT_ITERATIONS}");
     println!(
@@ -161,6 +168,18 @@ async fn run() -> io::Result<()> {
         "terminal_bytes_per_full_redraw={}",
         rendered_bytes.load(Ordering::Relaxed) / REDRAW_ITERATIONS
     );
+    if let Some(rss_kib) = post_workload_rss_kib {
+        println!("post_mica_workload_rss_kib={rss_kib}");
+        if let Some(before) = post_fixture_rss_kib {
+            println!(
+                "mica_workload_rss_growth_kib={}",
+                rss_kib.saturating_sub(before)
+            );
+        }
+    } else {
+        println!("post_mica_workload_rss_kib=unavailable");
+        println!("mica_workload_rss_growth_kib=unavailable");
+    }
 
     Ok(())
 }

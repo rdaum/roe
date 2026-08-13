@@ -1263,8 +1263,14 @@ pub fn run_vello(
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+    use roe_core::editor::{WindowNode, WindowType};
+    use roe_core::file_watcher::FileWatcher;
+    use roe_core::kill_ring::KillRing;
     use roe_core::native_kernel::ResourceId;
+    use roe_core::native_services::SystemClock;
     use roe_core::session::{ViewGeometry, ViewScroll};
+    use roe_core::{Buffer, BufferId, Frame, Window as EditorWindow, WindowId};
+    use slotmap::SlotMap;
     use std::cell::Cell;
     use std::rc::Rc;
     use std::sync::atomic::AtomicUsize;
@@ -1323,6 +1329,74 @@ mod lifecycle_tests {
 
         assert!(completed.get(), "periodic runtime pump stranded ready work");
         drop(task);
+    }
+
+    fn session_editor() -> Editor {
+        let mut buffers: SlotMap<BufferId, Buffer> = SlotMap::default();
+        let buffer = Buffer::new();
+        buffer.set_object("*vello-session*".to_owned());
+        buffer.load_str("headless scene λ");
+        let buffer_id = buffers.insert(buffer);
+        let mut windows: SlotMap<WindowId, EditorWindow> = SlotMap::default();
+        let window_id = windows.insert(EditorWindow {
+            x: 0,
+            y: 0,
+            width_chars: 80,
+            height_chars: 23,
+            active_buffer: buffer_id,
+            start_line: 0,
+            start_column: 0,
+            cursor: 16,
+            window_type: WindowType::Normal,
+        });
+        Editor {
+            frame: Frame::new(80, 23),
+            buffers,
+            windows,
+            active_window: window_id,
+            window_tree: WindowNode::new_leaf(window_id),
+            kill_ring: KillRing::without_clipboard(60),
+            previous_active_window: None,
+            buffer_history: vec![buffer_id],
+            echo_message: String::new(),
+            echo_message_time: None,
+            clock: Arc::new(SystemClock),
+            mouse_drag_state: None,
+            messages_buffer_id: None,
+            file_watcher: FileWatcher::new(),
+        }
+    }
+
+    #[test]
+    fn production_mica_session_builds_a_vello_scene_without_a_display() {
+        let runtime = compio::runtime::Runtime::new().unwrap();
+        let mut app = RoeVelloApp::new(
+            session_editor(),
+            VelloTheme::default(),
+            runtime,
+            Arc::new(WakeState::default()),
+        )
+        .unwrap();
+        app.build_session_scene(DEFAULT_WIDTH, DEFAULT_HEIGHT)
+            .unwrap();
+
+        let output = app.runtime.block_on(async {
+            let envelope = app.session.envelope(InputEvent::Text("x".to_owned()));
+            app.session.dispatch(envelope).await
+        });
+        app.apply_session_output(output.unwrap());
+        app.scene.reset();
+        app.build_session_scene(DEFAULT_WIDTH, DEFAULT_HEIGHT)
+            .unwrap();
+        assert_eq!(
+            app.redraw_state
+                .session_presentation()
+                .current()
+                .unwrap()
+                .views[0]
+                .visible_text,
+            "headless scene λx"
+        );
     }
 
     fn presented_view(columns: u16, rows: u16, max_line_chars: usize) -> PresentedView {
