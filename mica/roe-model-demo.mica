@@ -8,18 +8,67 @@ make_identity(:roe/demo_frame)
 make_identity(:roe/demo_buffer)
 make_identity(:roe/demo_view_a)
 make_identity(:roe/demo_view_b)
+make_identity(:roe/demo_local_map)
+make_identity(:roe/demo_shadow_map)
+make_identity(:roe/demo_shadow_command)
+make_identity(:roe/demo_minor_mode)
+make_identity(:roe/demo_parent_face)
+make_identity(:roe/demo_child_face)
+make_identity(:roe/demo_parent_config)
+make_identity(:roe/demo_child_config)
 
-assert Delegates(#roe/demo_actor, #roe/editor_actor, 0)
-assert Delegates(#roe/demo_session, #roe/editor_session, 0)
-assert Delegates(#roe/demo_frame, #roe/frame, 0)
-assert Delegates(#roe/demo_buffer, #roe/buffer, 0)
-assert Delegates(#roe/demo_view_a, #roe/view, 0)
-assert Delegates(#roe/demo_view_b, #roe/view, 0)
+assert Delegates(#roe/demo_local_map, #roe/keymap, 0)
+assert Delegates(#roe/demo_shadow_map, #roe/keymap, 0)
+assert Delegates(#roe/demo_shadow_command, #roe/command, 0)
+assert Delegates(#roe/demo_minor_mode, #roe/mode, 0)
+assert Delegates(#roe/demo_parent_face, #roe/face, 0)
+assert Delegates(#roe/demo_child_face, #roe/face, 0)
+
+assert roe/Keymap(#roe/demo_local_map)
+assert roe/Keymap(#roe/demo_shadow_map)
+assert roe/KeymapParent(#roe/demo_local_map, #roe/global_map)
+assert roe/Command(#roe/demo_shadow_command)
+assert roe/CommandSelector(#roe/demo_shadow_command, :roe/demo_shadow)
+assert roe/CommandSummary(#roe/demo_shadow_command, "Low-priority fixture command")
+assert roe/KeyBinding(#roe/demo_shadow_map, "C-x o", #roe/demo_shadow_command, 10)
+assert roe/CommandArgument(#roe/other_window, 0, :window, :logical_view)
+assert roe/ArgumentPrompt(#roe/other_window, 0, "Window")
+assert roe/ArgumentCompletion(#roe/other_window, 0, :visible_views)
+assert roe/MinorMode(#roe/demo_minor_mode)
+assert roe/ModeHook(#roe/fundamental_mode, :after_activate, 100)
+assert roe/ModeHook(#roe/demo_minor_mode, :after_edit, 50)
+assert roe/SyntaxRule(#roe/fundamental_mode, :word, "[[:alnum:]_]", 100)
+assert roe/SyntaxRule(#roe/demo_minor_mode, :comment, "//", 50)
+assert roe/Face(#roe/demo_parent_face)
+assert roe/Face(#roe/demo_child_face)
+assert roe/FaceParent(#roe/demo_child_face, #roe/demo_parent_face)
+assert roe/FaceAttribute(#roe/demo_parent_face, :foreground, "white")
+assert roe/FaceAttribute(#roe/demo_parent_face, :weight, "normal")
+assert roe/FaceAttribute(#roe/demo_child_face, :weight, "bold")
+assert roe/Configuration(#roe/demo_parent_config, :tab_width, 8)
+assert roe/Configuration(#roe/demo_parent_config, :theme, "dark")
+assert roe/ConfigurationParent(#roe/demo_child_config, #roe/demo_parent_config)
+assert roe/Configuration(#roe/demo_child_config, :tab_width, 4)
 
 assert CanRead(#roe/demo_actor, :roe/ActiveView)
+assert CanRead(#roe/demo_actor, :roe/SessionActor)
+assert CanRead(#roe/demo_actor, :roe/SessionKeymap)
+assert CanRead(#roe/demo_actor, :roe/EffectiveBinding)
+assert CanRead(#roe/demo_actor, :roe/CommandSelector)
+assert CanRead(#roe/demo_actor, :roe/CommandArgument)
+assert CanRead(#roe/demo_actor, :roe/ArgumentPrompt)
+assert CanRead(#roe/demo_actor, :roe/ArgumentCompletion)
+assert CanRead(#roe/demo_actor, :roe/DiscoverableCommand)
 assert CanRead(#roe/demo_actor, :roe/NextView)
+assert CanRead(#roe/demo_actor, :roe/EffectiveModeHook)
+assert CanRead(#roe/demo_actor, :roe/EffectiveFaceAttribute)
+assert CanRead(#roe/demo_actor, :roe/EffectiveSyntaxRule)
+assert CanRead(#roe/demo_actor, :roe/EffectiveConfiguration)
 assert CanWrite(#roe/demo_actor, :roe/ActiveView)
+assert CanInvoke(#roe/demo_actor, :roe/dispatch_key)
 assert CanInvoke(#roe/demo_actor, :roe/other_window)
+assert CanInvoke(#roe/demo_actor, :roe/demo_shadow)
+assert CanInvoke(#roe/demo_actor, :roe/demo_policy_probe)
 assert CanEffect(#roe/demo_actor)
 assert roe/CanUseBuffer(#roe/demo_actor, #roe/demo_buffer)
 assert roe/CanRequestService(#roe/demo_actor, :text_read)
@@ -39,8 +88,35 @@ assert roe/ViewBuffer(#roe/demo_view_b, #roe/demo_buffer)
 assert roe/ActiveView(#roe/demo_session, #roe/demo_view_a)
 assert roe/ViewCursor(#roe/demo_view_a, 0)
 assert roe/ViewCursor(#roe/demo_view_b, 0)
-assert roe/SessionKeymap(#roe/demo_session, #roe/global_map, 100)
+assert roe/BufferMajorMode(#roe/demo_buffer, #roe/fundamental_mode)
+assert roe/BufferMinorMode(#roe/demo_buffer, #roe/demo_minor_mode)
+assert roe/SessionKeymap(#roe/demo_session, #roe/demo_local_map, 100)
+assert roe/SessionKeymap(#roe/demo_session, #roe/demo_shadow_map, 0)
 assert roe/NextView(#roe/demo_view_a, #roe/demo_view_b)
 assert roe/NextView(#roe/demo_view_b, #roe/demo_view_a)
 
-return roe/dispatch_key(#roe/demo_actor, #roe/demo_session, "C-x o")
+verb roe/demo_shadow(actor, session)
+  return :wrong_precedence
+end
+
+// Exercise the Phase 3 policy relations through the same non-root endpoint as
+// dispatch_key. A missing grant, fact, or composition rule changes the result.
+verb roe/demo_policy_probe(actor, session)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  let argument = one roe/CommandArgument(#roe/other_window, 0, ?name, ?kind)
+  argument != nothing || return :missing_argument
+  let prompt = one roe/ArgumentPrompt(#roe/other_window, 0, ?value)
+  prompt != nothing || return :missing_prompt
+  let completion = one roe/ArgumentCompletion(#roe/other_window, 0, ?selector)
+  completion != nothing || return :missing_completion
+  roe/DiscoverableCommand(actor, #roe/other_window) || return :not_discoverable
+  roe/EffectiveModeHook(#roe/demo_buffer, :after_activate, 100) || return :missing_major_hook
+  roe/EffectiveModeHook(#roe/demo_buffer, :after_edit, 50) || return :missing_minor_hook
+  roe/EffectiveFaceAttribute(#roe/demo_child_face, :foreground, "white") || return :missing_face_inheritance
+  roe/EffectiveFaceAttribute(#roe/demo_child_face, :weight, "bold") || return :missing_face_override
+  roe/EffectiveSyntaxRule(#roe/demo_buffer, #roe/fundamental_mode, :word, "[[:alnum:]_]", 100) || return :missing_major_syntax
+  roe/EffectiveSyntaxRule(#roe/demo_buffer, #roe/demo_minor_mode, :comment, "//", 50) || return :missing_minor_syntax
+  roe/EffectiveConfiguration(#roe/demo_child_config, :tab_width, 4) || return :missing_config_override
+  roe/EffectiveConfiguration(#roe/demo_child_config, :theme, "dark") || return :missing_config_inheritance
+  return :ok
+end

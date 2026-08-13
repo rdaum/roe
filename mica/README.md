@@ -15,5 +15,7 @@ runner path Roe will embed with:
 
 ```sh
 cargo run --manifest-path ../mica/Cargo.toml -p mica-runner --bin mica -- \
-  filein "$PWD/mica/roe-model.mica" "$PWD/mica/roe-model-demo.mica"
+  eval --filein "$PWD/mica/roe-model.mica" --filein "$PWD/mica/roe-model-demo.mica" \
+  --actor roe/demo_actor \
+  'return roe/dispatch_key(#roe/demo_actor, #roe/demo_session, "C-x o")'
 ```

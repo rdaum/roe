@@ -30,17 +30,22 @@ make_relation(:Delegates, 3)
 make_relation(:roe/Command, 1)
 make_functional_relation(:roe/CommandSelector, 2, [0])
 make_functional_relation(:roe/CommandSummary, 2, [0])
+make_relation(:roe/CommandArgument, 4)
+make_relation(:roe/ArgumentPrompt, 3)
+make_relation(:roe/ArgumentCompletion, 3)
 make_relation(:roe/Keymap, 1)
-make_relation(:roe/KeymapParent, 3)
+make_relation(:roe/KeymapParent, 2)
 make_relation(:roe/KeyBinding, 4)
 make_relation(:roe/MajorMode, 1)
 make_relation(:roe/MinorMode, 1)
 make_relation(:roe/ModeKeymap, 2)
 make_relation(:roe/ModeHook, 3)
 make_relation(:roe/Face, 1)
+make_relation(:roe/FaceParent, 2)
 make_relation(:roe/FaceAttribute, 3)
 make_relation(:roe/SyntaxRule, 4)
 make_relation(:roe/Configuration, 3)
+make_relation(:roe/ConfigurationParent, 2)
 make_relation(:roe/Package, 1)
 make_functional_relation(:roe/PackageUnit, 2, [0])
 make_functional_relation(:roe/PackageEnabled, 2, [0])
@@ -89,15 +94,27 @@ make_relation(:roe/CanRequestService, 2)
 
 // Derived editor facts.
 make_relation(:roe/EffectiveBinding, 4)
+make_relation(:roe/DiscoverableCommand, 2)
 make_relation(:roe/VisibleBuffer, 2)
 make_relation(:roe/EffectiveMajorMode, 2)
+make_relation(:roe/EffectiveModeHook, 3)
+make_relation(:roe/LocalFaceAttribute, 2)
+make_relation(:roe/EffectiveFaceAttribute, 3)
+make_relation(:roe/EffectiveSyntaxRule, 5)
+make_relation(:roe/LocalConfiguration, 2)
+make_relation(:roe/EffectiveConfiguration, 3)
 
 roe/EffectiveBinding(keymap, sequence, command, precedence) :-
   roe/KeyBinding(keymap, sequence, command, precedence)
 
 roe/EffectiveBinding(keymap, sequence, command, precedence) :-
-  roe/KeymapParent(keymap, parent, offset),
+  roe/KeymapParent(keymap, parent),
   roe/EffectiveBinding(parent, sequence, command, precedence)
+
+roe/DiscoverableCommand(actor, command) :-
+  roe/Command(command),
+  roe/CommandSelector(command, selector),
+  CanInvoke(actor, selector)
 
 roe/VisibleBuffer(session, buffer) :-
   roe/SessionFrame(session, frame),
@@ -112,6 +129,44 @@ roe/VisibleBuffer(session, buffer) :-
 
 roe/EffectiveMajorMode(buffer, mode) :-
   roe/BufferMajorMode(buffer, mode)
+
+roe/EffectiveModeHook(buffer, hook, precedence) :-
+  roe/BufferMajorMode(buffer, mode),
+  roe/ModeHook(mode, hook, precedence)
+
+roe/EffectiveModeHook(buffer, hook, precedence) :-
+  roe/BufferMinorMode(buffer, mode),
+  roe/ModeHook(mode, hook, precedence)
+
+roe/LocalFaceAttribute(face, attribute) :-
+  roe/FaceAttribute(face, attribute, value)
+
+roe/EffectiveFaceAttribute(face, attribute, value) :-
+  roe/FaceAttribute(face, attribute, value)
+
+roe/EffectiveFaceAttribute(face, attribute, value) :-
+  roe/FaceParent(face, parent),
+  roe/EffectiveFaceAttribute(parent, attribute, value),
+  not roe/LocalFaceAttribute(face, attribute)
+
+roe/EffectiveSyntaxRule(buffer, mode, kind, pattern, precedence) :-
+  roe/BufferMajorMode(buffer, mode),
+  roe/SyntaxRule(mode, kind, pattern, precedence)
+
+roe/EffectiveSyntaxRule(buffer, mode, kind, pattern, precedence) :-
+  roe/BufferMinorMode(buffer, mode),
+  roe/SyntaxRule(mode, kind, pattern, precedence)
+
+roe/LocalConfiguration(scope, key) :-
+  roe/Configuration(scope, key, value)
+
+roe/EffectiveConfiguration(scope, key, value) :-
+  roe/Configuration(scope, key, value)
+
+roe/EffectiveConfiguration(scope, key, value) :-
+  roe/ConfigurationParent(scope, parent),
+  roe/EffectiveConfiguration(parent, key, value),
+  not roe/LocalConfiguration(scope, key)
 
 assert Delegates(#roe/global_map, #roe/keymap, 0)
 assert Delegates(#roe/other_window, #roe/command, 0)
@@ -132,7 +187,7 @@ assert roe/Package(#roe/core_package)
 assert roe/PackageUnit(#roe/core_package, :roe/core)
 assert roe/PackageEnabled(#roe/core_package, true)
 
-verb roe/other_window(actor @ #roe/editor_actor, session @ #roe/editor_session)
+verb roe/other_window(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor
   let current = one roe/ActiveView(session, ?view)
   if current == nothing
@@ -148,15 +203,31 @@ verb roe/other_window(actor @ #roe/editor_actor, session @ #roe/editor_session)
   return next
 end
 
-verb roe/dispatch_key(actor @ #roe/editor_actor, session @ #roe/editor_session, sequence @ #string)
+verb roe/dispatch_key(actor, session, sequence @ #string)
+  let selected = nothing
+  let selected_precedence = -2147483648
+  let ambiguous = false
   for active in roe/SessionKeymap(session, ?keymap, ?session_precedence)
-    let binding = one roe/EffectiveBinding(active[:keymap], sequence, ?command, ?precedence)
-    if binding != nothing
-      let selector = one roe/CommandSelector(binding[:command], ?selector)
-      if selector != nothing
-        return invoke(selector, {:actor -> actor, :session -> session})
+    for binding in roe/EffectiveBinding(active[:keymap], sequence, ?command, ?precedence)
+      let precedence = active[:session_precedence] + binding[:precedence]
+      if selected == nothing || precedence > selected_precedence
+        selected = binding[:command]
+        selected_precedence = precedence
+        ambiguous = false
+      elseif precedence == selected_precedence && selected != binding[:command]
+        ambiguous = true
       end
     end
   end
-  return :unbound
+  if selected == nothing
+    return :unbound
+  end
+  if ambiguous
+    return :ambiguous
+  end
+  let selector = one roe/CommandSelector(selected, ?selector)
+  if selector == nothing
+    return :missing_selector
+  end
+  return invoke(selector, {:actor -> actor, :session -> session})
 end

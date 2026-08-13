@@ -22,13 +22,19 @@ binding, mode, hook, completion candidate, or package.
 The checked prototype is [`mica/roe-model.mica`](../../mica/roe-model.mica). It is intentionally
 ordinary Mica source with no Roe-specific runtime builtin.
 
+`Delegates` is durable type/policy description only. Endpoint-created actor, session, frame, view,
+and buffer identities are classified by their explicit volatile relations (`EditorSession`,
+`SessionActor`, `Frame`, `View`, and `LogicalBuffer`); opening an endpoint never requires asserting
+a durable delegation edge. Command behaviors validate the volatile actor/session association before
+changing session state, in addition to the endpoint's relational read/write/invoke/effect grants.
+
 ## State classes
 
 | Class                 | Examples                                                                                                                    | Creation and removal                                                                                 | Persistence                                 |
 | --------------------- | --------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- | ------------------------------------------- |
 | Durable description   | commands, selectors, summaries, keymaps/bindings, modes, hooks, faces, syntax rules, configuration, package-to-unit mapping | named unit filein/add/replace/disable                                                                | fileout-able after persistence is enabled   |
 | Session-volatile      | editor session, actor, frame/view tree, active view, buffer/view association, cursor, mark, selection, active keymaps       | asserted with endpoint open; retracted with endpoint close                                           | never copied to a durable unit              |
-| Derived               | effective binding, visible buffers, effective mode/hook/face composition                                                    | relation rules; recomputed from authoritative facts                                                  | never persisted as authority                |
+| Derived               | discoverable commands, effective binding, visible buffers, mode/hook/face/syntax/configuration composition                  | relation rules; recomputed from authoritative facts                                                  | never persisted as authority                |
 | Native-cached         | buffer/presentation revision observations                                                                                   | host assertion after native completion/effect                                                        | disposable and reconstructible              |
 | Ephemeral association | endpoint identity, native text resource and generation                                                                      | host volatile tuples; invalidated on close, resource removal, driver failure, or generation mismatch | prohibited from fileout and durable storage |
 
