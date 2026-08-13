@@ -34,7 +34,7 @@ Startup order:
 3. run `check_filein` on the Roe core unit and install it as a named unit before accepting input;
 4. if checking or installation fails, keep the recovery unit alive, expose diagnostics, and do not
    claim the normal unit is active;
-5. allocate an unpredictable ephemeral identity per Roe session;
+5. allocate a process-local, non-durable ephemeral identity per Roe session;
 6. open the endpoint with actor/principal context plus volatile session/resource tuples; and
 7. begin one host event-consumer pump before submitting normal editor input.
 

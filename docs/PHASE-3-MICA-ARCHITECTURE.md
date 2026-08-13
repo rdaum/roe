@@ -41,7 +41,9 @@ keymap/command/window workflow without duplicating native policy.
 The durable `roe/core` source contains commands, keymaps, modes, hooks, faces, syntax,
 configuration, packages, authority description, relation definitions, derived rules, and behavior.
 The demo source contains session/frame/view/buffer fixtures only. Phase 4 replaces those fixtures
-with endpoint-volatile tuples asserted by the host.
+with endpoint-volatile tuples asserted by the host. Every host-managed session, logical-object, and
+native-association relation is declared `:volatile` in Mica source, which is required by
+`open_endpoint_with_context_and_volatile_tuples_named` and the volatile assertion/retraction APIs.
 
 ## Identity and invalidation rules
 
