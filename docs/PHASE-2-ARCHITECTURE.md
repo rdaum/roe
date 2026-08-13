@@ -15,6 +15,7 @@ Phase 2 was implemented in these reviewable changes:
 | `7e29cf3` | Prevented idle inputs from manufacturing unchanged presentation revisions. |
 | `a695fd8` | Routed terminal and Vello input, policy execution, pointer/layout operations, presentation, and shutdown through `HostSession`. |
 | `3b2e7be` | Restored Vello selection, active cursor, and scrollbar realization from session presentation state. |
+| `31a2a03` | Closed the fresh-review gaps in watcher delivery, lifecycle/output bounds, resource invalidation, and Vello chrome geometry. |
 
 ## Native kernel
 
@@ -31,10 +32,13 @@ Logical layouts use transport identities and reject duplicate views, missing act
 non-finite ratios, ratios outside `(0, 1)`, and zero-sized frames.
 
 Native service operations cover file read/write, clipboard read/write, wall-clock read, child
-process execution, and watcher association. Every operation checks an explicit `CapabilityGrants`
-set before looking up or disclosing a resource. Kernel errors distinguish denied authority, stale
-resources, invalid ranges/layout, I/O, and clipboard failures. A kernel failure is returned as a
-request completion; it does not tear down the session endpoint.
+process execution, and watcher association. Watch registration owns a real `notify` backend with a
+bounded 256-hint queue; change hints carry the ephemeral resource identity into the session
+lifecycle, and backend failures are surfaced rather than reported as successful bookkeeping.
+Every operation checks an explicit `CapabilityGrants` set before looking up or disclosing a
+resource. Kernel errors distinguish denied authority, stale resources, invalid ranges/layout, I/O,
+clipboard, and watcher failures. A kernel failure is returned as a request completion; it does not
+tear down the session endpoint.
 
 The kernel enforces mechanisms only. It contains no command names, key bindings, modes, completion
 rules, hooks, packages, or renderer policy.
@@ -54,8 +58,9 @@ The protocol has the four distinct families required by the roadmap:
   with request identities;
 - `PresentationUpdate`: a full snapshot or a delta naming its exact base and resulting revision;
   and
-- `LifecycleEvent`: ready/capability discovery, warning, error, quit request, heartbeat, and
-  endpoint close.
+- `LifecycleEvent`: ready/capability discovery, warning, recoverable error, fatal failure, overload,
+  cancellation result, native resource change/invalidation, quit request, heartbeat, and endpoint
+  close.
 
 Every envelope contains protocol version, session epoch, and input sequence. A live in-process
 endpoint accepts exactly the next sequence; a duplicate, gap, stale epoch, or unsupported version
@@ -69,6 +74,11 @@ The direct adapter also enforces payload and presentation bounds:
 - at most 65,536 characters in text/native text payloads;
 - frame dimensions from 1 through 1,000 cells on each axis; and
 - at most 1,000,000 characters in one presented visible slice.
+
+One native completion carries at most 1,048,576 bytes of variable-size result data. Snapshot,
+file, clipboard, and process output beyond that limit becomes an explicit overload lifecycle event
+and failed completion. Successful text mutations return fixed-size change metadata; callers request
+a snapshot separately when they need buffer contents.
 
 Native completion vectors are bounded by the input shape: one native request produces at most one
 completion. Cancellation currently reports that no request is pending because native operations
@@ -91,9 +101,11 @@ revision.
 
 Terminal owns cell mapping, ANSI/crossterm state, color realization, border glyphs, and cursor
 visibility. Vello owns Parley shaping, GPU scenes, surfaces, scale factors, glyph styling, and
-pixel-level scrollbar hit normalization and realization. Both render chrome in Rust from the same
-Mica-ready modeline, echo, style, geometry, selection, cursor, scroll-metric, and visible-slice
-values. Neither renderer infers commands or mode policy from presentation data.
+pixel-level scrollbar hit normalization and realization. Vello reserves renderer-owned lanes for
+its scrollbars, and only realizes the horizontal bar on overflow, so chrome cannot cover text.
+Both render chrome in Rust from the same Mica-ready modeline, echo, style, geometry, selection,
+cursor, scroll-metric, and visible-slice values. Neither renderer infers commands or mode policy
+from presentation data.
 
 The older `Renderer<Editor>` trait and `renderer::PresentationSnapshot` remain only as the Phase 0
 compatibility/conformance surface. Production frontend loops do not use them. They can be removed
@@ -155,9 +167,11 @@ The Phase 2 acceptance commands are:
 | `cargo test -p roe-vello --test session_conformance` | Proves shared presentation acceptance and gap detection. |
 
 Focused tests cover stale resource generations, Unicode character ranges, atomic invalid-range
-failure, grouped replace undo/redo, capability denial, layout invariants, exact input ordering,
-bounded idle behavior, revision monotonicity, full resync, endpoint close, deterministic headless
-transcript replay, nested split targeting, and cross-frontend presentation conformance.
+failure, grouped replace undo/redo, capability denial, real bounded native-watch delivery into the
+session lifecycle, bounded input and completion overload, explicit cancellation/invalidation,
+layout invariants, exact input ordering, bounded idle behavior, revision monotonicity, full resync,
+endpoint close, deterministic headless transcript replay, nested split targeting, Vello scrollbar
+lane/overflow geometry, and cross-frontend presentation conformance.
 
 Phase 2's exit criteria are met. Both production frontends use one session contract for input and
 presentation; frontends no longer execute commands or manage modes; the native kernel is tested
