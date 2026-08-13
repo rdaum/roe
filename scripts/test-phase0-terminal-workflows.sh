@@ -53,6 +53,12 @@ finish_session() {
 start_session no-file
 finish_session no-file
 
+# The native quit chord remains reachable through Mica while a minibuffer
+# prompt owns ordinary input.
+start_session prompt-quit
+tmux -L "$tmux_socket" send-keys -t prompt-quit M-x
+finish_session prompt-quit
+
 # One-file startup, insertion, save, and clean shutdown.
 one_file="$probe_dir/one.txt"
 printf 'alpha\n' >"$one_file"

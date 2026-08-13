@@ -205,6 +205,7 @@ assert roe/CommandSummary(#roe/quit, "Quit Roe")
 assert roe/CommandName(#roe/quit, "quit")
 assert roe/CommandHostAction(#roe/quit, :quit)
 assert roe/KeyBinding(#roe/global_map, "C-x C-c", #roe/quit, 1000)
+assert roe/PromptGlobalCommand(#roe/quit)
 assert roe/PackageCommand(#roe/core_package, #roe/quit)
 assert RoleCanInvoke(#roe/editor_role, :roe/quit)
 
@@ -557,6 +558,32 @@ end
 verb roe/prompt_key(actor, session, sequence)
   let state = one roe/PromptState(session, ?prompt_kind, ?query, ?selected, ?target, ?aux)
   state != nothing || return :no_prompt
+  if roe/KeyPrefix(sequence)
+    return :prefix
+  end
+  let global_command = nothing
+  let global_precedence = -2147483648
+  let global_ambiguous = false
+  for active in roe/EffectiveSessionKeymap(session, ?keymap, ?session_precedence)
+    for binding in roe/EffectiveBinding(active[:keymap], sequence, ?command, ?precedence)
+      let precedence = active[:session_precedence] + binding[:precedence]
+      if global_command == nothing || precedence > global_precedence
+        global_command = binding[:command]
+        global_precedence = precedence
+        global_ambiguous = false
+      elseif precedence == global_precedence && global_command != binding[:command]
+        global_ambiguous = true
+      end
+    end
+  end
+  if global_command != nothing && roe/PromptGlobalCommand(global_command)
+    if global_ambiguous
+      raise E_AMBIGUOUS, "ambiguous prompt-global key binding"
+    end
+    let global_selector = one roe/CommandSelector(global_command, ?selector)
+    global_selector != nothing || return :missing_prompt_global_selector
+    return invoke(global_selector, {:actor -> actor, :session -> session})
+  end
   if state[:prompt_kind] == :isearch_forward || state[:prompt_kind] == :isearch_backward
     return roe/search_prompt_key(actor, session, sequence)
   end

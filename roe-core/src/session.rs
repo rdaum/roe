@@ -3873,6 +3873,57 @@ mod tests {
     }
 
     #[test]
+    fn mica_quit_chord_remains_available_while_a_prompt_is_active() {
+        let _guard = MICA_TEST_LOCK.lock().unwrap();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let control =
+                LogicalKey::Modifier(crate::keys::KeyModifier::Control(crate::keys::Side::Left));
+            let meta =
+                LogicalKey::Modifier(crate::keys::KeyModifier::Meta(crate::keys::Side::Left));
+
+            for prompt_keys in [
+                vec![meta, LogicalKey::AlphaNumeric('x')],
+                vec![control, LogicalKey::AlphaNumeric('s')],
+            ] {
+                let mut session = HostSession::open_with_mica_clock(
+                    test_editor(),
+                    CapabilityGrants::editor_default(),
+                    Arc::new(FixedNativeClock(42)),
+                )
+                .unwrap();
+                let prompt = session
+                    .dispatch(session.envelope(InputEvent::Keys(prompt_keys)))
+                    .await
+                    .unwrap();
+                assert!(snapshot(&prompt).views.iter().any(|view| view.command_view));
+
+                let prefix = session
+                    .dispatch(session.envelope(InputEvent::Keys(vec![
+                        control,
+                        LogicalKey::AlphaNumeric('x'),
+                    ])))
+                    .await
+                    .unwrap();
+                assert!(!prefix.lifecycle.contains(&LifecycleEvent::QuitRequested));
+
+                let quit = session
+                    .dispatch(session.envelope(InputEvent::Keys(vec![
+                        control,
+                        LogicalKey::AlphaNumeric('c'),
+                    ])))
+                    .await
+                    .unwrap();
+                assert!(quit.lifecycle.contains(&LifecycleEvent::QuitRequested));
+
+                session
+                    .dispatch(session.envelope(InputEvent::Close))
+                    .await
+                    .unwrap();
+            }
+        });
+    }
+
+    #[test]
     fn mica_owns_pointer_selection_and_view_scroll_policy() {
         let _guard = MICA_TEST_LOCK.lock().unwrap();
         compio::runtime::Runtime::new().unwrap().block_on(async {
