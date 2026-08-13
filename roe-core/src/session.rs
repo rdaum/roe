@@ -321,6 +321,120 @@ pub enum SessionError {
     Kernel(#[from] KernelError),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MicaSyntaxRule {
+    kind: String,
+    pattern: String,
+    precedence: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SyntaxClassAtom {
+    Alnum,
+    Alpha,
+    Digit,
+    Lower,
+    Upper,
+    Space,
+    Blank,
+    HexDigit,
+    Literal(char),
+    Range(char, char),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SyntaxClass {
+    negated: bool,
+    atoms: Vec<SyntaxClassAtom>,
+}
+
+impl SyntaxClass {
+    fn parse(pattern: &str) -> Result<Self, String> {
+        let Some(inner) = pattern
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+        else {
+            return Err(format!(
+                "unsupported Mica word syntax pattern {pattern:?}: expected a character class"
+            ));
+        };
+        let mut characters: Vec<char> = inner.chars().collect();
+        let negated = characters.first() == Some(&'^');
+        if negated {
+            characters.remove(0);
+        }
+        let mut atoms = Vec::new();
+        let mut index = 0;
+        while index < characters.len() {
+            if characters.get(index) == Some(&'[') && characters.get(index + 1) == Some(&':') {
+                let Some(end) = (index + 2..characters.len().saturating_sub(1)).find(|candidate| {
+                    characters.get(*candidate) == Some(&':')
+                        && characters.get(candidate + 1) == Some(&']')
+                }) else {
+                    return Err(format!(
+                        "invalid POSIX class in Mica syntax pattern {pattern:?}"
+                    ));
+                };
+                let name: String = characters[index + 2..end].iter().collect();
+                atoms.push(match name.as_str() {
+                    "alnum" => SyntaxClassAtom::Alnum,
+                    "alpha" => SyntaxClassAtom::Alpha,
+                    "digit" => SyntaxClassAtom::Digit,
+                    "lower" => SyntaxClassAtom::Lower,
+                    "upper" => SyntaxClassAtom::Upper,
+                    "space" => SyntaxClassAtom::Space,
+                    "blank" => SyntaxClassAtom::Blank,
+                    "xdigit" => SyntaxClassAtom::HexDigit,
+                    _ => {
+                        return Err(format!(
+                            "unsupported POSIX class {name:?} in Mica syntax pattern"
+                        ));
+                    }
+                });
+                index = end + 2;
+                continue;
+            }
+            let start = if characters[index] == '\\' {
+                index += 1;
+                *characters
+                    .get(index)
+                    .ok_or_else(|| format!("trailing escape in Mica syntax pattern {pattern:?}"))?
+            } else {
+                characters[index]
+            };
+            if characters.get(index + 1) == Some(&'-')
+                && let Some(end) = characters.get(index + 2).copied()
+            {
+                atoms.push(SyntaxClassAtom::Range(start, end));
+                index += 3;
+            } else {
+                atoms.push(SyntaxClassAtom::Literal(start));
+                index += 1;
+            }
+        }
+        if atoms.is_empty() {
+            return Err("Mica word syntax character class is empty".to_owned());
+        }
+        Ok(Self { negated, atoms })
+    }
+
+    fn contains(&self, character: char) -> bool {
+        let matched = self.atoms.iter().any(|atom| match atom {
+            SyntaxClassAtom::Alnum => character.is_alphanumeric(),
+            SyntaxClassAtom::Alpha => character.is_alphabetic(),
+            SyntaxClassAtom::Digit => character.is_numeric(),
+            SyntaxClassAtom::Lower => character.is_lowercase(),
+            SyntaxClassAtom::Upper => character.is_uppercase(),
+            SyntaxClassAtom::Space => character.is_whitespace(),
+            SyntaxClassAtom::Blank => matches!(character, ' ' | '\t'),
+            SyntaxClassAtom::HexDigit => character.is_ascii_hexdigit(),
+            SyntaxClassAtom::Literal(expected) => character == *expected,
+            SyntaxClassAtom::Range(start, end) => *start <= character && character <= *end,
+        });
+        matched != self.negated
+    }
+}
+
 /// Direct, ordered in-process session endpoint.
 pub struct HostSession {
     editor: Editor,
@@ -337,7 +451,7 @@ pub struct HostSession {
     mica_modes: HashMap<BufferId, String>,
     mica_faces: HashMap<String, HashMap<String, String>>,
     mica_configuration: HashMap<String, String>,
-    mica_syntax: HashMap<BufferId, Vec<(String, String)>>,
+    mica_syntax: HashMap<BufferId, Vec<MicaSyntaxRule>>,
     mica_search_ranges: HashMap<WindowId, Vec<(usize, usize, String)>>,
     closed: bool,
 }
@@ -975,11 +1089,13 @@ impl HostSession {
                 "syntax_policy" => {
                     if let Some(buffer) = policy.subject {
                         let rules = self.mica_syntax.entry(buffer).or_default();
-                        if !rules
-                            .iter()
-                            .any(|rule| rule == &(policy.name.clone(), policy.value.clone()))
-                        {
-                            rules.push((policy.name, policy.value));
+                        let rule = MicaSyntaxRule {
+                            kind: policy.name,
+                            pattern: policy.value,
+                            precedence: policy.precedence.unwrap_or_default(),
+                        };
+                        if !rules.contains(&rule) {
+                            rules.push(rule);
                         }
                     }
                 }
@@ -1131,10 +1247,17 @@ impl HostSession {
             }
             if matches!(action.name.as_str(), "kill_word" | "backward_kill_word") {
                 let action_name = action.name.clone();
-                let actions = self.mica_kill_word(action.name == "kill_word");
-                self.resolve_actions(actions, lifecycle, invalidations)
-                    .await;
-                self.write_kill_ring_to_native(&action_name, lifecycle);
+                match self.mica_kill_word(action.name == "kill_word") {
+                    Ok(actions) => {
+                        self.resolve_actions(actions, lifecycle, invalidations)
+                            .await;
+                        self.write_kill_ring_to_native(&action_name, lifecycle);
+                    }
+                    Err(message) => {
+                        self.editor.set_echo_message(message.clone());
+                        lifecycle.push(LifecycleEvent::Error(message));
+                    }
+                }
                 continue;
             }
             let action_name = action.name.clone();
@@ -1409,24 +1532,37 @@ impl HostSession {
         );
     }
 
-    fn mica_kill_word(&mut self, forward: bool) -> Vec<ChromeAction> {
+    fn mica_kill_word(&mut self, forward: bool) -> Result<Vec<ChromeAction>, String> {
         let window = &self.editor.windows[self.editor.active_window];
         let buffer_id = window.active_buffer;
         let cursor = window.cursor;
         let text: Vec<char> = self.editor.buffers[buffer_id].content().chars().collect();
-        let mica_word_rule = self
+        let word_rules: Vec<_> = self
             .mica_syntax
             .get(&buffer_id)
             .into_iter()
             .flatten()
-            .any(|(kind, pattern)| kind == "word" && pattern == "[[:alnum:]_]");
-        let is_word = |character: char| {
-            if mica_word_rule {
-                character.is_alphanumeric() || character == '_'
-            } else {
-                !character.is_whitespace()
-            }
-        };
+            .filter(|rule| rule.kind == "word")
+            .collect();
+        let precedence = word_rules
+            .iter()
+            .map(|rule| rule.precedence)
+            .max()
+            .ok_or_else(|| "Mica has no effective word syntax rule".to_owned())?;
+        let mut patterns: Vec<_> = word_rules
+            .into_iter()
+            .filter(|rule| rule.precedence == precedence)
+            .map(|rule| rule.pattern.as_str())
+            .collect();
+        patterns.sort_unstable();
+        patterns.dedup();
+        if patterns.len() != 1 {
+            return Err(format!(
+                "Mica word syntax is ambiguous at precedence {precedence}"
+            ));
+        }
+        let syntax = SyntaxClass::parse(patterns[0])?;
+        let is_word = |character: char| syntax.contains(character);
         let boundary = if forward {
             let mut position = cursor.min(text.len());
             while position < text.len() && !is_word(text[position]) {
@@ -1454,8 +1590,9 @@ impl HostSession {
         } else {
             -isize::try_from(cursor.saturating_sub(boundary)).unwrap_or(isize::MAX)
         };
-        self.editor
-            .kill_text(&crate::editor::ActionPosition::Cursor, count)
+        Ok(self
+            .editor
+            .kill_text(&crate::editor::ActionPosition::Cursor, count))
     }
 
     fn write_kill_ring_to_native(
@@ -2689,8 +2826,111 @@ mod tests {
             assert!(
                 session.mica_syntax[&buffer]
                     .iter()
-                    .any(|rule| rule == &("word".to_owned(), "[[:alnum:]_]".to_owned()))
+                    .any(|rule| rule.kind == "word"
+                        && rule.pattern == "[[:alnum:]_]"
+                        && rule.precedence == 100)
             );
+
+            let original = include_str!("../../mica/roe-first-wave.mica");
+            let hyphen_is_word = original.replace(
+                "assert roe/SyntaxRule(#roe/fundamental_mode, :word, \"[[:alnum:]_]\", 100)",
+                "assert roe/SyntaxRule(#roe/fundamental_mode, :word, \"[[:alpha:]-]\", 100)",
+            );
+            session
+                .replace_mica_first_wave(hyphen_is_word)
+                .await
+                .unwrap();
+            session.editor.buffers[buffer].load_str("foo-bar baz");
+            session.editor.windows[window].cursor = 0;
+            let replaced = session
+                .dispatch(
+                    session.envelope(InputEvent::Keys(vec![meta, LogicalKey::AlphaNumeric('d')])),
+                )
+                .await
+                .unwrap();
+            assert_eq!(snapshot(&replaced).views[0].visible_text, "baz");
+
+            let unsupported = original.replace(
+                "assert roe/SyntaxRule(#roe/fundamental_mode, :word, \"[[:alnum:]_]\", 100)",
+                "assert roe/SyntaxRule(#roe/fundamental_mode, :word, \"word\", 100)",
+            );
+            session.replace_mica_first_wave(unsupported).await.unwrap();
+            session.editor.buffers[buffer].load_str("unchanged");
+            session.editor.windows[window].cursor = 0;
+            let rejected = session
+                .dispatch(
+                    session.envelope(InputEvent::Keys(vec![meta, LogicalKey::AlphaNumeric('d')])),
+                )
+                .await
+                .unwrap();
+            assert_eq!(snapshot(&rejected).views[0].visible_text, "unchanged");
+            assert!(rejected.lifecycle.iter().any(|event| matches!(
+                event,
+                LifecycleEvent::Error(message)
+                    if message.contains("unsupported Mica word syntax pattern")
+            )));
+
+            session
+                .dispatch(session.envelope(InputEvent::Close))
+                .await
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn mica_orders_bindings_and_edit_hooks_by_precedence() {
+        let _guard = MICA_TEST_LOCK.lock().unwrap();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut session = HostSession::open_with_mica_clock(
+                test_editor(),
+                CapabilityGrants::editor_default(),
+                Arc::new(FixedNativeClock(42)),
+            )
+            .unwrap();
+            let original = include_str!("../../mica/roe-first-wave.mica");
+            let ordered = format!(
+                "{original}\nassert roe/NativeBinding(\"x\", :cursor_right, 6000)\nassert roe/KeyBinding(#roe/global_map, \"x\", #roe/redraw, 7000)\nassert roe/ModeHook(#roe/fundamental_mode, :low_hook, 10)\nassert roe/ModeHook(#roe/fundamental_mode, :high_hook, 50)\n"
+            );
+            session.replace_mica_first_wave(ordered).await.unwrap();
+
+            let command_wins = session
+                .dispatch(session.envelope(InputEvent::Text("x".to_owned())))
+                .await
+                .unwrap();
+            assert_eq!(snapshot(&command_wins).views[0].visible_text, "hello");
+
+            let buffer = session.editor.windows[session.editor.active_window].active_buffer;
+            session.editor.buffers[buffer].load_str("hello");
+            session.editor.windows[session.editor.active_window].cursor = 5;
+            let with_hooks = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Backspace])))
+                .await
+                .unwrap();
+            let hook_errors: Vec<_> = with_hooks
+                .lifecycle
+                .iter()
+                .filter_map(|event| match event {
+                    LifecycleEvent::Error(message) if message.contains("_hook") => Some(message),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(hook_errors.len(), 2);
+            assert!(hook_errors[0].contains("high_hook"));
+            assert!(hook_errors[1].contains("low_hook"));
+
+            let ambiguous = format!(
+                "{original}\nassert roe/KeyBinding(#roe/global_map, \"x\", #roe/redraw, 7000)\nassert roe/KeyBinding(#roe/global_map, \"x\", #roe/quit, 7000)\n"
+            );
+            session.replace_mica_first_wave(ambiguous).await.unwrap();
+            let rejected = session
+                .dispatch(session.envelope(InputEvent::Text("x".to_owned())))
+                .await
+                .unwrap();
+            assert!(rejected.lifecycle.iter().any(|event| matches!(
+                event,
+                LifecycleEvent::Error(message) if message.contains("ambiguous command key binding")
+            )));
+            assert!(!rejected.lifecycle.contains(&LifecycleEvent::QuitRequested));
 
             session
                 .dispatch(session.envelope(InputEvent::Close))
@@ -2747,7 +2987,7 @@ mod tests {
             assert_eq!(active.cursor, 6);
             assert_eq!(
                 session.mica.as_ref().unwrap().identity_counts_for_test(),
-                (2, 2)
+                (3, 2)
             );
 
             session.editor.active_window = original_view;
@@ -2761,7 +3001,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 session.mica.as_ref().unwrap().identity_counts_for_test(),
-                (1, 1)
+                (2, 1)
             );
             assert_eq!(
                 snapshot(&after_removal).views[0].visible_text,

@@ -50,6 +50,7 @@ make_relation(:roe/MinorMode, 1)
 make_functional_relation(:roe/ModeName, 2, [0])
 make_relation(:roe/ModeKeymap, 3)
 make_relation(:roe/ModeHook, 3)
+make_functional_relation(:roe/DefaultMajorMode, 2, [0])
 make_relation(:roe/Face, 1)
 make_functional_relation(:roe/FaceName, 2, [0])
 make_relation(:roe/FaceParent, 2)
@@ -127,6 +128,7 @@ make_relation(:roe/DiscoverableCommand, 2)
 make_relation(:roe/ViewInTree, 2)
 make_relation(:roe/SessionLeafView, 2)
 make_relation(:roe/VisibleBuffer, 2)
+make_relation(:roe/BufferHasExplicitMajorMode, 1)
 make_relation(:roe/EffectiveMajorMode, 2)
 make_relation(:roe/EffectiveModeHook, 3)
 make_relation(:roe/LocalFaceAttribute, 2)
@@ -187,7 +189,7 @@ roe/EffectiveSessionKeymap(session, keymap, precedence) :-
 roe/EffectiveSessionKeymap(session, keymap, precedence) :-
   roe/ActiveView(session, view),
   roe/ViewBuffer(view, buffer),
-  roe/BufferMajorMode(buffer, mode),
+  roe/EffectiveMajorMode(buffer, mode),
   roe/EnabledMode(mode),
   roe/ModeKeymap(mode, keymap, precedence),
   roe/EnabledKeymap(keymap)
@@ -233,13 +235,21 @@ roe/ArgumentCandidate(:visible_views, actor, session, view, name) :-
   roe/ViewBuffer(view, buffer),
   roe/BufferName(buffer, name)
 
+roe/BufferHasExplicitMajorMode(buffer) :-
+  roe/BufferMajorMode(buffer, mode)
+
 roe/EffectiveMajorMode(buffer, mode) :-
   roe/BufferMajorMode(buffer, mode),
   roe/EnabledMode(mode)
 
-roe/EffectiveModeHook(buffer, hook, precedence) :-
-  roe/BufferMajorMode(buffer, mode),
+roe/EffectiveMajorMode(buffer, mode) :-
+  roe/LogicalBuffer(buffer),
+  roe/DefaultMajorMode(#roe/core_configuration, mode),
   roe/EnabledMode(mode),
+  not roe/BufferHasExplicitMajorMode(buffer)
+
+roe/EffectiveModeHook(buffer, hook, precedence) :-
+  roe/EffectiveMajorMode(buffer, mode),
   roe/ModeHook(mode, hook, precedence)
 
 roe/EffectiveModeHook(buffer, hook, precedence) :-
@@ -259,8 +269,7 @@ roe/EffectiveFaceAttribute(face, attribute, value) :-
   not roe/LocalFaceAttribute(face, attribute)
 
 roe/EffectiveSyntaxRule(buffer, mode, kind, pattern, precedence) :-
-  roe/BufferMajorMode(buffer, mode),
-  roe/EnabledMode(mode),
+  roe/EffectiveMajorMode(buffer, mode),
   roe/SyntaxRule(mode, kind, pattern, precedence)
 
 roe/EffectiveSyntaxRule(buffer, mode, kind, pattern, precedence) :-
@@ -295,6 +304,7 @@ assert roe/Keymap(#roe/global_map)
 assert roe/KeyBinding(#roe/global_map, "C-x o", #roe/other_window, 100)
 assert roe/MajorMode(#roe/fundamental_mode)
 assert roe/ModeName(#roe/fundamental_mode, "fundamental")
+assert roe/DefaultMajorMode(#roe/core_configuration, #roe/fundamental_mode)
 assert roe/ModeKeymap(#roe/fundamental_mode, #roe/global_map, 50)
 assert roe/ModeHook(#roe/fundamental_mode, :invalidate_syntax, 100)
 assert roe/Face(#roe/default_face)
@@ -354,6 +364,8 @@ assert RoleCanWrite(#roe/editor_role, :roe/PromptState)
 assert RoleCanWrite(#roe/editor_role, :roe/PromptLast)
 assert RoleCanWrite(#roe/editor_role, :roe/FileCandidate)
 assert RoleCanInvoke(#roe/editor_role, :roe/dispatch_key)
+assert RoleCanInvoke(#roe/editor_role, :roe/run_native_action)
+assert RoleCanInvoke(#roe/editor_role, :roe/emit_edit_hooks)
 assert RoleCanInvoke(#roe/editor_role, :roe/other_window)
 assert RoleCanInvoke(#roe/editor_role, :roe/acquire_argument)
 assert RoleCanInvoke(#roe/editor_role, :roe/accept_argument_candidate)
@@ -401,55 +413,41 @@ end
 
 verb roe/dispatch_key(actor, session, sequence @ #string)
   roe/publish_policy(actor, session)
-  let native = one roe/NativeBinding(sequence, ?action, ?precedence)
-  if native != nothing
-    if roe/NativeEditingAction(native[:action])
-      roe/CanRequestService(actor, :text_write) || return :text_write_denied
+  let native_action = nothing
+  let native_precedence = -2147483648
+  let native_ambiguous = false
+  for native in roe/NativeBinding(sequence, ?action, ?precedence)
+    if native_action == nothing || native[:precedence] > native_precedence
+      native_action = native[:action]
+      native_precedence = native[:precedence]
+      native_ambiguous = false
+    elseif native[:precedence] == native_precedence && native_action != native[:action]
+      native_ambiguous = true
     end
-    if native[:action] == :kill_line || native[:action] == :kill_region || native[:action] == :copy_region || native[:action] == :kill_word || native[:action] == :backward_kill_word
-      roe/CanRequestService(actor, :clipboard_write) || return :clipboard_write_denied
-    end
-    if native[:action] == :yank
-      roe/CanRequestService(actor, :clipboard_read) || return :clipboard_read_denied
-    end
-    if native[:action] == :indent
-      let width = one roe/EffectiveConfiguration(#roe/core_configuration, :tab_width, ?width)
-      if width == nothing
-        width = 4
-      end
-      let text = ""
-      let count = 0
-      while count < width
-        text = string_concat(text, " ")
-        count = count + 1
-      end
-      emit(session, {:kind -> :native_action, :action -> :insert_text, :text -> text})
-    else
-      emit(session, {:kind -> :native_action, :action -> native[:action]})
-    end
-    if roe/NativeEditingAction(native[:action])
-      let view = one roe/ActiveView(session, ?view)
-      let buffer = one roe/ViewBuffer(view, ?buffer)
-      for hook in roe/EffectiveModeHook(buffer, ?hook, ?precedence)
-        emit(session, {:kind -> :host_action, :action -> hook[:hook], :view -> view})
-      end
-    end
-    return :handled
   end
   let selected = nothing
   let selected_precedence = -2147483648
-  let ambiguous = false
+  let command_ambiguous = false
   for active in roe/EffectiveSessionKeymap(session, ?keymap, ?session_precedence)
     for binding in roe/EffectiveBinding(active[:keymap], sequence, ?command, ?precedence)
       let precedence = active[:session_precedence] + binding[:precedence]
       if selected == nothing || precedence > selected_precedence
         selected = binding[:command]
         selected_precedence = precedence
-        ambiguous = false
+        command_ambiguous = false
       elseif precedence == selected_precedence && selected != binding[:command]
-        ambiguous = true
+        command_ambiguous = true
       end
     end
+  end
+  if native_action != nothing && (selected == nothing || native_precedence > selected_precedence)
+    if native_ambiguous
+      raise E_AMBIGUOUS, "ambiguous native key binding"
+    end
+    return roe/run_native_action(actor, session, native_action)
+  end
+  if native_action != nothing && selected != nothing && native_precedence == selected_precedence
+    raise E_AMBIGUOUS, "native and command bindings have equal precedence"
   end
   if selected == nothing
     if roe/KeyPrefix(sequence)
@@ -458,23 +456,64 @@ verb roe/dispatch_key(actor, session, sequence @ #string)
     if string_len(sequence) == 1
       roe/CanRequestService(actor, :text_write) || return :text_write_denied
       emit(session, {:kind -> :native_action, :action -> :insert_text, :text -> sequence})
-      let view = one roe/ActiveView(session, ?view)
-      let buffer = one roe/ViewBuffer(view, ?buffer)
-      for hook in roe/EffectiveModeHook(buffer, ?hook, ?precedence)
-        emit(session, {:kind -> :host_action, :action -> hook[:hook], :view -> view})
-      end
+      roe/emit_edit_hooks(actor, session)
       return :handled
     end
     return :unbound
   end
-  if ambiguous
-    return :ambiguous
+  if command_ambiguous
+    raise E_AMBIGUOUS, "ambiguous command key binding"
   end
   let selector = one roe/CommandSelector(selected, ?selector)
   if selector == nothing
-    return :missing_selector
+    raise E_COMMAND, "selected command has no selector"
   end
   return invoke(selector, {:actor -> actor, :session -> session})
+end
+
+verb roe/run_native_action(actor, session, action)
+  if roe/NativeEditingAction(action)
+    roe/CanRequestService(actor, :text_write) || return :text_write_denied
+  end
+  if action == :kill_line || action == :kill_region || action == :copy_region || action == :kill_word || action == :backward_kill_word
+    roe/CanRequestService(actor, :clipboard_write) || return :clipboard_write_denied
+  end
+  if action == :yank
+    roe/CanRequestService(actor, :clipboard_read) || return :clipboard_read_denied
+  end
+  if action == :indent
+    let width = one roe/EffectiveConfiguration(#roe/core_configuration, :tab_width, ?width)
+    if width == nothing
+      width = 4
+    end
+    let text = ""
+    let count = 0
+    while count < width
+      text = string_concat(text, " ")
+      count = count + 1
+    end
+    emit(session, {:kind -> :native_action, :action -> :insert_text, :text -> text})
+  else
+    emit(session, {:kind -> :native_action, :action -> action})
+  end
+  if roe/NativeEditingAction(action)
+    roe/emit_edit_hooks(actor, session)
+  end
+  return :handled
+end
+
+verb roe/emit_edit_hooks(actor, session)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  let view = one roe/ActiveView(session, ?view)
+  let buffer = one roe/ViewBuffer(view, ?buffer)
+  let hooks = []
+  for hook in roe/EffectiveModeHook(buffer, ?hook, ?precedence)
+    hooks = [@hooks, [0 - hook[:precedence], hook[:hook]]]
+  end
+  for hook in sort(hooks)
+    emit(session, {:kind -> :host_action, :action -> hook[1], :view -> view})
+  end
+  return :ok
 end
 
 verb roe/pointer_event(actor, session, view, position, phase, button)

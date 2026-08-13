@@ -152,6 +152,7 @@ pub struct MicaPolicyFact {
     pub name: String,
     pub attribute: Option<String>,
     pub value: String,
+    pub precedence: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -389,7 +390,6 @@ pub struct MicaHost {
     session: Identity,
     frame: Identity,
     editor_role: Identity,
-    fundamental_mode: Identity,
     global_map: Identity,
     buffer_ids: HashMap<BufferId, Identity>,
     buffer_names: HashMap<BufferId, String>,
@@ -449,7 +449,6 @@ impl MicaHost {
         let session = driver.allocate_ephemeral_identity()?;
         let frame = driver.allocate_ephemeral_identity()?;
         let editor_role = driver.named_identity(sym("roe/editor_role"))?;
-        let fundamental_mode = driver.named_identity(sym("roe/fundamental_mode"))?;
         let global_map = driver.named_identity(sym("roe/global_map"))?;
 
         let mut buffer_ids = HashMap::new();
@@ -528,10 +527,6 @@ impl MicaHost {
                 [Value::identity(logical), Value::string(buffer.object())].into(),
             ));
             tuples.push((
-                sym("roe/BufferMajorMode"),
-                [Value::identity(logical), Value::identity(fundamental_mode)].into(),
-            ));
-            tuples.push((
                 sym("roe/NativeTextResource"),
                 [Value::identity(logical), Value::identity(native)].into(),
             ));
@@ -593,7 +588,6 @@ impl MicaHost {
             session,
             frame,
             editor_role,
-            fundamental_mode,
             global_map,
             buffer_ids,
             buffer_names,
@@ -1035,14 +1029,6 @@ end
                     .into(),
                 ),
                 (
-                    sym("roe/BufferMajorMode"),
-                    [
-                        Value::identity(logical),
-                        Value::identity(self.fundamental_mode),
-                    ]
-                    .into(),
-                ),
-                (
                     sym("roe/NativeTextResource"),
                     [Value::identity(logical), Value::identity(native)].into(),
                 ),
@@ -1111,14 +1097,6 @@ end
                 (
                     sym("roe/BufferName"),
                     [Value::identity(logical), Value::string(buffer.object())].into(),
-                ),
-                (
-                    sym("roe/BufferMajorMode"),
-                    [
-                        Value::identity(logical),
-                        Value::identity(self.fundamental_mode),
-                    ]
-                    .into(),
                 ),
                 (
                     sym("roe/NativeTextResource"),
@@ -1488,6 +1466,7 @@ end
             .and_then(|value| value.as_symbol())
             .and_then(Symbol::name)
             .map(str::to_owned);
+        let precedence = map_value(value, "precedence").and_then(|value| value.as_int());
         let raw = map_value(value, "value").or_else(|| map_value(value, "pattern"));
         let value = raw
             .clone()
@@ -1500,6 +1479,7 @@ end
             name,
             attribute,
             value,
+            precedence,
         })
     }
 
@@ -1724,14 +1704,6 @@ end
                 [
                     Value::identity(*logical),
                     Value::string(&self.buffer_names[buffer_id]),
-                ]
-                .into(),
-            ));
-            tuples.push((
-                sym("roe/BufferMajorMode"),
-                [
-                    Value::identity(*logical),
-                    Value::identity(self.fundamental_mode),
                 ]
                 .into(),
             ));
