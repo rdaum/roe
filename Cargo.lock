@@ -107,6 +107,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-swap"
+version = "1.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
+name = "ariadne"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8454c8a44ce2cb9cc7e7fae67fc6128465b343b92c6631e94beca3c8d1524ea5"
+dependencies = [
+ "unicode-width",
+ "yansi",
+]
+
+[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -150,6 +169,12 @@ name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
+
+[[package]]
+name = "base64"
+version = "0.22.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "bit-set"
@@ -337,10 +362,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b84ee96a86948d04388f3a0b8c36b9f0a6b40b3528ac0d65737e53632fb37fe"
 dependencies = [
  "compio-buf",
+ "compio-dispatcher",
  "compio-driver",
  "compio-fs",
  "compio-io",
  "compio-log",
+ "compio-net",
  "compio-runtime",
 ]
 
@@ -353,6 +380,18 @@ dependencies = [
  "arrayvec",
  "bytes",
  "libc",
+]
+
+[[package]]
+name = "compio-dispatcher"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "294348deec2e477774bc20a215afbded1cf8eda758d7f81342b42064cdde1da7"
+dependencies = [
+ "compio-driver",
+ "compio-runtime",
+ "flume",
+ "futures-channel",
 ]
 
 [[package]]
@@ -424,12 +463,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "compio-net"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "becd7d40522c885113752a3640cba9f9d347f205b646bb3f8ff3967173a228f2"
+dependencies = [
+ "cfg-if",
+ "compio-buf",
+ "compio-driver",
+ "compio-io",
+ "compio-runtime",
+ "either",
+ "libc",
+ "once_cell",
+ "socket2",
+ "widestring",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "compio-runtime"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6c1c71f011bdd9c8f30e97d877b606505ee6d241c7782cfaed172f66acbd9cd"
 dependencies = [
  "async-task",
+ "cfg-if",
  "compio-buf",
  "compio-driver",
  "compio-log",
@@ -521,6 +580,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "crossbeam-deque"
+version = "0.8.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5181e0de7b61eb03a81e347d6dd8797bae9da5146707b51077e2d71a54ec0ceb"
+dependencies = [
+ "crossbeam-epoch",
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-epoch"
+version = "0.9.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
+dependencies = [
+ "crossbeam-utils",
 ]
 
 [[package]]
@@ -657,6 +735,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 
 [[package]]
+name = "either"
+version = "1.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e5e8f6c15a24b9a3ee5efec809ccd006d3b30e8b3bb63c39af737c7f87daa1d"
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -685,6 +769,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1a05365e3b1c6d1650318537c7460c6923f1abdd272ad6842baa2b509957a06"
 dependencies = [
  "num-traits",
+]
+
+[[package]]
+name = "fast-telemetry"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04fa85600a18af9573c744f3dd750dfe81cecf3a8aab2fc8fa7e6aa66c41cba8"
+dependencies = [
+ "crossbeam-utils",
+ "fast-telemetry-macros",
+ "itoa",
+ "parking_lot",
+ "ryu",
+ "uuid",
+]
+
+[[package]]
+name = "fast-telemetry-macros"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b9281464287b2bdbd41b13b9c3f65d935ea4e051e46d8529d265a29d726d456"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -724,6 +833,8 @@ version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e139bc46ca777eb5efaf62df0ab8cc5fd400866427e56c68b22e414e53bd3be"
 dependencies = [
+ "futures-core",
+ "futures-sink",
  "spin",
 ]
 
@@ -813,6 +924,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "76ee7a02da4d231650c7cea31349b889be2f45ddb3ef3032d2ec8185f6313fd2"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "futures-channel"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1f9e3d69d39e4862ffed03ed071a76f9a13ba1d9109d355b0f0aa6b15e393c4"
+dependencies = [
+ "futures-core",
 ]
 
 [[package]]
@@ -1252,6 +1372,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "itoa"
+version = "1.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+
+[[package]]
 name = "jni"
 version = "0.22.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1500,6 +1626,90 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "mica-compiler"
+version = "0.1.0"
+source = "git+https://github.com/timbran-project/mica.git?rev=a13f479229b761bf45b7ef71802cd4ca6e588dd4#a13f479229b761bf45b7ef71802cd4ca6e588dd4"
+dependencies = [
+ "ariadne",
+ "base64",
+ "mica-relation-kernel",
+ "mica-var",
+ "mica-vm",
+]
+
+[[package]]
+name = "mica-driver"
+version = "0.1.0"
+source = "git+https://github.com/timbran-project/mica.git?rev=a13f479229b761bf45b7ef71802cd4ca6e588dd4#a13f479229b761bf45b7ef71802cd4ca6e588dd4"
+dependencies = [
+ "compio",
+ "fast-telemetry",
+ "futures-util",
+ "mica-compiler",
+ "mica-runtime",
+ "mica-var",
+ "tracing",
+]
+
+[[package]]
+name = "mica-host-protocol"
+version = "0.1.0"
+source = "git+https://github.com/timbran-project/mica.git?rev=a13f479229b761bf45b7ef71802cd4ca6e588dd4#a13f479229b761bf45b7ef71802cd4ca6e588dd4"
+dependencies = [
+ "mica-var",
+ "serde_json",
+]
+
+[[package]]
+name = "mica-relation-kernel"
+version = "0.1.0"
+source = "git+https://github.com/timbran-project/mica.git?rev=a13f479229b761bf45b7ef71802cd4ca6e588dd4#a13f479229b761bf45b7ef71802cd4ca6e588dd4"
+dependencies = [
+ "arc-swap",
+ "fast-telemetry",
+ "mica-var",
+ "rart",
+ "rayon",
+]
+
+[[package]]
+name = "mica-runtime"
+version = "0.1.0"
+source = "git+https://github.com/timbran-project/mica.git?rev=a13f479229b761bf45b7ef71802cd4ca6e588dd4#a13f479229b761bf45b7ef71802cd4ca6e588dd4"
+dependencies = [
+ "base64",
+ "fast-telemetry",
+ "mica-compiler",
+ "mica-host-protocol",
+ "mica-relation-kernel",
+ "mica-var",
+ "mica-vm",
+ "serde_json",
+ "tracing",
+ "xml",
+]
+
+[[package]]
+name = "mica-var"
+version = "0.1.0"
+source = "git+https://github.com/timbran-project/mica.git?rev=a13f479229b761bf45b7ef71802cd4ca6e588dd4#a13f479229b761bf45b7ef71802cd4ca6e588dd4"
+dependencies = [
+ "base64",
+]
+
+[[package]]
+name = "mica-vm"
+version = "0.1.0"
+source = "git+https://github.com/timbran-project/mica.git?rev=a13f479229b761bf45b7ef71802cd4ca6e588dd4#a13f479229b761bf45b7ef71802cd4ca6e588dd4"
+dependencies = [
+ "arc-swap",
+ "fast-telemetry",
+ "mica-relation-kernel",
+ "mica-var",
+ "tracing",
 ]
 
 [[package]]
@@ -2288,6 +2498,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ca45419789ae5a7899559e9512e58ca889e41f04f1f2445e9f4b290ceccd1d08"
 
 [[package]]
+name = "rart"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19087bab094578a3e932bf449dfd52336c3cad7cc6462db77172e31cc01ba0c9"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "raw-window-handle"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2303,6 +2522,26 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-foundation 0.3.2",
  "objc2-quartz-core 0.3.2",
+]
+
+[[package]]
+name = "rayon"
+version = "1.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb39b166781f92d482534ef4b4b1b2568f42613b53e5b6c160e24cfbfa30926d"
+dependencies = [
+ "either",
+ "rayon-core",
+]
+
+[[package]]
+name = "rayon-core"
+version = "1.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
+dependencies = [
+ "crossbeam-deque",
+ "crossbeam-utils",
 ]
 
 [[package]]
@@ -2396,6 +2635,7 @@ version = "0.1.0"
 dependencies = [
  "arboard",
  "compio",
+ "mica-driver",
  "notify",
  "ropey",
  "serde",
@@ -2500,6 +2740,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
+name = "ryu"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2567,6 +2813,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.3",
+]
+
+[[package]]
+name = "serde_json"
+version = "1.0.151"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
+dependencies = [
+ "itoa",
+ "memchr",
+ "serde",
+ "serde_core",
+ "zmij",
 ]
 
 [[package]]
@@ -3066,6 +3325,17 @@ name = "utf8_iter"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
+
+[[package]]
+name = "uuid"
+version = "1.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf3923a6f5c4c6382e0b653c4117f48d631ea17f38ed86e2a828e6f7412f5239"
+dependencies = [
+ "getrandom 0.4.3",
+ "js-sys",
+ "wasm-bindgen",
+]
 
 [[package]]
 name = "valuable"
@@ -3950,10 +4220,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9cc00251562a284751c9973bace760d86c0276c471b4be569fe6b068ee97a56"
 
 [[package]]
+name = "xml"
+version = "1.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f45bb2c13fec6a6cb4c0f76a7e94839e110a14ec803ec2940777a94c347bc52"
+
+[[package]]
 name = "xml-rs"
 version = "0.8.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
+
+[[package]]
+name = "yansi"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
 
 [[package]]
 name = "yeslogic-fontconfig-sys"
@@ -4064,6 +4346,12 @@ dependencies = [
  "quote",
  "syn 2.0.119",
 ]
+
+[[package]]
+name = "zmij"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zune-core"

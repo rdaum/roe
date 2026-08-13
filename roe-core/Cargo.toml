@@ -11,6 +11,7 @@ description = "Core editor logic for Roe (Ryan's Own Emacs)"
 [dependencies]
 arboard = { workspace = true }
 compio = { workspace = true }
+mica-driver = { workspace = true }
 notify = { workspace = true }
 ropey = { workspace = true }
 serde = { workspace = true }

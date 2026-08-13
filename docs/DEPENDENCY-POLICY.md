@@ -1,21 +1,22 @@
 # Toolchain and dependency policy
 
-Roe's declared minimum supported Rust version (MSRV) is 1.88. The repository pins Rust 1.97.1 in
-`rust-toolchain.toml` for reproducible development and CI. A dependency update may raise the MSRV
-only in a dedicated commit that updates both this document and workspace metadata.
+Roe's declared minimum supported Rust version (MSRV) is 1.95. The repository pins Rust 1.97.1 in
+`rust-toolchain.toml` for reproducible development and CI. Phase 4 raised the MSRV from 1.88 in the
+same dedicated cutover that pinned the Mica driver; later raises must likewise update this document,
+workspace metadata, and CI together.
 
 ## Update groups
 
 The Phase 1 inventory was captured on 2026-08-13 with `cargo outdated`, `cargo tree -d`, crate
 metadata, and upstream release notes.
 
-| Group               | Dependencies                                                    | Policy                                                                                              |
-| ------------------- | --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| Routine compatible  | `arboard`, `crossterm`, `notify`, `ropey`, `similar`, `slotmap` | Follow current stable releases compatible with the MSRV.                                            |
-| Runtime pin         | `compio = 0.18.0`                                               | Exact pin shared with Mica. Change only together with the pinned Mica revision and lifecycle tests. |
-| MSRV transitive pin | `compio-buf = 0.8.1`                                           | Lockfile pin: 0.8.2+ uses a library API unavailable on Rust 1.88. Revisit with the Compio pin.      |
-| Coupled graphics    | `vello`, its WGPU graph, `parley`, `winit`, `pollster`          | Upgrade as one reviewed group with Vello build and frontend conformance checks.                     |
-| Removed             | `async-trait`, direct `futures`                                | Unused actor/event-stream dependencies removed in Phase 1.                                         |
+| Group              | Dependencies                                                    | Policy                                                                                                         |
+| ------------------ | --------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| Routine compatible | `arboard`, `crossterm`, `notify`, `ropey`, `similar`, `slotmap` | Follow current stable releases compatible with the MSRV.                                                       |
+| Runtime pins       | `compio = 0.18.0`, exact `mica-driver` revision                 | Change together with Mica lifecycle, replacement, cancellation, and terminal workflow tests.                   |
+| Mica features      | `mica-driver` with `default-features = false`                   | Keep CPU relation execution; do not initialize Mica WGPU, Fjall, Cranelift, or source-provider feature graphs. |
+| Coupled graphics   | `vello`, its WGPU graph, `parley`, `winit`, `pollster`          | Upgrade as one reviewed group with Vello build and frontend conformance checks.                                |
+| Removed            | `async-trait`, direct `futures`                                 | Unused actor/event-stream dependencies removed in Phase 1.                                                     |
 
 Ropey 2 is currently a prerelease and is not treated as the current stable target. Winit 0.31 is
 also prerelease. Mica's first integration must use `default-features = false`, leaving its WGPU
@@ -23,10 +24,10 @@ relation accelerator disabled until Roe and Mica intentionally choose a device/v
 
 ## Required checks
 
-Run `./scripts/check.sh` before committing. `./scripts/check-dependencies.sh` verifies the Compio
-and MSRV lockfile pins and rejects duplicate direct dependency declarations outside workspace
-policy. Install `cargo-audit` and run `./scripts/check-security.sh` for the advisory check; CI runs
-the same command. Exceptions require a documented reason and review deadline.
+Run `./scripts/check.sh` before committing. `./scripts/check-dependencies.sh` verifies the exact
+Compio and Mica pins and rejects duplicate direct dependency declarations outside workspace policy.
+Install `cargo-audit` and run `./scripts/check-security.sh` for the advisory check; CI runs the same
+command. Exceptions require a documented reason and review deadline.
 
 ## Advisory exceptions
 
