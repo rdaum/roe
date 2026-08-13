@@ -509,12 +509,11 @@ impl<'a> RoeVelloApp<'a> {
             .saturating_sub(2 + gutter_chars as u16) as usize;
         let content_rows = view.geometry.rows.saturating_sub(2) as usize;
         let mut absolute = view.visible_start_char;
-        for (row, raw_line) in view
-            .visible_text
-            .split_inclusive('\n')
-            .take(content_rows)
-            .enumerate()
-        {
+        let mut lines: Vec<&str> = view.visible_text.split_inclusive('\n').collect();
+        if lines.is_empty() {
+            lines.push("");
+        }
+        for (row, raw_line) in lines.into_iter().take(content_rows).enumerate() {
             let line = raw_line.trim_end_matches('\n');
             let displayed: String = line
                 .chars()
@@ -535,6 +534,33 @@ impl<'a> RoeVelloApp<'a> {
                 );
             }
             let visible_column = usize::from(view.scroll.start_column);
+            let display_start = absolute + visible_column;
+            let display_end = display_start + displayed.chars().count();
+            if let Some(selection) = view.selection {
+                let start = selection.anchor.min(selection.active).max(display_start);
+                let end = selection.anchor.max(selection.active).min(display_end);
+                if start < end {
+                    let left = content_x + (start - display_start) as f64 * char_width;
+                    let right = content_x + (end - display_start) as f64 * char_width;
+                    self.scene.fill(
+                        Fill::NonZero,
+                        Affine::IDENTITY,
+                        self.theme.selection_color,
+                        None,
+                        &Rect::new(left, line_y, right, line_y + line_height),
+                    );
+                }
+            }
+            if view.active && view.cursor >= display_start && view.cursor <= display_end {
+                let cursor_x = content_x + (view.cursor - display_start) as f64 * char_width;
+                self.scene.fill(
+                    Fill::NonZero,
+                    Affine::IDENTITY,
+                    self.theme.cursor_color,
+                    None,
+                    &Rect::new(cursor_x, line_y, cursor_x + 2.0, line_y + line_height),
+                );
+            }
             let spans: Vec<StyledSpan> = view
                 .styled_ranges
                 .iter()
@@ -573,6 +599,95 @@ impl<'a> RoeVelloApp<'a> {
             );
             absolute += line.chars().count() + usize::from(raw_line.ends_with('\n'));
         }
+
+        let scrollbar_top = y + 2.0;
+        let scrollbar_extent = (height - line_height - 4.0).max(1.0);
+        let scrollbar_x = x + width - SCROLLBAR_WIDTH - 2.0;
+        self.scene.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            Color::from_rgba8(0x40, 0x40, 0x40, 0x80),
+            None,
+            &Rect::new(
+                scrollbar_x,
+                scrollbar_top,
+                scrollbar_x + SCROLLBAR_WIDTH,
+                scrollbar_top + scrollbar_extent,
+            ),
+        );
+        let visible_lines = content_rows.max(1);
+        let vertical_fraction = (visible_lines as f64 / view.total_lines.max(1) as f64).min(1.0);
+        let thumb_height = (scrollbar_extent * vertical_fraction)
+            .max(20.0)
+            .min(scrollbar_extent);
+        let max_line = view.total_lines.saturating_sub(visible_lines);
+        let vertical_position = if max_line == 0 {
+            0.0
+        } else {
+            f64::from(view.scroll.start_line) / max_line as f64
+        };
+        let thumb_y = scrollbar_top + vertical_position * (scrollbar_extent - thumb_height);
+        self.scene.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            if view.active {
+                self.theme.active_border_color
+            } else {
+                self.theme.border_color
+            },
+            None,
+            &Rect::new(
+                scrollbar_x + 2.0,
+                thumb_y,
+                scrollbar_x + SCROLLBAR_WIDTH - 2.0,
+                thumb_y + thumb_height,
+            ),
+        );
+
+        let horizontal_x = x + 2.0;
+        let horizontal_y = y + height - line_height - SCROLLBAR_WIDTH - 2.0;
+        let horizontal_extent = (width - SCROLLBAR_WIDTH - 6.0).max(1.0);
+        self.scene.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            Color::from_rgba8(0x40, 0x40, 0x40, 0x80),
+            None,
+            &Rect::new(
+                horizontal_x,
+                horizontal_y,
+                horizontal_x + horizontal_extent,
+                horizontal_y + SCROLLBAR_WIDTH,
+            ),
+        );
+        let visible_columns = content_width_chars.max(1);
+        let horizontal_fraction =
+            (visible_columns as f64 / view.max_line_chars.max(1) as f64).min(1.0);
+        let thumb_width = (horizontal_extent * horizontal_fraction)
+            .max(20.0)
+            .min(horizontal_extent);
+        let max_column = view.max_line_chars.saturating_sub(visible_columns);
+        let horizontal_position = if max_column == 0 {
+            0.0
+        } else {
+            f64::from(view.scroll.start_column) / max_column as f64
+        };
+        let thumb_x = horizontal_x + horizontal_position * (horizontal_extent - thumb_width);
+        self.scene.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            if view.active {
+                self.theme.active_border_color
+            } else {
+                self.theme.border_color
+            },
+            None,
+            &Rect::new(
+                thumb_x,
+                horizontal_y + 2.0,
+                thumb_x + thumb_width,
+                horizontal_y + SCROLLBAR_WIDTH - 2.0,
+            ),
+        );
     }
 
     async fn handle_key_event(&mut self, event: winit::event::KeyEvent) {
