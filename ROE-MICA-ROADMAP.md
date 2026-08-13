@@ -126,7 +126,11 @@ boundary. Avoid compatibility layers for Julia-era or temporary Rust APIs.
 ### Work
 
 1. Inventory the workspace, dependency graph, build targets, feature flags, and supported platforms.
-2. Record representative workflows for both frontends:
+2. Record representative workflows for both frontends. Exercise the production terminal adapter in a
+   controlled pseudo-terminal and the production Vello adapter on a display-capable host. When a
+   required platform is unavailable, record that limitation explicitly and retain the workflow as an
+   open platform-smoke obligation; cover its renderer-neutral semantics headlessly rather than
+   inventing a successful observation:
    - startup with no files and with one or more files;
    - text insertion, movement, region operations, undo, and save;
    - command selection, buffer selection, file selection, and incremental search;

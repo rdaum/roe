@@ -28,14 +28,40 @@ fi
 
 if [[ -x /usr/bin/time ]]; then
     /usr/bin/time \
-        --format='roe_cli_startup_seconds=%e\nroe_cli_max_rss_kib=%M' \
+        --format='roe_help_wall_seconds=%e\nroe_help_max_rss_kib=%M' \
         "$roe_binary" --help >/dev/null
+fi
+
+if command -v tmux >/dev/null; then
+    startup_socket="roe-phase0-baseline-$$"
+    startup_begin_ns="$(date +%s%N)"
+    tmux -L "$startup_socket" new-session -d -s startup -x 80 -y 24 \
+        "exec $roe_binary"
+    startup_ready=false
+    for _ in $(seq 1 500); do
+        startup_pane="$(tmux -L "$startup_socket" capture-pane -p -t startup)"
+        if [[ "$startup_pane" == *'*Welcome*'* ]]; then
+            startup_ready=true
+            break
+        fi
+        sleep 0.01
+    done
+    startup_end_ns="$(date +%s%N)"
+    startup_elapsed_ns="$((startup_end_ns - startup_begin_ns))"
+    if [[ "$startup_ready" == true ]]; then
+        awk -v elapsed_ns="$startup_elapsed_ns" \
+            'BEGIN { printf "roe_terminal_ready_ms=%.3f\n", elapsed_ns / 1000000 }'
+    else
+        printf '%s\n' 'roe_terminal_ready_ms=timeout'
+    fi
+    tmux -L "$startup_socket" send-keys -t startup C-x C-c 2>/dev/null || true
+    tmux -L "$startup_socket" kill-server 2>/dev/null || true
 fi
 
 if [[ -x /usr/bin/time ]] && command -v script >/dev/null && command -v timeout >/dev/null; then
     idle_metrics="$(mktemp)"
     TERM=xterm-256color script -qec \
-        "/usr/bin/time --output=$idle_metrics --format='roe_terminal_idle_seconds=%e\nroe_terminal_idle_max_rss_kib=%M' timeout 1 $roe_binary" \
+        "stty rows 24 cols 80; exec /usr/bin/time --output=$idle_metrics --format='roe_terminal_idle_seconds=%e\nroe_terminal_idle_max_rss_kib=%M' timeout 1 $roe_binary" \
         /dev/null >/dev/null 2>&1 || true
     if [[ -s "$idle_metrics" ]]; then
         sed 's/^Command exited with non-zero status 124$//' "$idle_metrics"

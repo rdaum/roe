@@ -60,15 +60,19 @@ cargo test --workspace -- --test-threads=8
 cargo test -p roe-core editor::tests
 cargo test -p roe-terminal --test renderer_conformance
 cargo test -p roe-vello --test renderer_conformance
+cargo build --release --bin roe-vello
+./scripts/test-phase0-terminal-workflows.sh
 ./scripts/measure-phase0-baseline.sh
 ```
 
 At capture time:
 
 - `cargo check --workspace` passes;
-- `cargo test --workspace -- --test-threads=8` passes 123 tests;
-- terminal rendering and the redraw-state component used by the production Vello frontend pass the
-  shared dirty-lifecycle conformance test; and
+- `cargo test --workspace -- --test-threads=8` passes 125 tests;
+- terminal rendering and the redraw-state component which gates production Vello redraw handling
+  pass the shared dirty-lifecycle conformance test;
+- the production terminal adapter passes controlled startup, edit/save, search, window, watcher, and
+  clean-shutdown workflows; and
 - kill-ring and editor tests use an injected clipboard boundary and do not touch the user's system
   clipboard.
 
@@ -98,20 +102,26 @@ tests use injected clocks.
 
 The following platform smoke status was recorded on 2026-08-13:
 
-| Workflow                  | Terminal                                                                                    | Vello                                                                                |
-| ------------------------- | ------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
-| Release build             | Passed                                                                                      | Passed through `cargo test --workspace`; release binary not run                      |
-| Start and remain idle     | Passed for one second in an isolated pseudo-terminal                                        | Not runnable: no X11 or Wayland display is available in the verification environment |
-| Clean forced exit         | The timeout probe terminates the isolated process; graceful interactive quit remains manual | Not run                                                                              |
-| Full interactive workflow | Not automated at this baseline                                                              | Not automated at this baseline                                                       |
+| Workflow                      | Terminal                                                                                   | Vello                                                                                |
+| ----------------------------- | ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------ |
+| Release build                 | Passed with `cargo build --release --bin roe`                                              | Passed with `cargo build --release --bin roe-vello`                                  |
+| No-, one-, and two-file start | Passed in isolated 80x24 tmux terminals                                                    | Not runnable: no X11 or Wayland display is available in the verification environment |
+| Insert and save               | Passed against a uniquely owned temporary file                                             | Platform observation unavailable                                                     |
+| Incremental search            | Passed on a buffer with a multibyte prefix; insertion occurred at the selected match       | Renderer-neutral semantics pass; platform observation unavailable                    |
+| Split/select/delete windows   | Passed through production key input                                                        | Renderer-neutral semantics pass; platform observation unavailable                    |
+| External modification         | Passed: a notify event woke the idle loop, reloaded the buffer, and the new text was saved | Renderer-neutral watcher round trip passes; platform observation unavailable         |
+| Clean shutdown                | Passed via `C-x C-c` for every scripted terminal workflow                                  | Platform observation unavailable                                                     |
+| Failure during shutdown       | Not automated; terminal restoration/error-path renovation remains Phase 1 work             | Not automated                                                                        |
 
-This records both the results and what the environment could not exercise. It does not establish
-that the two frontends behave identically. The production Vello application now uses the tested
-redraw-state component, but actual scene construction and GPU presentation remain outside the shared
-suite until Phase 2 makes presentation headlessly observable.
+`./scripts/test-phase0-terminal-workflows.sh` reproduces the terminal observations without using the
+user's active terminal. This records both results and what the environment could not exercise; an
+unavailable Vello platform observation is an explicit open obligation, not a pass. The production
+Vello application now gates `RedrawRequested` with the tested redraw-state component, but actual
+scene construction and GPU presentation remain outside the shared suite until Phase 2 makes
+presentation headlessly observable.
 
-Before a release or major frontend change, manually exercise these remaining platform paths in both
-frontends:
+Before a release or major frontend change, exercise these remaining platform paths in Vello and the
+terminal paths not covered by the controlled workflow script:
 
 1. start with no file, one file, and two files;
 2. insert text, move by character/word/paragraph/page, select, kill, yank, undo, and redo;
@@ -126,9 +136,9 @@ event-loop tests rather than keep this manual checklist indefinitely.
 
 ## Mechanical invariants
 
-The first two groups are current mechanical invariants covered by tests. The final group is the
-required lifecycle target and is explicitly not true of the detached actor implementation at this
-baseline.
+The buffer-position statements below are current mechanical invariants covered by tests. Window,
+presentation, and lifecycle statements distinguish what is enforced now from the target that later
+phases must make mechanically true.
 
 ### Buffer and positions
 
@@ -143,13 +153,17 @@ baseline.
 
 ### Windows and presentation
 
-- Every normal window refers to a live buffer.
-- Every leaf in the window tree refers to exactly one live window, and deleting a window removes the
-  corresponding leaf without leaving a phantom selection target.
-- Split ratios remain valid and layout gives each realized window its required minimum geometry.
+- Normal editor construction and the tested split/delete paths give every normal window a live
+  buffer. A general runtime tree validator is still a Phase 2 requirement.
+- Split/delete tests compare the live-window set with the tree leaves and cover the historical
+  phantom-window failure. They do not yet enforce uniqueness at every mutation boundary.
+- Split construction normalizes non-finite and out-of-range ratios. Minimum-geometry validation is
+  not yet a general kernel invariant.
 - Renderer invalidation is monotonic until cleared: marking any region makes `needs_redraw()` true;
-  clearing dirty state makes it false.
-- Terminal and Vello may realize a frame differently but receive the same logical editor meaning.
+  clearing dirty state makes it false. The shared suite covers renderer dirty state, not end-to-end
+  delivery of every dirty-region variant.
+- Terminal and Vello should realize the same logical presentation. They do not yet receive one
+  shared presentation object and still interpret `ChromeAction` separately.
 
 ### Required task and external-resource invariants
 
@@ -174,28 +188,32 @@ terminal redraws into a counting writer. It also measures the real `roe --help` 
 the real terminal application for one idle second inside an isolated pseudo-terminal. No user's
 terminal or clipboard is modified.
 
-The 2026-08-13 aarch64 result was:
+The 2026-08-13 aarch64 sample was:
 
 ```text
 fixture_lines=2000
-fixture_construction_us=420
-post_fixture_rss_kib=2452
+fixture_construction_us=184
+post_fixture_rss_kib=2448
 edit_iterations=10000
-edit_round_trip_ns_per_iteration=1046
+edit_round_trip_ns_per_iteration=1040
 redraw_iterations=100
-terminal_full_redraw_us_per_iteration=1861
+terminal_full_redraw_us_per_iteration=246
 terminal_bytes_per_full_redraw=31729
-process_wall_seconds=0.19
-process_max_rss_kib=2784
-roe_cli_startup_seconds=0.00
-roe_cli_max_rss_kib=2272
+process_wall_seconds=0.03
+process_max_rss_kib=2624
+roe_help_wall_seconds=0.00
+roe_help_max_rss_kib=2304
+roe_terminal_ready_ms=25.391
 roe_terminal_idle_seconds=1.00
-roe_terminal_idle_max_rss_kib=1956
+roe_terminal_idle_max_rss_kib=1948
 ```
 
-These numbers are coarse regression sentinels. Compare results only on the same build profile,
-machine, and fixture. Production-shaped interactive measurements remain required before making
-performance claims.
+`roe_terminal_ready_ms` measures process launch through the first captured `*Welcome*` frame in a
+fresh tmux server, and therefore includes tmux server startup overhead. The idle probe uses a real
+80x24 pseudo-terminal rather than the previous zero-sized terminal, which crashed before editor
+construction. These numbers are coarse regression sentinels. Compare results only on the same build
+profile, machine, and fixture. Production-shaped interactive measurements remain required before
+making performance claims.
 
 ## Known failures and debt at the baseline
 
@@ -207,7 +225,8 @@ performance claims.
 | Vello/Compio wakeup   | Winit waits for platform events while Compio only advances inside `window_event`; independent work can stall.                            |
 | Frontend semantics    | Both frontends still interpret `ChromeAction`; shared conformance covers production redraw state, not scene or terminal-cell equality.   |
 | Error handling        | User/environment failures and internal invariants are mixed across `String` errors, ignored results, panics, and exits.                  |
-| End-to-end UI testing | No automated terminal PTY or graphical event-loop workflow exists.                                                                       |
+| End-to-end UI testing | Controlled terminal workflows pass in tmux; no graphical event-loop workflow can run without an X11/Wayland host.                        |
+| Watcher deletion      | Modification delivery is covered, but deletion is currently dropped after canonicalization of the now-missing path.                      |
 | Performance coverage  | The harness measures core editing and terminal full redraw only, not GPU redraw, input-to-presentation latency, or idle event-loop cost. |
 
 Nothing in this table is waived. Each item is routed to a later phase of the roadmap.
