@@ -30,6 +30,7 @@ pub mod native_kernel;
 pub mod native_services;
 pub mod renderer;
 pub mod selection_menu;
+pub mod session;
 pub mod syntax;
 pub mod undo;
 pub mod window;

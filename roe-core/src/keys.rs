@@ -12,6 +12,7 @@
 //
 
 use crate::command_registry::*;
+use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
 pub trait Bindings {
@@ -99,7 +100,7 @@ pub enum KeyAction {
     KillBuffer,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum CursorDirection {
     Left,
     Right,
@@ -117,7 +118,7 @@ pub enum CursorDirection {
     ParagraphBackward,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum Side {
     Left,
     Right,
@@ -125,7 +126,7 @@ pub enum Side {
 
 /// The set of emacs-ish keys we care about, that we map the physical system keycodes to.
 /// Series of these then get mapped to actions.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum LogicalKey {
     Left,
     Right,
@@ -184,7 +185,7 @@ impl LogicalKey {
         s.to_string()
     }
 }
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum KeyModifier {
     Hyper(Side),
     Super(Side),
