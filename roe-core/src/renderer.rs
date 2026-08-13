@@ -128,6 +128,18 @@ impl DirtyTracker {
         }
     }
 
+    /// Return whether any presentation state is waiting to be redrawn.
+    pub fn is_dirty(&self) -> bool {
+        self.full_screen_dirty
+            || !self.dirty_buffers.is_empty()
+            || !self.dirty_window_chrome.is_empty()
+            || !self.dirty_modeline_components.is_empty()
+            || self
+                .dirty_lines
+                .values()
+                .any(|lines| lines.iter().any(Option::is_some))
+    }
+
     /// Mark a region as dirty
     pub fn mark_dirty(&mut self, region: DirtyRegion) {
         match region {
@@ -306,6 +318,9 @@ pub trait Renderer {
 
     /// Clear all dirty state (called after successful render)
     fn clear_dirty(&mut self);
+
+    /// Return whether the frontend needs to schedule a redraw.
+    fn needs_redraw(&self) -> bool;
 }
 
 #[cfg(test)]
@@ -393,6 +408,18 @@ mod tests {
         assert!(tracker.is_line_dirty(buffer_id, 0));
         assert!(tracker.is_line_dirty(buffer_id, 100));
         assert!(tracker.is_buffer_dirty(buffer_id));
+    }
+
+    #[test]
+    fn test_dirty_tracker_reports_any_dirty_region() {
+        let mut tracker = DirtyTracker::new();
+        let buffer_id = test_buffer_id();
+
+        assert!(!tracker.is_dirty());
+        tracker.mark_dirty(DirtyRegion::Line { buffer_id, line: 2 });
+        assert!(tracker.is_dirty());
+        tracker.clear();
+        assert!(!tracker.is_dirty());
     }
 
     #[test]

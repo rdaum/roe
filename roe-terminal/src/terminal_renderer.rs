@@ -11,6 +11,7 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
+use compio::time::interval;
 use crossterm::event::{
     Event, EventStream, KeyCode, KeyModifiers, ModifierKeyCode, MouseButton, MouseEvent,
     MouseEventKind,
@@ -23,14 +24,13 @@ use roe_core::editor::{BorderInfo, ChromeAction, DragType, Frame, MouseDragState
 use roe_core::gutter::{
     calculate_gutter_width, format_line_number, get_line_status, GutterConfig, LineStatus,
 };
-use roe_core::syntax::face_registry;
 use roe_core::keys::{KeyModifier, LogicalKey, Side};
 use roe_core::renderer::{DirtyRegion, DirtyTracker, ModelineComponent, Renderer};
+use roe_core::syntax::face_registry;
 use roe_core::syntax::Color as SyntaxColor;
 use roe_core::{Editor, HighlightSpan, WindowId};
 use std::collections::HashSet;
 use std::io::Write;
-use compio::time::interval;
 use std::time::Duration;
 
 pub const ECHO_AREA_HEIGHT: u16 = 1;
@@ -689,6 +689,10 @@ impl<W: Write> Renderer for TerminalRenderer<W> {
 
     fn clear_dirty(&mut self) {
         self.dirty_tracker.clear();
+    }
+
+    fn needs_redraw(&self) -> bool {
+        self.dirty_tracker.is_dirty()
     }
 }
 

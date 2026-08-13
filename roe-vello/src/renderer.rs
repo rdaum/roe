@@ -62,7 +62,7 @@ impl VelloRenderer {
 
     /// Check if a redraw is needed
     pub fn needs_redraw(&self) -> bool {
-        self.needs_redraw || self.dirty_tracker.is_full_screen_dirty()
+        self.needs_redraw || self.dirty_tracker.is_dirty()
     }
 
     /// Mark that a redraw has been performed
@@ -95,5 +95,10 @@ impl Renderer for VelloRenderer {
 
     fn clear_dirty(&mut self) {
         self.dirty_tracker.clear();
+        self.needs_redraw = false;
+    }
+
+    fn needs_redraw(&self) -> bool {
+        VelloRenderer::needs_redraw(self)
     }
 }

@@ -3481,6 +3481,9 @@ mod tests {
     use crate::keys::{DefaultBindings, KeyState, LogicalKey};
     use crate::mode::ScratchMode;
     use slotmap::SlotMap;
+    use std::sync::Mutex;
+
+    static COMPIO_RUNTIME_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_editor() -> Editor {
         let scratch_mode = Box::new(ScratchMode {});
@@ -3533,6 +3536,7 @@ mod tests {
 
     #[test]
     fn test_cursor_move_right() {
+        let _runtime_guard = COMPIO_RUNTIME_LOCK.lock().unwrap();
         compio::runtime::Runtime::new().unwrap().block_on(async {
         let mut editor = test_editor();
         let window = &editor.windows[editor.active_window];
@@ -3554,6 +3558,7 @@ mod tests {
 
     #[test]
     fn test_cursor_move_down() {
+        let _runtime_guard = COMPIO_RUNTIME_LOCK.lock().unwrap();
         compio::runtime::Runtime::new().unwrap().block_on(async {
         let mut editor = test_editor();
 
@@ -3575,6 +3580,7 @@ mod tests {
 
     #[test]
     fn test_cursor_move_beyond_buffer() {
+        let _runtime_guard = COMPIO_RUNTIME_LOCK.lock().unwrap();
         compio::runtime::Runtime::new().unwrap().block_on(async {
         let mut editor = test_editor();
         let buffer_len = {
@@ -3598,6 +3604,7 @@ mod tests {
 
     #[test]
     fn test_cursor_position_calculation() {
+        let _runtime_guard = COMPIO_RUNTIME_LOCK.lock().unwrap();
         compio::runtime::Runtime::new().unwrap().block_on(async {
         let mut editor = test_editor();
 
