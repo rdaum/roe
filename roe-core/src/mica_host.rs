@@ -51,6 +51,7 @@ pub enum MicaKeyResult {
 pub struct MicaEventBatch {
     pub effects: Vec<MicaPresentationEffect>,
     pub host_actions: Vec<String>,
+    pub native_actions: Vec<String>,
     pub command_candidates: Vec<(String, String)>,
     pub buffer_candidates: Vec<(BufferId, String)>,
     pub errors: Vec<String>,
@@ -62,6 +63,7 @@ impl MicaEventBatch {
     fn extend(&mut self, mut other: Self) {
         self.effects.append(&mut other.effects);
         self.host_actions.append(&mut other.host_actions);
+        self.native_actions.append(&mut other.native_actions);
         self.command_candidates
             .append(&mut other.command_candidates);
         self.buffer_candidates.append(&mut other.buffer_candidates);
@@ -402,6 +404,7 @@ impl MicaHost {
             return Err(MicaHostError::Closed);
         }
         self.synchronize_context(editor, resource_ids)?;
+        let had_prefix = self.pending_key_prefix.is_some();
         let sequence = self
             .pending_key_prefix
             .as_ref()
@@ -418,7 +421,10 @@ impl MicaHost {
                 ],
             )
             .await?;
-        let result = self.wait_for_task(submitted.task_id).await?;
+        let mut result = self.wait_for_task(submitted.task_id).await?;
+        if had_prefix && result.key == MicaKeyResult::Unbound {
+            result.key = MicaKeyResult::Failed(format!("{sequence} is undefined"));
+        }
         if result.key == MicaKeyResult::Prefix {
             self.pending_key_prefix = Some(sequence);
         } else {
@@ -433,6 +439,30 @@ impl MicaHost {
             self.record_background_event(event, &mut batch);
         }
         batch
+    }
+
+    pub async fn invoke_selector(
+        &mut self,
+        editor: &Editor,
+        resource_ids: &HashMap<BufferId, ResourceId>,
+        selector: &str,
+    ) -> Result<MicaEventBatch, MicaHostError> {
+        if self.closed {
+            return Err(MicaHostError::Closed);
+        }
+        self.synchronize_context(editor, resource_ids)?;
+        let submitted = self
+            .driver
+            .submit_invocation_for_endpoint(
+                self.endpoint,
+                sym(selector),
+                vec![
+                    (sym("actor"), Value::identity(self.actor)),
+                    (sym("session"), Value::identity(self.session)),
+                ],
+            )
+            .await?;
+        Ok(self.wait_for_task(submitted.task_id).await?.events)
     }
 
     pub async fn replace_first_wave(&self, source: String) -> Result<(), MicaHostError> {
@@ -787,6 +817,10 @@ end
                         if let Some(effect) = self.presentation_effect(effect.target, &effect.value)
                         {
                             batch.effects.push(effect);
+                        } else if let Some(action) =
+                            self.native_action(effect.target, &effect.value)
+                        {
+                            batch.native_actions.push(action);
                         } else if let Some(action) = self.host_action(effect.target, &effect.value)
                         {
                             batch.host_actions.push(action);
@@ -851,6 +885,8 @@ end
             DriverEvent::Effect(effect) => {
                 if let Some(effect) = self.presentation_effect(effect.target, &effect.value) {
                     batch.effects.push(effect);
+                } else if let Some(action) = self.native_action(effect.target, &effect.value) {
+                    batch.native_actions.push(action);
                 } else if let Some(action) = self.host_action(effect.target, &effect.value) {
                     batch.host_actions.push(action);
                 } else if let Some(candidate) = self.command_candidate(effect.target, &effect.value)
@@ -908,6 +944,15 @@ end
         })
     }
 
+    fn native_action(&self, target: Identity, value: &Value) -> Option<String> {
+        if target != self.session || map_value(value, "kind")?.as_symbol()? != sym("native_action")
+        {
+            return None;
+        }
+        let action = map_value(value, "action")?.as_symbol()?;
+        Some(action.name()?.to_owned())
+    }
+
     fn host_action(&self, target: Identity, value: &Value) -> Option<String> {
         if target != self.session || map_value(value, "kind")?.as_symbol()? != sym("host_action") {
             return None;
@@ -925,7 +970,7 @@ end
             return None;
         }
         let name = map_value(value, "name")?.with_str(str::to_owned)?;
-        let action = map_value(value, "action")?
+        let action = map_value(value, "selector")?
             .as_symbol()?
             .name()
             .map(str::to_owned)?;

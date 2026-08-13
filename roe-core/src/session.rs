@@ -15,7 +15,7 @@ use crate::editor::{
     BorderInfo, ChromeAction, CommandType, CommandWindowPosition, DragType, MouseDragState,
     SplitDirection, WindowNode, WindowType,
 };
-use crate::keys::{ConfigurableBindings, LogicalKey};
+use crate::keys::{CursorDirection, KeyAction, LogicalKey, NoBindings};
 use crate::mica_host::{
     MicaEventBatch, MicaHost, MicaHostError, MicaKeyResult, normalized_key_sequence,
 };
@@ -352,7 +352,7 @@ impl HostSession {
     /// frontend-conformance tests that deliberately exercise only Rust policy.
     pub fn open_with_mica(editor: Editor, grants: CapabilityGrants) -> Result<Self, MicaHostError> {
         let mut editor = editor;
-        editor.bindings = Box::new(ConfigurableBindings::new_native_fallback());
+        editor.bindings = Box::new(NoBindings);
         let mut session = Self::open(editor, grants);
         session.mica = Some(MicaHost::open(
             &session.editor,
@@ -368,7 +368,7 @@ impl HostSession {
         clock: Arc<dyn NativeClock>,
     ) -> Result<Self, MicaHostError> {
         let mut editor = editor;
-        editor.bindings = Box::new(ConfigurableBindings::new_native_fallback());
+        editor.bindings = Box::new(NoBindings);
         let mut session = Self::open_with_kernel(
             editor,
             Arc::new(Mutex::new(NativeKernel::with_clock(grants, clock))),
@@ -487,7 +487,15 @@ impl HostSession {
                         lifecycle.push(LifecycleEvent::Error(message));
                     }
                     Some(Ok(MicaKeyResult::Unbound)) | None => {
-                        match self.editor.key_event(keys).await {
+                        let direct = match keys.as_slice() {
+                            [LogicalKey::AlphaNumeric(character)] => {
+                                self.editor
+                                    .perform_native_action(KeyAction::AlphaNumeric(*character))
+                                    .await
+                            }
+                            _ => self.editor.key_event(keys).await,
+                        };
+                        match direct {
                             Ok(actions) => {
                                 self.resolve_actions(actions, &mut lifecycle, &mut invalidations)
                                     .await;
@@ -501,7 +509,7 @@ impl HostSession {
                 for character in text.chars() {
                     match self
                         .editor
-                        .key_event(vec![LogicalKey::AlphaNumeric(character)])
+                        .perform_native_action(KeyAction::AlphaNumeric(character))
                         .await
                     {
                         Ok(actions) => {
@@ -747,6 +755,21 @@ impl HostSession {
             self.editor.set_echo_message(message.clone());
             invalidations.push(Invalidation::EchoArea);
             lifecycle.push(LifecycleEvent::Error(message));
+        }
+        for action in events.native_actions {
+            let Some(action) = mica_native_action(&action) else {
+                lifecycle.push(LifecycleEvent::Error(format!(
+                    "unknown Mica native action: {action}"
+                )));
+                continue;
+            };
+            match self.editor.perform_native_action(action).await {
+                Ok(actions) => {
+                    self.resolve_actions(actions, lifecycle, invalidations)
+                        .await
+                }
+                Err(error) => self.fail_endpoint(error, lifecycle),
+            }
         }
         for action in events.host_actions {
             match action.as_str() {
@@ -999,80 +1022,28 @@ impl HostSession {
                     invalidations.push(Invalidation::Full);
                 }
                 ChromeAction::ExecuteCommand(command_name) => {
-                    match self
-                        .mica_palette_actions
-                        .get(&command_name)
-                        .map(String::as_str)
-                    {
-                        Some("quit") => lifecycle.push(LifecycleEvent::QuitRequested),
-                        Some("redraw") => invalidations.push(Invalidation::Full),
-                        Some("split_horizontal") => {
-                            self.editor.split_horizontal();
-                            invalidations.push(Invalidation::Full);
-                        }
-                        Some("split_vertical") => {
-                            self.editor.split_vertical();
-                            invalidations.push(Invalidation::Full);
-                        }
-                        Some("other_window") => {
-                            self.editor.switch_window();
-                            invalidations.push(Invalidation::Full);
-                        }
-                        Some("delete_window") => {
-                            if self.editor.delete_window() {
-                                invalidations.push(Invalidation::Full);
-                            }
-                        }
-                        Some("delete_other_windows") => {
-                            if self.editor.delete_other_windows() {
-                                invalidations.push(Invalidation::Full);
-                            }
-                        }
-                        Some("save_buffer") => pending.extend(
-                            self.editor
-                                .process_chrome_actions(vec![ChromeAction::Save])
-                                .await,
-                        ),
-                        Some("find_file") => pending.extend(
-                            self.editor
-                                .process_chrome_actions(vec![ChromeAction::OpenFile(
-                                    crate::editor::OpenType::New,
-                                )])
-                                .await,
-                        ),
-                        Some("visit_file") => pending.extend(
-                            self.editor
-                                .process_chrome_actions(vec![ChromeAction::OpenFile(
-                                    crate::editor::OpenType::Visit,
-                                )])
-                                .await,
-                        ),
-                        Some("switch_buffer") => pending.extend(
-                            self.editor
-                                .process_chrome_actions(vec![ChromeAction::SwitchBuffer])
-                                .await,
-                        ),
-                        Some("kill_buffer") => pending.extend(
-                            self.editor
-                                .process_chrome_actions(vec![ChromeAction::KillBuffer])
-                                .await,
-                        ),
-                        Some("isearch_forward") => pending.extend(
-                            self.editor
-                                .process_chrome_actions(vec![ChromeAction::ISearchForward])
-                                .await,
-                        ),
-                        Some("isearch_backward") => pending.extend(
-                            self.editor
-                                .process_chrome_actions(vec![ChromeAction::ISearchBackward])
-                                .await,
-                        ),
-                        Some(unknown) => lifecycle.push(LifecycleEvent::Error(format!(
-                            "unsupported Mica command action: {unknown}"
-                        ))),
-                        None => lifecycle.push(LifecycleEvent::Error(format!(
+                    let Some(selector) = self.mica_palette_actions.get(&command_name).cloned()
+                    else {
+                        lifecycle.push(LifecycleEvent::Error(format!(
                             "Mica command is no longer discoverable: {command_name}"
-                        ))),
+                        )));
+                        continue;
+                    };
+                    let Some(mut mica) = self.mica.take() else {
+                        lifecycle.push(LifecycleEvent::Error(
+                            "Mica command selected without a live Mica host".to_owned(),
+                        ));
+                        continue;
+                    };
+                    let invoked = mica
+                        .invoke_selector(&self.editor, &self.buffer_resources, &selector)
+                        .await;
+                    self.mica = Some(mica);
+                    match invoked {
+                        Ok(events) => {
+                            Box::pin(self.apply_mica_events(events, lifecycle, invalidations)).await
+                        }
+                        Err(error) => lifecycle.push(LifecycleEvent::Error(error.to_string())),
                     }
                 }
                 ChromeAction::FileWatcherStatus => {
@@ -1372,6 +1343,55 @@ impl HostSession {
             styles,
             echo_area: self.editor.echo_message.clone(),
         }
+    }
+}
+
+fn mica_native_action(action: &str) -> Option<KeyAction> {
+    let cursor = |direction| Some(KeyAction::Cursor(direction));
+    let select = |direction| Some(KeyAction::CursorSelect(direction));
+    match action {
+        "cursor_left" => cursor(CursorDirection::Left),
+        "cursor_right" => cursor(CursorDirection::Right),
+        "cursor_up" => cursor(CursorDirection::Up),
+        "cursor_down" => cursor(CursorDirection::Down),
+        "cursor_line_start" => cursor(CursorDirection::LineStart),
+        "cursor_line_end" => cursor(CursorDirection::LineEnd),
+        "cursor_buffer_start" => cursor(CursorDirection::BufferStart),
+        "cursor_buffer_end" => cursor(CursorDirection::BufferEnd),
+        "cursor_page_up" => cursor(CursorDirection::PageUp),
+        "cursor_page_down" => cursor(CursorDirection::PageDown),
+        "cursor_word_forward" => cursor(CursorDirection::WordForward),
+        "cursor_word_backward" => cursor(CursorDirection::WordBackward),
+        "cursor_paragraph_forward" => cursor(CursorDirection::ParagraphForward),
+        "cursor_paragraph_backward" => cursor(CursorDirection::ParagraphBackward),
+        "cursor_left_select" => select(CursorDirection::Left),
+        "cursor_right_select" => select(CursorDirection::Right),
+        "cursor_up_select" => select(CursorDirection::Up),
+        "cursor_down_select" => select(CursorDirection::Down),
+        "cursor_line_start_select" => select(CursorDirection::LineStart),
+        "cursor_line_end_select" => select(CursorDirection::LineEnd),
+        "cursor_buffer_start_select" => select(CursorDirection::BufferStart),
+        "cursor_buffer_end_select" => select(CursorDirection::BufferEnd),
+        "cursor_page_up_select" => select(CursorDirection::PageUp),
+        "cursor_page_down_select" => select(CursorDirection::PageDown),
+        "cursor_word_forward_select" => select(CursorDirection::WordForward),
+        "cursor_word_backward_select" => select(CursorDirection::WordBackward),
+        "backspace" => Some(KeyAction::Backspace),
+        "delete" => Some(KeyAction::Delete),
+        "enter" => Some(KeyAction::Enter),
+        "tab" => Some(KeyAction::Tab),
+        "kill_line" => Some(KeyAction::KillLine(false)),
+        "kill_region" => Some(KeyAction::KillRegion(true)),
+        "copy_region" => Some(KeyAction::KillRegion(false)),
+        "yank" => Some(KeyAction::Yank(None)),
+        "kill_word" => Some(KeyAction::DeleteWord),
+        "backward_kill_word" => Some(KeyAction::BackspaceWord),
+        "set_mark" => Some(KeyAction::MarkStart),
+        "cancel" => Some(KeyAction::Cancel),
+        "escape" => Some(KeyAction::Escape),
+        "undo" => Some(KeyAction::Undo),
+        "redo" => Some(KeyAction::Redo),
+        _ => None,
     }
 }
 
@@ -1875,6 +1895,40 @@ mod tests {
             let control =
                 LogicalKey::Modifier(crate::keys::KeyModifier::Control(crate::keys::Side::Left));
 
+            session
+                .dispatch(session.envelope(InputEvent::Text("Z".to_owned())))
+                .await
+                .unwrap();
+            session
+                .dispatch(session.envelope(InputEvent::Keys(vec![
+                    control,
+                    LogicalKey::AlphaNumeric('x'),
+                ])))
+                .await
+                .unwrap();
+            let undone = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::AlphaNumeric('u')])))
+                .await
+                .unwrap();
+            assert_eq!(snapshot(&undone).views[0].visible_text, "hello");
+
+            session
+                .dispatch(session.envelope(InputEvent::Keys(vec![
+                    control,
+                    LogicalKey::AlphaNumeric('x'),
+                ])))
+                .await
+                .unwrap();
+            let unknown = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::AlphaNumeric('z')])))
+                .await
+                .unwrap();
+            assert_eq!(snapshot(&unknown).views[0].visible_text, "hello");
+            assert!(unknown.lifecycle.iter().any(|event| matches!(
+                event,
+                LifecycleEvent::Error(message) if message.contains("C-x z is undefined")
+            )));
+
             let prefix = session
                 .dispatch(session.envelope(InputEvent::Keys(vec![
                     control,
@@ -1970,6 +2024,33 @@ mod tests {
                 session
                     .mica_palette_actions
                     .contains_key("split-window-horizontally")
+            );
+            assert!(
+                session
+                    .mica_palette_actions
+                    .contains_key("insert-current-time")
+            );
+
+            session
+                .dispatch(session.envelope(InputEvent::Text("insert-current-time".to_owned())))
+                .await
+                .unwrap();
+            let inserted = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Enter])))
+                .await
+                .unwrap();
+            assert_eq!(snapshot(&inserted).views[0].visible_text, "hello42\n");
+
+            let palette = session
+                .dispatch(
+                    session.envelope(InputEvent::Keys(vec![meta, LogicalKey::AlphaNumeric('x')])),
+                )
+                .await
+                .unwrap();
+            assert!(
+                snapshot(&palette)
+                    .echo_area
+                    .contains("Mica command selection")
             );
 
             session

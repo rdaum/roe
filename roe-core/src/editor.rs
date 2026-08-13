@@ -245,6 +245,14 @@ pub struct Editor {
 /// in the active window.
 impl Editor {}
 
+struct SingleActionBinding(KeyAction);
+
+impl Bindings for SingleActionBinding {
+    fn keystroke(&self, _keys: Vec<LogicalKey>) -> KeyAction {
+        self.0.clone()
+    }
+}
+
 /// Operations that can be performed on a buffer by scripted commands
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum BufferOperation {
@@ -332,6 +340,19 @@ pub enum ChromeAction {
 }
 
 impl Editor {
+    /// Realize an action selected by Mica's keymap. The temporary binding is a
+    /// mechanism adapter only; it does not assign any platform key meaning.
+    pub async fn perform_native_action(
+        &mut self,
+        action: KeyAction,
+    ) -> Result<Vec<ChromeAction>, std::io::Error> {
+        self.key_state.take();
+        let previous = std::mem::replace(&mut self.bindings, Box::new(SingleActionBinding(action)));
+        let result = self.key_event(vec![LogicalKey::Unmapped]).await;
+        self.bindings = previous;
+        result
+    }
+
     fn with_clipboard_error(
         mut actions: Vec<ChromeAction>,
         error: Option<ClipboardError>,

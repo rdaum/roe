@@ -41,6 +41,7 @@ make_relation(:roe/Keymap, 1)
 make_relation(:roe/KeymapParent, 2)
 make_relation(:roe/KeyBinding, 4)
 make_relation(:roe/KeyPrefix, 1)
+make_relation(:roe/NativeBinding, 3)
 make_relation(:roe/MajorMode, 1)
 make_relation(:roe/MinorMode, 1)
 make_relation(:roe/ModeKeymap, 3)
@@ -84,6 +85,9 @@ make_relation(:roe/ViewSelection, 3, :volatile)
 make_relation(:roe/SessionKeymap, 3, :volatile)
 make_relation(:roe/NextView, 2, :volatile)
 make_relation(:roe/ActorRole, 2, :volatile)
+make_functional_relation(:roe/PromptState, 6, [0], :volatile)
+make_functional_relation(:roe/PromptLast, 3, [0, 1], :volatile)
+make_relation(:roe/FileCandidate, 3, :volatile)
 
 // Ephemeral host associations and native-cached observations. The host owns
 // their invalidation and never persists them in a named unit or durable store.
@@ -301,6 +305,10 @@ assert RoleCanRead(#roe/editor_role, :roe/CanRequestService)
 assert RoleCanRead(#roe/editor_role, :roe/EffectiveSessionKeymap)
 assert RoleCanRead(#roe/editor_role, :roe/EffectiveBinding)
 assert RoleCanRead(#roe/editor_role, :roe/KeyPrefix)
+assert RoleCanRead(#roe/editor_role, :roe/NativeBinding)
+assert RoleCanRead(#roe/editor_role, :roe/PromptState)
+assert RoleCanRead(#roe/editor_role, :roe/PromptLast)
+assert RoleCanRead(#roe/editor_role, :roe/FileCandidate)
 assert RoleCanRead(#roe/editor_role, :roe/CommandSelector)
 assert RoleCanRead(#roe/editor_role, :roe/CommandName)
 assert RoleCanRead(#roe/editor_role, :roe/CommandHostAction)
@@ -317,6 +325,9 @@ assert RoleCanRead(#roe/editor_role, :roe/EffectiveSyntaxRule)
 assert RoleCanRead(#roe/editor_role, :roe/EffectiveConfiguration)
 assert RoleCanWrite(#roe/editor_role, :roe/ActiveView)
 assert RoleCanWrite(#roe/editor_role, :roe/ViewCursor)
+assert RoleCanWrite(#roe/editor_role, :roe/PromptState)
+assert RoleCanWrite(#roe/editor_role, :roe/PromptLast)
+assert RoleCanWrite(#roe/editor_role, :roe/FileCandidate)
 assert RoleCanInvoke(#roe/editor_role, :roe/dispatch_key)
 assert RoleCanInvoke(#roe/editor_role, :roe/other_window)
 assert RoleCanInvoke(#roe/editor_role, :roe/acquire_argument)
@@ -352,6 +363,11 @@ verb roe/other_window(actor, session)
 end
 
 verb roe/dispatch_key(actor, session, sequence @ #string)
+  let native = one roe/NativeBinding(sequence, ?action, ?precedence)
+  if native != nothing
+    emit(session, {:kind -> :native_action, :action -> native[:action]})
+    return :handled
+  end
   let selected = nothing
   let selected_precedence = -2147483648
   let ambiguous = false

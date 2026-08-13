@@ -19,6 +19,16 @@ pub trait Bindings {
     fn keystroke(&self, keys: Vec<LogicalKey>) -> KeyAction;
 }
 
+/// Empty mechanism adapter used by Mica-owned production sessions. Platform
+/// key meaning is resolved by Mica before the editor sees an action.
+pub struct NoBindings;
+
+impl Bindings for NoBindings {
+    fn keystroke(&self, _keys: Vec<LogicalKey>) -> KeyAction {
+        KeyAction::Unbound
+    }
+}
+
 /// An enumeration of our logical actions caused by keystrokes.
 /// Direct text manipulation and meta-actions stay as KeyActions.
 /// Complex UI/system actions become commands.
@@ -267,31 +277,6 @@ impl ConfigurableBindings {
             bindings: std::collections::HashMap::new(),
         };
         bindings.register_default_bindings();
-        bindings
-    }
-
-    /// Direct editing bindings retained while Mica owns global command and
-    /// keymap policy. No named command or global redraw binding survives.
-    pub fn new_native_fallback() -> Self {
-        let mut bindings = Self::new();
-        bindings.bindings.retain(|_, action| {
-            !matches!(
-                action,
-                KeyAction::Command(_)
-                    | KeyAction::CommandMode
-                    | KeyAction::Save
-                    | KeyAction::Quit
-                    | KeyAction::FindFile
-                    | KeyAction::SplitHorizontal
-                    | KeyAction::SplitVertical
-                    | KeyAction::SwitchWindow
-                    | KeyAction::DeleteWindow
-                    | KeyAction::DeleteOtherWindows
-                    | KeyAction::SwitchBuffer
-                    | KeyAction::KillBuffer
-                    | KeyAction::Redraw
-            )
-        });
         bindings
     }
 
