@@ -87,6 +87,8 @@ pub enum MicaHostError {
     MissingIdentity,
     #[error("Mica session host is already closed")]
     Closed,
+    #[error("Mica editor policy rejected the operation: {0}")]
+    Policy(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,12 +121,19 @@ pub struct MicaPromptUpdate {
     pub candidates: Vec<(String, MicaPromptTarget)>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MicaHostAction {
     pub name: String,
     pub buffer: Option<BufferId>,
     pub view: Option<WindowId>,
     pub path: Option<String>,
+    pub position: Option<usize>,
+    pub anchor: Option<usize>,
+    pub phase: Option<String>,
+    pub line: Option<u16>,
+    pub column: Option<u16>,
+    pub split_path: Option<Vec<usize>>,
+    pub ratio: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -647,6 +656,97 @@ impl MicaHost {
             self.pending_key_prefix = None;
         }
         Ok(result)
+    }
+
+    pub async fn dispatch_pointer(
+        &mut self,
+        editor: &Editor,
+        resource_ids: &HashMap<BufferId, ResourceId>,
+        view: WindowId,
+        position: usize,
+        phase: &str,
+        button: &str,
+    ) -> Result<MicaEventBatch, MicaHostError> {
+        self.synchronize_context(editor, resource_ids)?;
+        let view = *self
+            .view_ids
+            .get(&view)
+            .ok_or(MicaHostError::MissingIdentity)?;
+        self.invoke_editor_verb(
+            "roe/pointer_event",
+            vec![
+                (sym("view"), Value::identity(view)),
+                (sym("position"), int_value(position)),
+                (sym("phase"), Value::symbol(sym(phase))),
+                (sym("button"), Value::symbol(sym(button))),
+            ],
+        )
+        .await
+    }
+
+    pub async fn set_view_scroll(
+        &mut self,
+        editor: &Editor,
+        resource_ids: &HashMap<BufferId, ResourceId>,
+        view: WindowId,
+        line: u16,
+        column: u16,
+    ) -> Result<MicaEventBatch, MicaHostError> {
+        self.synchronize_context(editor, resource_ids)?;
+        let view = *self
+            .view_ids
+            .get(&view)
+            .ok_or(MicaHostError::MissingIdentity)?;
+        self.invoke_editor_verb(
+            "roe/set_view_scroll",
+            vec![
+                (sym("view"), Value::identity(view)),
+                (sym("line"), int_value(line as usize)),
+                (sym("column"), int_value(column as usize)),
+            ],
+        )
+        .await
+    }
+
+    pub async fn set_split_ratio(
+        &mut self,
+        editor: &Editor,
+        resource_ids: &HashMap<BufferId, ResourceId>,
+        path: &[usize],
+        ratio: f32,
+    ) -> Result<MicaEventBatch, MicaHostError> {
+        self.synchronize_context(editor, resource_ids)?;
+        let node = *self
+            .layout_nodes
+            .get(path)
+            .ok_or(MicaHostError::MissingIdentity)?;
+        let ratio = Value::float(ratio).map_err(|_| MicaHostError::MissingIdentity)?;
+        self.invoke_editor_verb(
+            "roe/set_split_ratio",
+            vec![(sym("node"), Value::identity(node)), (sym("ratio"), ratio)],
+        )
+        .await
+    }
+
+    async fn invoke_editor_verb(
+        &mut self,
+        selector: &str,
+        mut arguments: Vec<(Symbol, Value)>,
+    ) -> Result<MicaEventBatch, MicaHostError> {
+        if self.closed {
+            return Err(MicaHostError::Closed);
+        }
+        arguments.push((sym("actor"), Value::identity(self.actor)));
+        arguments.push((sym("session"), Value::identity(self.session)));
+        let submitted = self
+            .driver
+            .submit_invocation_for_endpoint(self.endpoint, sym(selector), arguments)
+            .await?;
+        let result = self.wait_for_task(submitted.task_id).await?;
+        match result.key {
+            MicaKeyResult::Failed(message) => Err(MicaHostError::Policy(message)),
+            _ => Ok(result.events),
+        }
     }
 
     pub fn drain_background_events(&mut self) -> MicaEventBatch {
@@ -1347,11 +1447,41 @@ end
                     .iter()
                     .find_map(|(view, identity)| (*identity == logical).then_some(*view))
             });
+        let position = map_value(value, "position")
+            .and_then(|value| value.as_int())
+            .and_then(|value| usize::try_from(value).ok());
+        let anchor = map_value(value, "anchor")
+            .and_then(|value| value.as_int())
+            .and_then(|value| usize::try_from(value).ok());
+        let phase = map_value(value, "phase")
+            .and_then(|value| value.as_symbol())
+            .and_then(|value| value.name().map(str::to_owned));
+        let line = map_value(value, "line")
+            .and_then(|value| value.as_int())
+            .and_then(|value| u16::try_from(value).ok());
+        let column = map_value(value, "column")
+            .and_then(|value| value.as_int())
+            .and_then(|value| u16::try_from(value).ok());
+        let split_path = map_value(value, "node")
+            .and_then(|value| value.as_identity())
+            .and_then(|node| {
+                self.layout_nodes
+                    .iter()
+                    .find_map(|(path, identity)| (*identity == node).then_some(path.clone()))
+            });
+        let ratio = map_value(value, "ratio").and_then(|value| value.as_float());
         Some(MicaHostAction {
             name,
             buffer,
             view,
             path,
+            position,
+            anchor,
+            phase,
+            line,
+            column,
+            split_path,
+            ratio,
         })
     }
 

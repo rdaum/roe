@@ -479,44 +479,81 @@ impl Editor {
         ]
     }
 
-    pub async fn open_mica_file(
+    pub fn open_mica_file(
         &mut self,
         path: std::path::PathBuf,
         open_type: OpenType,
+        content: Option<String>,
     ) -> Vec<ChromeAction> {
-        self.handle_open_file_action(path, open_type).await
-    }
-
-    pub async fn save_active_buffer(&mut self) -> Vec<ChromeAction> {
-        use compio::buf::BufResult;
-        use compio::io::AsyncWriteAtExt;
-
-        let buffer_id = self.windows[self.active_window].active_buffer;
-        let Some(buffer) = self.buffers.get(buffer_id).cloned() else {
-            return vec![ChromeAction::Echo("No active buffer".to_owned())];
-        };
-        let path = buffer.object();
-        let content = buffer.content();
-        let result: std::io::Result<()> = async {
-            let mut file = compio::fs::File::create(&path).await?;
-            let BufResult(result, _) = file.write_all_at(content.clone().into_bytes(), 0).await;
-            result
+        let mut actions = Vec::new();
+        if let Some(command_window_id) = self.find_command_window() {
+            self.close_command_window(command_window_id);
+            actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
         }
-        .await;
-        if let Err(error) = result {
-            return vec![ChromeAction::Echo(format!("Error saving {path}: {error}"))];
-        }
-        let watch_error = self
-            .file_watcher
-            .watch_file(buffer_id, std::path::Path::new(&path), content)
-            .err();
-        let mut actions = vec![ChromeAction::Echo(format!("Saved: {path}"))];
-        if let Some(error) = watch_error {
-            actions.push(ChromeAction::Echo(format!(
-                "Saved {path}, but failed to watch it: {error}"
-            )));
+        let window = self
+            .previous_active_window
+            .filter(|window_id| self.windows.contains_key(*window_id))
+            .unwrap_or(self.active_window);
+        let replaced = (open_type == OpenType::Visit)
+            .then(|| self.windows[window].active_buffer)
+            .filter(|buffer| !self.is_command_buffer(*buffer));
+        let existed = content.is_some();
+        match self.open_file_content_in_window(path.clone(), window, content) {
+            Ok(message) => {
+                let opened = self.windows[window].active_buffer;
+                let watch_error = if existed {
+                    self.file_watcher
+                        .watch_file(opened, &path, self.buffers[opened].content())
+                        .err()
+                        .map(|error| {
+                            format!("Opened {}, but failed to watch it: {error}", path.display())
+                        })
+                } else {
+                    None
+                };
+                let unwatch_error = if let Some(replaced) = replaced
+                    && !self
+                        .windows
+                        .values()
+                        .any(|candidate| candidate.active_buffer == replaced)
+                {
+                    let error = self.file_watcher.unwatch_file(replaced).err();
+                    self.buffers.remove(replaced);
+                    error.map(|error| {
+                        format!("Replaced buffer, but failed to stop watching it: {error}")
+                    })
+                } else {
+                    None
+                };
+                actions.push(ChromeAction::Echo(message));
+                actions.extend(watch_error.into_iter().map(ChromeAction::Echo));
+                actions.extend(unwatch_error.into_iter().map(ChromeAction::Echo));
+                actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
+            }
+            Err(error) => actions.push(ChromeAction::Echo(format!("Error opening file: {error}"))),
         }
         actions
+    }
+
+    fn open_file_content_in_window(
+        &mut self,
+        path: std::path::PathBuf,
+        window: WindowId,
+        content: Option<String>,
+    ) -> Result<String, String> {
+        if !self.windows.contains_key(window) {
+            return Err("Window no longer exists".to_owned());
+        }
+        let buffer = Buffer::new();
+        buffer.set_object(path.to_string_lossy().to_string());
+        if let Some(content) = content {
+            buffer.load_str(&content);
+            buffer.set_show_gutter(true);
+        }
+        let buffer_id = self.buffers.insert(buffer);
+        self.windows[window].active_buffer = buffer_id;
+        self.windows[window].cursor = 0;
+        Ok(format!("Opened: {}", path.display()))
     }
 
     fn with_clipboard_error(
@@ -1728,6 +1765,7 @@ impl Editor {
         self.insert_text(text, position)
     }
 
+    #[cfg(test)]
     async fn handle_open_file_action(
         &mut self,
         path: std::path::PathBuf,
@@ -1789,6 +1827,7 @@ impl Editor {
     }
 
     /// Open a file in the specified window
+    #[cfg(test)]
     async fn open_file_in_window(
         &mut self,
         file_path: std::path::PathBuf,
@@ -1812,21 +1851,7 @@ impl Editor {
             }
         };
 
-        // Major mode selection based on file extension will be re-added when
-        // Mica owns command policy; this remains a native file-open mechanism.
-
-        let buffer_id = self.buffers.insert(buffer);
-
-        // Switch the window to the new buffer
-        if let Some(window) = self.windows.get_mut(window_id) {
-            window.active_buffer = buffer_id;
-            window.cursor = 0; // Reset cursor to start of buffer
-
-            Ok(format!("Opened: {}", file_path.display()))
-        } else {
-            self.buffers.remove(buffer_id);
-            Err("Window no longer exists".to_string())
-        }
+        self.open_file_content_in_window(file_path, window_id, Some(buffer.content()))
     }
 
     /// Create a CommandContext from the current editor state

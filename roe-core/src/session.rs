@@ -21,8 +21,8 @@ use crate::mica_host::{
     normalized_key_sequence,
 };
 use crate::native_kernel::{
-    Capability, CapabilityGrants, KernelError, NativeClock, NativeKernel, NativeOperation,
-    NativeResult, ResourceId, TextSelection, ViewId,
+    Capability, CapabilityGrants, KernelError, LayoutNode, LogicalLayout, NativeClock,
+    NativeKernel, NativeOperation, NativeResult, ResourceId, SplitAxis, TextSelection, ViewId,
 };
 use crate::{BufferId, Editor, WindowId};
 use serde::{Deserialize, Serialize};
@@ -317,6 +317,7 @@ pub struct HostSession {
     view_ids: HashMap<WindowId, ViewId>,
     next_view_id: u64,
     pointer_selection: Option<(WindowId, usize)>,
+    pending_pointer_drag: Option<(BorderInfo, WindowId, (u16, u16))>,
     mica: Option<MicaHost>,
     mica_modes: HashMap<BufferId, String>,
     mica_faces: HashMap<String, HashMap<String, String>>,
@@ -343,6 +344,7 @@ impl HostSession {
             view_ids: HashMap::new(),
             next_view_id: 1,
             pointer_selection: None,
+            pending_pointer_drag: None,
             mica: None,
             mica_modes: HashMap::new(),
             mica_faces: HashMap::new(),
@@ -603,8 +605,8 @@ impl HostSession {
                 }
             }
             InputEvent::Pointer(pointer) => {
-                self.apply_pointer(pointer);
-                invalidations.push(Invalidation::Full);
+                self.apply_pointer(pointer, &mut lifecycle, &mut invalidations)
+                    .await;
             }
             InputEvent::SetViewScroll {
                 view,
@@ -629,14 +631,33 @@ impl HostSession {
                         .max()
                         .unwrap_or(0)
                         .min(u16::MAX as usize) as u16;
-                    let window = &mut self.editor.windows[window_id];
-                    if let Some(line) = start_line {
-                        window.start_line = line.min(max_line);
+                    let window = &self.editor.windows[window_id];
+                    let line = start_line.unwrap_or(window.start_line).min(max_line);
+                    let column = start_column.unwrap_or(window.start_column).min(max_column);
+                    if let Some(mut mica) = self.mica.take() {
+                        let result = mica
+                            .set_view_scroll(
+                                &self.editor,
+                                &self.buffer_resources,
+                                window_id,
+                                line,
+                                column,
+                            )
+                            .await;
+                        self.mica = Some(mica);
+                        match result {
+                            Ok(events) => {
+                                self.apply_mica_events(events, &mut lifecycle, &mut invalidations)
+                                    .await;
+                            }
+                            Err(error) => lifecycle.push(LifecycleEvent::Error(error.to_string())),
+                        }
+                    } else {
+                        let window = &mut self.editor.windows[window_id];
+                        window.start_line = line;
+                        window.start_column = column;
+                        invalidations.push(Invalidation::View(view));
                     }
-                    if let Some(column) = start_column {
-                        window.start_column = column.min(max_column);
-                    }
-                    invalidations.push(Invalidation::View(view));
                 } else {
                     lifecycle.push(LifecycleEvent::Warning(format!(
                         "view {} is no longer live",
@@ -990,6 +1011,40 @@ impl HostSession {
             lifecycle.push(LifecycleEvent::Error(message));
         }
         for action in events.native_actions {
+            let mut denied = false;
+            for capability in mica_native_capabilities(&action.name) {
+                if let Err(error) = self.kernel.lock().unwrap().authorize(*capability) {
+                    lifecycle.push(LifecycleEvent::Error(format!(
+                        "Mica native action {} was denied: {error}",
+                        action.name
+                    )));
+                    denied = true;
+                    break;
+                }
+            }
+            if denied {
+                continue;
+            }
+            if action.name == "yank" {
+                match self
+                    .kernel
+                    .lock()
+                    .unwrap()
+                    .execute(NativeOperation::ReadClipboard)
+                {
+                    Ok(NativeResult::ClipboardContents(text)) => {
+                        self.editor.kill_ring.import_external_text(text);
+                    }
+                    Ok(other) => lifecycle.push(LifecycleEvent::Error(format!(
+                        "clipboard read returned an unexpected native result: {other:?}"
+                    ))),
+                    Err(error) => {
+                        lifecycle.push(LifecycleEvent::Warning(format!(
+                            "clipboard read failed before yank; using the internal kill ring: {error}"
+                        )));
+                    }
+                }
+            }
             if action.name == "insert_text" {
                 let actions = self.editor.insert_text(
                     action.text.unwrap_or_default(),
@@ -1000,9 +1055,11 @@ impl HostSession {
                 continue;
             }
             if matches!(action.name.as_str(), "kill_word" | "backward_kill_word") {
+                let action_name = action.name.clone();
                 let actions = self.mica_kill_word(action.name == "kill_word");
                 self.resolve_actions(actions, lifecycle, invalidations)
                     .await;
+                self.write_kill_ring_to_native(&action_name, lifecycle);
                 continue;
             }
             let action_name = action.name.clone();
@@ -1015,7 +1072,8 @@ impl HostSession {
             match self.editor.perform_native_action(action).await {
                 Ok(actions) => {
                     self.resolve_actions(actions, lifecycle, invalidations)
-                        .await
+                        .await;
+                    self.write_kill_ring_to_native(&action_name, lifecycle);
                 }
                 Err(error) => self.fail_endpoint(error, lifecycle),
             }
@@ -1025,6 +1083,12 @@ impl HostSession {
                 "quit" => lifecycle.push(LifecycleEvent::QuitRequested),
                 "redraw" => invalidations.push(Invalidation::Full),
                 "split_horizontal" => {
+                    if let Err(error) = self.kernel.lock().unwrap().authorize(Capability::Layout) {
+                        lifecycle.push(LifecycleEvent::Error(format!(
+                            "Mica horizontal split was denied: {error}"
+                        )));
+                        continue;
+                    }
                     if let Some(view) = action.view {
                         self.editor.active_window = view;
                     }
@@ -1032,6 +1096,12 @@ impl HostSession {
                     invalidations.push(Invalidation::Full);
                 }
                 "split_vertical" => {
+                    if let Err(error) = self.kernel.lock().unwrap().authorize(Capability::Layout) {
+                        lifecycle.push(LifecycleEvent::Error(format!(
+                            "Mica vertical split was denied: {error}"
+                        )));
+                        continue;
+                    }
                     if let Some(view) = action.view {
                         self.editor.active_window = view;
                     }
@@ -1049,6 +1119,12 @@ impl HostSession {
                     invalidations.push(Invalidation::Full);
                 }
                 "delete_window" => {
+                    if let Err(error) = self.kernel.lock().unwrap().authorize(Capability::Layout) {
+                        lifecycle.push(LifecycleEvent::Error(format!(
+                            "Mica window deletion was denied: {error}"
+                        )));
+                        continue;
+                    }
                     if let Some(view) = action.view {
                         self.editor.active_window = view;
                     }
@@ -1057,11 +1133,105 @@ impl HostSession {
                     }
                 }
                 "delete_other_windows" => {
+                    if let Err(error) = self.kernel.lock().unwrap().authorize(Capability::Layout) {
+                        lifecycle.push(LifecycleEvent::Error(format!(
+                            "Mica window collapse was denied: {error}"
+                        )));
+                        continue;
+                    }
                     if let Some(view) = action.view {
                         self.editor.active_window = view;
                     }
                     if self.editor.delete_other_windows() {
                         invalidations.push(Invalidation::Full);
+                    }
+                }
+                "begin_layout_drag" => match (action.view, self.pending_pointer_drag.take()) {
+                    (Some(view), Some((border, target, position))) if view == target => {
+                        self.editor.mouse_drag_state = Some(MouseDragState {
+                            drag_type: DragType::WindowBorder,
+                            start_pos: position,
+                            last_pos: position,
+                            current_pos: position,
+                            target_window: Some(target),
+                            border_info: Some(border),
+                        });
+                        self.pointer_selection = None;
+                    }
+                    _ => lifecycle.push(LifecycleEvent::Error(
+                        "Mica layout-drag decision lost its native border target".to_owned(),
+                    )),
+                },
+                "pointer_selection" => match action.phase.as_deref() {
+                    Some("down") => {
+                        if let (Some(view), Some(position), Some(anchor)) =
+                            (action.view, action.position, action.anchor)
+                        {
+                            if self.editor.active_window != view {
+                                self.editor.previous_active_window =
+                                    Some(self.editor.active_window);
+                                self.editor.active_window = view;
+                            }
+                            let buffer = self.editor.windows[view].active_buffer;
+                            self.editor.buffers[buffer].clear_mark();
+                            self.editor.windows[view].cursor = position;
+                            self.pointer_selection = Some((view, anchor));
+                            invalidations.push(Invalidation::Full);
+                        }
+                    }
+                    Some("move") => {
+                        if let (Some(view), Some(position), Some(anchor)) =
+                            (action.view, action.position, action.anchor)
+                        {
+                            let buffer = self.editor.windows[view].active_buffer;
+                            self.editor.buffers[buffer].set_mark(anchor);
+                            self.editor.windows[view].cursor = position;
+                            invalidations.push(Invalidation::Full);
+                        }
+                    }
+                    Some("up") => {
+                        self.editor.mouse_drag_state = None;
+                        self.pointer_selection = None;
+                        self.pending_pointer_drag = None;
+                    }
+                    _ => lifecycle.push(LifecycleEvent::Error(
+                        "Mica pointer decision had an unknown phase".to_owned(),
+                    )),
+                },
+                "set_view_scroll" => {
+                    if let (Some(view), Some(line), Some(column)) =
+                        (action.view, action.line, action.column)
+                    {
+                        let window = &mut self.editor.windows[view];
+                        window.start_line = line;
+                        window.start_column = column;
+                        if let Some(id) = self.view_ids.get(&view).copied() {
+                            invalidations.push(Invalidation::View(id));
+                        }
+                    }
+                }
+                "set_split_ratio" => {
+                    if let (Some(path), Some(ratio)) = (action.split_path, action.ratio) {
+                        let mut proposed = self.editor.window_tree.clone();
+                        if set_ratio_at_path(&mut proposed, &path, ratio) {
+                            let layout = logical_layout(&proposed, &self.editor, &self.view_ids);
+                            match layout.and_then(|layout| {
+                                self.kernel
+                                    .lock()
+                                    .unwrap()
+                                    .execute(NativeOperation::ValidateLayout { layout })
+                                    .map_err(|error| error.to_string())
+                            }) {
+                                Ok(_) => {
+                                    self.editor.window_tree = proposed;
+                                    self.editor.calculate_window_layout();
+                                    invalidations.push(Invalidation::Full);
+                                }
+                                Err(error) => lifecycle.push(LifecycleEvent::Error(format!(
+                                    "Mica split-ratio decision failed native validation: {error}"
+                                ))),
+                            }
+                        }
                     }
                 }
                 "invalidate_syntax" => {
@@ -1101,12 +1271,42 @@ impl HostSession {
                 }
                 "find_file_selected" | "visit_file_selected" => {
                     if let Some(path) = action.path {
+                        let path = std::path::PathBuf::from(path);
                         let open_type = if action.name == "find_file_selected" {
                             crate::editor::OpenType::New
                         } else {
                             crate::editor::OpenType::Visit
                         };
-                        let actions = self.editor.open_mica_file(path.into(), open_type).await;
+                        let content = match self
+                            .kernel
+                            .lock()
+                            .unwrap()
+                            .execute(NativeOperation::ReadFile { path: path.clone() })
+                        {
+                            Ok(NativeResult::FileContents(content)) => Some(content),
+                            Err(KernelError::Io(error))
+                                if error.kind() == std::io::ErrorKind::NotFound =>
+                            {
+                                None
+                            }
+                            Ok(other) => {
+                                lifecycle.push(LifecycleEvent::Error(format!(
+                                    "file read returned an unexpected native result: {other:?}"
+                                )));
+                                continue;
+                            }
+                            Err(error) => {
+                                let message = format!(
+                                    "failed to open {} through the native kernel: {error}",
+                                    path.display()
+                                );
+                                lifecycle.push(LifecycleEvent::Error(message.clone()));
+                                self.editor.set_echo_message(message);
+                                invalidations.push(Invalidation::EchoArea);
+                                continue;
+                            }
+                        };
+                        let actions = self.editor.open_mica_file(path, open_type, content);
                         self.resolve_actions(actions, lifecycle, invalidations)
                             .await;
                     } else {
@@ -1183,6 +1383,33 @@ impl HostSession {
             .kill_text(&crate::editor::ActionPosition::Cursor, count)
     }
 
+    fn write_kill_ring_to_native(
+        &mut self,
+        action_name: &str,
+        lifecycle: &mut Vec<LifecycleEvent>,
+    ) {
+        if !mica_action_writes_clipboard(action_name) {
+            return;
+        }
+        let Some(text) = self.editor.kill_ring.current().map(str::to_owned) else {
+            return;
+        };
+        match self
+            .kernel
+            .lock()
+            .unwrap()
+            .execute(NativeOperation::WriteClipboard { contents: text })
+        {
+            Ok(NativeResult::ClipboardWritten) => {}
+            Ok(other) => lifecycle.push(LifecycleEvent::Error(format!(
+                "clipboard write returned an unexpected native result: {other:?}"
+            ))),
+            Err(error) => lifecycle.push(LifecycleEvent::Error(format!(
+                "clipboard write failed after {action_name}: {error}"
+            ))),
+        }
+    }
+
     fn validate_envelope(&self, envelope: &InputEnvelope) -> Result<(), SessionError> {
         if self.closed {
             return Err(SessionError::Closed);
@@ -1246,7 +1473,7 @@ impl HostSession {
     async fn resolve_actions(
         &mut self,
         actions: Vec<ChromeAction>,
-        _lifecycle: &mut Vec<LifecycleEvent>,
+        lifecycle: &mut Vec<LifecycleEvent>,
         invalidations: &mut Vec<Invalidation>,
     ) {
         let mut pending: VecDeque<_> = actions.into();
@@ -1258,11 +1485,57 @@ impl HostSession {
                 }
                 ChromeAction::MarkDirty(_) => invalidations.push(Invalidation::Full),
                 ChromeAction::Save => {
-                    pending.extend(self.editor.save_active_buffer().await);
+                    pending.extend(self.save_active_buffer_via_kernel(lifecycle));
                 }
                 ChromeAction::CursorMove(_) | ChromeAction::BufferChanged { .. } => {}
             }
         }
+    }
+
+    fn save_active_buffer_via_kernel(
+        &mut self,
+        lifecycle: &mut Vec<LifecycleEvent>,
+    ) -> Vec<ChromeAction> {
+        let window = self.editor.active_window;
+        let buffer_id = self.editor.windows[window].active_buffer;
+        let Some(buffer) = self.editor.buffers.get(buffer_id).cloned() else {
+            return vec![ChromeAction::Echo("No active buffer".to_owned())];
+        };
+        let path = std::path::PathBuf::from(buffer.object());
+        let content = buffer.content();
+        match self
+            .kernel
+            .lock()
+            .unwrap()
+            .execute(NativeOperation::WriteFile {
+                path: path.clone(),
+                contents: content.clone(),
+            }) {
+            Ok(NativeResult::FileWritten) => {}
+            Ok(other) => {
+                let message = format!("save returned an unexpected native result: {other:?}");
+                lifecycle.push(LifecycleEvent::Error(message.clone()));
+                return vec![ChromeAction::Echo(message)];
+            }
+            Err(error) => {
+                let message = format!("failed to save {}: {error}", path.display());
+                lifecycle.push(LifecycleEvent::Error(message.clone()));
+                return vec![ChromeAction::Echo(message)];
+            }
+        }
+        let watch_error = self
+            .editor
+            .file_watcher
+            .watch_file(buffer_id, &path, content)
+            .err();
+        let mut actions = vec![ChromeAction::Echo(format!("Saved: {}", path.display()))];
+        if let Some(error) = watch_error {
+            actions.push(ChromeAction::Echo(format!(
+                "Saved {}, but failed to watch it: {error}",
+                path.display()
+            )));
+        }
+        actions
     }
 
     fn fail_endpoint(&mut self, error: std::io::Error, lifecycle: &mut Vec<LifecycleEvent>) {
@@ -1283,7 +1556,165 @@ impl HostSession {
         lifecycle.push(LifecycleEvent::EndpointClosed);
     }
 
-    fn apply_pointer(&mut self, pointer: PointerEvent) {
+    async fn apply_pointer(
+        &mut self,
+        pointer: PointerEvent,
+        lifecycle: &mut Vec<LifecycleEvent>,
+        invalidations: &mut Vec<Invalidation>,
+    ) {
+        if self.mica.is_none() {
+            self.apply_pointer_without_policy(pointer);
+            invalidations.push(Invalidation::Full);
+            return;
+        }
+
+        let button = pointer_button_name(pointer.button);
+        if pointer.kind == PointerKind::Up {
+            let window = self
+                .pointer_selection
+                .map(|(window, _)| window)
+                .or_else(|| {
+                    self.editor
+                        .mouse_drag_state
+                        .as_ref()
+                        .and_then(|drag| drag.target_window)
+                })
+                .unwrap_or(self.editor.active_window);
+            let position = self.editor.windows[window].cursor;
+            self.dispatch_mica_pointer(window, position, "up", button, lifecycle, invalidations)
+                .await;
+            return;
+        }
+
+        if pointer.kind == PointerKind::Move {
+            if let Some(drag_state) = self.editor.mouse_drag_state.clone() {
+                let position = (pointer.column, pointer.row);
+                let dx = i32::from(position.0) - i32::from(drag_state.last_pos.0);
+                let dy = i32::from(position.1) - i32::from(drag_state.last_pos.1);
+                if let Some(state) = self.editor.mouse_drag_state.as_mut() {
+                    state.last_pos = position;
+                    state.current_pos = position;
+                }
+                if let Some(border) = drag_state.border_info.as_ref()
+                    && let Some(current) =
+                        ratio_at_path(&self.editor.window_tree, &border.split_node_path)
+                {
+                    const SENSITIVITY: f32 = 0.005;
+                    let delta = if border.is_vertical {
+                        dx as f32 * SENSITIVITY
+                    } else {
+                        dy as f32 * SENSITIVITY
+                    };
+                    let proposed = (current + delta).clamp(0.15, 0.85);
+                    if proposed != current {
+                        let mut mica = self.mica.take().expect("Mica presence checked above");
+                        let result = mica
+                            .set_split_ratio(
+                                &self.editor,
+                                &self.buffer_resources,
+                                &border.split_node_path,
+                                proposed,
+                            )
+                            .await;
+                        self.mica = Some(mica);
+                        match result {
+                            Ok(events) => {
+                                self.apply_mica_events(events, lifecycle, invalidations)
+                                    .await;
+                            }
+                            Err(error) => lifecycle.push(LifecycleEvent::Error(error.to_string())),
+                        }
+                    }
+                }
+                return;
+            }
+            if let Some((window, _)) = self.pointer_selection {
+                let position = cursor_at(&self.editor, window, pointer.column, pointer.row);
+                self.dispatch_mica_pointer(
+                    window,
+                    position,
+                    "move",
+                    button,
+                    lifecycle,
+                    invalidations,
+                )
+                .await;
+            }
+            return;
+        }
+
+        if pointer.button == PointerButton::Primary
+            && let Some((border, target)) = detect_border(&self.editor, pointer.column, pointer.row)
+        {
+            self.pending_pointer_drag = Some((border, target, (pointer.column, pointer.row)));
+            let position = self.editor.windows[target].cursor;
+            self.dispatch_mica_pointer(
+                target,
+                position,
+                "layout_down",
+                button,
+                lifecycle,
+                invalidations,
+            )
+            .await;
+            return;
+        }
+
+        let selected = self
+            .editor
+            .windows
+            .iter()
+            .find(|(_, window)| {
+                pointer.column >= window.x.saturating_add(1)
+                    && pointer.column
+                        < window
+                            .x
+                            .saturating_add(window.width_chars.saturating_sub(1))
+                    && pointer.row >= window.y.saturating_add(1)
+                    && pointer.row
+                        < window
+                            .y
+                            .saturating_add(window.height_chars.saturating_sub(1))
+            })
+            .map(|(id, _)| id);
+        if let Some(window) = selected {
+            let position = cursor_at(&self.editor, window, pointer.column, pointer.row);
+            self.dispatch_mica_pointer(window, position, "down", button, lifecycle, invalidations)
+                .await;
+        }
+    }
+
+    async fn dispatch_mica_pointer(
+        &mut self,
+        view: WindowId,
+        position: usize,
+        phase: &str,
+        button: &str,
+        lifecycle: &mut Vec<LifecycleEvent>,
+        invalidations: &mut Vec<Invalidation>,
+    ) {
+        let mut mica = self.mica.take().expect("Mica presence checked by caller");
+        let result = mica
+            .dispatch_pointer(
+                &self.editor,
+                &self.buffer_resources,
+                view,
+                position,
+                phase,
+                button,
+            )
+            .await;
+        self.mica = Some(mica);
+        match result {
+            Ok(events) => {
+                self.apply_mica_events(events, lifecycle, invalidations)
+                    .await;
+            }
+            Err(error) => lifecycle.push(LifecycleEvent::Error(error.to_string())),
+        }
+    }
+
+    fn apply_pointer_without_policy(&mut self, pointer: PointerEvent) {
         if pointer.button != PointerButton::Primary && pointer.kind != PointerKind::Move {
             return;
         }
@@ -1615,6 +2046,27 @@ fn mica_native_action(action: &str) -> Option<KeyAction> {
     }
 }
 
+fn mica_native_capabilities(name: &str) -> &'static [Capability] {
+    match name {
+        "kill_line" | "kill_region" | "kill_word" | "backward_kill_word" => {
+            &[Capability::TextWrite, Capability::ClipboardWrite]
+        }
+        "copy_region" => &[Capability::ClipboardWrite],
+        "yank" => &[Capability::TextWrite, Capability::ClipboardRead],
+        "insert_text" | "backspace" | "delete" | "enter" | "indent" | "undo" | "redo" => {
+            &[Capability::TextWrite]
+        }
+        _ => &[],
+    }
+}
+
+fn mica_action_writes_clipboard(name: &str) -> bool {
+    matches!(
+        name,
+        "kill_line" | "kill_region" | "copy_region" | "kill_word" | "backward_kill_word"
+    )
+}
+
 fn text_character_from_keys(keys: &[LogicalKey]) -> Option<char> {
     match keys {
         [LogicalKey::AlphaNumeric(character)] => Some(*character),
@@ -1823,6 +2275,92 @@ fn update_layout_drag(editor: &mut Editor, border: &BorderInfo, dx: i32, dy: i32
     }
     adjust_ratio_at_path(&mut editor.window_tree, &border.split_node_path, change);
     editor.calculate_window_layout();
+}
+
+fn pointer_button_name(button: PointerButton) -> &'static str {
+    match button {
+        PointerButton::Primary => "primary",
+        PointerButton::Secondary => "secondary",
+        PointerButton::Middle => "middle",
+        PointerButton::None => "none",
+    }
+}
+
+fn ratio_at_path(node: &WindowNode, path: &[usize]) -> Option<f32> {
+    if path.is_empty() {
+        return match node {
+            WindowNode::Split { ratio, .. } => Some(*ratio),
+            WindowNode::Leaf { .. } => None,
+        };
+    }
+    match node {
+        WindowNode::Leaf { .. } => None,
+        WindowNode::Split { first, second, .. } => match path[0] {
+            0 => ratio_at_path(first, &path[1..]),
+            1 => ratio_at_path(second, &path[1..]),
+            _ => None,
+        },
+    }
+}
+
+fn set_ratio_at_path(node: &mut WindowNode, path: &[usize], ratio: f32) -> bool {
+    if path.is_empty() {
+        if let WindowNode::Split { ratio: current, .. } = node {
+            *current = ratio;
+            return true;
+        }
+        return false;
+    }
+    match node {
+        WindowNode::Leaf { .. } => false,
+        WindowNode::Split { first, second, .. } => match path[0] {
+            0 => set_ratio_at_path(first, &path[1..], ratio),
+            1 => set_ratio_at_path(second, &path[1..], ratio),
+            _ => false,
+        },
+    }
+}
+
+fn logical_layout(
+    tree: &WindowNode,
+    editor: &Editor,
+    view_ids: &HashMap<WindowId, ViewId>,
+) -> Result<LogicalLayout, String> {
+    fn convert(
+        node: &WindowNode,
+        view_ids: &HashMap<WindowId, ViewId>,
+    ) -> Result<LayoutNode, String> {
+        match node {
+            WindowNode::Leaf { window_id } => view_ids
+                .get(window_id)
+                .copied()
+                .map(LayoutNode::View)
+                .ok_or_else(|| "layout leaf has no transport view identity".to_owned()),
+            WindowNode::Split {
+                direction,
+                ratio,
+                first,
+                second,
+            } => Ok(LayoutNode::Split {
+                axis: match direction {
+                    SplitDirection::Horizontal => SplitAxis::Horizontal,
+                    SplitDirection::Vertical => SplitAxis::Vertical,
+                },
+                ratio: *ratio,
+                first: Box::new(convert(first, view_ids)?),
+                second: Box::new(convert(second, view_ids)?),
+            }),
+        }
+    }
+
+    Ok(LogicalLayout {
+        columns: editor.frame.available_columns,
+        rows: editor.frame.available_lines,
+        active: *view_ids
+            .get(&editor.active_window)
+            .ok_or_else(|| "active window has no transport view identity".to_owned())?,
+        root: convert(tree, view_ids)?,
+    })
 }
 
 fn adjust_ratio_at_path(node: &mut WindowNode, path: &[usize], change: f32) {
@@ -2177,6 +2715,66 @@ mod tests {
     }
 
     #[test]
+    fn mica_host_effects_cannot_bypass_native_capabilities() {
+        let _guard = MICA_TEST_LOCK.lock().unwrap();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut session = HostSession::open_with_mica(
+                test_editor(),
+                CapabilityGrants::new([Capability::TextRead]),
+            )
+            .unwrap();
+
+            let insertion = session
+                .dispatch(session.envelope(InputEvent::Text("x".to_owned())))
+                .await
+                .unwrap();
+            let active = session.editor.windows[session.editor.active_window].active_buffer;
+            assert_eq!(session.editor.buffers[active].content(), "hello");
+            assert!(insertion.lifecycle.iter().any(|event| matches!(
+                event,
+                LifecycleEvent::Error(message) if message.contains("text_write") || message.contains("TextWrite")
+            )));
+
+            let control =
+                LogicalKey::Modifier(crate::keys::KeyModifier::Control(crate::keys::Side::Left));
+            let split = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![
+                    control.clone(),
+                    LogicalKey::AlphaNumeric('x'),
+                    LogicalKey::AlphaNumeric('2'),
+                ])))
+                .await
+                .unwrap();
+            assert_eq!(session.editor.windows.len(), 1);
+            assert!(split.lifecycle.iter().any(|event| matches!(
+                event,
+                LifecycleEvent::Error(message) if message.contains("Layout")
+            )));
+
+            let save = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![
+                    control,
+                    LogicalKey::AlphaNumeric('x'),
+                    LogicalKey::Modifier(crate::keys::KeyModifier::Control(
+                        crate::keys::Side::Left,
+                    )),
+                    LogicalKey::AlphaNumeric('s'),
+                ])))
+                .await
+                .unwrap();
+            assert!(save.lifecycle.iter().any(|event| matches!(
+                event,
+                LifecycleEvent::Error(message) if message.contains("FileWrite")
+            )));
+
+            session
+                .dispatch(session.envelope(InputEvent::Close))
+                .await
+                .unwrap();
+        });
+    }
+
+    #[test]
     fn mica_owns_global_chords_and_window_policy() {
         let _guard = MICA_TEST_LOCK.lock().unwrap();
         compio::runtime::Runtime::new().unwrap().block_on(async {
@@ -2446,6 +3044,87 @@ mod tests {
                 .unwrap();
             assert_eq!(snapshot(&cancelled).views[0].cursor, 5);
             assert!(!snapshot(&cancelled).views[0].command_view);
+
+            session
+                .dispatch(session.envelope(InputEvent::Close))
+                .await
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn mica_owns_pointer_selection_and_view_scroll_policy() {
+        let _guard = MICA_TEST_LOCK.lock().unwrap();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut session =
+                HostSession::open_with_mica(test_editor(), CapabilityGrants::editor_default())
+                    .unwrap();
+            let initial = session.initial_output().await;
+            let view = snapshot(&initial).active_view;
+
+            for (index, event) in [
+                PointerEvent {
+                    column: 2,
+                    row: 1,
+                    kind: PointerKind::Down,
+                    button: PointerButton::Primary,
+                },
+                PointerEvent {
+                    column: 4,
+                    row: 1,
+                    kind: PointerKind::Move,
+                    button: PointerButton::None,
+                },
+                PointerEvent {
+                    column: 4,
+                    row: 1,
+                    kind: PointerKind::Up,
+                    button: PointerButton::Primary,
+                },
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let output = session
+                    .dispatch(session.envelope(InputEvent::Pointer(event)))
+                    .await
+                    .unwrap();
+                assert!(
+                    output
+                        .lifecycle
+                        .iter()
+                        .all(|event| !matches!(event, LifecycleEvent::Error(_)))
+                );
+                if index == 0 {
+                    assert_eq!(session.pointer_selection.map(|(_, anchor)| anchor), Some(1));
+                }
+                if index == 1 {
+                    let window = session.editor.active_window;
+                    let buffer = session.editor.windows[window].active_buffer;
+                    assert_eq!(session.editor.buffers[buffer].get_mark(), Some(1));
+                }
+            }
+
+            let window = session.editor.active_window;
+            let buffer = session.editor.windows[window].active_buffer;
+            assert_eq!(session.editor.buffers[buffer].get_mark(), Some(1));
+            assert_eq!(session.editor.windows[window].cursor, 3);
+
+            let scrolled = session
+                .dispatch(session.envelope(InputEvent::SetViewScroll {
+                    view,
+                    start_line: Some(0),
+                    start_column: Some(2),
+                }))
+                .await
+                .unwrap();
+            assert_eq!(snapshot(&scrolled).views[0].scroll.start_column, 2);
+            assert!(
+                scrolled
+                    .lifecycle
+                    .iter()
+                    .all(|event| !matches!(event, LifecycleEvent::Error(_)))
+            );
 
             session
                 .dispatch(session.envelope(InputEvent::Close))

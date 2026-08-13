@@ -87,6 +87,7 @@ make_functional_relation(:roe/ActiveView, 2, [0], :volatile)
 make_functional_relation(:roe/ViewCursor, 2, [0], :volatile)
 make_functional_relation(:roe/ViewMark, 2, [0], :volatile)
 make_relation(:roe/ViewSelection, 3, :volatile)
+make_functional_relation(:roe/PointerSelection, 3, [0], :volatile)
 make_relation(:roe/SessionKeymap, 3, :volatile)
 make_relation(:roe/NextView, 2, :volatile)
 make_relation(:roe/ActorRole, 2, :volatile)
@@ -309,6 +310,9 @@ assert RoleCanRead(#roe/editor_role, :roe/ActiveView)
 assert RoleCanRead(#roe/editor_role, :roe/SessionActor)
 assert RoleCanRead(#roe/editor_role, :roe/ViewBuffer)
 assert RoleCanRead(#roe/editor_role, :roe/ViewCursor)
+assert RoleCanRead(#roe/editor_role, :roe/ViewMark)
+assert RoleCanRead(#roe/editor_role, :roe/ViewSelection)
+assert RoleCanRead(#roe/editor_role, :roe/PointerSelection)
 assert RoleCanRead(#roe/editor_role, :roe/LogicalBuffer)
 assert RoleCanRead(#roe/editor_role, :roe/BufferName)
 assert RoleCanRead(#roe/editor_role, :roe/CanUseBuffer)
@@ -341,6 +345,9 @@ assert RoleCanRead(#roe/editor_role, :roe/EffectiveSyntaxRule)
 assert RoleCanRead(#roe/editor_role, :roe/EffectiveConfiguration)
 assert RoleCanWrite(#roe/editor_role, :roe/ActiveView)
 assert RoleCanWrite(#roe/editor_role, :roe/ViewCursor)
+assert RoleCanWrite(#roe/editor_role, :roe/ViewMark)
+assert RoleCanWrite(#roe/editor_role, :roe/ViewSelection)
+assert RoleCanWrite(#roe/editor_role, :roe/PointerSelection)
 assert RoleCanWrite(#roe/editor_role, :roe/PromptState)
 assert RoleCanWrite(#roe/editor_role, :roe/PromptLast)
 assert RoleCanWrite(#roe/editor_role, :roe/FileCandidate)
@@ -357,6 +364,9 @@ assert RoleCanInvoke(#roe/editor_role, :roe/start_search)
 assert RoleCanInvoke(#roe/editor_role, :roe/refresh_search)
 assert RoleCanInvoke(#roe/editor_role, :roe/search_prompt_key)
 assert RoleCanInvoke(#roe/editor_role, :roe/publish_policy)
+assert RoleCanInvoke(#roe/editor_role, :roe/pointer_event)
+assert RoleCanInvoke(#roe/editor_role, :roe/set_view_scroll)
+assert RoleCanInvoke(#roe/editor_role, :roe/set_split_ratio)
 assert RoleCanEffect(#roe/editor_role)
 assert roe/RoleCanRequestService(#roe/editor_role, :text_read)
 assert roe/RoleCanRequestService(#roe/editor_role, :text_write)
@@ -391,6 +401,15 @@ verb roe/dispatch_key(actor, session, sequence @ #string)
   roe/publish_policy(actor, session)
   let native = one roe/NativeBinding(sequence, ?action, ?precedence)
   if native != nothing
+    if roe/NativeEditingAction(native[:action])
+      roe/CanRequestService(actor, :text_write) || return :text_write_denied
+    end
+    if native[:action] == :kill_line || native[:action] == :kill_region || native[:action] == :copy_region || native[:action] == :kill_word || native[:action] == :backward_kill_word
+      roe/CanRequestService(actor, :clipboard_write) || return :clipboard_write_denied
+    end
+    if native[:action] == :yank
+      roe/CanRequestService(actor, :clipboard_read) || return :clipboard_read_denied
+    end
     if native[:action] == :indent
       let width = one roe/EffectiveConfiguration(#roe/core_configuration, :tab_width, ?width)
       if width == nothing
@@ -435,6 +454,7 @@ verb roe/dispatch_key(actor, session, sequence @ #string)
       return :prefix
     end
     if string_len(sequence) == 1
+      roe/CanRequestService(actor, :text_write) || return :text_write_denied
       emit(session, {:kind -> :native_action, :action -> :insert_text, :text -> sequence})
       let view = one roe/ActiveView(session, ?view)
       let buffer = one roe/ViewBuffer(view, ?buffer)
@@ -453,6 +473,98 @@ verb roe/dispatch_key(actor, session, sequence @ #string)
     return :missing_selector
   end
   return invoke(selector, {:actor -> actor, :session -> session})
+end
+
+verb roe/pointer_event(actor, session, view, position, phase, button)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  roe/SessionLeafView(session, view) || return :invalid_view
+  let buffer = one roe/ViewBuffer(view, ?buffer)
+  roe/CanUseBuffer(actor, buffer) || return :buffer_denied
+  if button != :primary && phase != :move && phase != :up
+    return :ignored
+  end
+
+  if phase == :layout_down
+    roe/CanRequestService(actor, :layout_validate) || return :layout_denied
+    emit(session, {:kind -> :host_action, :action -> :begin_layout_drag, :view -> view})
+    return :handled
+  end
+
+  let pointer = one roe/PointerSelection(session, ?view, ?anchor)
+  if phase == :up
+    if pointer != nothing
+      retract roe/PointerSelection(session, pointer[:view], pointer[:anchor])
+    end
+    emit(session, {:kind -> :host_action, :action -> :pointer_selection, :view -> view, :position -> position, :phase -> phase})
+    return :handled
+  end
+
+  if phase == :down
+    if pointer != nothing
+      retract roe/PointerSelection(session, pointer[:view], pointer[:anchor])
+    end
+    let active = one roe/ActiveView(session, ?active)
+    if active != nothing && active != view
+      retract roe/ActiveView(session, active)
+    end
+    assert roe/ActiveView(session, view)
+    let old_cursor = one roe/ViewCursor(view, ?cursor)
+    if old_cursor != nothing
+      retract roe/ViewCursor(view, old_cursor)
+    end
+    let old_mark = one roe/ViewMark(view, ?mark)
+    if old_mark != nothing
+      retract roe/ViewMark(view, old_mark)
+    end
+    for old_selection in roe/ViewSelection(view, ?anchor, ?active)
+      retract roe/ViewSelection(view, old_selection[:anchor], old_selection[:active])
+    end
+    assert roe/ViewCursor(view, position)
+    assert roe/PointerSelection(session, view, position)
+    emit(session, {:kind -> :host_action, :action -> :pointer_selection, :view -> view, :position -> position, :anchor -> position, :phase -> phase})
+    return :handled
+  end
+
+  if phase == :move
+    pointer != nothing || return :no_pointer_selection
+    pointer[:view] == view || return :pointer_view_mismatch
+    let old_cursor = one roe/ViewCursor(view, ?cursor)
+    if old_cursor != nothing
+      retract roe/ViewCursor(view, old_cursor)
+    end
+    let old_mark = one roe/ViewMark(view, ?mark)
+    if old_mark != nothing
+      retract roe/ViewMark(view, old_mark)
+    end
+    for old_selection in roe/ViewSelection(view, ?anchor, ?active)
+      retract roe/ViewSelection(view, old_selection[:anchor], old_selection[:active])
+    end
+    assert roe/ViewCursor(view, position)
+    assert roe/ViewMark(view, pointer[:anchor])
+    assert roe/ViewSelection(view, pointer[:anchor], position)
+    emit(session, {:kind -> :host_action, :action -> :pointer_selection, :view -> view, :position -> position, :anchor -> pointer[:anchor], :phase -> phase})
+    return :handled
+  end
+  return :ignored
+end
+
+verb roe/set_view_scroll(actor, session, view, line, column)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  roe/SessionLeafView(session, view) || return :invalid_view
+  emit(session, {:kind -> :host_action, :action -> :set_view_scroll, :view -> view, :line -> line, :column -> column})
+  return :handled
+end
+
+verb roe/set_split_ratio(actor, session, node, ratio)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  roe/CanRequestService(actor, :layout_validate) || return :layout_denied
+  let old = one roe/ViewSplitRatio(node, ?ratio)
+  old != nothing || return :invalid_split
+  ratio > 0.0 && ratio < 1.0 || return :invalid_ratio
+  retract roe/ViewSplitRatio(node, old)
+  assert roe/ViewSplitRatio(node, ratio)
+  emit(session, {:kind -> :host_action, :action -> :set_split_ratio, :node -> node, :ratio -> ratio})
+  return :handled
 end
 
 // Return either a supplied value or the declarative prompt/completion request

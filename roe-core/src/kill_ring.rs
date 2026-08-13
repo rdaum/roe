@@ -153,6 +153,20 @@ impl KillRing {
         self.clipboard_error.take()
     }
 
+    /// Admit text already read through the session's capability-checked native
+    /// clipboard boundary. This does not call a platform clipboard itself.
+    pub fn import_external_text(&mut self, text: String) {
+        if text.is_empty() || self.entries.last() == Some(&text) {
+            return;
+        }
+        self.entries.push(text);
+        if self.entries.len() > self.max_size {
+            self.entries.remove(0);
+        }
+        self.current_index = self.entries.len().saturating_sub(1);
+        self.last_was_kill = false;
+    }
+
     /// Add text to the kill-ring and copy to system clipboard
     /// If the last operation was also a kill, append to the most recent entry
     pub fn kill(&mut self, text: String) -> Option<ClipboardError> {

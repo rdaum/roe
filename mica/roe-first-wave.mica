@@ -324,6 +324,10 @@ assert RoleCanInvoke(#roe/editor_role, :roe/redraw)
 
 verb roe/save_buffer(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor
+  let view = one roe/ActiveView(session, ?view)
+  let buffer = one roe/ViewBuffer(view, ?buffer)
+  roe/CanUseBuffer(actor, buffer) || return :buffer_denied
+  roe/CanRequestService(actor, :file_write) || return :file_write_denied
   emit(session, {:kind -> :host_action, :action -> :save_buffer})
   return :ok
 end
@@ -363,6 +367,7 @@ end
 
 verb roe/split_horizontal(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor
+  roe/CanRequestService(actor, :layout_validate) || return :layout_denied
   let target = one roe/ActiveView(session, ?view)
   roe/SessionLeafView(session, target) || return :invalid_active_view
   emit(session, {:kind -> :host_action, :action -> :split_horizontal, :view -> target})
@@ -371,6 +376,7 @@ end
 
 verb roe/split_vertical(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor
+  roe/CanRequestService(actor, :layout_validate) || return :layout_denied
   let target = one roe/ActiveView(session, ?view)
   roe/SessionLeafView(session, target) || return :invalid_active_view
   emit(session, {:kind -> :host_action, :action -> :split_vertical, :view -> target})
@@ -391,6 +397,7 @@ end
 
 verb roe/delete_window(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor
+  roe/CanRequestService(actor, :layout_validate) || return :layout_denied
   let target = one roe/ActiveView(session, ?view)
   roe/SessionLeafView(session, target) || return :invalid_active_view
   emit(session, {:kind -> :host_action, :action -> :delete_window, :view -> target})
@@ -399,6 +406,7 @@ end
 
 verb roe/delete_other_windows(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor
+  roe/CanRequestService(actor, :layout_validate) || return :layout_denied
   let target = one roe/ActiveView(session, ?view)
   roe/SessionLeafView(session, target) || return :invalid_active_view
   emit(session, {:kind -> :host_action, :action -> :delete_other_windows, :view -> target})
@@ -532,9 +540,11 @@ verb roe/prompt_key(actor, session, sequence)
       emit(session, {:kind -> :host_action, :action -> :kill_buffer_selected, :buffer -> chosen[1]})
       return :ok
     elseif state[:prompt_kind] == :find_file
+      roe/CanRequestService(actor, :file_read) || return :file_read_denied
       emit(session, {:kind -> :host_action, :action -> :find_file_selected, :path -> chosen[1]})
       return :ok
     elseif state[:prompt_kind] == :visit_file
+      roe/CanRequestService(actor, :file_read) || return :file_read_denied
       emit(session, {:kind -> :host_action, :action -> :visit_file_selected, :path -> chosen[1]})
       return :ok
     end

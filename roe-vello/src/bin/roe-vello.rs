@@ -160,7 +160,7 @@ async fn create_editor(config: EditorConfig) -> std::io::Result<Editor> {
         active_window: active_window_id,
         previous_active_window: None,
         window_tree,
-        kill_ring: kill_ring::KillRing::new(),
+        kill_ring: kill_ring::KillRing::without_clipboard(60),
         buffer_history: Vec::new(),
         echo_message: String::new(),
         echo_message_time: None,

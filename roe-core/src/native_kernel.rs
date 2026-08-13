@@ -323,6 +323,11 @@ impl NativeKernel {
         &self.grants
     }
 
+    /// Check endpoint-native authority before a host realizes a Mica effect.
+    pub fn authorize(&self, capability: Capability) -> Result<(), KernelError> {
+        self.require(capability)
+    }
+
     /// Register an existing Roe buffer without copying its Rope storage.
     pub fn register_buffer(&mut self, buffer: Buffer) -> ResourceId {
         self.allocate(TextResource {
