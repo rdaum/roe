@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const WATCH_EVENT_CAPACITY: usize = 256;
+pub const MAX_NATIVE_RESOURCES: usize = 1_024;
 
 /// Wall-clock source for native time requests. Tests inject this boundary so
 /// Mica command policy remains deterministic without gaining a clock builtin.
@@ -249,6 +250,8 @@ pub enum KernelError {
     CapabilityDenied(Capability),
     #[error("native resource {0:?} is stale or unknown")]
     StaleResource(ResourceId),
+    #[error("native resource capacity of {capacity} is exhausted")]
+    ResourceExhausted { capacity: usize },
     #[error("text range {start}..{end} is outside resource length {len}")]
     InvalidRange {
         start: usize,
@@ -329,7 +332,7 @@ impl NativeKernel {
     }
 
     /// Register an existing Roe buffer without copying its Rope storage.
-    pub fn register_buffer(&mut self, buffer: Buffer) -> ResourceId {
+    pub fn register_buffer(&mut self, buffer: Buffer) -> Result<ResourceId, KernelError> {
         self.allocate(TextResource {
             buffer,
             selection: None,
@@ -344,7 +347,7 @@ impl NativeKernel {
                 let buffer = Buffer::new();
                 buffer.set_object(name);
                 buffer.load_str(&initial);
-                Ok(NativeResult::ResourceCreated(self.register_buffer(buffer)))
+                Ok(NativeResult::ResourceCreated(self.register_buffer(buffer)?))
             }
             NativeOperation::CloseResource { resource } => {
                 self.require(Capability::TextWrite)?;
@@ -527,25 +530,30 @@ impl NativeKernel {
         }
     }
 
-    fn allocate(&mut self, resource: TextResource) -> ResourceId {
+    fn allocate(&mut self, resource: TextResource) -> Result<ResourceId, KernelError> {
         if let Some(slot) = self.free.pop() {
             let entry = &mut self.slots[slot as usize];
             debug_assert!(entry.resource.is_none());
             entry.resource = Some(resource);
-            ResourceId {
+            Ok(ResourceId {
                 slot,
                 generation: entry.generation,
-            }
+            })
         } else {
+            if self.slots.len() >= MAX_NATIVE_RESOURCES {
+                return Err(KernelError::ResourceExhausted {
+                    capacity: MAX_NATIVE_RESOURCES,
+                });
+            }
             let slot = self.slots.len() as u32;
             self.slots.push(ResourceSlot {
                 generation: 1,
                 resource: Some(resource),
             });
-            ResourceId {
+            Ok(ResourceId {
                 slot,
                 generation: 1,
-            }
+            })
         }
     }
 
@@ -864,6 +872,29 @@ mod tests {
         ]))
     }
 
+    #[test]
+    fn native_resource_capacity_is_explicit_and_slots_are_reused() {
+        let mut kernel = text_kernel();
+        let mut resources = Vec::with_capacity(MAX_NATIVE_RESOURCES);
+        for _ in 0..MAX_NATIVE_RESOURCES {
+            resources.push(kernel.register_buffer(Buffer::new()).unwrap());
+        }
+        assert!(matches!(
+            kernel.register_buffer(Buffer::new()),
+            Err(KernelError::ResourceExhausted {
+                capacity: MAX_NATIVE_RESOURCES
+            })
+        ));
+
+        let retired = resources[0];
+        kernel
+            .execute(NativeOperation::CloseResource { resource: retired })
+            .unwrap();
+        let reused = kernel.register_buffer(Buffer::new()).unwrap();
+        assert_eq!(reused.slot, retired.slot);
+        assert_ne!(reused.generation, retired.generation);
+    }
+
     fn created_id(result: NativeResult) -> ResourceId {
         match result {
             NativeResult::ResourceCreated(id) => id,
@@ -1007,7 +1038,7 @@ mod tests {
         std::fs::write(&path, "before").unwrap();
 
         let mut kernel = NativeKernel::new(CapabilityGrants::new([Capability::Watch]));
-        let resource = kernel.register_buffer(Buffer::new());
+        let resource = kernel.register_buffer(Buffer::new()).unwrap();
         kernel
             .execute(NativeOperation::RegisterWatch {
                 resource,
@@ -1056,7 +1087,7 @@ mod tests {
         std::fs::write(&path, "content").unwrap();
 
         let mut kernel = NativeKernel::new(CapabilityGrants::new([Capability::Watch]));
-        let resource = kernel.register_buffer(Buffer::new());
+        let resource = kernel.register_buffer(Buffer::new()).unwrap();
         kernel
             .execute(NativeOperation::RegisterWatch {
                 resource,

@@ -5,7 +5,7 @@
 //! boundary; it does not expose renderer or Rust policy objects to Mica.
 
 use crate::editor::{SplitDirection, WindowNode};
-use crate::native_kernel::{NativeKernel, NativeOperation, NativeResult, ResourceId};
+use crate::native_kernel::{KernelError, NativeKernel, NativeOperation, NativeResult, ResourceId};
 use crate::{BufferId, Editor, WindowId};
 use mica_driver::{
     CompioTaskDriver, DriverError, DriverEvent, DriverResources, ExternalRequestContext,
@@ -87,6 +87,8 @@ pub enum MicaHostError {
     MissingIdentity,
     #[error("Mica session host is already closed")]
     Closed,
+    #[error("Roe native kernel failed while opening the Mica session: {0}")]
+    Kernel(#[from] KernelError),
     #[error("Mica editor policy rejected the operation: {0}")]
     Policy(String),
 }
@@ -398,6 +400,7 @@ pub struct MicaHost {
     layout_nodes: HashMap<Vec<usize>, Identity>,
     layout_tuples: Vec<LayoutFact>,
     disabled_packages: HashSet<Identity>,
+    first_wave_loaded: bool,
     active_view: WindowId,
     pending_key_prefix: Option<String>,
     prompt_active: bool,
@@ -437,12 +440,6 @@ impl MicaHost {
 
         let driver = CompioTaskDriver::builder(resources)
             .initial_filein_unit(sym("roe/core"), CORE_SOURCE, FileinMode::Add, None)
-            .initial_filein_unit(
-                sym("roe/first-wave"),
-                FIRST_WAVE_SOURCE,
-                FileinMode::Add,
-                None,
-            )
             .external_request_handler(external_handler)
             .build()?;
 
@@ -607,6 +604,7 @@ impl MicaHost {
             layout_nodes,
             layout_tuples,
             disabled_packages: HashSet::new(),
+            first_wave_loaded: false,
             active_view,
             pending_key_prefix: None,
             prompt_active: false,
@@ -623,6 +621,7 @@ impl MicaHost {
         if self.closed {
             return Err(MicaHostError::Closed);
         }
+        self.ensure_first_wave().await?;
         self.synchronize_context(editor, resource_ids)?;
         let had_prefix = self.pending_key_prefix.is_some();
         let sequence = self
@@ -765,6 +764,7 @@ impl MicaHost {
         if self.closed {
             return Err(MicaHostError::Closed);
         }
+        self.ensure_first_wave().await?;
         self.synchronize_context(editor, resource_ids)?;
         let submitted = self
             .driver
@@ -785,11 +785,19 @@ impl MicaHost {
         Ok(())
     }
 
-    pub async fn replace_unit(&self, unit: &str, source: String) -> Result<(), MicaHostError> {
+    pub async fn replace_unit(&mut self, unit: &str, source: String) -> Result<(), MicaHostError> {
         self.driver.check_filein(source.clone(), None).await?;
+        let mode = if unit == "roe/first-wave" && !self.first_wave_loaded {
+            FileinMode::Add
+        } else {
+            FileinMode::Replace
+        };
         self.driver
-            .filein_unit(sym(unit), source, FileinMode::Replace, None)
+            .filein_unit(sym(unit), source, mode, None)
             .await?;
+        if unit == "roe/first-wave" {
+            self.first_wave_loaded = true;
+        }
         Ok(())
     }
 
@@ -797,9 +805,28 @@ impl MicaHost {
         Ok(self.driver.fileout_unit(sym(unit)).await?)
     }
 
-    pub async fn restore_first_wave(&self) -> Result<(), MicaHostError> {
+    pub async fn restore_first_wave(&mut self) -> Result<(), MicaHostError> {
         self.replace_unit("roe/first-wave", FIRST_WAVE_SOURCE.to_owned())
             .await
+    }
+
+    async fn ensure_first_wave(&mut self) -> Result<(), MicaHostError> {
+        if self.first_wave_loaded {
+            return Ok(());
+        }
+        self.driver
+            .check_filein(FIRST_WAVE_SOURCE.to_owned(), None)
+            .await?;
+        self.driver
+            .filein_unit(
+                sym("roe/first-wave"),
+                FIRST_WAVE_SOURCE.to_owned(),
+                FileinMode::Add,
+                None,
+            )
+            .await?;
+        self.first_wave_loaded = true;
+        Ok(())
     }
 
     pub fn set_package_enabled(

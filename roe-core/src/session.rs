@@ -85,6 +85,7 @@ pub enum InputEvent {
         request_id: RequestId,
         operation: NativeOperation,
     },
+    Recovery(RecoveryOperation),
     Cancel {
         request_id: RequestId,
     },
@@ -93,6 +94,16 @@ pub enum InputEvent {
         after: Option<Revision>,
     },
     Close,
+}
+
+/// Small non-programmable surface retained when Mica user policy is broken.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecoveryOperation {
+    CheckSource { source: String },
+    ReplaceUnit { unit: String, source: String },
+    ExportUnit { unit: String },
+    RestoreFirstWave,
+    SetPackageEnabled { package: String, enabled: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -169,6 +180,10 @@ pub enum LifecycleEvent {
     },
     MicaSubscriptionReady {
         mailbox: u64,
+    },
+    RecoveryResult {
+        operation: String,
+        result: Result<Option<String>, String>,
     },
     QuitRequested,
     EndpointClosed,
@@ -328,11 +343,14 @@ pub struct HostSession {
 }
 
 impl HostSession {
-    pub fn open(editor: Editor, grants: CapabilityGrants) -> Self {
+    pub fn open(editor: Editor, grants: CapabilityGrants) -> Result<Self, KernelError> {
         Self::open_with_kernel(editor, Arc::new(Mutex::new(NativeKernel::new(grants))))
     }
 
-    fn open_with_kernel(editor: Editor, kernel: Arc<Mutex<NativeKernel>>) -> Self {
+    fn open_with_kernel(
+        editor: Editor,
+        kernel: Arc<Mutex<NativeKernel>>,
+    ) -> Result<Self, KernelError> {
         let epoch = SessionEpoch(NEXT_EPOCH.fetch_add(1, Ordering::Relaxed));
         let mut session = Self {
             editor,
@@ -353,15 +371,28 @@ impl HostSession {
             mica_search_ranges: HashMap::new(),
             closed: false,
         };
-        let _ = session.synchronize_identities();
-        session
+        for (buffer, value) in &session.editor.buffers {
+            let resource = session
+                .kernel
+                .lock()
+                .unwrap()
+                .register_buffer(value.clone())?;
+            session.buffer_resources.insert(buffer, resource);
+        }
+        for window in session.editor.windows.keys() {
+            session
+                .view_ids
+                .insert(window, ViewId(session.next_view_id));
+            session.next_view_id += 1;
+        }
+        Ok(session)
     }
 
     /// Open the public-driver Mica endpoint used by the first integration
     /// wave. The ordinary constructor remains available for headless and
     /// protocol and native-mechanism tests that do not need policy dispatch.
     pub fn open_with_mica(editor: Editor, grants: CapabilityGrants) -> Result<Self, MicaHostError> {
-        let mut session = Self::open(editor, grants);
+        let mut session = Self::open(editor, grants)?;
         session.mica = Some(MicaHost::open(
             &session.editor,
             Arc::clone(&session.kernel),
@@ -378,7 +409,7 @@ impl HostSession {
         let mut session = Self::open_with_kernel(
             editor,
             Arc::new(Mutex::new(NativeKernel::with_clock(grants, clock))),
-        );
+        )?;
         session.mica = Some(MicaHost::open(
             &session.editor,
             Arc::clone(&session.kernel),
@@ -730,6 +761,49 @@ impl HostSession {
                 }
                 completions.push(NativeCompletion { request_id, result });
             }
+            InputEvent::Recovery(operation) => {
+                let (name, result) = match operation {
+                    RecoveryOperation::CheckSource { source } => (
+                        "check-source",
+                        self.check_mica_source(source)
+                            .await
+                            .map(|()| None)
+                            .map_err(|error| error.to_string()),
+                    ),
+                    RecoveryOperation::ReplaceUnit { unit, source } => (
+                        "replace-unit",
+                        self.replace_mica_unit(&unit, source)
+                            .await
+                            .map(|()| None)
+                            .map_err(|error| error.to_string()),
+                    ),
+                    RecoveryOperation::ExportUnit { unit } => (
+                        "export-unit",
+                        self.export_mica_unit(&unit)
+                            .await
+                            .map(Some)
+                            .map_err(|error| error.to_string()),
+                    ),
+                    RecoveryOperation::RestoreFirstWave => (
+                        "restore-first-wave",
+                        self.restore_mica_first_wave()
+                            .await
+                            .map(|()| None)
+                            .map_err(|error| error.to_string()),
+                    ),
+                    RecoveryOperation::SetPackageEnabled { package, enabled } => (
+                        "set-package-enabled",
+                        self.set_mica_package_enabled(&package, enabled)
+                            .map(|()| None)
+                            .map_err(|error| error.to_string()),
+                    ),
+                };
+                lifecycle.push(LifecycleEvent::RecoveryResult {
+                    operation: name.to_owned(),
+                    result,
+                });
+                invalidations.push(Invalidation::Full);
+            }
             InputEvent::Cancel { request_id } => {
                 lifecycle.push(LifecycleEvent::RequestCancelled {
                     request_id,
@@ -831,7 +905,7 @@ impl HostSession {
         source: String,
     ) -> Result<(), MicaHostError> {
         self.mica
-            .as_ref()
+            .as_mut()
             .ok_or(MicaHostError::Closed)?
             .replace_unit(unit, source)
             .await
@@ -847,7 +921,7 @@ impl HostSession {
 
     pub async fn restore_mica_first_wave(&mut self) -> Result<(), MicaHostError> {
         self.mica
-            .as_ref()
+            .as_mut()
             .ok_or(MicaHostError::Closed)?
             .restore_first_wave()
             .await
@@ -1466,6 +1540,14 @@ impl HostSession {
                     "native text payload exceeds {MAX_TEXT_CHARS_PER_INPUT} characters"
                 )))
             }
+            InputEvent::Recovery(RecoveryOperation::CheckSource { source })
+            | InputEvent::Recovery(RecoveryOperation::ReplaceUnit { source, .. })
+                if source.chars().count() > MAX_TEXT_CHARS_PER_INPUT =>
+            {
+                Err(SessionError::InputTooLarge(format!(
+                    "Mica recovery source exceeds {MAX_TEXT_CHARS_PER_INPUT} characters"
+                )))
+            }
             _ => Ok(()),
         }
     }
@@ -1818,9 +1900,17 @@ impl HostSession {
             }
         });
         for (buffer_id, buffer) in &self.editor.buffers {
-            self.buffer_resources
-                .entry(buffer_id)
-                .or_insert_with(|| self.kernel.lock().unwrap().register_buffer(buffer.clone()));
+            if !self.buffer_resources.contains_key(&buffer_id) {
+                match self.kernel.lock().unwrap().register_buffer(buffer.clone()) {
+                    Ok(resource) => {
+                        self.buffer_resources.insert(buffer_id, resource);
+                    }
+                    Err(error) => cleanup_warnings.push(format!(
+                        "buffer {} has no native resource: {error}",
+                        buffer.object()
+                    )),
+                }
+            }
         }
 
         let live_windows: HashSet<_> = self.editor.windows.keys().collect();
@@ -2492,7 +2582,7 @@ mod tests {
     }
 
     fn test_session_with_grants(grants: CapabilityGrants) -> HostSession {
-        HostSession::open(test_editor(), grants)
+        HostSession::open(test_editor(), grants).unwrap()
     }
 
     fn test_session() -> HostSession {
@@ -3276,6 +3366,75 @@ mod tests {
                 snapshot(&recovered).views[0].visible_text,
                 "hellov2:42\nv2:42\n42\n"
             );
+            session
+                .dispatch(session.envelope(InputEvent::Close))
+                .await
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn native_recovery_surface_operates_before_user_policy_load() {
+        let _guard = MICA_TEST_LOCK.lock().unwrap();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut session = HostSession::open_with_mica_clock(
+                test_editor(),
+                CapabilityGrants::editor_default(),
+                Arc::new(FixedNativeClock(42)),
+            )
+            .unwrap();
+
+            let rejected = session
+                .dispatch(
+                    session.envelope(InputEvent::Recovery(RecoveryOperation::CheckSource {
+                        source: "verb this is malformed".to_owned(),
+                    })),
+                )
+                .await
+                .unwrap();
+            assert!(rejected.lifecycle.iter().any(|event| matches!(
+                event,
+                LifecycleEvent::RecoveryResult { result: Err(_), .. }
+            )));
+            assert!(!session.closed);
+
+            let installed = session
+                .dispatch(
+                    session.envelope(InputEvent::Recovery(RecoveryOperation::ReplaceUnit {
+                        unit: "roe/first-wave".to_owned(),
+                        source: include_str!("../../mica/roe-first-wave.mica").to_owned(),
+                    })),
+                )
+                .await
+                .unwrap();
+            assert!(installed.lifecycle.iter().any(|event| matches!(
+                event,
+                LifecycleEvent::RecoveryResult {
+                    result: Ok(None),
+                    ..
+                }
+            )));
+
+            let command = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Function(12)])))
+                .await
+                .unwrap();
+            assert_eq!(snapshot(&command).views[0].visible_text, "hello42\n");
+
+            let exported = session
+                .dispatch(
+                    session.envelope(InputEvent::Recovery(RecoveryOperation::ExportUnit {
+                        unit: "roe/first-wave".to_owned(),
+                    })),
+                )
+                .await
+                .unwrap();
+            assert!(exported.lifecycle.iter().any(|event| matches!(
+                event,
+                LifecycleEvent::RecoveryResult { result: Ok(Some(source)), .. }
+                    if source.contains("insert_current_time")
+            )));
+
             session
                 .dispatch(session.envelope(InputEvent::Close))
                 .await

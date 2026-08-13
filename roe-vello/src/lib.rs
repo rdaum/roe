@@ -305,6 +305,12 @@ impl<'a> RoeVelloApp<'a> {
                 LifecycleEvent::Overloaded { detail } => {
                     tracing::warn!(%detail, "session overload")
                 }
+                LifecycleEvent::RecoveryResult { operation, result } => match result {
+                    Ok(_) => tracing::info!(%operation, "Mica recovery operation completed"),
+                    Err(error) => {
+                        tracing::error!(%operation, %error, "Mica recovery operation failed")
+                    }
+                },
                 LifecycleEvent::Ready { .. }
                 | LifecycleEvent::Heartbeat
                 | LifecycleEvent::MicaTaskCancelled { .. }
