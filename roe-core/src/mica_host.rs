@@ -4,6 +4,7 @@
 //! identities, bounded native requests, and committed effects at the host
 //! boundary; it does not expose renderer or Rust policy objects to Mica.
 
+use crate::editor::{SplitDirection, WindowNode};
 use crate::native_kernel::{NativeKernel, NativeOperation, NativeResult, ResourceId};
 use crate::{BufferId, Editor, WindowId};
 use mica_driver::{
@@ -15,6 +16,59 @@ use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+#[derive(Debug, Clone)]
+enum LayoutFact {
+    View(Identity),
+    Root(Identity, Identity),
+    First(Identity, Identity),
+    Second(Identity, Identity),
+    Axis(Identity, Symbol),
+    Ratio(Identity, f32),
+    Next(Identity, Identity),
+}
+
+macro_rules! layout_named_tuples {
+    ($facts:expr) => {{
+        let mut tuples = Vec::new();
+        for fact in $facts {
+            match *fact {
+                LayoutFact::View(view) => {
+                    tuples.push((sym("roe/View"), [Value::identity(view)].into()))
+                }
+                LayoutFact::Root(frame, root) => tuples.push((
+                    sym("roe/FrameRootView"),
+                    [Value::identity(frame), Value::identity(root)].into(),
+                )),
+                LayoutFact::First(parent, child) => tuples.push((
+                    sym("roe/ViewFirstChild"),
+                    [Value::identity(parent), Value::identity(child)].into(),
+                )),
+                LayoutFact::Second(parent, child) => tuples.push((
+                    sym("roe/ViewSecondChild"),
+                    [Value::identity(parent), Value::identity(child)].into(),
+                )),
+                LayoutFact::Axis(view, axis) => tuples.push((
+                    sym("roe/ViewSplitAxis"),
+                    [Value::identity(view), Value::symbol(axis)].into(),
+                )),
+                LayoutFact::Ratio(view, ratio) => tuples.push((
+                    sym("roe/ViewSplitRatio"),
+                    [
+                        Value::identity(view),
+                        Value::float(ratio).expect("finite normalized split ratio"),
+                    ]
+                    .into(),
+                )),
+                LayoutFact::Next(current, next) => tuples.push((
+                    sym("roe/NextView"),
+                    [Value::identity(current), Value::identity(next)].into(),
+                )),
+            }
+        }
+        tuples
+    }};
+}
 
 const CORE_SOURCE: &str = include_str!("../../mica/roe-model.mica");
 const FIRST_WAVE_SOURCE: &str = include_str!("../../mica/roe-first-wave.mica");
@@ -66,6 +120,7 @@ pub struct MicaPromptUpdate {
 pub struct MicaHostAction {
     pub name: String,
     pub buffer: Option<BufferId>,
+    pub view: Option<WindowId>,
     pub path: Option<String>,
 }
 
@@ -287,6 +342,7 @@ pub struct MicaHost {
     endpoint: Identity,
     actor: Identity,
     session: Identity,
+    frame: Identity,
     editor_role: Identity,
     fundamental_mode: Identity,
     global_map: Identity,
@@ -297,6 +353,8 @@ pub struct MicaHost {
     view_ids: HashMap<WindowId, Identity>,
     view_buffers: HashMap<WindowId, BufferId>,
     view_cursors: HashMap<WindowId, usize>,
+    layout_nodes: HashMap<Vec<usize>, Identity>,
+    layout_tuples: Vec<LayoutFact>,
     active_view: WindowId,
     pending_key_prefix: Option<String>,
     prompt_active: bool,
@@ -348,6 +406,7 @@ impl MicaHost {
         let endpoint = driver.allocate_ephemeral_identity()?;
         let actor = driver.allocate_ephemeral_identity()?;
         let session = driver.allocate_ephemeral_identity()?;
+        let frame = driver.allocate_ephemeral_identity()?;
         let editor_role = driver.named_identity(sym("roe/editor_role"))?;
         let fundamental_mode = driver.named_identity(sym("roe/fundamental_mode"))?;
         let global_map = driver.named_identity(sym("roe/global_map"))?;
@@ -390,6 +449,11 @@ impl MicaHost {
             (
                 sym("roe/SessionEndpoint"),
                 [Value::identity(session), Value::identity(endpoint)].into(),
+            ),
+            (sym("roe/Frame"), [Value::identity(frame)].into()),
+            (
+                sym("roe/SessionFrame"),
+                [Value::identity(session), Value::identity(frame)].into(),
             ),
             (
                 sym("roe/ActorRole"),
@@ -452,6 +516,15 @@ impl MicaHost {
                 [Value::identity(view), int_value(window.cursor)].into(),
             ));
         }
+        let mut layout_nodes = HashMap::new();
+        let layout_tuples = build_layout_tuples(
+            &driver,
+            frame,
+            &editor.window_tree,
+            &view_ids,
+            &mut layout_nodes,
+        )?;
+        tuples.extend(layout_named_tuples!(&layout_tuples));
         driver.open_endpoint_with_context_and_volatile_tuples_named(
             endpoint,
             None,
@@ -477,6 +550,7 @@ impl MicaHost {
             endpoint,
             actor,
             session,
+            frame,
             editor_role,
             fundamental_mode,
             global_map,
@@ -487,6 +561,8 @@ impl MicaHost {
             view_ids,
             view_buffers,
             view_cursors,
+            layout_nodes,
+            layout_tuples,
             active_view,
             pending_key_prefix: None,
             prompt_active: false,
@@ -839,6 +915,35 @@ end
         }
         let buffer = self.buffer_ids[&window.active_buffer];
 
+        for (window_id, candidate) in &editor.windows {
+            if self.view_ids.contains_key(&window_id) {
+                continue;
+            }
+            let Some(logical_buffer) = self.buffer_ids.get(&candidate.active_buffer).copied()
+            else {
+                continue;
+            };
+            let logical_view = self.driver.allocate_ephemeral_identity()?;
+            self.view_ids.insert(window_id, logical_view);
+            self.view_buffers.insert(window_id, candidate.active_buffer);
+            self.view_cursors.insert(window_id, candidate.cursor);
+            assert.extend([
+                (sym("roe/View"), [Value::identity(logical_view)].into()),
+                (
+                    sym("roe/ViewBuffer"),
+                    [
+                        Value::identity(logical_view),
+                        Value::identity(logical_buffer),
+                    ]
+                    .into(),
+                ),
+                (
+                    sym("roe/ViewCursor"),
+                    [Value::identity(logical_view), int_value(candidate.cursor)].into(),
+                ),
+            ]);
+        }
+
         if let std::collections::hash_map::Entry::Vacant(entry) = self.view_ids.entry(active) {
             let view = self.driver.allocate_ephemeral_identity()?;
             entry.insert(view);
@@ -898,6 +1003,22 @@ end
         self.active_view = active;
         self.view_buffers.insert(active, window.active_buffer);
         self.view_cursors.insert(active, window.cursor);
+        self.synchronize_layout(editor)?;
+        Ok(())
+    }
+
+    fn synchronize_layout(&mut self, editor: &Editor) -> Result<(), MicaHostError> {
+        self.driver
+            .retract_volatile_tuples_named(layout_named_tuples!(&self.layout_tuples))?;
+        self.layout_tuples = build_layout_tuples(
+            &self.driver,
+            self.frame,
+            &editor.window_tree,
+            &self.view_ids,
+            &mut self.layout_nodes,
+        )?;
+        self.driver
+            .assert_volatile_tuples_named(layout_named_tuples!(&self.layout_tuples))?;
         Ok(())
     }
 
@@ -1100,7 +1221,19 @@ end
                     .find_map(|(buffer, identity)| (*identity == logical).then_some(*buffer))
             });
         let path = map_value(value, "path").and_then(|value| value.with_str(str::to_owned));
-        Some(MicaHostAction { name, buffer, path })
+        let view = map_value(value, "view")
+            .and_then(|value| value.as_identity())
+            .and_then(|logical| {
+                self.view_ids
+                    .iter()
+                    .find_map(|(view, identity)| (*identity == logical).then_some(*view))
+            });
+        Some(MicaHostAction {
+            name,
+            buffer,
+            view,
+            path,
+        })
     }
 
     fn prompt_closed(&self, target: Identity, value: &Value) -> bool {
@@ -1384,6 +1517,88 @@ fn native_error(message: &str) -> Value {
         (Value::symbol(sym("status")), Value::symbol(sym("error"))),
         (Value::symbol(sym("error")), Value::string(message)),
     ])
+}
+
+fn build_layout_tuples(
+    driver: &CompioTaskDriver,
+    frame: Identity,
+    root: &WindowNode,
+    views: &HashMap<WindowId, Identity>,
+    nodes: &mut HashMap<Vec<usize>, Identity>,
+) -> Result<Vec<LayoutFact>, MicaHostError> {
+    fn visit(
+        driver: &CompioTaskDriver,
+        node: &WindowNode,
+        path: &mut Vec<usize>,
+        views: &HashMap<WindowId, Identity>,
+        nodes: &mut HashMap<Vec<usize>, Identity>,
+        tuples: &mut Vec<LayoutFact>,
+        leaves: &mut Vec<Identity>,
+    ) -> Result<Identity, MicaHostError> {
+        match node {
+            WindowNode::Leaf { window_id } => {
+                let view = *views.get(window_id).ok_or(MicaHostError::MissingIdentity)?;
+                leaves.push(view);
+                Ok(view)
+            }
+            WindowNode::Split {
+                direction,
+                ratio,
+                first,
+                second,
+            } => {
+                let identity = if let Some(identity) = nodes.get(path).copied() {
+                    identity
+                } else {
+                    let identity = driver.allocate_ephemeral_identity()?;
+                    nodes.insert(path.clone(), identity);
+                    identity
+                };
+                tuples.push(LayoutFact::View(identity));
+                path.push(0);
+                let first = visit(driver, first, path, views, nodes, tuples, leaves)?;
+                path.pop();
+                path.push(1);
+                let second = visit(driver, second, path, views, nodes, tuples, leaves)?;
+                path.pop();
+                tuples.extend([
+                    LayoutFact::First(identity, first),
+                    LayoutFact::Second(identity, second),
+                    LayoutFact::Axis(
+                        identity,
+                        match direction {
+                            SplitDirection::Horizontal => sym("horizontal"),
+                            SplitDirection::Vertical => sym("vertical"),
+                        },
+                    ),
+                    LayoutFact::Ratio(identity, *ratio),
+                ]);
+                Ok(identity)
+            }
+        }
+    }
+
+    let mut tuples = Vec::new();
+    let mut leaves = Vec::new();
+    let root = visit(
+        driver,
+        root,
+        &mut Vec::new(),
+        views,
+        nodes,
+        &mut tuples,
+        &mut leaves,
+    )?;
+    tuples.push(LayoutFact::Root(frame, root));
+    if leaves.len() > 1 {
+        for index in 0..leaves.len() {
+            tuples.push(LayoutFact::Next(
+                leaves[index],
+                leaves[(index + 1) % leaves.len()],
+            ));
+        }
+    }
+    Ok(tuples)
 }
 
 pub fn normalized_key_sequence(keys: &[crate::keys::LogicalKey]) -> String {

@@ -853,23 +853,41 @@ impl HostSession {
                 "quit" => lifecycle.push(LifecycleEvent::QuitRequested),
                 "redraw" => invalidations.push(Invalidation::Full),
                 "split_horizontal" => {
+                    if let Some(view) = action.view {
+                        self.editor.active_window = view;
+                    }
                     self.editor.split_horizontal();
                     invalidations.push(Invalidation::Full);
                 }
                 "split_vertical" => {
+                    if let Some(view) = action.view {
+                        self.editor.active_window = view;
+                    }
                     self.editor.split_vertical();
                     invalidations.push(Invalidation::Full);
                 }
                 "other_window" => {
-                    self.editor.switch_window();
+                    if let Some(view) = action.view {
+                        self.editor.active_window = view;
+                    } else {
+                        lifecycle.push(LifecycleEvent::Error(
+                            "Mica window selection lost its logical view".to_owned(),
+                        ));
+                    }
                     invalidations.push(Invalidation::Full);
                 }
                 "delete_window" => {
+                    if let Some(view) = action.view {
+                        self.editor.active_window = view;
+                    }
                     if self.editor.delete_window() {
                         invalidations.push(Invalidation::Full);
                     }
                 }
                 "delete_other_windows" => {
+                    if let Some(view) = action.view {
+                        self.editor.active_window = view;
+                    }
                     if self.editor.delete_other_windows() {
                         invalidations.push(Invalidation::Full);
                     }
@@ -2113,7 +2131,8 @@ mod tests {
             assert_eq!(snapshot(&switched).views.len(), 2);
             assert_ne!(
                 snapshot(&switched).active_view,
-                snapshot(&split).active_view
+                snapshot(&split).active_view,
+                "{switched:#?}"
             );
 
             session

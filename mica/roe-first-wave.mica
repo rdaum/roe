@@ -306,31 +306,45 @@ end
 
 verb roe/split_horizontal(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor
-  emit(session, {:kind -> :host_action, :action -> :split_horizontal})
+  let target = one roe/ActiveView(session, ?view)
+  roe/SessionLeafView(session, target) || return :invalid_active_view
+  emit(session, {:kind -> :host_action, :action -> :split_horizontal, :view -> target})
   return :ok
 end
 
 verb roe/split_vertical(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor
-  emit(session, {:kind -> :host_action, :action -> :split_vertical})
+  let target = one roe/ActiveView(session, ?view)
+  roe/SessionLeafView(session, target) || return :invalid_active_view
+  emit(session, {:kind -> :host_action, :action -> :split_vertical, :view -> target})
   return :ok
 end
 
 verb roe/native_other_window(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor
-  emit(session, {:kind -> :host_action, :action -> :other_window})
+  let current = one roe/ActiveView(session, ?view)
+  let next = one roe/NextView(current, ?view)
+  next != nothing || return :no_next_view
+  roe/SessionLeafView(session, next) || return :invalid_next_view
+  retract roe/ActiveView(session, current)
+  assert roe/ActiveView(session, next)
+  emit(session, {:kind -> :host_action, :action -> :other_window, :view -> next})
   return :ok
 end
 
 verb roe/delete_window(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor
-  emit(session, {:kind -> :host_action, :action -> :delete_window})
+  let target = one roe/ActiveView(session, ?view)
+  roe/SessionLeafView(session, target) || return :invalid_active_view
+  emit(session, {:kind -> :host_action, :action -> :delete_window, :view -> target})
   return :ok
 end
 
 verb roe/delete_other_windows(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor
-  emit(session, {:kind -> :host_action, :action -> :delete_other_windows})
+  let target = one roe/ActiveView(session, ?view)
+  roe/SessionLeafView(session, target) || return :invalid_active_view
+  emit(session, {:kind -> :host_action, :action -> :delete_other_windows, :view -> target})
   return :ok
 end
 
