@@ -3518,7 +3518,7 @@ mod tests {
             key_state: KeyState::new(),
             bindings: Box::new(DefaultBindings {}),
             window_tree: WindowNode::new_leaf(window_id),
-            kill_ring: KillRing::new(),
+            kill_ring: KillRing::without_clipboard(60),
             command_registry: Default::default(),
             buffer_history: vec![],
             echo_message: "".to_string(),

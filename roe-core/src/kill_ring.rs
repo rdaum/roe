@@ -11,7 +11,30 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
-use arboard::Clipboard;
+/// Clipboard operations used by the kill ring.
+///
+/// The boundary is injectable so tests and headless hosts do not read or mutate
+/// the process user's global clipboard.
+pub trait ClipboardBackend: Send {
+    fn set_text(&mut self, text: String) -> Result<(), String>;
+    fn get_text(&mut self) -> Result<String, String>;
+}
+
+struct SystemClipboard {
+    clipboard: arboard::Clipboard,
+}
+
+impl ClipboardBackend for SystemClipboard {
+    fn set_text(&mut self, text: String) -> Result<(), String> {
+        self.clipboard
+            .set_text(text)
+            .map_err(|error| error.to_string())
+    }
+
+    fn get_text(&mut self) -> Result<String, String> {
+        self.clipboard.get_text().map_err(|error| error.to_string())
+    }
+}
 
 /// Emacs-style kill-ring implementation with system clipboard integration
 ///
@@ -33,7 +56,7 @@ pub struct KillRing {
     /// Whether the last operation was a kill (for appending consecutive kills)
     last_was_kill: bool,
     /// System clipboard handle (optional - clipboard may not be available)
-    clipboard: Option<Clipboard>,
+    clipboard: Option<Box<dyn ClipboardBackend>>,
 }
 
 impl Default for KillRing {
@@ -51,15 +74,27 @@ impl KillRing {
     /// Create a new kill-ring with specified maximum capacity
     pub fn with_capacity(max_size: usize) -> Self {
         // Try to initialize clipboard, but don't fail if unavailable
-        let clipboard = Clipboard::new().ok();
+        let clipboard = arboard::Clipboard::new()
+            .ok()
+            .map(|clipboard| Box::new(SystemClipboard { clipboard }) as Box<dyn ClipboardBackend>);
 
-        KillRing {
+        Self::with_clipboard(max_size, clipboard)
+    }
+
+    /// Create a kill ring with an explicitly supplied clipboard implementation.
+    pub fn with_clipboard(max_size: usize, clipboard: Option<Box<dyn ClipboardBackend>>) -> Self {
+        Self {
             entries: Vec::new(),
-            max_size: max_size.max(1), // Ensure at least 1 entry
+            max_size: max_size.max(1),
             current_index: 0,
             last_was_kill: false,
             clipboard,
         }
+    }
+
+    /// Create a deterministic kill ring with no system clipboard integration.
+    pub fn without_clipboard(max_size: usize) -> Self {
+        Self::with_clipboard(max_size, None)
     }
 
     /// Copy text to system clipboard (best effort, ignores errors)
@@ -256,10 +291,30 @@ impl KillRing {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    struct TestClipboard {
+        text: Arc<Mutex<String>>,
+    }
+
+    impl ClipboardBackend for TestClipboard {
+        fn set_text(&mut self, text: String) -> Result<(), String> {
+            *self.text.lock().unwrap() = text;
+            Ok(())
+        }
+
+        fn get_text(&mut self) -> Result<String, String> {
+            Ok(self.text.lock().unwrap().clone())
+        }
+    }
+
+    fn test_ring() -> KillRing {
+        KillRing::without_clipboard(60)
+    }
 
     #[test]
     fn test_basic_kill_and_yank() {
-        let mut ring = KillRing::new();
+        let mut ring = test_ring();
 
         ring.kill("hello".to_string());
         assert_eq!(ring.yank(), Some("hello"));
@@ -267,7 +322,7 @@ mod tests {
 
     #[test]
     fn test_consecutive_kills_append() {
-        let mut ring = KillRing::new();
+        let mut ring = test_ring();
 
         ring.kill("hello".to_string());
         ring.kill(" world".to_string());
@@ -278,7 +333,7 @@ mod tests {
 
     #[test]
     fn test_non_consecutive_kills() {
-        let mut ring = KillRing::new();
+        let mut ring = test_ring();
 
         ring.kill("first".to_string());
         ring.break_kill_sequence(); // Simulate non-kill operation
@@ -290,7 +345,7 @@ mod tests {
 
     #[test]
     fn test_kill_prepend() {
-        let mut ring = KillRing::new();
+        let mut ring = test_ring();
 
         ring.kill("world".to_string());
         ring.kill_prepend("hello ".to_string());
@@ -300,7 +355,7 @@ mod tests {
 
     #[test]
     fn test_yank_index() {
-        let mut ring = KillRing::new();
+        let mut ring = test_ring();
 
         ring.kill("first".to_string());
         ring.break_kill_sequence();
@@ -316,7 +371,7 @@ mod tests {
 
     #[test]
     fn test_yank_pop() {
-        let mut ring = KillRing::new();
+        let mut ring = test_ring();
 
         ring.kill("first".to_string());
         ring.break_kill_sequence();
@@ -335,7 +390,7 @@ mod tests {
 
     #[test]
     fn test_max_capacity() {
-        let mut ring = KillRing::with_capacity(2);
+        let mut ring = KillRing::without_clipboard(2);
 
         ring.kill("first".to_string());
         ring.break_kill_sequence();
@@ -351,7 +406,7 @@ mod tests {
 
     #[test]
     fn test_empty_kill_ignored() {
-        let mut ring = KillRing::new();
+        let mut ring = test_ring();
 
         ring.kill("".to_string());
         assert!(ring.is_empty());
@@ -363,7 +418,7 @@ mod tests {
 
     #[test]
     fn test_current() {
-        let mut ring = KillRing::new();
+        let mut ring = test_ring();
 
         ring.kill("test".to_string());
         assert_eq!(ring.current(), Some("test"));
@@ -371,5 +426,19 @@ mod tests {
         // current() should not change state
         assert_eq!(ring.current(), Some("test"));
         assert_eq!(ring.yank(), Some("test"));
+    }
+
+    #[test]
+    fn test_injected_clipboard_imports_external_text() {
+        let text = Arc::new(Mutex::new(String::new()));
+        let clipboard = TestClipboard { text: text.clone() };
+        let mut ring = KillRing::with_clipboard(60, Some(Box::new(clipboard)));
+
+        ring.kill("internal".to_string());
+        assert_eq!(&*text.lock().unwrap(), "internal");
+
+        *text.lock().unwrap() = "external".to_string();
+        assert_eq!(ring.yank(), Some("external"));
+        assert_eq!(ring.entries(), &["internal", "external"]);
     }
 }
