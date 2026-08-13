@@ -124,7 +124,7 @@ impl IsearchMode {
     }
 
     /// Find all matches of search_term in the target buffer content
-    /// Returns byte positions for spans (consistent with syntax highlighting)
+    /// Returns character positions, matching buffers, cursors, and highlight spans.
     fn find_matches(&mut self) {
         self.matches.clear();
         self.current_match_index = None;
@@ -138,14 +138,14 @@ impl IsearchMode {
         // Match at original UTF-8 character boundaries. Lowercasing can change
         // byte length, so positions in a lowercased copy cannot safely be used
         // as spans in the original content.
-        for (start, _) in content.char_indices() {
+        for (start_char, (start_byte, _)) in content.char_indices().enumerate() {
             let mut folded = String::new();
-            for (relative_end, character) in content[start..].char_indices() {
+            for (relative_end_char, character) in content[start_byte..].chars().enumerate() {
                 folded.extend(character.to_lowercase());
                 if folded.len() >= needle_lower.len() {
                     if folded == needle_lower {
                         self.matches
-                            .push((start, start + relative_end + character.len_utf8()));
+                            .push((start_char, start_char + relative_end_char + 1));
                     }
                     break;
                 }
@@ -160,21 +160,16 @@ impl IsearchMode {
     }
 
     /// Find the nearest match to the original cursor position based on direction
-    /// Note: original_cursor is in chars, matches are in bytes
     fn find_nearest_match(&self) -> usize {
         if self.matches.is_empty() {
             return 0;
         }
 
-        // Convert original_cursor (char position) to byte position for comparison
-        let content = self.target_buffer.content();
-        let cursor_byte_pos = char_to_byte_pos(&content, self.original_cursor);
-
         match self.direction {
             SearchDirection::Forward => {
                 // Find first match at or after original cursor
                 for (i, (start, _)) in self.matches.iter().enumerate() {
-                    if *start >= cursor_byte_pos {
+                    if *start >= self.original_cursor {
                         return i;
                     }
                 }
@@ -184,7 +179,7 @@ impl IsearchMode {
             SearchDirection::Backward => {
                 // Find last match before original cursor
                 for (i, (start, _)) in self.matches.iter().enumerate().rev() {
-                    if *start < cursor_byte_pos {
+                    if *start < self.original_cursor {
                         return i;
                     }
                 }
@@ -338,19 +333,6 @@ impl Mode for IsearchMode {
     }
 }
 
-/// Convert a character position to byte position in a string
-fn char_to_byte_pos(s: &str, char_pos: usize) -> usize {
-    s.char_indices()
-        .nth(char_pos)
-        .map(|(byte_idx, _)| byte_idx)
-        .unwrap_or(s.len())
-}
-
-/// Convert a byte position to character position in a string
-pub fn byte_to_char_pos(s: &str, byte_pos: usize) -> usize {
-    s[..byte_pos.min(s.len())].chars().count()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,7 +357,7 @@ mod tests {
 
         let result = mode.perform(&KeyAction::AlphaNumeric('\u{03bb}'));
         assert!(matches!(result, ModeResult::Consumed(_)));
-        assert_eq!(mode.matches().len(), 2);
+        assert_eq!(mode.matches(), &[(5, 6), (11, 12)]);
         assert_eq!(mode.current_match_index(), Some(0));
 
         mode.perform(&KeyAction::Cursor(crate::keys::CursorDirection::Down));

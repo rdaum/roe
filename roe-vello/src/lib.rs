@@ -73,19 +73,6 @@ fn syntax_color_to_vello(color: &SyntaxColor, default: Color) -> Color {
     }
 }
 
-/// Convert a character position to byte position in a string
-fn char_to_byte(s: &str, char_pos: usize) -> usize {
-    s.char_indices()
-        .nth(char_pos)
-        .map(|(byte_idx, _)| byte_idx)
-        .unwrap_or(s.len())
-}
-
-/// Convert a byte position to character position in a string
-fn byte_to_char(s: &str, byte_pos: usize) -> usize {
-    s[..byte_pos.min(s.len())].chars().count()
-}
-
 /// Scrollbar width in logical pixels
 const SCROLLBAR_WIDTH: f64 = 14.0;
 
@@ -167,6 +154,13 @@ impl<'a> RoeVelloApp<'a> {
             drag_start_cursor: None,
             scrollbar_dragging: None,
             hscrollbar_dragging: None,
+        }
+    }
+
+    fn request_redraw(&mut self, region: DirtyRegion) {
+        self.redraw_state.invalidate(region);
+        if let Some(ref state) = self.state {
+            state.window.request_redraw();
         }
     }
 
@@ -617,9 +611,6 @@ impl<'a> RoeVelloApp<'a> {
         let fg_color = self.theme.fg_color;
         let face_registry_guard = face_registry().lock().ok();
 
-        // Get full buffer content for byte<->char conversion
-        let buffer_content = buffer.content();
-
         for (visual_line, line_start_char, line_text) in lines_to_render {
             // Apply horizontal scroll - skip start_column characters
             let visible_text: String = line_text.chars().skip(start_column).collect();
@@ -630,27 +621,20 @@ impl<'a> RoeVelloApp<'a> {
             let text_x = content_x as f32;
             let text_y = content_y as f32 + (visual_line as f32) * line_height as f32;
 
-            // Convert char positions to byte positions for span query
-            // (spans use byte positions for highlighting compatibility)
-            let line_start_byte = char_to_byte(&buffer_content, line_start_char);
-            let line_end_byte =
-                char_to_byte(&buffer_content, line_start_char + line_text.chars().count());
-            let syntax_spans = buffer.spans_in_range(line_start_byte..line_end_byte);
+            let line_char_count = line_text.chars().count();
+            let line_end_char = line_start_char + line_char_count;
+            let syntax_spans = buffer.spans_in_range(line_start_char..line_end_char);
 
             // Draw background rectangles for spans with background colors
-            let line_char_count = line_text.chars().count();
             let visible_char_count = visible_text.chars().count();
             if let Some(ref registry) = face_registry_guard {
                 for span in &syntax_spans {
                     if let Some(face) = registry.get(span.face_id) {
                         if let Some(ref bg_color) = face.background {
-                            // Convert span byte positions to char positions within line
-                            let span_byte_start_in_line =
-                                span.start.saturating_sub(line_start_byte);
-                            let span_byte_end_in_line = span.end.saturating_sub(line_start_byte);
-                            let span_start_in_line =
-                                byte_to_char(&line_text, span_byte_start_in_line);
-                            let span_end_in_line = byte_to_char(&line_text, span_byte_end_in_line)
+                            let span_start_in_line = span.start.saturating_sub(line_start_char);
+                            let span_end_in_line = span
+                                .end
+                                .saturating_sub(line_start_char)
                                 .min(line_char_count);
 
                             // Adjust for horizontal scroll
@@ -697,12 +681,11 @@ impl<'a> RoeVelloApp<'a> {
                     .iter()
                     .filter_map(|span| {
                         let face = registry.get(span.face_id)?;
-                        // Convert span byte positions to char positions within line
-                        let span_byte_start_in_line = span.start.saturating_sub(line_start_byte);
-                        let span_byte_end_in_line = span.end.saturating_sub(line_start_byte);
-                        let span_start_in_line = byte_to_char(&line_text, span_byte_start_in_line);
-                        let span_end_in_line =
-                            byte_to_char(&line_text, span_byte_end_in_line).min(line_char_count);
+                        let span_start_in_line = span.start.saturating_sub(line_start_char);
+                        let span_end_in_line = span
+                            .end
+                            .saturating_sub(line_start_char)
+                            .min(line_char_count);
 
                         // Adjust for horizontal scroll
                         if span_end_in_line <= start_column
@@ -1448,6 +1431,7 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
         .expect("Failed to create surface");
 
         self.state = Some(RenderState { window, surface });
+        self.request_redraw(DirtyRegion::FullScreen);
     }
 
     fn window_event(
@@ -1471,9 +1455,8 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
                     if let Some(ref mut state) = self.state {
                         self.render_cx
                             .resize_surface(&mut state.surface, size.width, size.height);
-                        state.window.request_redraw();
-                        self.redraw_state.invalidate(DirtyRegion::FullScreen);
                     }
+                    self.request_redraw(DirtyRegion::FullScreen);
                 }
                 WindowEvent::RedrawRequested => {
                     // Poll for external file changes
@@ -1482,9 +1465,10 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
                         match action {
                             ChromeAction::Echo(msg) => {
                                 self.editor.set_echo_message(msg);
+                                self.redraw_state.invalidate(DirtyRegion::FullScreen);
                             }
-                            ChromeAction::MarkDirty(_) => {
-                                // Will be redrawn anyway
+                            ChromeAction::MarkDirty(region) => {
+                                self.redraw_state.invalidate(region);
                             }
                             ChromeAction::BufferChanged {
                                 buffer_id: _,
@@ -1499,7 +1483,9 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
                         }
                     }
 
-                    self.render();
+                    if self.redraw_state.needs_redraw() {
+                        self.render();
+                    }
                 }
                 WindowEvent::KeyboardInput { event, .. } => {
                     let mut actions: std::collections::VecDeque<_> =
@@ -1605,10 +1591,7 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
                     }
 
                     // Request redraw after key events
-                    if let Some(ref state) = self.state {
-                        state.window.request_redraw();
-                        self.redraw_state.invalidate(DirtyRegion::FullScreen);
-                    }
+                    self.request_redraw(DirtyRegion::FullScreen);
                 }
                 WindowEvent::CursorMoved { position, .. } => {
                     // Convert physical to logical coordinates
@@ -1625,34 +1608,22 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
                     // Handle window border dragging (for resizing splits)
                     if self.editor.mouse_drag_state.is_some() {
                         self.handle_border_drag(logical_x, logical_y);
-                        if let Some(ref render_state) = self.state {
-                            render_state.window.request_redraw();
-                            self.redraw_state.invalidate(DirtyRegion::FullScreen);
-                        }
+                        self.request_redraw(DirtyRegion::FullScreen);
                     }
                     // Handle vertical scrollbar dragging
                     else if self.scrollbar_dragging.is_some() {
                         self.handle_scrollbar_drag(logical_y);
-                        if let Some(ref render_state) = self.state {
-                            render_state.window.request_redraw();
-                            self.redraw_state.invalidate(DirtyRegion::FullScreen);
-                        }
+                        self.request_redraw(DirtyRegion::FullScreen);
                     }
                     // Handle horizontal scrollbar dragging
                     else if self.hscrollbar_dragging.is_some() {
                         self.handle_hscrollbar_drag(logical_x);
-                        if let Some(ref render_state) = self.state {
-                            render_state.window.request_redraw();
-                            self.redraw_state.invalidate(DirtyRegion::FullScreen);
-                        }
+                        self.request_redraw(DirtyRegion::FullScreen);
                     }
                     // Handle text selection drag
                     else if self.mouse_dragging {
                         self.handle_mouse_drag(logical_x, logical_y);
-                        if let Some(ref render_state) = self.state {
-                            render_state.window.request_redraw();
-                            self.redraw_state.invalidate(DirtyRegion::FullScreen);
-                        }
+                        self.request_redraw(DirtyRegion::FullScreen);
                     }
 
                     // Update cursor icon based on hover state
@@ -1754,10 +1725,7 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
                                         self.drag_start_cursor = Some(cursor);
                                         self.mouse_dragging = true;
                                     }
-                                    if let Some(ref render_state) = self.state {
-                                        render_state.window.request_redraw();
-                                        self.redraw_state.invalidate(DirtyRegion::FullScreen);
-                                    }
+                                    self.request_redraw(DirtyRegion::FullScreen);
                                 }
                             }
                             ElementState::Released => {

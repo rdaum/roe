@@ -1018,6 +1018,19 @@ mod tests {
     }
 
     #[test]
+    fn unicode_edits_adjust_highlight_spans_in_character_units() {
+        let mut buffer = BufferInner::new(&[]);
+        buffer.load_str("é cat");
+        buffer.add_span(HighlightSpan::new(2, 5, FaceId::default()));
+
+        buffer.insert_pos("λ".to_string(), 0);
+
+        let spans = buffer.all_spans();
+        assert_eq!((spans[0].start, spans[0].end), (3, 6));
+        assert_eq!(buffer.content(), "λé cat");
+    }
+
+    #[test]
     fn test_position_conversions_clamp_invalid_line_and_column() {
         let mut buffer = BufferInner::new(&[]);
         buffer.load_str("abc\n\u{03bb}\u{03bc}\nlast");

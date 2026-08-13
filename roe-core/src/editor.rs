@@ -134,6 +134,11 @@ impl WindowNode {
         first: WindowNode,
         second: WindowNode,
     ) -> Self {
+        let ratio = if ratio.is_finite() {
+            ratio.clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
         WindowNode::Split {
             direction,
             ratio,
@@ -603,14 +608,12 @@ impl Editor {
 
                 // Move cursor to current match if any
                 if let Some(current_idx) = initial_current {
-                    if let Some((start_byte, _)) = initial_matches.get(current_idx) {
-                        let content = buffer.content();
-                        let char_pos = crate::isearch_mode::byte_to_char_pos(&content, *start_byte);
+                    if let Some((start_char, _)) = initial_matches.get(current_idx) {
                         if let Some(window) = self.windows.get_mut(target_window_id) {
-                            window.cursor = char_pos;
+                            window.cursor = *start_char;
 
                             // Ensure cursor is visible by scrolling if needed
-                            let (col, line) = buffer.to_column_line(char_pos);
+                            let (col, line) = buffer.to_column_line(*start_char);
                             let content_height = window.height_chars.saturating_sub(3);
                             let content_width = window.width_chars.saturating_sub(4);
                             Self::ensure_cursor_visible_static(
@@ -2257,19 +2260,13 @@ impl Editor {
 
                                 // Move cursor to current match if any
                                 if let Some(current_idx) = current_match {
-                                    if let Some((start_byte, _)) = matches.get(current_idx) {
+                                    if let Some((start_char, _)) = matches.get(current_idx) {
                                         if let Some(window) = self.windows.get_mut(target_window_id)
                                         {
-                                            // Convert byte position to char position for cursor
-                                            let content = buffer.content();
-                                            let char_pos = crate::isearch_mode::byte_to_char_pos(
-                                                &content,
-                                                *start_byte,
-                                            );
-                                            window.cursor = char_pos;
+                                            window.cursor = *start_char;
 
                                             // Ensure cursor is visible by scrolling if needed
-                                            let (col, line) = buffer.to_column_line(char_pos);
+                                            let (col, line) = buffer.to_column_line(*start_char);
                                             let content_height =
                                                 window.height_chars.saturating_sub(3);
                                             let content_width =
@@ -3810,6 +3807,26 @@ mod tests {
 
         // Verify that all remaining windows are valid in the tree
         verify_window_tree_integrity(&editor);
+    }
+
+    #[test]
+    fn split_ratios_are_normalized_at_construction() {
+        let mut windows: SlotMap<WindowId, ()> = SlotMap::with_key();
+        let first = WindowNode::new_leaf(windows.insert(()));
+        let second = WindowNode::new_leaf(windows.insert(()));
+
+        for (input, expected) in [(-1.0, 0.0), (2.0, 1.0), (f32::NAN, 0.5)] {
+            let node = WindowNode::new_split(
+                SplitDirection::Horizontal,
+                input,
+                first.clone(),
+                second.clone(),
+            );
+            let WindowNode::Split { ratio, .. } = node else {
+                unreachable!();
+            };
+            assert_eq!(ratio, expected);
+        }
     }
 
     #[test]

@@ -94,14 +94,6 @@ fn syntax_color_to_crossterm(color: &SyntaxColor, default: Color) -> Color {
     }
 }
 
-/// Convert a character position to byte position in a string
-fn char_to_byte(s: &str, char_pos: usize) -> usize {
-    s.char_indices()
-        .nth(char_pos)
-        .map(|(byte_idx, _)| byte_idx)
-        .unwrap_or(s.len())
-}
-
 /// Cached theme colors used by the terminal renderer
 #[derive(Clone)]
 pub struct CachedTheme {
@@ -228,12 +220,6 @@ impl<W: Write> TerminalRenderer<W> {
         let line_end_char = line_start_char + line_char_count;
         let start_column = window.start_column as usize;
 
-        // Get buffer content for byte<->char position conversion
-        // (spans use byte positions for highlighting compatibility)
-        let buffer_content = buffer.content();
-        let line_start_byte = char_to_byte(&buffer_content, line_start_char);
-        let line_end_byte = char_to_byte(&buffer_content, line_end_char);
-
         // Draw gutter
         if show_gutter {
             let merged_lines: HashSet<usize> = HashSet::new();
@@ -288,9 +274,9 @@ impl<W: Write> TerminalRenderer<W> {
             .take(content_width as usize)
             .collect();
 
-        // Get syntax spans for this line (using byte positions)
+        // Highlight spans use the same character offsets as the buffer.
         let syntax_spans: Vec<HighlightSpan> =
-            buffer.spans_in_range(line_start_byte..line_end_byte);
+            buffer.spans_in_range(line_start_char..line_end_char);
 
         // Get face registry for looking up face colors
         let face_registry_guard = face_registry().lock().ok();
@@ -299,23 +285,19 @@ impl<W: Write> TerminalRenderer<W> {
         for (char_idx, ch) in chars_to_render.iter().enumerate() {
             // Account for horizontal scroll when calculating buffer position (in chars)
             let buffer_pos_char = line_start_char + start_column + char_idx;
-            // Convert to byte position for span lookup
-            let buffer_pos_byte = char_to_byte(&buffer_content, buffer_pos_char);
-
             // Determine the style for this character
             // Priority: region selection > syntax highlighting > default
-            // Note: region_bounds uses char positions, span lookup uses byte positions
             let (fg, bg) = if let Some((region_start, region_end)) = region_bounds {
                 if buffer_pos_char >= region_start && buffer_pos_char < region_end {
                     // Character is in selection region
                     (Color::Black, self.theme.selection_color)
                 } else {
                     // Check syntax highlighting
-                    self.get_syntax_colors(buffer_pos_byte, &syntax_spans, &face_registry_guard)
+                    self.get_syntax_colors(buffer_pos_char, &syntax_spans, &face_registry_guard)
                 }
             } else {
                 // No region, check syntax highlighting
-                self.get_syntax_colors(buffer_pos_byte, &syntax_spans, &face_registry_guard)
+                self.get_syntax_colors(buffer_pos_char, &syntax_spans, &face_registry_guard)
             };
 
             queue!(&mut self.device, Print(ch.to_string().with(fg).on(bg)))?;
@@ -1114,11 +1096,6 @@ pub fn draw_window(
         let line_end_char = line_start_char + line_char_count;
         let start_column = window.start_column as usize;
 
-        // Get buffer content for byte<->char conversion (spans use byte positions)
-        let buffer_content = buffer.content();
-        let line_start_byte = char_to_byte(&buffer_content, line_start_char);
-        let line_end_byte = char_to_byte(&buffer_content, line_end_char);
-
         // Apply horizontal scroll - skip start_column characters, then take content_width
         let line_str = line_text;
         let visible_chars: Vec<char> = line_str
@@ -1127,9 +1104,9 @@ pub fn draw_window(
             .take(content_width as usize)
             .collect();
 
-        // Get syntax spans for this line (using byte positions)
+        // Highlight spans use the same character offsets as the buffer.
         let syntax_spans: Vec<HighlightSpan> =
-            buffer.spans_in_range(line_start_byte..line_end_byte);
+            buffer.spans_in_range(line_start_char..line_end_char);
 
         // Move cursor to the start of the text content
         queue!(device, cursor::MoveTo(content_x, content_y + content_line))?;
@@ -1138,11 +1115,7 @@ pub fn draw_window(
         for (char_idx, ch) in visible_chars.iter().enumerate() {
             // Account for horizontal scroll when calculating buffer position (char position)
             let buffer_pos_char = line_start_char + start_column + char_idx;
-            // Convert to byte position for span lookup
-            let buffer_pos_byte = char_to_byte(&buffer_content, buffer_pos_char);
-
             // Determine colors: region selection > syntax > default
-            // Note: region_bounds uses char positions, span lookup uses byte positions
             let (fg, bg) = if let Some((region_start, region_end)) = region_bounds {
                 if buffer_pos_char >= region_start && buffer_pos_char < region_end {
                     // Character is in selection region
@@ -1150,7 +1123,7 @@ pub fn draw_window(
                 } else {
                     // Check syntax highlighting
                     get_syntax_colors_standalone(
-                        buffer_pos_byte,
+                        buffer_pos_char,
                         &syntax_spans,
                         &face_registry_guard,
                         theme,
@@ -1159,7 +1132,7 @@ pub fn draw_window(
             } else {
                 // No region, check syntax highlighting
                 get_syntax_colors_standalone(
-                    buffer_pos_byte,
+                    buffer_pos_char,
                     &syntax_spans,
                     &face_registry_guard,
                     theme,
