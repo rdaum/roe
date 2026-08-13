@@ -410,14 +410,16 @@ assert roe/RoleCanRequestService(#roe/editor_role, :watch_unregister)
 
 verb roe/other_window(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor
-  let current = one roe/ActiveView(session, ?view)
-  if current == nothing
+  let current_rows = roe/ActiveView(session, ?view)
+  if not current_rows
     return :no_active_view
   end
-  let next = one roe/NextView(current, ?view)
-  if next == nothing
+  let exactly {:view -> current} = current_rows
+  let next_rows = roe/NextView(current, ?view)
+  if not next_rows
     return :no_next_view
   end
+  let exactly {:view -> next} = next_rows
   roe/SessionLeafView(session, next) || return :invalid_next_view
   retract roe/ActiveView(session, current)
   assert roe/ActiveView(session, next)
@@ -427,43 +429,50 @@ end
 
 verb roe/dispatch_key(actor, session, sequence @ #string)
   roe/publish_policy(actor, session)
-  let native_action = nothing
+  let native_action = none
   let native_precedence = -2147483648
   let native_ambiguous = false
   for native in roe/NativeBinding(sequence, ?action, ?precedence)
-    if native_action == nothing || native[:precedence] > native_precedence
-      native_action = native[:action]
+    if not native_action || native[:precedence] > native_precedence
+      native_action = some(native[:action])
       native_precedence = native[:precedence]
       native_ambiguous = false
-    elseif native[:precedence] == native_precedence && native_action != native[:action]
-      native_ambiguous = true
+    elseif native[:precedence] == native_precedence
+      let exactly {:value -> current_native_action} = native_action
+      if current_native_action != native[:action]
+        native_ambiguous = true
+      end
     end
   end
-  let selected = nothing
+  let selected = none
   let selected_precedence = -2147483648
   let command_ambiguous = false
   for active in roe/EffectiveSessionKeymap(session, ?keymap, ?session_precedence)
     for binding in roe/EffectiveBinding(active[:keymap], sequence, ?command, ?precedence)
       let precedence = active[:session_precedence] + binding[:precedence]
-      if selected == nothing || precedence > selected_precedence
-        selected = binding[:command]
+      if not selected || precedence > selected_precedence
+        selected = some(binding[:command])
         selected_precedence = precedence
         command_ambiguous = false
-      elseif precedence == selected_precedence && selected != binding[:command]
-        command_ambiguous = true
+      elseif precedence == selected_precedence
+        let exactly {:value -> current_command} = selected
+        if current_command != binding[:command]
+          command_ambiguous = true
+        end
       end
     end
   end
-  if native_action != nothing && (selected == nothing || native_precedence > selected_precedence)
+  if native_action && (not selected || native_precedence > selected_precedence)
     if native_ambiguous
       raise E_AMBIGUOUS, "ambiguous native key binding"
     end
-    return roe/run_native_action(actor, session, native_action)
+    let exactly {:value -> action} = native_action
+    return roe/run_native_action(actor, session, action)
   end
-  if native_action != nothing && selected != nothing && native_precedence == selected_precedence
+  if native_action && selected && native_precedence == selected_precedence
     raise E_AMBIGUOUS, "native and command bindings have equal precedence"
   end
-  if selected == nothing
+  if not selected
     if roe/KeyPrefix(sequence)
       return :prefix
     end
@@ -478,24 +487,26 @@ verb roe/dispatch_key(actor, session, sequence @ #string)
   if command_ambiguous
     raise E_AMBIGUOUS, "ambiguous command key binding"
   end
-  let selector = one roe/CommandSelector(selected, ?selector)
-  if selector == nothing
+  let exactly {:value -> selected_command} = selected
+  let selector_rows = roe/CommandSelector(selected_command, ?selector)
+  if not selector_rows
     raise E_COMMAND, "selected command has no selector"
   end
+  let exactly {:selector -> selector} = selector_rows
   return invoke(selector, {:actor -> actor, :session -> session})
 end
 
 verb roe/run_native_action(actor, session, action)
   if roe/NativeEditingAction(action)
     roe/CanRequestService(actor, :text_write) || return :text_write_denied
-    let view = one roe/ActiveView(session, ?view)
-    let buffer = one roe/ViewBuffer(view, ?buffer)
+    let exactly {:view -> view} = roe/ActiveView(session, ?view)
+    let exactly {:buffer -> buffer} = roe/ViewBuffer(view, ?buffer)
     roe/CanUseBuffer(actor, buffer) || return :buffer_denied
   end
   if roe/NativeBufferReadAction(action)
     roe/CanRequestService(actor, :text_read) || return :text_read_denied
-    let read_view = one roe/ActiveView(session, ?view)
-    let read_buffer = one roe/ViewBuffer(read_view, ?buffer)
+    let exactly {:view -> read_view} = roe/ActiveView(session, ?view)
+    let exactly {:buffer -> read_buffer} = roe/ViewBuffer(read_view, ?buffer)
     roe/CanUseBuffer(actor, read_buffer) || return :buffer_denied
   end
   if action == :kill_line || action == :kill_region || action == :copy_region || action == :kill_word || action == :backward_kill_word
@@ -505,9 +516,11 @@ verb roe/run_native_action(actor, session, action)
     roe/CanRequestService(actor, :clipboard_read) || return :clipboard_read_denied
   end
   if action == :indent
-    let width = one roe/EffectiveConfiguration(#roe/core_configuration, :tab_width, ?width)
-    if width == nothing
-      width = 4
+    let width = 4
+    let width_rows = roe/EffectiveConfiguration(#roe/core_configuration, :tab_width, ?width)
+    if width_rows
+      let exactly {:width -> configured_width} = width_rows
+      width = configured_width
     end
     let text = ""
     let count = 0
@@ -527,8 +540,8 @@ end
 
 verb roe/emit_edit_hooks(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor
-  let view = one roe/ActiveView(session, ?view)
-  let buffer = one roe/ViewBuffer(view, ?buffer)
+  let exactly {:view -> view} = roe/ActiveView(session, ?view)
+  let exactly {:buffer -> buffer} = roe/ViewBuffer(view, ?buffer)
   let hooks = []
   for hook in roe/EffectiveModeHook(buffer, ?hook, ?precedence)
     hooks = [@hooks, [0 - hook[:precedence], hook[:hook]]]
@@ -548,7 +561,7 @@ end
 verb roe/pointer_event(actor, session, view, position, phase, button)
   roe/SessionActor(session, actor) || return :not_session_actor
   roe/SessionLeafView(session, view) || return :invalid_view
-  let buffer = one roe/ViewBuffer(view, ?buffer)
+  let exactly {:buffer -> buffer} = roe/ViewBuffer(view, ?buffer)
   roe/CanUseBuffer(actor, buffer) || return :buffer_denied
   if button != :primary && phase != :move && phase != :up
     return :ignored
@@ -560,30 +573,37 @@ verb roe/pointer_event(actor, session, view, position, phase, button)
     return :handled
   end
 
-  let pointer = one roe/PointerSelection(session, ?view, ?anchor)
+  let pointer_rows = roe/PointerSelection(session, ?view, ?anchor)
   if phase == :up
-    if pointer != nothing
-      retract roe/PointerSelection(session, pointer[:view], pointer[:anchor])
+    if pointer_rows
+      let exactly {:view -> pointer_view, :anchor -> pointer_anchor} = pointer_rows
+      retract roe/PointerSelection(session, pointer_view, pointer_anchor)
     end
     emit(session, {:kind -> :host_action, :action -> :pointer_selection, :view -> view, :position -> position, :phase -> phase})
     return :handled
   end
 
   if phase == :down
-    if pointer != nothing
-      retract roe/PointerSelection(session, pointer[:view], pointer[:anchor])
+    if pointer_rows
+      let exactly {:view -> pointer_view, :anchor -> pointer_anchor} = pointer_rows
+      retract roe/PointerSelection(session, pointer_view, pointer_anchor)
     end
-    let active = one roe/ActiveView(session, ?active)
-    if active != nothing && active != view
-      retract roe/ActiveView(session, active)
+    let active_rows = roe/ActiveView(session, ?active)
+    if active_rows
+      let exactly {:active -> active} = active_rows
+      if active != view
+        retract roe/ActiveView(session, active)
+      end
     end
     assert roe/ActiveView(session, view)
-    let old_cursor = one roe/ViewCursor(view, ?cursor)
-    if old_cursor != nothing
+    let old_cursor_rows = roe/ViewCursor(view, ?cursor)
+    if old_cursor_rows
+      let exactly {:cursor -> old_cursor} = old_cursor_rows
       retract roe/ViewCursor(view, old_cursor)
     end
-    let old_mark = one roe/ViewMark(view, ?mark)
-    if old_mark != nothing
+    let old_mark_rows = roe/ViewMark(view, ?mark)
+    if old_mark_rows
+      let exactly {:mark -> old_mark} = old_mark_rows
       retract roe/ViewMark(view, old_mark)
     end
     for old_selection in roe/ViewSelection(view, ?anchor, ?active)
@@ -596,23 +616,26 @@ verb roe/pointer_event(actor, session, view, position, phase, button)
   end
 
   if phase == :move
-    pointer != nothing || return :no_pointer_selection
-    pointer[:view] == view || return :pointer_view_mismatch
-    let old_cursor = one roe/ViewCursor(view, ?cursor)
-    if old_cursor != nothing
+    pointer_rows || return :no_pointer_selection
+    let exactly {:view -> pointer_view, :anchor -> pointer_anchor} = pointer_rows
+    pointer_view == view || return :pointer_view_mismatch
+    let old_cursor_rows = roe/ViewCursor(view, ?cursor)
+    if old_cursor_rows
+      let exactly {:cursor -> old_cursor} = old_cursor_rows
       retract roe/ViewCursor(view, old_cursor)
     end
-    let old_mark = one roe/ViewMark(view, ?mark)
-    if old_mark != nothing
+    let old_mark_rows = roe/ViewMark(view, ?mark)
+    if old_mark_rows
+      let exactly {:mark -> old_mark} = old_mark_rows
       retract roe/ViewMark(view, old_mark)
     end
     for old_selection in roe/ViewSelection(view, ?anchor, ?active)
       retract roe/ViewSelection(view, old_selection[:anchor], old_selection[:active])
     end
     assert roe/ViewCursor(view, position)
-    assert roe/ViewMark(view, pointer[:anchor])
-    assert roe/ViewSelection(view, pointer[:anchor], position)
-    emit(session, {:kind -> :host_action, :action -> :pointer_selection, :view -> view, :position -> position, :anchor -> pointer[:anchor], :phase -> phase})
+    assert roe/ViewMark(view, pointer_anchor)
+    assert roe/ViewSelection(view, pointer_anchor, position)
+    emit(session, {:kind -> :host_action, :action -> :pointer_selection, :view -> view, :position -> position, :anchor -> pointer_anchor, :phase -> phase})
     return :handled
   end
   return :ignored
@@ -628,8 +651,9 @@ end
 verb roe/set_split_ratio(actor, session, node, ratio)
   roe/SessionActor(session, actor) || return :not_session_actor
   roe/CanRequestService(actor, :layout_validate) || return :layout_denied
-  let old = one roe/ViewSplitRatio(node, ?ratio)
-  old != nothing || return :invalid_split
+  let old_rows = roe/ViewSplitRatio(node, ?old_ratio)
+  old_rows || return :invalid_split
+  let exactly {:old_ratio -> old} = old_rows
   ratio > 0.0 && ratio < 1.0 || return :invalid_ratio
   retract roe/ViewSplitRatio(node, old)
   assert roe/ViewSplitRatio(node, ratio)
@@ -639,26 +663,32 @@ end
 
 // Return either a supplied value or the declarative prompt/completion request
 // that a Mica-owned minibuffer will realize in Phase 5.
-verb roe/acquire_argument(actor, session, command, position, supplied)
+verb roe/acquire_argument(actor, session, command, position, supplied: option<dynamic>)
   roe/SessionActor(session, actor) || return :not_session_actor
   roe/DiscoverableCommand(actor, command) || return :not_discoverable
-  if supplied != nothing
-    return {:kind -> :argument_value, :value -> supplied}
+  if supplied
+    let exactly {:value -> supplied_value} = supplied
+    return {:kind -> :argument_value, :value -> supplied_value}
   end
-  let argument = one roe/CommandArgument(command, position, ?name, ?value_kind)
-  if argument == nothing
+  let argument_rows = roe/CommandArgument(command, position, ?name, ?value_kind)
+  if not argument_rows
     return :missing_argument
   end
-  let prompt = one roe/ArgumentPrompt(command, position, ?prompt)
-  if prompt == nothing
+  let exactly {:name -> name, :value_kind -> value_kind} = argument_rows
+  let prompt_rows = roe/ArgumentPrompt(command, position, ?prompt)
+  if not prompt_rows
     return :missing_prompt
   end
-  let completion = one roe/ArgumentCompletion(command, position, ?selector)
-  let candidate_kind = one roe/ArgumentCandidateKind(completion, ?value_kind)
-  if completion != nothing && candidate_kind != argument[:value_kind]
-    return :invalid_completion_type
+  let exactly {:prompt -> prompt} = prompt_rows
+  let completion = none
+  let completion_rows = roe/ArgumentCompletion(command, position, ?selector)
+  if completion_rows
+    let exactly {:selector -> selector} = completion_rows
+    let exactly {:value_kind -> candidate_kind} = roe/ArgumentCandidateKind(selector, ?value_kind)
+    candidate_kind == value_kind || return :invalid_completion_type
+    completion = some(selector)
   end
-  return {:kind -> :argument_required, :name -> argument[:name], :value_kind -> argument[:value_kind], :prompt -> prompt, :completion -> completion}
+  return {:kind -> :argument_required, :name -> name, :value_kind -> value_kind, :prompt -> prompt, :completion -> completion}
 end
 
 // Validate a completion against the command's declared provider rather than
@@ -666,27 +696,31 @@ end
 verb roe/accept_argument_candidate(actor, session, command, position, candidate)
   roe/SessionActor(session, actor) || return :not_session_actor
   roe/DiscoverableCommand(actor, command) || return :not_discoverable
-  let completion = one roe/ArgumentCompletion(command, position, ?selector)
-  if completion == nothing
+  let completion_rows = roe/ArgumentCompletion(command, position, ?selector)
+  if not completion_rows
     return :missing_completion
   end
-  let selected = one roe/ArgumentCandidate(completion, actor, session, candidate, ?label)
-  if selected == nothing
+  let exactly {:selector -> completion} = completion_rows
+  let selected_rows = roe/ArgumentCandidate(completion, actor, session, candidate, ?label)
+  if not selected_rows
     return :invalid_candidate
   end
-  let argument = one roe/CommandArgument(command, position, ?name, ?value_kind)
-  argument != nothing || return :missing_argument
-  let candidate_kind = one roe/ArgumentCandidateKind(completion, ?value_kind)
-  candidate_kind != nothing || return :invalid_candidate_type
-  candidate_kind == argument[:value_kind] || return :invalid_candidate_type
-  if argument[:value_kind] == :logical_view
+  let exactly {:label -> selected_label} = selected_rows
+  let argument_rows = roe/CommandArgument(command, position, ?name, ?value_kind)
+  argument_rows || return :missing_argument
+  let exactly {:name -> argument_name, :value_kind -> argument_kind} = argument_rows
+  let candidate_kind_rows = roe/ArgumentCandidateKind(completion, ?value_kind)
+  candidate_kind_rows || return :invalid_candidate_type
+  let exactly {:value_kind -> candidate_kind} = candidate_kind_rows
+  candidate_kind == argument_kind || return :invalid_candidate_type
+  if argument_kind == :logical_view
     roe/SessionLeafView(session, candidate) || return :invalid_candidate_type
-  elseif argument[:value_kind] == :logical_buffer
+  elseif argument_kind == :logical_buffer
     roe/VisibleBuffer(session, candidate) || return :invalid_candidate_type
-  elseif argument[:value_kind] == :selector
+  elseif argument_kind == :selector
     CanInvoke(actor, candidate) || return :invalid_candidate_type
-  elseif argument[:value_kind] != :path && argument[:value_kind] != :opaque
+  elseif argument_kind != :path && argument_kind != :opaque
     return :unsupported_candidate_type
   end
-  return {:kind -> :argument_value, :value -> candidate, :label -> selected, :value_kind -> argument[:value_kind]}
+  return {:kind -> :argument_value, :value -> candidate, :label -> selected_label, :value_kind -> argument_kind}
 end

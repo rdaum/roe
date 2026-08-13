@@ -126,13 +126,10 @@ end
 // dispatch_key. A missing grant, fact, or composition rule changes the result.
 verb roe/demo_policy_probe(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor
-  let argument = one roe/CommandArgument(#roe/other_window, 0, ?name, ?kind)
-  argument != nothing || return :missing_argument
-  let prompt = one roe/ArgumentPrompt(#roe/other_window, 0, ?value)
-  prompt != nothing || return :missing_prompt
-  let completion = one roe/ArgumentCompletion(#roe/other_window, 0, ?selector)
-  completion != nothing || return :missing_completion
-  let acquisition = invoke(:roe/acquire_argument, {:actor -> actor, :session -> session, :command -> #roe/other_window, :position -> 0, :supplied -> nothing})
+  roe/CommandArgument(#roe/other_window, 0, ?name, ?kind) || return :missing_argument
+  roe/ArgumentPrompt(#roe/other_window, 0, ?value) || return :missing_prompt
+  roe/ArgumentCompletion(#roe/other_window, 0, ?selector) || return :missing_completion
+  let acquisition = invoke(:roe/acquire_argument, {:actor -> actor, :session -> session, :command -> #roe/other_window, :position -> 0, :supplied -> none})
   acquisition[:kind] == :argument_required || return :bad_acquisition
   roe/ArgumentCandidate(:visible_views, actor, session, #roe/demo_view_a, "*demo*") || return :missing_candidate_a
   roe/ArgumentCandidate(:visible_views, actor, session, #roe/demo_view_b, "*demo*") || return :missing_candidate_b
@@ -140,12 +137,10 @@ verb roe/demo_policy_probe(actor, session)
   selected[:value] == #roe/demo_view_b || return :bad_candidate_selection
   roe/DiscoverableCommand(actor, #roe/other_window) || return :not_discoverable
   roe/EffectiveSessionKeymap(session, #roe/demo_shadow_map, 0) || return :missing_mode_keymap
-  let disabled_binding = one roe/EffectiveBinding(#roe/demo_disabled_map, "C-x o", ?command, ?precedence)
-  disabled_binding == nothing || return :disabled_package_binding
+  not roe/EffectiveBinding(#roe/demo_disabled_map, "C-x o", ?command, ?precedence) || return :disabled_package_binding
   roe/EffectiveModeHook(#roe/demo_buffer, :after_activate, 100) || return :missing_major_hook
   roe/EffectiveModeHook(#roe/demo_buffer, :after_edit, 50) || return :missing_minor_hook
-  let disabled_hook = one roe/EffectiveModeHook(#roe/demo_buffer, :disabled_hook, ?precedence)
-  disabled_hook == nothing || return :disabled_package_hook
+  not roe/EffectiveModeHook(#roe/demo_buffer, :disabled_hook, ?precedence) || return :disabled_package_hook
   roe/EffectiveFaceAttribute(#roe/demo_child_face, :foreground, "white") || return :missing_face_inheritance
   roe/EffectiveFaceAttribute(#roe/demo_child_face, :weight, "bold") || return :missing_face_override
   roe/EffectiveSyntaxRule(#roe/demo_buffer, #roe/fundamental_mode, :word, "[[:alnum:]_]", 100) || return :missing_major_syntax

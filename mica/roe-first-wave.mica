@@ -31,21 +31,24 @@ assert roe/SyntaxRule(#roe/fundamental_mode, :word, "[[:alnum:]_]", 100)
 
 verb roe/insert_current_time(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor
-  let view = one roe/ActiveView(session, ?view)
-  if view == nothing
+  let view_rows = roe/ActiveView(session, ?view)
+  if not view_rows
     return :no_active_view
   end
-  let buffer = one roe/ViewBuffer(view, ?buffer)
-  if buffer == nothing
+  let exactly {:view -> view} = view_rows
+  let buffer_rows = roe/ViewBuffer(view, ?buffer)
+  if not buffer_rows
     return :no_active_buffer
   end
+  let exactly {:buffer -> buffer} = buffer_rows
   roe/CanUseBuffer(actor, buffer) || return :buffer_denied
   roe/CanRequestService(actor, :clock_read) || return :clock_denied
   roe/CanRequestService(actor, :text_write) || return :text_write_denied
-  let cursor = one roe/ViewCursor(view, ?cursor)
-  if cursor == nothing
+  let cursor_rows = roe/ViewCursor(view, ?cursor)
+  if not cursor_rows
     return :no_cursor
   end
+  let exactly {:cursor -> cursor} = cursor_rows
 
   let clock = external_request(:clock_millis, {:buffer -> buffer}, 1)
   if clock[:status] != :ok
@@ -169,10 +172,12 @@ verb roe/publish_policy(actor, session)
   // projections behind.
   emit(session, {:kind -> :policy_reset})
   for found in roe/LogicalBuffer(?buffer)
-    let mode = one roe/EffectiveMajorMode(found[:buffer], ?mode)
-    if mode != nothing
-      let name = one roe/ModeName(mode, ?name)
-      if name != nothing
+    let mode_rows = roe/EffectiveMajorMode(found[:buffer], ?mode)
+    if mode_rows
+      let exactly {:mode -> mode} = mode_rows
+      let name_rows = roe/ModeName(mode, ?name)
+      if name_rows
+        let exactly {:name -> name} = name_rows
         emit(session, {:kind -> :mode_policy, :buffer -> found[:buffer], :name -> name})
       end
     end
@@ -181,8 +186,9 @@ verb roe/publish_policy(actor, session)
     end
   end
   for found in roe/Face(?face)
-    let name = one roe/FaceName(found[:face], ?name)
-    if name != nothing
+    let name_rows = roe/FaceName(found[:face], ?name)
+    if name_rows
+      let exactly {:name -> name} = name_rows
       for attribute in roe/EffectiveFaceAttribute(found[:face], ?attribute, ?value)
         emit(session, {:kind -> :face_policy, :face -> name, :attribute -> attribute[:attribute], :value -> attribute[:value]})
       end
@@ -349,21 +355,24 @@ verb roe/select_window(actor, session)
 end
 
 verb roe/begin_argument_prompt(actor, session, command, position)
-  let acquisition = invoke(:roe/acquire_argument, {:actor -> actor, :session -> session, :command -> command, :position -> position, :supplied -> nothing})
+  let acquisition = invoke(:roe/acquire_argument, {:actor -> actor, :session -> session, :command -> command, :position -> position, :supplied -> none})
   if acquisition == :invalid_completion_type
     return :argument_unavailable
   end
   acquisition[:kind] == :argument_required || return :argument_unavailable
-  assert roe/PromptState(session, :command_argument, "", 0, nothing, [command, position, acquisition[:value_kind], acquisition[:prompt]])
+  assert roe/PromptState(session, :command_argument, "", 0, none, some([command, position, acquisition[:value_kind], acquisition[:prompt]]))
   return roe/refresh_prompt(actor, session)
 end
 
 verb roe/select_window_value(actor, session, value)
   roe/SessionActor(session, actor) || return :not_session_actor
   roe/SessionLeafView(session, value) || return :invalid_view
-  let current = one roe/ActiveView(session, ?view)
-  if current != nothing && current != value
-    retract roe/ActiveView(session, current)
+  let current_rows = roe/ActiveView(session, ?view)
+  if current_rows
+    let exactly {:view -> current} = current_rows
+    if current != value
+      retract roe/ActiveView(session, current)
+    end
   end
   assert roe/ActiveView(session, value)
   emit(session, {:kind -> :host_action, :action -> :other_window, :view -> value})
@@ -372,8 +381,8 @@ end
 
 verb roe/save_buffer(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor
-  let view = one roe/ActiveView(session, ?view)
-  let buffer = one roe/ViewBuffer(view, ?buffer)
+  let exactly {:view -> view} = roe/ActiveView(session, ?view)
+  let exactly {:buffer -> buffer} = roe/ViewBuffer(view, ?buffer)
   roe/CanUseBuffer(actor, buffer) || return :buffer_denied
   roe/CanRequestService(actor, :file_write) || return :file_write_denied
   emit(session, {:kind -> :host_action, :action -> :save_buffer})
@@ -408,15 +417,15 @@ verb roe/start_file_prompt(actor, session, prompt_kind)
   for path in listing[:value]
     assert roe/FileCandidate(session, path, false)
   end
-  let target = one roe/ActiveView(session, ?view)
-  assert roe/PromptState(session, prompt_kind, "", 0, target, nothing)
+  let exactly {:view -> target} = roe/ActiveView(session, ?view)
+  assert roe/PromptState(session, prompt_kind, "", 0, some(target), none)
   return roe/refresh_prompt(actor, session)
 end
 
 verb roe/split_horizontal(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor
   roe/CanRequestService(actor, :layout_validate) || return :layout_denied
-  let target = one roe/ActiveView(session, ?view)
+  let exactly {:view -> target} = roe/ActiveView(session, ?view)
   roe/SessionLeafView(session, target) || return :invalid_active_view
   emit(session, {:kind -> :host_action, :action -> :split_horizontal, :view -> target})
   return :ok
@@ -425,7 +434,7 @@ end
 verb roe/split_vertical(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor
   roe/CanRequestService(actor, :layout_validate) || return :layout_denied
-  let target = one roe/ActiveView(session, ?view)
+  let exactly {:view -> target} = roe/ActiveView(session, ?view)
   roe/SessionLeafView(session, target) || return :invalid_active_view
   emit(session, {:kind -> :host_action, :action -> :split_vertical, :view -> target})
   return :ok
@@ -433,9 +442,10 @@ end
 
 verb roe/native_other_window(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor
-  let current = one roe/ActiveView(session, ?view)
-  let next = one roe/NextView(current, ?view)
-  next != nothing || return :no_next_view
+  let exactly {:view -> current} = roe/ActiveView(session, ?view)
+  let next_rows = roe/NextView(current, ?view)
+  next_rows || return :no_next_view
+  let exactly {:view -> next} = next_rows
   roe/SessionLeafView(session, next) || return :invalid_next_view
   retract roe/ActiveView(session, current)
   assert roe/ActiveView(session, next)
@@ -446,7 +456,7 @@ end
 verb roe/delete_window(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor
   roe/CanRequestService(actor, :layout_validate) || return :layout_denied
-  let target = one roe/ActiveView(session, ?view)
+  let exactly {:view -> target} = roe/ActiveView(session, ?view)
   roe/SessionLeafView(session, target) || return :invalid_active_view
   emit(session, {:kind -> :host_action, :action -> :delete_window, :view -> target})
   return :ok
@@ -455,7 +465,7 @@ end
 verb roe/delete_other_windows(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor
   roe/CanRequestService(actor, :layout_validate) || return :layout_denied
-  let target = one roe/ActiveView(session, ?view)
+  let exactly {:view -> target} = roe/ActiveView(session, ?view)
   roe/SessionLeafView(session, target) || return :invalid_active_view
   emit(session, {:kind -> :host_action, :action -> :delete_other_windows, :view -> target})
   return :ok
@@ -463,22 +473,22 @@ end
 
 verb roe/switch_buffer(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor
-  let target = one roe/ActiveView(session, ?view)
-  assert roe/PromptState(session, :switch_buffer, "", 0, target, nothing)
+  let exactly {:view -> target} = roe/ActiveView(session, ?view)
+  assert roe/PromptState(session, :switch_buffer, "", 0, some(target), none)
   return roe/refresh_prompt(actor, session)
 end
 
 verb roe/kill_buffer(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor
-  let target = one roe/ActiveView(session, ?view)
-  assert roe/PromptState(session, :kill_buffer, "", 0, target, nothing)
+  let exactly {:view -> target} = roe/ActiveView(session, ?view)
+  assert roe/PromptState(session, :kill_buffer, "", 0, some(target), none)
   return roe/refresh_prompt(actor, session)
 end
 
 verb roe/execute_command(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor
-  let target = one roe/ActiveView(session, ?view)
-  assert roe/PromptState(session, :command, "", 0, target, nothing)
+  let exactly {:view -> target} = roe/ActiveView(session, ?view)
+  assert roe/PromptState(session, :command, "", 0, some(target), none)
   return roe/refresh_prompt(actor, session)
 end
 
@@ -494,18 +504,25 @@ verb roe/prompt_candidates(actor, session, prompt_kind, query)
   let candidates = []
   if prompt_kind == :command
     for found in roe/DiscoverableCommand(actor, ?command)
-      let name = one roe/CommandName(found[:command], ?name)
-      let selector = one roe/CommandSelector(found[:command], ?selector)
-      if name != nothing && selector != nothing && (query == "" || string_contains(lower(name), lower(query))) && roe/list_length(candidates) < 256
-        candidates = [@candidates, [name, selector]]
+      let name_rows = roe/CommandName(found[:command], ?name)
+      let selector_rows = roe/CommandSelector(found[:command], ?selector)
+      if name_rows && selector_rows
+        let exactly {:name -> name} = name_rows
+        let exactly {:selector -> selector} = selector_rows
+        if (query == "" || string_contains(lower(name), lower(query))) && roe/list_length(candidates) < 256
+          candidates = [@candidates, [name, selector]]
+        end
       end
     end
   elseif prompt_kind == :switch_buffer || prompt_kind == :kill_buffer
     for found in roe/LogicalBuffer(?buffer)
       if roe/CanUseBuffer(actor, found[:buffer])
-        let name = one roe/BufferName(found[:buffer], ?name)
-        if name != nothing && (query == "" || string_contains(lower(name), lower(query))) && roe/list_length(candidates) < 256
-          candidates = [@candidates, [name, found[:buffer]]]
+        let name_rows = roe/BufferName(found[:buffer], ?name)
+        if name_rows
+          let exactly {:name -> name} = name_rows
+          if (query == "" || string_contains(lower(name), lower(query))) && roe/list_length(candidates) < 256
+            candidates = [@candidates, [name, found[:buffer]]]
+          end
         end
       end
     end
@@ -518,13 +535,20 @@ verb roe/prompt_candidates(actor, session, prompt_kind, query)
       end
     end
   elseif prompt_kind == :command_argument
-    let state = one roe/PromptState(session, ?kind, ?state_query, ?selected, ?target, ?command)
-    if state != nothing
-      let completion = one roe/ArgumentCompletion(state[:command][0], state[:command][1], ?selector)
-      for found in roe/ArgumentCandidate(completion, actor, session, ?candidate, ?label)
-        if query == "" || string_contains(lower(found[:label]), lower(query))
-          if roe/list_length(candidates) < 256
-            candidates = [@candidates, [found[:label], found[:candidate]]]
+    let state_rows = roe/PromptState(session, ?kind, ?state_query, ?state_selected, ?target, ?aux)
+    if state_rows
+      let exactly {:aux -> aux} = state_rows
+      if aux
+        let exactly {:value -> command_state} = aux
+        let completion_rows = roe/ArgumentCompletion(command_state[0], command_state[1], ?selector)
+        if completion_rows
+          let exactly {:selector -> completion} = completion_rows
+          for found in roe/ArgumentCandidate(completion, actor, session, ?candidate, ?label)
+            if query == "" || string_contains(lower(found[:label]), lower(query))
+              if roe/list_length(candidates) < 256
+                candidates = [@candidates, [found[:label], found[:candidate]]]
+              end
+            end
           end
         end
       end
@@ -534,68 +558,76 @@ verb roe/prompt_candidates(actor, session, prompt_kind, query)
 end
 
 verb roe/refresh_prompt(actor, session)
-  let state = one roe/PromptState(session, ?prompt_kind, ?query, ?selected, ?target, ?aux)
-  state != nothing || return :no_prompt
-  let candidates = roe/prompt_candidates(actor, session, state[:prompt_kind], state[:query])
-  let selected = state[:selected]
+  let state_rows = roe/PromptState(session, ?prompt_kind, ?query, ?state_selected, ?target, ?aux)
+  state_rows || return :no_prompt
+  let exactly {:prompt_kind -> prompt_kind, :query -> query, :state_selected -> state_selected, :target -> target, :aux -> aux} = state_rows
+  let candidates = roe/prompt_candidates(actor, session, prompt_kind, query)
+  let selected = state_selected
   if roe/list_length(candidates) == 0
     selected = 0
   elseif selected >= roe/list_length(candidates)
     selected = roe/list_length(candidates) - 1
   end
-  if selected != state[:selected]
-    retract roe/PromptState(session, state[:prompt_kind], state[:query], state[:selected], state[:target], state[:aux])
-    assert roe/PromptState(session, state[:prompt_kind], state[:query], selected, state[:target], state[:aux])
+  if selected != state_selected
+    retract roe/PromptState(session, prompt_kind, query, state_selected, target, aux)
+    assert roe/PromptState(session, prompt_kind, query, selected, target, aux)
   end
   let prompt = ""
-  if state[:prompt_kind] == :command_argument
-    prompt = state[:aux][3]
-  end
-  if state[:prompt_kind] == :command_argument
-    emit(session, {:kind -> :prompt_update, :prompt_kind -> state[:prompt_kind], :value_kind -> state[:aux][2], :prompt -> prompt, :query -> state[:query], :selected -> selected, :candidates -> candidates})
+  if prompt_kind == :command_argument
+    let exactly {:value -> command_state} = aux
+    prompt = command_state[3]
+    emit(session, {:kind -> :prompt_update, :prompt_kind -> prompt_kind, :value_kind -> command_state[2], :prompt -> prompt, :query -> query, :selected -> selected, :candidates -> candidates})
   else
-    emit(session, {:kind -> :prompt_update, :prompt_kind -> state[:prompt_kind], :prompt -> prompt, :query -> state[:query], :selected -> selected, :candidates -> candidates})
+    emit(session, {:kind -> :prompt_update, :prompt_kind -> prompt_kind, :prompt -> prompt, :query -> query, :selected -> selected, :candidates -> candidates})
   end
   return :ok
 end
 
 verb roe/prompt_key(actor, session, sequence)
-  let state = one roe/PromptState(session, ?prompt_kind, ?query, ?selected, ?target, ?aux)
-  state != nothing || return :no_prompt
+  let state_rows = roe/PromptState(session, ?prompt_kind, ?state_query, ?state_selected, ?target, ?aux)
+  state_rows || return :no_prompt
+  let exactly {:prompt_kind -> prompt_kind, :state_query -> state_query, :state_selected -> state_selected, :target -> target, :aux -> aux} = state_rows
   if roe/KeyPrefix(sequence)
     return :prefix
   end
-  let global_command = nothing
+  let global_command = none
   let global_precedence = -2147483648
   let global_ambiguous = false
   for active in roe/EffectiveSessionKeymap(session, ?keymap, ?session_precedence)
     for binding in roe/EffectiveBinding(active[:keymap], sequence, ?command, ?precedence)
       let precedence = active[:session_precedence] + binding[:precedence]
-      if global_command == nothing || precedence > global_precedence
-        global_command = binding[:command]
+      if not global_command || precedence > global_precedence
+        global_command = some(binding[:command])
         global_precedence = precedence
         global_ambiguous = false
-      elseif precedence == global_precedence && global_command != binding[:command]
-        global_ambiguous = true
+      elseif precedence == global_precedence
+        let exactly {:value -> current_global_command} = global_command
+        if current_global_command != binding[:command]
+          global_ambiguous = true
+        end
       end
     end
   end
-  if global_command != nothing && roe/PromptGlobalCommand(global_command)
-    if global_ambiguous
-      raise E_AMBIGUOUS, "ambiguous prompt-global key binding"
+  if global_command
+    let exactly {:value -> command} = global_command
+    if roe/PromptGlobalCommand(command)
+      if global_ambiguous
+        raise E_AMBIGUOUS, "ambiguous prompt-global key binding"
+      end
+      let selector_rows = roe/CommandSelector(command, ?selector)
+      selector_rows || return :missing_prompt_global_selector
+      let exactly {:selector -> global_selector} = selector_rows
+      return invoke(global_selector, {:actor -> actor, :session -> session})
     end
-    let global_selector = one roe/CommandSelector(global_command, ?selector)
-    global_selector != nothing || return :missing_prompt_global_selector
-    return invoke(global_selector, {:actor -> actor, :session -> session})
   end
-  if state[:prompt_kind] == :isearch_forward || state[:prompt_kind] == :isearch_backward
+  if prompt_kind == :isearch_forward || prompt_kind == :isearch_backward
     return roe/search_prompt_key(actor, session, sequence)
   end
-  let query = state[:query]
-  let selected = state[:selected]
-  let candidates = roe/prompt_candidates(actor, session, state[:prompt_kind], query)
+  let query = state_query
+  let selected = state_selected
+  let candidates = roe/prompt_candidates(actor, session, prompt_kind, query)
   if sequence == "Esc" || sequence == "C-g"
-    retract roe/PromptState(session, state[:prompt_kind], state[:query], state[:selected], state[:target], state[:aux])
+    retract roe/PromptState(session, prompt_kind, state_query, state_selected, target, aux)
     emit(session, {:kind -> :prompt_close})
     return :cancelled
   elseif sequence == "⌫"
@@ -616,36 +648,42 @@ verb roe/prompt_key(actor, session, sequence)
       return roe/refresh_prompt(actor, session)
     end
     let chosen = candidates[selected]
-    retract roe/PromptState(session, state[:prompt_kind], state[:query], state[:selected], state[:target], state[:aux])
+    retract roe/PromptState(session, prompt_kind, state_query, state_selected, target, aux)
     emit(session, {:kind -> :prompt_close})
-    if state[:target] != nothing
-      let current = one roe/ActiveView(session, ?view)
-      if current != nothing && current != state[:target]
-        retract roe/ActiveView(session, current)
-        assert roe/ActiveView(session, state[:target])
+    if target
+      let exactly {:value -> target_view} = target
+      let current_rows = roe/ActiveView(session, ?view)
+      if current_rows
+        let exactly {:view -> current} = current_rows
+        if current != target_view
+          retract roe/ActiveView(session, current)
+          assert roe/ActiveView(session, target_view)
+        end
       end
     end
-    if state[:prompt_kind] == :command
+    if prompt_kind == :command
       return invoke(chosen[1], {:actor -> actor, :session -> session})
-    elseif state[:prompt_kind] == :switch_buffer
+    elseif prompt_kind == :switch_buffer
       emit(session, {:kind -> :host_action, :action -> :switch_buffer_selected, :buffer -> chosen[1]})
       return :ok
-    elseif state[:prompt_kind] == :kill_buffer
+    elseif prompt_kind == :kill_buffer
       emit(session, {:kind -> :host_action, :action -> :kill_buffer_selected, :buffer -> chosen[1]})
       return :ok
-    elseif state[:prompt_kind] == :find_file
+    elseif prompt_kind == :find_file
       roe/CanRequestService(actor, :file_read) || return :file_read_denied
       emit(session, {:kind -> :host_action, :action -> :find_file_selected, :path -> chosen[1]})
       return :ok
-    elseif state[:prompt_kind] == :visit_file
+    elseif prompt_kind == :visit_file
       roe/CanRequestService(actor, :file_read) || return :file_read_denied
       emit(session, {:kind -> :host_action, :action -> :visit_file_selected, :path -> chosen[1]})
       return :ok
-    elseif state[:prompt_kind] == :command_argument
-      let accepted = invoke(:roe/accept_argument_candidate, {:actor -> actor, :session -> session, :command -> state[:aux][0], :position -> state[:aux][1], :candidate -> chosen[1]})
+    elseif prompt_kind == :command_argument
+      let exactly {:value -> command_state} = aux
+      let accepted = invoke(:roe/accept_argument_candidate, {:actor -> actor, :session -> session, :command -> command_state[0], :position -> command_state[1], :candidate -> chosen[1]})
       accepted[:kind] == :argument_value || return :invalid_argument
-      let implementation = one roe/CommandImplementation(state[:aux][0], ?selector)
-      implementation != nothing || return :missing_implementation
+      let implementation_rows = roe/CommandImplementation(command_state[0], ?selector)
+      implementation_rows || return :missing_implementation
+      let exactly {:selector -> implementation} = implementation_rows
       return invoke(implementation, {:actor -> actor, :session -> session, :value -> accepted[:value]})
     end
   elseif string_len(sequence) == 1
@@ -654,8 +692,8 @@ verb roe/prompt_key(actor, session, sequence)
   else
     return :handled
   end
-  retract roe/PromptState(session, state[:prompt_kind], state[:query], state[:selected], state[:target], state[:aux])
-  assert roe/PromptState(session, state[:prompt_kind], query, selected, state[:target], state[:aux])
+  retract roe/PromptState(session, prompt_kind, state_query, state_selected, target, aux)
+  assert roe/PromptState(session, prompt_kind, query, selected, target, aux)
   return roe/refresh_prompt(actor, session)
 end
 
@@ -671,60 +709,69 @@ end
 
 verb roe/start_search(actor, session, prompt_kind)
   roe/CanRequestService(actor, :text_read) || return :text_read_denied
-  let target = one roe/ActiveView(session, ?view)
-  let original = one roe/ViewCursor(target, ?cursor)
-  let previous = one roe/PromptLast(session, :search, ?query)
-  if previous == nothing
-    previous = ""
+  let exactly {:view -> target} = roe/ActiveView(session, ?view)
+  let exactly {:cursor -> original} = roe/ViewCursor(target, ?cursor)
+  let previous = ""
+  let previous_rows = roe/PromptLast(session, :search, ?query)
+  if previous_rows
+    let exactly {:query -> previous_query} = previous_rows
+    previous = previous_query
   end
-  assert roe/PromptState(session, prompt_kind, previous, 0, target, original)
+  assert roe/PromptState(session, prompt_kind, previous, 0, some(target), some(original))
   return roe/refresh_search(actor, session)
 end
 
 verb roe/refresh_search(actor, session)
-  let state = one roe/PromptState(session, ?prompt_kind, ?query, ?selected, ?target, ?aux)
-  state != nothing || return :no_prompt
-  let buffer = one roe/ViewBuffer(state[:target], ?buffer)
-  buffer != nothing || return :no_buffer
-  let result = external_request(:text_search, {:buffer -> buffer, :query -> state[:query]}, 1)
+  let state_rows = roe/PromptState(session, ?prompt_kind, ?query, ?state_selected, ?target, ?aux)
+  state_rows || return :no_prompt
+  let exactly {:prompt_kind -> prompt_kind, :query -> query, :state_selected -> state_selected, :target -> target, :aux -> aux} = state_rows
+  let exactly {:value -> target_view} = target
+  let buffer_rows = roe/ViewBuffer(target_view, ?buffer)
+  buffer_rows || return :no_buffer
+  let exactly {:buffer -> buffer} = buffer_rows
+  let result = external_request(:text_search, {:buffer -> buffer, :query -> query}, 1)
   if result[:status] != :ok
     raise E_NATIVE, result[:error]
   end
   let matches = result[:value]
-  let selected = state[:selected]
+  let selected = state_selected
   let count = roe/list_length(matches)
   if count == 0
     selected = 0
   elseif selected >= count
     selected = count - 1
   end
-  if selected != state[:selected]
-    retract roe/PromptState(session, state[:prompt_kind], state[:query], state[:selected], state[:target], state[:aux])
-    assert roe/PromptState(session, state[:prompt_kind], state[:query], selected, state[:target], state[:aux])
+  if selected != state_selected
+    retract roe/PromptState(session, prompt_kind, query, state_selected, target, aux)
+    assert roe/PromptState(session, prompt_kind, query, selected, target, aux)
   end
-  emit(session, {:kind -> :prompt_update, :prompt_kind -> state[:prompt_kind], :query -> state[:query], :selected -> selected, :candidates -> []})
-  emit(session, {:kind -> :search_update, :view -> state[:target], :matches -> matches, :selected -> selected})
+  emit(session, {:kind -> :prompt_update, :prompt_kind -> prompt_kind, :query -> query, :selected -> selected, :candidates -> []})
+  emit(session, {:kind -> :search_update, :view -> target_view, :matches -> matches, :selected -> selected})
   return :ok
 end
 
 verb roe/search_prompt_key(actor, session, sequence)
-  let state = one roe/PromptState(session, ?prompt_kind, ?query, ?selected, ?target, ?aux)
-  state != nothing || return :no_prompt
-  let query = state[:query]
-  let selected = state[:selected]
+  let state_rows = roe/PromptState(session, ?prompt_kind, ?state_query, ?state_selected, ?target, ?aux)
+  state_rows || return :no_prompt
+  let exactly {:prompt_kind -> prompt_kind, :state_query -> state_query, :state_selected -> state_selected, :target -> target, :aux -> aux} = state_rows
+  let exactly {:value -> target_view} = target
+  let exactly {:value -> original_cursor} = aux
+  let query = state_query
+  let selected = state_selected
   if sequence == "Esc" || sequence == "C-g"
-    retract roe/PromptState(session, state[:prompt_kind], state[:query], state[:selected], state[:target], state[:aux])
-    emit(session, {:kind -> :search_finish, :view -> state[:target], :original -> state[:aux], :query -> state[:query], :accepted -> false})
+    retract roe/PromptState(session, prompt_kind, state_query, state_selected, target, aux)
+    emit(session, {:kind -> :search_finish, :view -> target_view, :original -> original_cursor, :query -> state_query, :accepted -> false})
     emit(session, {:kind -> :prompt_close})
     return :cancelled
   elseif sequence == "⏎"
-    let previous = one roe/PromptLast(session, :search, ?previous)
-    if previous != nothing
+    let previous_rows = roe/PromptLast(session, :search, ?previous)
+    if previous_rows
+      let exactly {:previous -> previous} = previous_rows
       retract roe/PromptLast(session, :search, previous)
     end
-    assert roe/PromptLast(session, :search, state[:query])
-    retract roe/PromptState(session, state[:prompt_kind], state[:query], state[:selected], state[:target], state[:aux])
-    emit(session, {:kind -> :search_finish, :view -> state[:target], :original -> state[:aux], :query -> state[:query], :accepted -> true})
+    assert roe/PromptLast(session, :search, state_query)
+    retract roe/PromptState(session, prompt_kind, state_query, state_selected, target, aux)
+    emit(session, {:kind -> :search_finish, :view -> target_view, :original -> original_cursor, :query -> state_query, :accepted -> true})
     emit(session, {:kind -> :prompt_close})
     return :accepted
   elseif sequence == "⌫"
@@ -744,8 +791,8 @@ verb roe/search_prompt_key(actor, session, sequence)
   else
     return :handled
   end
-  retract roe/PromptState(session, state[:prompt_kind], state[:query], state[:selected], state[:target], state[:aux])
-  assert roe/PromptState(session, state[:prompt_kind], query, selected, state[:target], state[:aux])
+  retract roe/PromptState(session, prompt_kind, state_query, state_selected, target, aux)
+  assert roe/PromptState(session, prompt_kind, query, selected, target, aux)
   return roe/refresh_search(actor, session)
 end
 
