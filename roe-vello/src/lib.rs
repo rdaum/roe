@@ -305,6 +305,7 @@ impl<'a> RoeVelloApp<'a> {
                 LifecycleEvent::Ready { .. }
                 | LifecycleEvent::Heartbeat
                 | LifecycleEvent::MicaTaskCancelled { .. }
+                | LifecycleEvent::MicaSubscriptionReady { .. }
                 | LifecycleEvent::RequestCancelled { .. }
                 | LifecycleEvent::ResourceChanged { .. }
                 | LifecycleEvent::ResourceInvalidated { .. } => {}

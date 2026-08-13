@@ -11,7 +11,7 @@ use mica_driver::{
     ExternalRequestFuture, ExternalRequestHandler, FileinMode, Identity, RelationAcceleration,
     Symbol, TaskId, TaskLimits, Value,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -42,10 +42,32 @@ pub struct MicaPresentationEffect {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MicaKeyResult {
     Unbound,
-    Handled {
-        effects: Vec<MicaPresentationEffect>,
-    },
+    Handled,
     Failed(String),
+}
+
+#[derive(Debug, Default)]
+pub struct MicaEventBatch {
+    pub effects: Vec<MicaPresentationEffect>,
+    pub errors: Vec<String>,
+    pub cancelled_tasks: Vec<TaskId>,
+    pub ready_subscriptions: Vec<u64>,
+}
+
+impl MicaEventBatch {
+    fn extend(&mut self, mut other: Self) {
+        self.effects.append(&mut other.effects);
+        self.errors.append(&mut other.errors);
+        self.cancelled_tasks.append(&mut other.cancelled_tasks);
+        self.ready_subscriptions
+            .append(&mut other.ready_subscriptions);
+    }
+}
+
+#[derive(Debug)]
+pub struct MicaDispatchResult {
+    pub key: MicaKeyResult,
+    pub events: MicaEventBatch,
 }
 
 struct NativeBridge {
@@ -57,6 +79,7 @@ struct NativeBridge {
 struct NativeBridgeState {
     actor: Option<Identity>,
     resources: HashMap<Identity, ResourceId>,
+    services: HashSet<Symbol>,
 }
 
 impl NativeBridge {
@@ -67,10 +90,16 @@ impl NativeBridge {
         }
     }
 
-    fn configure(&self, actor: Identity, resources: HashMap<Identity, ResourceId>) {
+    fn configure(
+        &self,
+        actor: Identity,
+        resources: HashMap<Identity, ResourceId>,
+        services: HashSet<Symbol>,
+    ) {
         let mut state = self.state.lock().unwrap();
         state.actor = Some(actor);
         state.resources = resources;
+        state.services = services;
     }
 
     fn add_resource(&self, buffer: Identity, resource: ResourceId) {
@@ -79,6 +108,15 @@ impl NativeBridge {
             .unwrap()
             .resources
             .insert(buffer, resource);
+    }
+
+    fn remove_resource(&self, buffer: Identity) {
+        self.state.lock().unwrap().resources.remove(&buffer);
+    }
+
+    #[cfg(test)]
+    fn revoke_service(&self, service: Symbol) {
+        self.state.lock().unwrap().services.remove(&service);
     }
 
     fn handle(&self, context: ExternalRequestContext, service: Symbol, payload: Value) -> Value {
@@ -90,9 +128,20 @@ impl NativeBridge {
             return native_error("request actor does not own this Roe endpoint");
         }
 
+        let required_service = if service == sym("clock_millis") {
+            sym("clock_read")
+        } else if service == sym("text_insert") {
+            sym("text_write")
+        } else {
+            return native_error("unknown Roe native service");
+        };
+        if !state.services.contains(&required_service) {
+            return native_error("request actor lacks the required native service grant");
+        }
+
         let operation = if service == sym("clock_millis") {
             NativeOperation::ReadClockMillis
-        } else if service == sym("text_insert") {
+        } else {
             let Some(buffer) = map_value(&payload, "buffer").and_then(|value| value.as_identity())
             else {
                 return native_error("text_insert requires an identity buffer");
@@ -112,10 +161,6 @@ impl NativeBridge {
                 return native_error("text_insert requires string text");
             };
             NativeOperation::Insert { resource, at, text }
-        } else if service == sym("test_pending") {
-            return native_error("test_pending must be handled asynchronously");
-        } else {
-            return native_error("unknown Roe native service");
         };
         drop(state);
 
@@ -310,7 +355,11 @@ impl MicaHost {
             sym("roe/session-v1"),
             tuples,
         )?;
-        bridge.configure(actor, bridge_resources);
+        bridge.configure(
+            actor,
+            bridge_resources,
+            [sym("clock_read"), sym("text_write")].into(),
+        );
 
         Ok(Self {
             driver,
@@ -338,7 +387,7 @@ impl MicaHost {
         editor: &Editor,
         resource_ids: &HashMap<BufferId, ResourceId>,
         sequence: String,
-    ) -> Result<MicaKeyResult, MicaHostError> {
+    ) -> Result<MicaDispatchResult, MicaHostError> {
         if self.closed {
             return Err(MicaHostError::Closed);
         }
@@ -358,15 +407,30 @@ impl MicaHost {
         self.wait_for_task(submitted.task_id).await
     }
 
+    pub fn drain_background_events(&mut self) -> MicaEventBatch {
+        let mut batch = MicaEventBatch::default();
+        for event in self.driver.drain_events() {
+            self.record_background_event(event, &mut batch);
+        }
+        batch
+    }
+
     pub async fn replace_first_wave(&self, source: String) -> Result<(), MicaHostError> {
         self.driver.check_filein(source.clone(), None).await?;
         self.driver
             .filein_unit(sym("roe/first-wave"), source, FileinMode::Replace, None)
             .await?;
-        // Filein effects, if a future replacement adds any, remain on the one
-        // driver stream and are consumed here rather than by a second reader.
-        self.driver.drain_events();
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn revoke_service_for_test(&self, service: &str) {
+        self.bridge.revoke_service(sym(service));
+    }
+
+    #[cfg(test)]
+    pub fn identity_counts_for_test(&self) -> (usize, usize) {
+        (self.buffer_ids.len(), self.view_ids.len())
     }
 
     #[cfg(test)]
@@ -398,6 +462,42 @@ end
             )
             .await?;
         self.driver.drain_events();
+        Ok(submitted.task_id)
+    }
+
+    #[cfg(test)]
+    pub async fn start_background_test_task(&self) -> Result<TaskId, MicaHostError> {
+        const SOURCE: &str = r#"
+assert RoleCanInvoke(#roe/editor_role, :roe/test_background)
+verb roe/test_background(actor, session)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  let view = one roe/ActiveView(session, ?view)
+  let buffer = one roe/ViewBuffer(view, ?buffer)
+  let cursor = one roe/ViewCursor(view, ?cursor)
+  suspend(0.02)
+  emit(session, {:kind -> :presentation_invalidated, :view -> view, :buffer -> buffer, :cursor -> cursor})
+  return :done
+end
+"#;
+        self.driver
+            .filein_unit(
+                sym("roe/test-background"),
+                SOURCE.to_owned(),
+                FileinMode::Add,
+                None,
+            )
+            .await?;
+        let submitted = self
+            .driver
+            .submit_invocation_for_endpoint(
+                self.endpoint,
+                sym("roe/test_background"),
+                vec![
+                    (sym("actor"), Value::identity(self.actor)),
+                    (sym("session"), Value::identity(self.session)),
+                ],
+            )
+            .await?;
         Ok(submitted.task_id)
     }
 
@@ -439,6 +539,97 @@ end
         editor: &Editor,
         resource_ids: &HashMap<BufferId, ResourceId>,
     ) -> Result<(), MicaHostError> {
+        let live_buffers: HashSet<_> = editor.buffers.keys().collect();
+        let live_views: HashSet<_> = editor.windows.keys().collect();
+        let stale_buffers: Vec<_> = self
+            .buffer_ids
+            .keys()
+            .copied()
+            .filter(|buffer| !live_buffers.contains(buffer))
+            .collect();
+        let stale_views: Vec<_> = self
+            .view_ids
+            .keys()
+            .copied()
+            .filter(|view| !live_views.contains(view))
+            .collect();
+        let mut stale_tuples = Vec::new();
+        for window_id in &stale_views {
+            let view = self.view_ids[window_id];
+            if *window_id == self.active_view {
+                stale_tuples.push((
+                    sym("roe/ActiveView"),
+                    [Value::identity(self.session), Value::identity(view)].into(),
+                ));
+            }
+            stale_tuples.push((sym("roe/View"), [Value::identity(view)].into()));
+            if let Some(buffer_id) = self.view_buffers.get(window_id) {
+                stale_tuples.push((
+                    sym("roe/ViewBuffer"),
+                    [
+                        Value::identity(view),
+                        Value::identity(self.buffer_ids[buffer_id]),
+                    ]
+                    .into(),
+                ));
+            }
+            if let Some(cursor) = self.view_cursors.get(window_id) {
+                stale_tuples.push((
+                    sym("roe/ViewCursor"),
+                    [Value::identity(view), int_value(*cursor)].into(),
+                ));
+            }
+        }
+        for buffer_id in &stale_buffers {
+            let logical = self.buffer_ids[buffer_id];
+            let native = self.native_ids[buffer_id];
+            let resource = self.resource_ids[buffer_id];
+            stale_tuples.extend([
+                (sym("roe/LogicalBuffer"), [Value::identity(logical)].into()),
+                (
+                    sym("roe/BufferName"),
+                    [
+                        Value::identity(logical),
+                        Value::string(&self.buffer_names[buffer_id]),
+                    ]
+                    .into(),
+                ),
+                (
+                    sym("roe/BufferMajorMode"),
+                    [
+                        Value::identity(logical),
+                        Value::identity(self.fundamental_mode),
+                    ]
+                    .into(),
+                ),
+                (
+                    sym("roe/NativeTextResource"),
+                    [Value::identity(logical), Value::identity(native)].into(),
+                ),
+                (
+                    sym("roe/NativeResourceGeneration"),
+                    [Value::identity(native), int_value(resource.generation)].into(),
+                ),
+                (
+                    sym("roe/CanUseBuffer"),
+                    [Value::identity(self.actor), Value::identity(logical)].into(),
+                ),
+            ]);
+        }
+        self.driver.retract_volatile_tuples_named(stale_tuples)?;
+        for window_id in stale_views {
+            self.view_ids.remove(&window_id);
+            self.view_buffers.remove(&window_id);
+            self.view_cursors.remove(&window_id);
+        }
+        for buffer_id in stale_buffers {
+            let logical = self.buffer_ids.remove(&buffer_id).unwrap();
+            self.bridge.remove_resource(logical);
+            self.buffer_names.remove(&buffer_id);
+            self.native_ids.remove(&buffer_id);
+            self.resource_ids.remove(&buffer_id);
+        }
+
         let active = editor.active_window;
         let window = editor
             .windows
@@ -501,12 +692,14 @@ end
             assert.push((sym("roe/View"), [Value::identity(view)].into()));
         }
         let view = self.view_ids[&active];
-        if self.active_view != active {
+        if self.active_view != active
+            && let Some(previous_active) = self.view_ids.get(&self.active_view).copied()
+        {
             retract.push((
                 sym("roe/ActiveView"),
                 [
                     Value::identity(self.session),
-                    Value::identity(self.view_ids[&self.active_view]),
+                    Value::identity(previous_active),
                 ]
                 .into(),
             ));
@@ -553,8 +746,11 @@ end
         Ok(())
     }
 
-    async fn wait_for_task(&mut self, task_id: TaskId) -> Result<MicaKeyResult, MicaHostError> {
-        let mut effects = Vec::new();
+    async fn wait_for_task(
+        &mut self,
+        task_id: TaskId,
+    ) -> Result<MicaDispatchResult, MicaHostError> {
+        let mut batch = MicaEventBatch::default();
         loop {
             let events = {
                 let ready = self.driver.drain_events();
@@ -564,11 +760,13 @@ end
                     ready
                 }
             };
+            let mut key = None;
             for event in events {
                 match event {
                     DriverEvent::Effect(effect) => {
-                        if let Some(effect) = self.presentation_effect(&effect.value) {
-                            effects.push(effect);
+                        if let Some(effect) = self.presentation_effect(effect.target, &effect.value)
+                        {
+                            batch.effects.push(effect);
                         }
                     }
                     DriverEvent::TaskCompleted {
@@ -576,15 +774,16 @@ end
                         value,
                     } if completed == task_id => {
                         if value.as_symbol() == Some(sym("unbound")) {
-                            return Ok(MicaKeyResult::Unbound);
+                            key = Some(MicaKeyResult::Unbound);
+                        } else {
+                            key = Some(MicaKeyResult::Handled);
                         }
-                        return Ok(MicaKeyResult::Handled { effects });
                     }
                     DriverEvent::TaskAborted {
                         task_id: aborted,
                         error,
                     } if aborted == task_id => {
-                        return Ok(MicaKeyResult::Failed(format!(
+                        key = Some(MicaKeyResult::Failed(format!(
                             "Mica command aborted: {}",
                             self.driver.format_value(&error)
                         )));
@@ -593,7 +792,7 @@ end
                         task_id: failed,
                         error,
                     } if failed == task_id => {
-                        return Ok(MicaKeyResult::Failed(format!(
+                        key = Some(MicaKeyResult::Failed(format!(
                             "Mica command failed: {error}"
                         )));
                     }
@@ -601,17 +800,51 @@ end
                         task_id: cancelled,
                         reason,
                     } if cancelled == task_id => {
-                        return Ok(MicaKeyResult::Failed(format!(
+                        key = Some(MicaKeyResult::Failed(format!(
                             "Mica command cancelled: {reason:?}"
                         )));
                     }
-                    _ => {}
+                    event => self.record_background_event(event, &mut batch),
                 }
+            }
+            if let Some(key) = key {
+                return Ok(MicaDispatchResult { key, events: batch });
             }
         }
     }
 
-    fn presentation_effect(&mut self, value: &Value) -> Option<MicaPresentationEffect> {
+    fn record_background_event(&mut self, event: DriverEvent, batch: &mut MicaEventBatch) {
+        match event {
+            DriverEvent::Effect(effect) => {
+                if let Some(effect) = self.presentation_effect(effect.target, &effect.value) {
+                    batch.effects.push(effect);
+                }
+            }
+            DriverEvent::TaskAborted { task_id, error } => batch.errors.push(format!(
+                "Mica background task {task_id} aborted: {}",
+                self.driver.format_value(&error)
+            )),
+            DriverEvent::TaskFailed { task_id, error } => batch
+                .errors
+                .push(format!("Mica background task {task_id} failed: {error}")),
+            DriverEvent::TaskCancelled { task_id, .. } => {
+                batch.cancelled_tasks.push(task_id);
+            }
+            DriverEvent::SubscriptionReady { mailbox } => {
+                batch.ready_subscriptions.push(mailbox);
+            }
+            DriverEvent::TaskCompleted { .. } | DriverEvent::TaskSuspended { .. } => {}
+        }
+    }
+
+    fn presentation_effect(
+        &mut self,
+        target: Identity,
+        value: &Value,
+    ) -> Option<MicaPresentationEffect> {
+        if target != self.session {
+            return None;
+        }
         if map_value(value, "kind")?.as_symbol()? != sym("presentation_invalidated") {
             return None;
         }
@@ -634,12 +867,12 @@ end
         })
     }
 
-    pub async fn close(&mut self) -> Result<Vec<TaskId>, MicaHostError> {
+    pub async fn close(&mut self) -> Result<MicaEventBatch, MicaHostError> {
         if self.closed {
-            return Ok(Vec::new());
+            return Ok(MicaEventBatch::default());
         }
         self.closed = true;
-        self.driver.drain_events();
+        let mut events = self.drain_background_events();
         let mut tuples = vec![
             (
                 sym("roe/EditorSession"),
@@ -743,25 +976,31 @@ end
                 .await
         });
         while !close.is_finished() {
-            self.driver.drain_events();
+            events.extend(self.drain_background_events());
             compio::time::sleep(Duration::from_millis(1)).await;
         }
-        let report = close
+        let close_result = close
             .await
-            .map_err(|_| DriverError::Join("endpoint close task panicked".to_owned()))??;
-        self.driver.drain_events();
+            .map_err(|_| DriverError::Join("endpoint close task panicked".to_owned()))?;
+        events.extend(self.drain_background_events());
 
         let shutdown_driver = self.driver.clone();
         let shutdown = compio::runtime::spawn(async move { shutdown_driver.shutdown().await });
         while !shutdown.is_finished() {
-            self.driver.drain_events();
+            events.extend(self.drain_background_events());
             compio::time::sleep(Duration::from_millis(1)).await;
         }
-        shutdown
+        let shutdown_result = shutdown
             .await
-            .map_err(|_| DriverError::Join("driver shutdown task panicked".to_owned()))??;
-        self.driver.drain_events();
-        Ok(report.cancelled_tasks)
+            .map_err(|_| DriverError::Join("driver shutdown task panicked".to_owned()))?;
+        events.extend(self.drain_background_events());
+
+        let report = close_result?;
+        shutdown_result?;
+        events.cancelled_tasks.extend(report.cancelled_tasks);
+        events.cancelled_tasks.sort_unstable();
+        events.cancelled_tasks.dedup();
+        Ok(events)
     }
 }
 

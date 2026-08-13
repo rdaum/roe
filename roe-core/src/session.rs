@@ -16,7 +16,9 @@ use crate::editor::{
     BorderInfo, ChromeAction, DragType, MouseDragState, SplitDirection, WindowNode, WindowType,
 };
 use crate::keys::LogicalKey;
-use crate::mica_host::{MicaHost, MicaHostError, MicaKeyResult, normalized_key_sequence};
+use crate::mica_host::{
+    MicaEventBatch, MicaHost, MicaHostError, MicaKeyResult, normalized_key_sequence,
+};
 use crate::native_kernel::{
     Capability, CapabilityGrants, KernelError, NativeClock, NativeKernel, NativeOperation,
     NativeResult, ResourceId, TextSelection, ViewId,
@@ -164,6 +166,9 @@ pub enum LifecycleEvent {
     },
     MicaTaskCancelled {
         task_id: u64,
+    },
+    MicaSubscriptionReady {
+        mailbox: u64,
     },
     QuitRequested,
     EndpointClosed,
@@ -425,6 +430,11 @@ impl HostSession {
         let mut completions = Vec::new();
         let mut invalidations = Vec::new();
         let force_full = matches!(envelope.event, InputEvent::RequestSnapshot { .. });
+        if let Some(mut mica) = self.mica.take() {
+            let events = mica.drain_background_events();
+            self.mica = Some(mica);
+            self.apply_mica_events(events, &mut lifecycle, &mut invalidations);
+        }
 
         match envelope.event {
             InputEvent::Keys(keys) => {
@@ -437,30 +447,15 @@ impl HostSession {
                         )
                         .await;
                     self.mica = Some(mica);
-                    Some(result)
+                    Some(result.map(|dispatch| {
+                        self.apply_mica_events(dispatch.events, &mut lifecycle, &mut invalidations);
+                        dispatch.key
+                    }))
                 } else {
                     None
                 };
                 match mica_result {
-                    Some(Ok(MicaKeyResult::Handled { effects })) => {
-                        for effect in effects {
-                            if let Some(window) = self.editor.windows.get_mut(effect.view) {
-                                if window.active_buffer == effect.buffer {
-                                    window.cursor = effect.cursor;
-                                    if let Some(view) = self.view_ids.get(&effect.view).copied() {
-                                        invalidations.push(Invalidation::View(view));
-                                    } else {
-                                        invalidations.push(Invalidation::Full);
-                                    }
-                                } else {
-                                    lifecycle.push(LifecycleEvent::Warning(
-                                        "Mica effect referred to a stale view/buffer association"
-                                            .to_owned(),
-                                    ));
-                                }
-                            }
-                        }
-                    }
+                    Some(Ok(MicaKeyResult::Handled)) => {}
                     Some(Ok(MicaKeyResult::Failed(message))) => {
                         self.editor.set_echo_message(message.clone());
                         invalidations.push(Invalidation::EchoArea);
@@ -620,12 +615,8 @@ impl HostSession {
             InputEvent::Close => {
                 if let Some(mut mica) = self.mica.take() {
                     match mica.close().await {
-                        Ok(cancelled) => {
-                            lifecycle.extend(
-                                cancelled
-                                    .into_iter()
-                                    .map(|task_id| LifecycleEvent::MicaTaskCancelled { task_id }),
-                            );
+                        Ok(events) => {
+                            self.apply_mica_events(events, &mut lifecycle, &mut invalidations)
                         }
                         Err(error) => lifecycle.push(LifecycleEvent::Warning(format!(
                             "Mica endpoint shutdown: {error}"
@@ -704,6 +695,47 @@ impl HostSession {
             .ok_or(MicaHostError::Closed)?
             .replace_first_wave(source)
             .await
+    }
+
+    fn apply_mica_events(
+        &mut self,
+        events: MicaEventBatch,
+        lifecycle: &mut Vec<LifecycleEvent>,
+        invalidations: &mut Vec<Invalidation>,
+    ) {
+        for effect in events.effects {
+            if let Some(window) = self.editor.windows.get_mut(effect.view) {
+                if window.active_buffer == effect.buffer {
+                    window.cursor = effect.cursor;
+                    if let Some(view) = self.view_ids.get(&effect.view).copied() {
+                        invalidations.push(Invalidation::View(view));
+                    } else {
+                        invalidations.push(Invalidation::Full);
+                    }
+                } else {
+                    lifecycle.push(LifecycleEvent::Warning(
+                        "Mica effect referred to a stale view/buffer association".to_owned(),
+                    ));
+                }
+            }
+        }
+        for message in events.errors {
+            self.editor.set_echo_message(message.clone());
+            invalidations.push(Invalidation::EchoArea);
+            lifecycle.push(LifecycleEvent::Error(message));
+        }
+        lifecycle.extend(
+            events
+                .cancelled_tasks
+                .into_iter()
+                .map(|task_id| LifecycleEvent::MicaTaskCancelled { task_id }),
+        );
+        lifecycle.extend(
+            events
+                .ready_subscriptions
+                .into_iter()
+                .map(|mailbox| LifecycleEvent::MicaSubscriptionReady { mailbox }),
+        );
     }
 
     fn validate_envelope(&self, envelope: &InputEnvelope) -> Result<(), SessionError> {
@@ -1542,6 +1574,7 @@ mod tests {
                 "helloé42\n"
             );
 
+            let original_view = session.editor.active_window;
             let buffer = session
                 .editor
                 .create_buffer_with_mode(
@@ -1567,6 +1600,99 @@ mod tests {
                 .unwrap();
             assert_eq!(active.visible_text, "new42\n");
             assert_eq!(active.cursor, 6);
+            assert_eq!(
+                session.mica.as_ref().unwrap().identity_counts_for_test(),
+                (2, 2)
+            );
+
+            session.editor.active_window = original_view;
+            session.editor.windows.remove(view);
+            session.editor.window_tree = WindowNode::new_leaf(original_view);
+            session.editor.buffers.remove(buffer);
+            session.editor.buffer_hosts.remove(&buffer);
+            let _ = session.synchronize_identities();
+            let after_removal = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Function(12)])))
+                .await
+                .unwrap();
+            assert_eq!(
+                session.mica.as_ref().unwrap().identity_counts_for_test(),
+                (1, 1)
+            );
+            assert_eq!(
+                snapshot(&after_removal).views[0].visible_text,
+                "helloé42\n42\n"
+            );
+
+            session
+                .dispatch(session.envelope(InputEvent::Close))
+                .await
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn mica_native_bridge_enforces_service_authority() {
+        let _guard = MICA_TEST_LOCK.lock().unwrap();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut session = HostSession::open_with_mica_clock(
+                test_editor(),
+                CapabilityGrants::editor_default(),
+                Arc::new(FixedNativeClock(42)),
+            )
+            .unwrap();
+            session
+                .mica
+                .as_ref()
+                .unwrap()
+                .revoke_service_for_test("clock_read");
+
+            let denied = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Function(12)])))
+                .await
+                .unwrap();
+            assert!(denied.lifecycle.iter().any(|event| matches!(
+                event,
+                LifecycleEvent::Error(message) if message.contains("required native service grant")
+            )));
+            assert_eq!(snapshot(&denied).views[0].visible_text, "hello");
+
+            session
+                .dispatch(session.envelope(InputEvent::Close))
+                .await
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn mica_background_completion_is_pumped_by_idle_timer() {
+        let _guard = MICA_TEST_LOCK.lock().unwrap();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut session = HostSession::open_with_mica_clock(
+                test_editor(),
+                CapabilityGrants::editor_default(),
+                Arc::new(FixedNativeClock(42)),
+            )
+            .unwrap();
+            let task = session
+                .mica
+                .as_ref()
+                .unwrap()
+                .start_background_test_task()
+                .await
+                .unwrap();
+            compio::time::sleep(std::time::Duration::from_millis(40)).await;
+
+            let idle = session
+                .dispatch(session.envelope(InputEvent::Timer { token: 0 }))
+                .await
+                .unwrap();
+            assert!(idle.presentation.is_some());
+            assert_eq!(snapshot(&idle).views[0].visible_text, "hello");
+            assert!(idle.lifecycle.iter().all(|event| !matches!(
+                event,
+                LifecycleEvent::Error(message) if message.contains(&task.to_string())
+            )));
 
             session
                 .dispatch(session.envelope(InputEvent::Close))
