@@ -1139,7 +1139,8 @@ impl HostSession {
     }
 
     pub fn set_recovery_message(&mut self, message: String) {
-        self.editor.set_echo_message(message);
+        self.editor.echo_message = message;
+        self.editor.echo_message_time = Some(self.editor.clock.now());
     }
 
     async fn apply_mica_events(
@@ -3328,6 +3329,21 @@ mod tests {
                 LifecycleEvent::Error(message) if message.contains("FileWrite")
             )));
 
+            let resource = session.buffer_resources[&active];
+            let direct = session
+                .dispatch(session.envelope(InputEvent::NativeRequest {
+                    request_id: RequestId(77),
+                    operation: NativeOperation::Snapshot { resource },
+                }))
+                .await
+                .unwrap();
+            assert!(direct.native_completions.iter().any(|completion| {
+                completion.request_id == RequestId(77)
+                    && completion.result.as_ref().is_err_and(|error| {
+                        error.contains("direct native requests are disabled")
+                    })
+            }));
+
             session
                 .dispatch(session.envelope(InputEvent::Close))
                 .await
@@ -4010,6 +4026,32 @@ mod tests {
                 LifecycleEvent::RecoveryResult { result: Ok(Some(source)), .. }
                     if source.contains("insert_current_time")
             )));
+
+            let recovery_dir = std::env::temp_dir().join(format!(
+                "roe-recovery-{}-{}",
+                std::process::id(),
+                session.epoch.0
+            ));
+            std::fs::create_dir(&recovery_dir).unwrap();
+            let export_path = recovery_dir.join("first-wave.mica");
+            let reports = session
+                .execute_startup_recovery(&[
+                    StartupRecoveryOperation::Inspect,
+                    StartupRecoveryOperation::ExportUnit {
+                        unit: "roe/first-wave".to_owned(),
+                        path: export_path.clone(),
+                    },
+                ])
+                .await
+                .unwrap();
+            assert!(reports[0].contains("endpoint="));
+            assert!(
+                std::fs::read_to_string(&export_path)
+                    .unwrap()
+                    .contains("insert_current_time")
+            );
+            std::fs::remove_file(export_path).unwrap();
+            std::fs::remove_dir(recovery_dir).unwrap();
 
             session
                 .dispatch(session.envelope(InputEvent::Close))

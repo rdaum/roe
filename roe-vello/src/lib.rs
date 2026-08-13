@@ -1389,11 +1389,19 @@ mod lifecycle_tests {
             VelloTheme::default(),
             runtime,
             Arc::new(WakeState::default()),
-            &[],
+            &[StartupRecoveryOperation::Inspect],
         )
         .unwrap();
         app.build_session_scene(DEFAULT_WIDTH, DEFAULT_HEIGHT)
             .unwrap();
+        assert!(
+            app.redraw_state
+                .session_presentation()
+                .current()
+                .unwrap()
+                .echo_area
+                .contains("Mica recovery diagnostics")
+        );
 
         let output = app.runtime.block_on(async {
             let envelope = app.session.envelope(InputEvent::Text("x".to_owned()));

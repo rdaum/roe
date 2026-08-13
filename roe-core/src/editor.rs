@@ -3240,4 +3240,17 @@ mod tests {
         let buffer = &editor.buffers[window.active_buffer];
         assert_eq!(buffer.content(), "Herld\nTestllo\nWo");
     }
+
+    #[test]
+    fn messages_buffer_retains_a_bounded_recent_tail() {
+        let mut editor = test_editor();
+        for index in 0..2_000 {
+            editor.add_message_to_buffer(format!("{index:04} {}", "x".repeat(64)));
+        }
+        let messages = editor.messages_buffer_id.unwrap();
+        let content = editor.buffers[messages].content();
+        assert!(content.chars().count() <= MAX_MESSAGES_CHARS);
+        assert!(content.contains("1999"));
+        assert!(!content.contains("0000 x"));
+    }
 }
