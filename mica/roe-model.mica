@@ -23,6 +23,7 @@ make_identity(:roe/fundamental_mode)
 make_identity(:roe/default_face)
 make_identity(:roe/core_package)
 make_identity(:roe/editor_role)
+make_identity(:roe/core_configuration)
 
 make_relation(:Delegates, 3)
 
@@ -42,11 +43,14 @@ make_relation(:roe/KeymapParent, 2)
 make_relation(:roe/KeyBinding, 4)
 make_relation(:roe/KeyPrefix, 1)
 make_relation(:roe/NativeBinding, 3)
+make_relation(:roe/NativeEditingAction, 1)
 make_relation(:roe/MajorMode, 1)
 make_relation(:roe/MinorMode, 1)
+make_functional_relation(:roe/ModeName, 2, [0])
 make_relation(:roe/ModeKeymap, 3)
 make_relation(:roe/ModeHook, 3)
 make_relation(:roe/Face, 1)
+make_functional_relation(:roe/FaceName, 2, [0])
 make_relation(:roe/FaceParent, 2)
 make_relation(:roe/FaceAttribute, 3)
 make_relation(:roe/SyntaxRule, 4)
@@ -284,8 +288,11 @@ assert roe/ArgumentCompletion(#roe/other_window, 0, :visible_views)
 assert roe/Keymap(#roe/global_map)
 assert roe/KeyBinding(#roe/global_map, "C-x o", #roe/other_window, 100)
 assert roe/MajorMode(#roe/fundamental_mode)
+assert roe/ModeName(#roe/fundamental_mode, "fundamental")
 assert roe/ModeKeymap(#roe/fundamental_mode, #roe/global_map, 50)
+assert roe/ModeHook(#roe/fundamental_mode, :invalidate_syntax, 100)
 assert roe/Face(#roe/default_face)
+assert roe/FaceName(#roe/default_face, "default")
 assert roe/FaceAttribute(#roe/default_face, :foreground, "inherit")
 assert roe/Package(#roe/core_package)
 assert roe/PackageUnit(#roe/core_package, :roe/core)
@@ -306,6 +313,7 @@ assert RoleCanRead(#roe/editor_role, :roe/EffectiveSessionKeymap)
 assert RoleCanRead(#roe/editor_role, :roe/EffectiveBinding)
 assert RoleCanRead(#roe/editor_role, :roe/KeyPrefix)
 assert RoleCanRead(#roe/editor_role, :roe/NativeBinding)
+assert RoleCanRead(#roe/editor_role, :roe/NativeEditingAction)
 assert RoleCanRead(#roe/editor_role, :roe/PromptState)
 assert RoleCanRead(#roe/editor_role, :roe/PromptLast)
 assert RoleCanRead(#roe/editor_role, :roe/FileCandidate)
@@ -320,6 +328,10 @@ assert RoleCanRead(#roe/editor_role, :roe/DiscoverableCommand)
 assert RoleCanRead(#roe/editor_role, :roe/NextView)
 assert RoleCanRead(#roe/editor_role, :roe/SessionLeafView)
 assert RoleCanRead(#roe/editor_role, :roe/EffectiveModeHook)
+assert RoleCanRead(#roe/editor_role, :roe/EffectiveMajorMode)
+assert RoleCanRead(#roe/editor_role, :roe/ModeName)
+assert RoleCanRead(#roe/editor_role, :roe/FaceName)
+assert RoleCanRead(#roe/editor_role, :roe/Face)
 assert RoleCanRead(#roe/editor_role, :roe/EffectiveFaceAttribute)
 assert RoleCanRead(#roe/editor_role, :roe/EffectiveSyntaxRule)
 assert RoleCanRead(#roe/editor_role, :roe/EffectiveConfiguration)
@@ -340,6 +352,7 @@ assert RoleCanInvoke(#roe/editor_role, :roe/start_file_prompt)
 assert RoleCanInvoke(#roe/editor_role, :roe/start_search)
 assert RoleCanInvoke(#roe/editor_role, :roe/refresh_search)
 assert RoleCanInvoke(#roe/editor_role, :roe/search_prompt_key)
+assert RoleCanInvoke(#roe/editor_role, :roe/publish_policy)
 assert RoleCanEffect(#roe/editor_role)
 assert roe/RoleCanRequestService(#roe/editor_role, :text_read)
 assert roe/RoleCanRequestService(#roe/editor_role, :text_write)
@@ -371,9 +384,31 @@ verb roe/other_window(actor, session)
 end
 
 verb roe/dispatch_key(actor, session, sequence @ #string)
+  roe/publish_policy(actor, session)
   let native = one roe/NativeBinding(sequence, ?action, ?precedence)
   if native != nothing
-    emit(session, {:kind -> :native_action, :action -> native[:action]})
+    if native[:action] == :indent
+      let width = one roe/EffectiveConfiguration(#roe/core_configuration, :tab_width, ?width)
+      if width == nothing
+        width = 4
+      end
+      let text = ""
+      let count = 0
+      while count < width
+        text = string_concat(text, " ")
+        count = count + 1
+      end
+      emit(session, {:kind -> :native_action, :action -> :insert_text, :text -> text})
+    else
+      emit(session, {:kind -> :native_action, :action -> native[:action]})
+    end
+    if roe/NativeEditingAction(native[:action])
+      let view = one roe/ActiveView(session, ?view)
+      let buffer = one roe/ViewBuffer(view, ?buffer)
+      for hook in roe/EffectiveModeHook(buffer, ?hook, ?precedence)
+        emit(session, {:kind -> :host_action, :action -> hook[:hook], :view -> view})
+      end
+    end
     return :handled
   end
   let selected = nothing

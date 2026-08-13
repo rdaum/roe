@@ -320,6 +320,11 @@ pub struct HostSession {
     pointer_selection: Option<(WindowId, usize)>,
     mica: Option<MicaHost>,
     mica_palette_actions: HashMap<String, String>,
+    mica_modes: HashMap<BufferId, String>,
+    mica_faces: HashMap<String, HashMap<String, String>>,
+    mica_configuration: HashMap<String, String>,
+    mica_syntax: HashMap<BufferId, Vec<(String, String)>>,
+    mica_search_ranges: HashMap<WindowId, Vec<(usize, usize, String)>>,
     closed: bool,
 }
 
@@ -342,6 +347,11 @@ impl HostSession {
             pointer_selection: None,
             mica: None,
             mica_palette_actions: HashMap::new(),
+            mica_modes: HashMap::new(),
+            mica_faces: HashMap::new(),
+            mica_configuration: HashMap::new(),
+            mica_syntax: HashMap::new(),
+            mica_search_ranges: HashMap::new(),
             closed: false,
         };
         let _ = session.synchronize_identities();
@@ -763,6 +773,44 @@ impl HostSession {
         invalidations: &mut Vec<Invalidation>,
     ) {
         let buffer_candidates = events.buffer_candidates;
+        if events.policy_reset {
+            self.mica_modes.clear();
+            self.mica_faces.clear();
+            self.mica_configuration.clear();
+            self.mica_syntax.clear();
+        }
+        for policy in events.policy_facts {
+            match policy.kind.as_str() {
+                "mode_policy" => {
+                    if let Some(buffer) = policy.subject {
+                        self.mica_modes.insert(buffer, policy.name);
+                    }
+                }
+                "face_policy" => {
+                    if let Some(attribute) = policy.attribute {
+                        self.mica_faces
+                            .entry(policy.name)
+                            .or_default()
+                            .insert(attribute, policy.value);
+                    }
+                }
+                "configuration_policy" => {
+                    self.mica_configuration.insert(policy.name, policy.value);
+                }
+                "syntax_policy" => {
+                    if let Some(buffer) = policy.subject {
+                        let rules = self.mica_syntax.entry(buffer).or_default();
+                        if !rules
+                            .iter()
+                            .any(|rule| rule == &(policy.name.clone(), policy.value.clone()))
+                        {
+                            rules.push((policy.name, policy.value));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         if !events.command_candidates.is_empty() {
             self.mica_palette_actions = events.command_candidates.into_iter().collect();
         }
@@ -813,20 +861,51 @@ impl HostSession {
             invalidations.push(Invalidation::Full);
         }
         for update in events.search_updates {
-            let actions =
-                self.editor
-                    .apply_mica_search(update.view, &update.matches, update.selected);
-            self.resolve_actions(actions, lifecycle, invalidations)
-                .await;
+            let Some(window) = self.editor.windows.get_mut(update.view) else {
+                lifecycle.push(LifecycleEvent::Warning(
+                    "Mica search update referred to a stale view".to_owned(),
+                ));
+                continue;
+            };
+            self.mica_search_ranges.insert(
+                update.view,
+                update
+                    .matches
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (start, end))| {
+                        (
+                            *start,
+                            *end,
+                            if update.selected == Some(index) {
+                                "isearch-current"
+                            } else {
+                                "isearch-match"
+                            }
+                            .to_owned(),
+                        )
+                    })
+                    .collect(),
+            );
+            if let Some(index) = update.selected
+                && let Some((start, _)) = update.matches.get(index)
+            {
+                window.cursor = *start;
+            }
+            if let Some(view) = self.view_ids.get(&update.view).copied() {
+                invalidations.push(Invalidation::View(view));
+            } else {
+                invalidations.push(Invalidation::Full);
+            }
         }
         for finish in events.search_finishes {
-            let actions = self.editor.finish_mica_search(
-                finish.view,
-                finish.original_cursor,
-                finish.accepted,
-            );
-            self.resolve_actions(actions, lifecycle, invalidations)
-                .await;
+            self.mica_search_ranges.remove(&finish.view);
+            if !finish.accepted
+                && let Some(window) = self.editor.windows.get_mut(finish.view)
+            {
+                window.cursor = finish.original_cursor;
+            }
+            invalidations.push(Invalidation::Full);
         }
         for message in events.errors {
             self.editor.set_echo_message(message.clone());
@@ -834,9 +913,25 @@ impl HostSession {
             lifecycle.push(LifecycleEvent::Error(message));
         }
         for action in events.native_actions {
-            let Some(action) = mica_native_action(&action) else {
+            if action.name == "insert_text" {
+                let actions = self.editor.insert_text(
+                    action.text.unwrap_or_default(),
+                    &crate::mode::ActionPosition::Cursor,
+                );
+                self.resolve_actions(actions, lifecycle, invalidations)
+                    .await;
+                continue;
+            }
+            if matches!(action.name.as_str(), "kill_word" | "backward_kill_word") {
+                let actions = self.mica_kill_word(action.name == "kill_word");
+                self.resolve_actions(actions, lifecycle, invalidations)
+                    .await;
+                continue;
+            }
+            let action_name = action.name.clone();
+            let Some(action) = mica_native_action(&action_name) else {
                 lifecycle.push(LifecycleEvent::Error(format!(
-                    "unknown Mica native action: {action}"
+                    "unknown Mica native action: {action_name}"
                 )));
                 continue;
             };
@@ -890,6 +985,15 @@ impl HostSession {
                     }
                     if self.editor.delete_other_windows() {
                         invalidations.push(Invalidation::Full);
+                    }
+                }
+                "invalidate_syntax" => {
+                    if let Some(window) = action.view {
+                        if let Some(view) = self.view_ids.get(&window).copied() {
+                            invalidations.push(Invalidation::View(view));
+                        } else {
+                            invalidations.push(Invalidation::Full);
+                        }
                     }
                 }
                 "save_buffer" => {
@@ -1031,6 +1135,55 @@ impl HostSession {
                 .into_iter()
                 .map(|mailbox| LifecycleEvent::MicaSubscriptionReady { mailbox }),
         );
+    }
+
+    fn mica_kill_word(&mut self, forward: bool) -> Vec<ChromeAction> {
+        let window = &self.editor.windows[self.editor.active_window];
+        let buffer_id = window.active_buffer;
+        let cursor = window.cursor;
+        let text: Vec<char> = self.editor.buffers[buffer_id].content().chars().collect();
+        let mica_word_rule = self
+            .mica_syntax
+            .get(&buffer_id)
+            .into_iter()
+            .flatten()
+            .any(|(kind, pattern)| kind == "word" && pattern == "[[:alnum:]_]");
+        let is_word = |character: char| {
+            if mica_word_rule {
+                character.is_alphanumeric() || character == '_'
+            } else {
+                !character.is_whitespace()
+            }
+        };
+        let boundary = if forward {
+            let mut position = cursor.min(text.len());
+            while position < text.len() && !is_word(text[position]) {
+                position += 1;
+            }
+            while position < text.len() && is_word(text[position]) {
+                position += 1;
+            }
+            while position < text.len() && !is_word(text[position]) {
+                position += 1;
+            }
+            position
+        } else {
+            let mut position = cursor.min(text.len());
+            while position > 0 && !is_word(text[position - 1]) {
+                position -= 1;
+            }
+            while position > 0 && is_word(text[position - 1]) {
+                position -= 1;
+            }
+            position
+        };
+        let count = if forward {
+            isize::try_from(boundary.saturating_sub(cursor)).unwrap_or(isize::MAX)
+        } else {
+            -isize::try_from(cursor.saturating_sub(boundary)).unwrap_or(isize::MAX)
+        };
+        self.editor
+            .kill_text(&crate::mode::ActionPosition::Cursor, count)
     }
 
     fn validate_envelope(&self, envelope: &InputEnvelope) -> Result<(), SessionError> {
@@ -1324,6 +1477,8 @@ impl HostSession {
         let live_windows: HashSet<_> = self.editor.windows.keys().collect();
         self.view_ids
             .retain(|window, _| live_windows.contains(window));
+        self.mica_search_ranges
+            .retain(|window, _| live_windows.contains(window));
         for window_id in self.editor.windows.keys() {
             self.view_ids.entry(window_id).or_insert_with(|| {
                 let id = ViewId(self.next_view_id);
@@ -1391,40 +1546,89 @@ impl HostSession {
                 .take(visible_end_char.saturating_sub(visible_start_char))
                 .collect();
 
-            let styled_ranges = buffer
-                .spans_in_range(visible_start_char..visible_end_char)
-                .into_iter()
-                .filter_map(|span| {
-                    let face = face_registry.as_ref()?.get(span.face_id)?;
-                    let style = *style_by_name.entry(face.name.clone()).or_insert_with(|| {
-                        let id = StyleRef(styles.len() as u32 + 1);
-                        styles.push(StyleDefinition {
-                            id,
-                            name: face.name.clone(),
-                            foreground: face.foreground.as_ref().map(presentation_color),
-                            background: face.background.as_ref().map(presentation_color),
-                            bold: face.bold,
-                            italic: face.italic,
-                            underline: face.underline,
-                            strikethrough: face.strikethrough,
-                        });
-                        id
-                    });
-                    Some(StyledRange {
-                        start: span.start,
-                        end: span.end,
-                        style,
+            let styled_ranges = if self.mica.is_some() {
+                self.mica_search_ranges
+                    .get(&window_id)
+                    .into_iter()
+                    .flatten()
+                    .filter(|(start, end, _)| {
+                        *end > visible_start_char && *start < visible_end_char
                     })
-                })
-                .collect();
+                    .map(|(start, end, name)| {
+                        let style = *style_by_name.entry(name.clone()).or_insert_with(|| {
+                            let id = StyleRef(styles.len() as u32 + 1);
+                            let attributes = self.mica_faces.get(name);
+                            styles.push(StyleDefinition {
+                                id,
+                                name: name.clone(),
+                                foreground: attributes
+                                    .and_then(|values| values.get("foreground"))
+                                    .and_then(|value| presentation_color_hex(value)),
+                                background: attributes
+                                    .and_then(|values| values.get("background"))
+                                    .and_then(|value| presentation_color_hex(value)),
+                                bold: attributes
+                                    .and_then(|values| values.get("weight"))
+                                    .is_some_and(|value| value == "bold"),
+                                italic: attributes
+                                    .and_then(|values| values.get("slant"))
+                                    .is_some_and(|value| value == "italic"),
+                                underline: attributes
+                                    .and_then(|values| values.get("underline"))
+                                    .is_some_and(|value| value == "true"),
+                                strikethrough: false,
+                            });
+                            id
+                        });
+                        StyledRange {
+                            start: *start,
+                            end: *end,
+                            style,
+                        }
+                    })
+                    .collect()
+            } else {
+                buffer
+                    .spans_in_range(visible_start_char..visible_end_char)
+                    .into_iter()
+                    .filter_map(|span| {
+                        let face = face_registry.as_ref()?.get(span.face_id)?;
+                        let style = *style_by_name.entry(face.name.clone()).or_insert_with(|| {
+                            let id = StyleRef(styles.len() as u32 + 1);
+                            styles.push(StyleDefinition {
+                                id,
+                                name: face.name.clone(),
+                                foreground: face.foreground.as_ref().map(presentation_color),
+                                background: face.background.as_ref().map(presentation_color),
+                                bold: face.bold,
+                                italic: face.italic,
+                                underline: face.underline,
+                                strikethrough: face.strikethrough,
+                            });
+                            id
+                        });
+                        Some(StyledRange {
+                            start: span.start,
+                            end: span.end,
+                            style,
+                        })
+                    })
+                    .collect()
+            };
 
             let selection = buffer
                 .get_region(window.cursor)
                 .map(|(anchor, active)| TextSelection { anchor, active });
             let (column, line) = buffer.to_column_line(window.cursor);
-            let mode = buffer
-                .major_mode()
-                .unwrap_or_else(|| "fundamental".to_string());
+            let mode = self
+                .mica_modes
+                .get(&window.active_buffer)
+                .cloned()
+                .unwrap_or_else(|| {
+                    buffer
+                        .major_mode()
+                        .unwrap_or_else(|| "fundamental".to_string())
+                });
             let modeline = format!(
                 "{} ({mode}) {}:{}",
                 buffer.object(),
@@ -1810,6 +2014,18 @@ fn presentation_color(color: &Color) -> PresentationColor {
     }
 }
 
+fn presentation_color_hex(value: &str) -> Option<PresentationColor> {
+    let hex = value.strip_prefix('#')?;
+    if hex.len() != 6 {
+        return None;
+    }
+    Some(PresentationColor::Rgb {
+        r: u8::from_str_radix(&hex[0..2], 16).ok()?,
+        g: u8::from_str_radix(&hex[2..4], 16).ok()?,
+        b: u8::from_str_radix(&hex[4..6], 16).ok()?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1923,9 +2139,31 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 snapshot(&output).views[0].visible_text,
-                "hello1700000000123\n"
+                "hello1700000000123\n",
+                "{output:#?}"
             );
             assert_eq!(snapshot(&output).views[0].cursor, 19);
+            assert!(
+                session
+                    .mica_modes
+                    .values()
+                    .any(|mode| mode == "fundamental")
+            );
+            assert_eq!(
+                session
+                    .mica_configuration
+                    .get("tab_width")
+                    .map(String::as_str),
+                Some("4")
+            );
+            let indented = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Tab])))
+                .await
+                .unwrap();
+            assert_eq!(
+                snapshot(&indented).views[0].visible_text,
+                "hello1700000000123\n    "
+            );
             assert!(
                 output
                     .lifecycle
@@ -1938,6 +2176,48 @@ mod tests {
                 .await
                 .unwrap();
             assert!(close.lifecycle.contains(&LifecycleEvent::EndpointClosed));
+        });
+    }
+
+    #[test]
+    fn mica_syntax_policy_controls_native_word_editing() {
+        let _guard = MICA_TEST_LOCK.lock().unwrap();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut editor = test_editor();
+            let window = editor.active_window;
+            let buffer = editor.windows[window].active_buffer;
+            editor.buffers[buffer].load_str("foo-bar baz");
+            editor.windows[window].cursor = 0;
+            let mut session = HostSession::open_with_mica_clock(
+                editor,
+                CapabilityGrants::editor_default(),
+                Arc::new(FixedNativeClock(42)),
+            )
+            .unwrap();
+            let meta =
+                LogicalKey::Modifier(crate::keys::KeyModifier::Meta(crate::keys::Side::Left));
+
+            let output = session
+                .dispatch(
+                    session.envelope(InputEvent::Keys(vec![meta, LogicalKey::AlphaNumeric('d')])),
+                )
+                .await
+                .unwrap();
+
+            // Mica's [[:alnum:]_] word rule makes '-' punctuation. The native
+            // mechanism kills through the punctuation to the next word rather
+            // than using the legacy Rust mode's non-whitespace definition.
+            assert_eq!(snapshot(&output).views[0].visible_text, "bar baz");
+            assert!(
+                session.mica_syntax[&buffer]
+                    .iter()
+                    .any(|rule| rule == &("word".to_owned(), "[[:alnum:]_]".to_owned()))
+            );
+
+            session
+                .dispatch(session.envelope(InputEvent::Close))
+                .await
+                .unwrap();
         });
     }
 
@@ -2289,6 +2569,21 @@ mod tests {
                     .cursor,
                 0
             );
+            assert!(
+                snapshot(&searched)
+                    .views
+                    .iter()
+                    .any(|view| { !view.command_view && view.styled_ranges.len() == 2 })
+            );
+            assert!(snapshot(&searched).styles.iter().any(|style| {
+                style.name == "isearch-current"
+                    && style.background
+                        == Some(PresentationColor::Rgb {
+                            r: 255,
+                            g: 255,
+                            b: 0,
+                        })
+            }));
             let next = session
                 .dispatch(session.envelope(InputEvent::Keys(vec![
                     control,
@@ -2398,9 +2693,12 @@ mod tests {
                 "hellov2:42\nv2:42\n"
             );
 
-            let prefix = original.split("verb roe/insert_current_time").next().unwrap();
+            let start = original.find("verb roe/insert_current_time").unwrap();
+            let end = start + original[start..].find("\nend\n").unwrap() + "\nend\n".len();
             let failing = format!(
-                "{prefix}verb roe/insert_current_time(actor, session)\n  raise E_TEST, \"intentional command failure\"\nend\n"
+                "{}verb roe/insert_current_time(actor, session)\n  raise E_TEST, \"intentional command failure\"\nend\n{}",
+                &original[..start],
+                &original[end..]
             );
             session.replace_mica_first_wave(failing).await.unwrap();
             let failed = session

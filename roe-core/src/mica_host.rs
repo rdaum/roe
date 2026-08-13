@@ -125,6 +125,21 @@ pub struct MicaHostAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MicaNativeAction {
+    pub name: String,
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MicaPolicyFact {
+    pub kind: String,
+    pub subject: Option<BufferId>,
+    pub name: String,
+    pub attribute: Option<String>,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MicaSearchUpdate {
     pub view: WindowId,
     pub matches: Vec<(usize, usize)>,
@@ -143,7 +158,9 @@ pub struct MicaSearchFinish {
 pub struct MicaEventBatch {
     pub effects: Vec<MicaPresentationEffect>,
     pub host_actions: Vec<MicaHostAction>,
-    pub native_actions: Vec<String>,
+    pub native_actions: Vec<MicaNativeAction>,
+    pub policy_reset: bool,
+    pub policy_facts: Vec<MicaPolicyFact>,
     pub prompt_updates: Vec<MicaPromptUpdate>,
     pub prompt_close: bool,
     pub search_updates: Vec<MicaSearchUpdate>,
@@ -160,6 +177,8 @@ impl MicaEventBatch {
         self.effects.append(&mut other.effects);
         self.host_actions.append(&mut other.host_actions);
         self.native_actions.append(&mut other.native_actions);
+        self.policy_reset |= other.policy_reset;
+        self.policy_facts.append(&mut other.policy_facts);
         self.prompt_updates.append(&mut other.prompt_updates);
         self.prompt_close |= other.prompt_close;
         self.search_updates.append(&mut other.search_updates);
@@ -1059,6 +1078,11 @@ end
                             self.search_finish(effect.target, &effect.value)
                         {
                             batch.search_finishes.push(finish);
+                        } else if self.policy_reset(effect.target, &effect.value) {
+                            batch.policy_reset = true;
+                        } else if let Some(policy) = self.policy_fact(effect.target, &effect.value)
+                        {
+                            batch.policy_facts.push(policy);
                         } else if let Some(action) =
                             self.native_action(effect.target, &effect.value)
                         {
@@ -1137,6 +1161,10 @@ end
                     batch.search_updates.push(update);
                 } else if let Some(finish) = self.search_finish(effect.target, &effect.value) {
                     batch.search_finishes.push(finish);
+                } else if self.policy_reset(effect.target, &effect.value) {
+                    batch.policy_reset = true;
+                } else if let Some(policy) = self.policy_fact(effect.target, &effect.value) {
+                    batch.policy_facts.push(policy);
                 } else if let Some(action) = self.native_action(effect.target, &effect.value) {
                     batch.native_actions.push(action);
                 } else if let Some(action) = self.host_action(effect.target, &effect.value) {
@@ -1196,13 +1224,70 @@ end
         })
     }
 
-    fn native_action(&self, target: Identity, value: &Value) -> Option<String> {
+    fn native_action(&self, target: Identity, value: &Value) -> Option<MicaNativeAction> {
         if target != self.session || map_value(value, "kind")?.as_symbol()? != sym("native_action")
         {
             return None;
         }
         let action = map_value(value, "action")?.as_symbol()?;
-        Some(action.name()?.to_owned())
+        Some(MicaNativeAction {
+            name: action.name()?.to_owned(),
+            text: map_value(value, "text").and_then(|value| value.with_str(str::to_owned)),
+        })
+    }
+
+    fn policy_fact(&self, target: Identity, value: &Value) -> Option<MicaPolicyFact> {
+        if target != self.session {
+            return None;
+        }
+        let kind = map_value(value, "kind")?.as_symbol()?.name()?.to_owned();
+        if !matches!(
+            kind.as_str(),
+            "mode_policy" | "face_policy" | "syntax_policy" | "configuration_policy"
+        ) {
+            return None;
+        }
+        let subject = map_value(value, "buffer")
+            .and_then(|value| value.as_identity())
+            .and_then(|logical| {
+                self.buffer_ids
+                    .iter()
+                    .find_map(|(buffer, identity)| (*identity == logical).then_some(*buffer))
+            });
+        let name = if kind == "face_policy" {
+            map_value(value, "face")?.with_str(str::to_owned)?
+        } else if kind == "mode_policy" {
+            map_value(value, "name")?.with_str(str::to_owned)?
+        } else {
+            map_value(value, "syntax_kind")
+                .or_else(|| map_value(value, "key"))?
+                .as_symbol()?
+                .name()?
+                .to_owned()
+        };
+        let attribute = map_value(value, "attribute")
+            .and_then(|value| value.as_symbol())
+            .and_then(Symbol::name)
+            .map(str::to_owned);
+        let raw = map_value(value, "value").or_else(|| map_value(value, "pattern"));
+        let value = raw
+            .clone()
+            .and_then(|value| value.with_str(str::to_owned))
+            .or_else(|| raw.map(|value| self.driver.format_value(&value)))
+            .unwrap_or_default();
+        Some(MicaPolicyFact {
+            kind,
+            subject,
+            name,
+            attribute,
+            value,
+        })
+    }
+
+    fn policy_reset(&self, target: Identity, value: &Value) -> bool {
+        target == self.session
+            && map_value(value, "kind").and_then(|value| value.as_symbol())
+                == Some(sym("policy_reset"))
     }
 
     fn host_action(&self, target: Identity, value: &Value) -> Option<MicaHostAction> {

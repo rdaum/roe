@@ -3,6 +3,8 @@
 // Rust supplies volatile session/resource facts and realizes native requests.
 
 make_identity(:roe/insert_current_time)
+make_identity(:roe/isearch_match_face)
+make_identity(:roe/isearch_current_face)
 
 assert Delegates(#roe/insert_current_time, #roe/command, 0)
 assert roe/Command(#roe/insert_current_time)
@@ -12,6 +14,16 @@ assert roe/CommandName(#roe/insert_current_time, "insert-current-time")
 assert roe/KeyBinding(#roe/global_map, "F12", #roe/insert_current_time, 1000)
 assert roe/PackageCommand(#roe/core_package, #roe/insert_current_time)
 assert RoleCanInvoke(#roe/editor_role, :roe/insert_current_time)
+
+assert roe/Face(#roe/isearch_match_face)
+assert roe/FaceName(#roe/isearch_match_face, "isearch-match")
+assert roe/FaceAttribute(#roe/isearch_match_face, :background, "#3a3a3a")
+assert roe/Face(#roe/isearch_current_face)
+assert roe/FaceName(#roe/isearch_current_face, "isearch-current")
+assert roe/FaceAttribute(#roe/isearch_current_face, :foreground, "#000000")
+assert roe/FaceAttribute(#roe/isearch_current_face, :background, "#ffff00")
+assert roe/Configuration(#roe/core_configuration, :tab_width, 4)
+assert roe/SyntaxRule(#roe/fundamental_mode, :word, "[[:alnum:]_]", 100)
 
 verb roe/insert_current_time(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor
@@ -100,7 +112,7 @@ assert roe/NativeBinding("⌫", :backspace, 1000)
 assert roe/NativeBinding("Del", :delete, 1000)
 assert roe/NativeBinding("C-d", :delete, 1000)
 assert roe/NativeBinding("⏎", :enter, 1000)
-assert roe/NativeBinding("Tab", :tab, 1000)
+assert roe/NativeBinding("Tab", :indent, 1000)
 assert roe/NativeBinding("C-k", :kill_line, 1000)
 assert roe/NativeBinding("C-w", :kill_region, 1000)
 assert roe/NativeBinding("M-w", :copy_region, 1000)
@@ -130,6 +142,50 @@ assert roe/NativeBinding("C-S-←", :cursor_word_backward_select, 1000)
 assert roe/NativeBinding("C-S-→", :cursor_word_forward_select, 1000)
 assert roe/NativeBinding("C-S-Home", :cursor_buffer_start_select, 1000)
 assert roe/NativeBinding("C-S-End", :cursor_buffer_end_select, 1000)
+
+assert roe/NativeEditingAction(:backspace)
+assert roe/NativeEditingAction(:delete)
+assert roe/NativeEditingAction(:enter)
+assert roe/NativeEditingAction(:indent)
+assert roe/NativeEditingAction(:kill_line)
+assert roe/NativeEditingAction(:kill_region)
+assert roe/NativeEditingAction(:yank)
+assert roe/NativeEditingAction(:kill_word)
+assert roe/NativeEditingAction(:backward_kill_word)
+assert roe/NativeEditingAction(:undo)
+assert roe/NativeEditingAction(:redo)
+
+verb roe/publish_policy(actor, session)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  // The host applies this emission as an atomic snapshot boundary. This makes
+  // unit replacement retract removed settings instead of leaving stale Rust
+  // projections behind.
+  emit(session, {:kind -> :policy_reset})
+  for found in roe/LogicalBuffer(?buffer)
+    let mode = one roe/EffectiveMajorMode(found[:buffer], ?mode)
+    if mode != nothing
+      let name = one roe/ModeName(mode, ?name)
+      if name != nothing
+        emit(session, {:kind -> :mode_policy, :buffer -> found[:buffer], :name -> name})
+      end
+    end
+    for syntax in roe/EffectiveSyntaxRule(found[:buffer], ?mode, ?syntax_kind, ?pattern, ?precedence)
+      emit(session, {:kind -> :syntax_policy, :buffer -> found[:buffer], :syntax_kind -> syntax[:syntax_kind], :pattern -> syntax[:pattern], :precedence -> syntax[:precedence]})
+    end
+  end
+  for found in roe/Face(?face)
+    let name = one roe/FaceName(found[:face], ?name)
+    if name != nothing
+      for attribute in roe/EffectiveFaceAttribute(found[:face], ?attribute, ?value)
+        emit(session, {:kind -> :face_policy, :face -> name, :attribute -> attribute[:attribute], :value -> attribute[:value]})
+      end
+    end
+  end
+  for setting in roe/EffectiveConfiguration(#roe/core_configuration, ?key, ?value)
+    emit(session, {:kind -> :configuration_policy, :key -> setting[:key], :value -> setting[:value]})
+  end
+  return :ok
+end
 
 assert roe/Command(#roe/save_buffer)
 assert roe/CommandSelector(#roe/save_buffer, :roe/save_buffer)

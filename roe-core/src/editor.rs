@@ -346,6 +346,32 @@ impl Editor {
         &mut self,
         action: KeyAction,
     ) -> Result<Vec<ChromeAction>, std::io::Error> {
+        // Editing primitives selected by Mica are realized directly against the
+        // native editor mechanism. They must not pass through BufferHost's Rust
+        // Mode chain, which is retained only for non-Mica compatibility tests.
+        let direct = match action {
+            KeyAction::AlphaNumeric(character) => {
+                Some(self.insert_text(character.to_string(), &ActionPosition::Cursor))
+            }
+            KeyAction::Backspace => Some(self.delete_text(&ActionPosition::Cursor, -1)),
+            KeyAction::Delete => Some(self.delete_text(&ActionPosition::Cursor, 1)),
+            KeyAction::Enter => Some(self.insert_text("\n".to_owned(), &ActionPosition::Cursor)),
+            KeyAction::Tab => Some(self.insert_text("\t".to_owned(), &ActionPosition::Cursor)),
+            KeyAction::MarkStart => Some(self.set_mark()),
+            KeyAction::KillRegion(true) => Some(self.kill_region()),
+            KeyAction::KillRegion(false) => Some(self.copy_region()),
+            KeyAction::KillLine(_) => Some(self.kill_line()),
+            KeyAction::Yank(Some(index)) => Some(self.yank_index(&ActionPosition::Cursor, index)),
+            KeyAction::Yank(None) => Some(self.yank(&ActionPosition::Cursor)),
+            KeyAction::DeleteWord => Some(self.forward_kill_word()),
+            KeyAction::BackspaceWord => Some(self.backward_kill_word()),
+            _ => None,
+        };
+        if let Some(actions) = direct {
+            self.key_state.take();
+            return Ok(actions);
+        }
+
         self.key_state.take();
         let previous = std::mem::replace(&mut self.bindings, Box::new(SingleActionBinding(action)));
         let result = self.key_event(vec![LogicalKey::Unmapped]).await;
