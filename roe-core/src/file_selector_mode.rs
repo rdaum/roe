@@ -14,9 +14,10 @@
 use crate::editor::OpenType;
 use crate::keys::KeyAction;
 use crate::mode::{ActionPosition, Mode, ModeAction, ModeResult};
+use crate::native_services::{FileSystem, SystemFileSystem};
 use crate::BufferId;
-use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Interactive file selector mode for C-x C-f (find-file)
 /// This mode manages a command window buffer that displays files and directories
@@ -43,11 +44,19 @@ pub struct FileSelectorMode {
     all_paths: Vec<PathBuf>,
     /// How to open the selected file
     open_type: OpenType,
+    file_system: Arc<dyn FileSystem>,
 }
 
 impl FileSelectorMode {
     /// Create a new FileSelectorMode with initial state
     pub fn new(open_type: OpenType) -> Self {
+        Self::with_file_system(open_type, Arc::new(SystemFileSystem))
+    }
+
+    pub fn with_file_system(open_type: OpenType, file_system: Arc<dyn FileSystem>) -> Self {
+        let current_dir = file_system
+            .current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."));
         Self {
             input: String::new(),
             matches: Vec::new(),
@@ -56,10 +65,11 @@ impl FileSelectorMode {
             max_visible_items: 8, // Show 8 items at once
             item_scroll_offset: 0,
             buffer_id: None,
-            current_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            current_dir,
             all_items: Vec::new(),
             all_paths: Vec::new(),
             open_type,
+            file_system,
         }
     }
 
@@ -94,20 +104,15 @@ impl FileSelectorMode {
         }
 
         // Read directory contents
-        if let Ok(entries) = fs::read_dir(&self.current_dir) {
+        if let Ok(entries) = self.file_system.read_directory(&self.current_dir) {
             let mut dirs = Vec::new();
             let mut files = Vec::new();
 
-            for entry in entries.flatten() {
-                if let Ok(metadata) = entry.metadata() {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    let path = entry.path();
-
-                    if metadata.is_dir() {
-                        dirs.push((format!("{name}/"), path));
-                    } else {
-                        files.push((name, path));
-                    }
+            for entry in entries {
+                if entry.is_directory {
+                    dirs.push((format!("{}/", entry.name), entry.path));
+                } else {
+                    files.push((entry.name, entry.path));
                 }
             }
 
@@ -191,7 +196,7 @@ impl FileSelectorMode {
 
     /// Navigate to a directory
     pub fn navigate_to_directory(&mut self, path: PathBuf) -> bool {
-        if path.is_dir() {
+        if self.file_system.is_directory(&path) {
             self.current_dir = path;
             self.input.clear(); // Clear filter when changing directories
             self.load_directory();
@@ -355,5 +360,53 @@ impl Mode for FileSelectorMode {
             }
             _ => ModeResult::Ignored,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::native_services::DirectoryEntry;
+    use slotmap::SlotMap;
+    use std::io;
+    use std::path::Path;
+
+    struct TestFileSystem;
+
+    impl FileSystem for TestFileSystem {
+        fn current_dir(&self) -> io::Result<PathBuf> {
+            Ok(PathBuf::from("/workspace"))
+        }
+
+        fn read_directory(&self, path: &Path) -> io::Result<Vec<DirectoryEntry>> {
+            assert_eq!(path, Path::new("/workspace"));
+            Ok(vec![
+                DirectoryEntry {
+                    name: "src".to_string(),
+                    path: path.join("src"),
+                    is_directory: true,
+                },
+                DirectoryEntry {
+                    name: "README.md".to_string(),
+                    path: path.join("README.md"),
+                    is_directory: false,
+                },
+            ])
+        }
+
+        fn is_directory(&self, path: &Path) -> bool {
+            path == Path::new("/workspace") || path == Path::new("/workspace/src")
+        }
+    }
+
+    #[test]
+    fn directory_listing_uses_injected_file_system() {
+        let mut mode = FileSelectorMode::with_file_system(OpenType::New, Arc::new(TestFileSystem));
+        let mut buffers: SlotMap<BufferId, ()> = SlotMap::with_key();
+        mode.init_with_buffer(buffers.insert(()));
+
+        assert_eq!(mode.current_dir, PathBuf::from("/workspace"));
+        assert_eq!(mode.matches, vec!["../", "src/", "README.md"]);
+        assert_eq!(mode.paths[1], PathBuf::from("/workspace/src"));
     }
 }

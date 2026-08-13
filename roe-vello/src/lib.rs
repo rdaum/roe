@@ -31,6 +31,7 @@ use roe_core::editor::{
 use roe_core::gutter::{
     calculate_gutter_width, format_line_number, get_line_status, GutterConfig, LineStatus,
 };
+use roe_core::renderer::DirtyRegion;
 use roe_core::syntax::face_registry;
 use roe_core::syntax::Color as SyntaxColor;
 use roe_core::{Editor, WindowId};
@@ -106,6 +107,7 @@ pub struct RoeVelloApp<'a> {
     render_cx: RenderContext,
     /// The renderer
     renderers: Vec<Option<vello::Renderer>>,
+    redraw_state: VelloRenderer,
     /// Current render state (window + surface)
     state: Option<RenderState<'a>>,
     /// The scene to render
@@ -153,6 +155,7 @@ impl<'a> RoeVelloApp<'a> {
             runtime,
             render_cx: RenderContext::new(),
             renderers: vec![],
+            redraw_state: VelloRenderer::with_theme(theme.clone()),
             state: None,
             scene: Scene::new(),
             text_renderer: TextRenderer::new(font_size, font_family),
@@ -265,14 +268,17 @@ impl<'a> RoeVelloApp<'a> {
             )
             .expect("Failed to render to texture");
 
+        self.redraw_state.redraw_complete();
+
         let surface_view = surface_texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = device_handle
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("vello_blit"),
-            });
+        let mut encoder =
+            device_handle
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("vello_blit"),
+                });
         state.surface.blitter.copy(
             &device_handle.device,
             &mut encoder,
@@ -1454,314 +1460,321 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
         // lazily spawn buffer hosts, which requires an active runtime.
         let runtime = self.runtime.clone();
         runtime.block_on(async {
-        match event {
-            WindowEvent::CloseRequested => {
-                event_loop.exit();
-            }
-            WindowEvent::ModifiersChanged(new_modifiers) => {
-                self.modifiers = new_modifiers.state();
-            }
-            WindowEvent::Resized(size) => {
-                if let Some(ref mut state) = self.state {
-                    self.render_cx
-                        .resize_surface(&mut state.surface, size.width, size.height);
-                    state.window.request_redraw();
+            match event {
+                WindowEvent::CloseRequested => {
+                    event_loop.exit();
                 }
-            }
-            WindowEvent::RedrawRequested => {
-                // Poll for external file changes
-                let file_change_actions = self.editor.poll_file_changes();
-                for action in file_change_actions {
-                    match action {
-                        ChromeAction::Echo(msg) => {
-                            self.editor.set_echo_message(msg);
-                        }
-                        ChromeAction::MarkDirty(_) => {
-                            // Will be redrawn anyway
-                        }
-                        ChromeAction::BufferChanged {
-                            buffer_id: _,
-                            start: _,
-                            old_end: _,
-                            new_end: _,
-                        } => {
-                            // Major mode after-change hooks will be dispatched here once
-                            // the scripting runtime (mica) is integrated.
-                        }
-                        _ => {}
+                WindowEvent::ModifiersChanged(new_modifiers) => {
+                    self.modifiers = new_modifiers.state();
+                }
+                WindowEvent::Resized(size) => {
+                    if let Some(ref mut state) = self.state {
+                        self.render_cx
+                            .resize_surface(&mut state.surface, size.width, size.height);
+                        state.window.request_redraw();
+                        self.redraw_state.invalidate(DirtyRegion::FullScreen);
                     }
                 }
+                WindowEvent::RedrawRequested => {
+                    // Poll for external file changes
+                    let file_change_actions = self.editor.poll_file_changes();
+                    for action in file_change_actions {
+                        match action {
+                            ChromeAction::Echo(msg) => {
+                                self.editor.set_echo_message(msg);
+                            }
+                            ChromeAction::MarkDirty(_) => {
+                                // Will be redrawn anyway
+                            }
+                            ChromeAction::BufferChanged {
+                                buffer_id: _,
+                                start: _,
+                                old_end: _,
+                                new_end: _,
+                            } => {
+                                // Major mode after-change hooks will be dispatched here once
+                                // the scripting runtime (mica) is integrated.
+                            }
+                            _ => {}
+                        }
+                    }
 
-                self.render();
-            }
-            WindowEvent::KeyboardInput { event, .. } => {
-                let mut actions: std::collections::VecDeque<_> =
-                    self.handle_key_event(event).await.into();
+                    self.render();
+                }
+                WindowEvent::KeyboardInput { event, .. } => {
+                    let mut actions: std::collections::VecDeque<_> =
+                        self.handle_key_event(event).await.into();
 
-                while let Some(action) = actions.pop_front() {
-                    match action {
-                        ChromeAction::Quit => {
-                            self.quit_requested = true;
-                            event_loop.exit();
-                        }
-                        ChromeAction::SplitHorizontal => {
-                            self.editor.split_horizontal();
-                        }
-                        ChromeAction::SplitVertical => {
-                            self.editor.split_vertical();
-                        }
-                        ChromeAction::SwitchWindow => {
-                            self.editor.switch_window();
-                        }
-                        ChromeAction::DeleteWindow => {
-                            self.editor.delete_window();
-                        }
-                        ChromeAction::DeleteOtherWindows => {
-                            self.editor.delete_other_windows();
-                        }
-                        ChromeAction::Echo(msg) => {
-                            self.editor.set_echo_message(msg);
-                        }
-                        ChromeAction::NewBufferWithMode {
-                            buffer_name,
-                            mode_name,
-                            initial_content,
-                        } => {
-                            // Create a new buffer with the specified mode
-                            let cursor_pos = initial_content.len();
-                            if let Some(buffer_id) = self.editor.create_buffer_with_mode(
+                    while let Some(action) = actions.pop_front() {
+                        match action {
+                            ChromeAction::Quit => {
+                                self.quit_requested = true;
+                                event_loop.exit();
+                            }
+                            ChromeAction::SplitHorizontal => {
+                                self.editor.split_horizontal();
+                            }
+                            ChromeAction::SplitVertical => {
+                                self.editor.split_vertical();
+                            }
+                            ChromeAction::SwitchWindow => {
+                                self.editor.switch_window();
+                            }
+                            ChromeAction::DeleteWindow => {
+                                self.editor.delete_window();
+                            }
+                            ChromeAction::DeleteOtherWindows => {
+                                self.editor.delete_other_windows();
+                            }
+                            ChromeAction::Echo(msg) => {
+                                self.editor.set_echo_message(msg);
+                            }
+                            ChromeAction::NewBufferWithMode {
                                 buffer_name,
                                 mode_name,
                                 initial_content,
-                            ) {
-                                // Switch current window to the new buffer
+                            } => {
+                                // Create a new buffer with the specified mode
+                                let cursor_pos = initial_content.chars().count();
+                                if let Some(buffer_id) = self.editor.create_buffer_with_mode(
+                                    buffer_name,
+                                    mode_name,
+                                    initial_content,
+                                ) {
+                                    // Switch current window to the new buffer
+                                    if let Some(current_window) =
+                                        self.editor.windows.get_mut(self.editor.active_window)
+                                    {
+                                        current_window.active_buffer = buffer_id;
+                                        current_window.cursor = cursor_pos;
+                                    }
+                                }
+                            }
+                            ChromeAction::ShowMessages => {
+                                // Create or show messages buffer
+                                let messages_buffer_id = self.editor.get_messages_buffer();
                                 if let Some(current_window) =
                                     self.editor.windows.get_mut(self.editor.active_window)
                                 {
-                                    current_window.active_buffer = buffer_id;
-                                    current_window.cursor = cursor_pos;
+                                    current_window.active_buffer = messages_buffer_id;
+                                    current_window.cursor = 0;
                                 }
                             }
-                        }
-                        ChromeAction::ShowMessages => {
-                            // Create or show messages buffer
-                            let messages_buffer_id = self.editor.get_messages_buffer();
-                            if let Some(current_window) =
-                                self.editor.windows.get_mut(self.editor.active_window)
-                            {
-                                current_window.active_buffer = messages_buffer_id;
-                                current_window.cursor = 0;
+                            ChromeAction::BufferChanged {
+                                buffer_id: _,
+                                start: _,
+                                old_end: _,
+                                new_end: _,
+                            } => {
+                                // Major mode after-change hooks will be dispatched here once
+                                // the scripting runtime (mica) is integrated.
                             }
-                        }
-                        ChromeAction::BufferChanged {
-                            buffer_id: _,
-                            start: _,
-                            old_end: _,
-                            new_end: _,
-                        } => {
-                            // Major mode after-change hooks will be dispatched here once
-                            // the scripting runtime (mica) is integrated.
-                        }
-                        ChromeAction::ExecuteCommand(command_name) => {
-                            // Execute another command via the command registry
-                            let context = self.editor.create_command_context();
-                            match roe_core::command_mode::CommandMode::execute_command(
-                                &command_name,
-                                &self.editor.command_registry,
-                                context,
-                            )
-                            .await
-                            {
-                                Ok(command_actions) => {
-                                    // Process through editor to handle BufferOps etc.
-                                    let processed = self
-                                        .editor
-                                        .process_chrome_actions(command_actions)
-                                        .await;
-                                    for a in processed {
-                                        actions.push_back(a);
+                            ChromeAction::ExecuteCommand(command_name) => {
+                                // Execute another command via the command registry
+                                let context = self.editor.create_command_context();
+                                match roe_core::command_mode::CommandMode::execute_command(
+                                    &command_name,
+                                    &self.editor.command_registry,
+                                    context,
+                                )
+                                .await
+                                {
+                                    Ok(command_actions) => {
+                                        // Process through editor to handle BufferOps etc.
+                                        let processed = self
+                                            .editor
+                                            .process_chrome_actions(command_actions)
+                                            .await;
+                                        for a in processed {
+                                            actions.push_back(a);
+                                        }
+                                    }
+                                    Err(error_msg) => {
+                                        self.editor.set_echo_message(format!(
+                                            "Command error: {error_msg}"
+                                        ));
                                     }
                                 }
-                                Err(error_msg) => {
-                                    self.editor.set_echo_message(format!(
-                                        "Command error: {error_msg}"
-                                    ));
-                                }
                             }
+                            ChromeAction::FileWatcherStatus => {
+                                let status = self.editor.file_watcher.status();
+                                self.editor.set_echo_message(status);
+                            }
+                            _ => {}
                         }
-                        ChromeAction::FileWatcherStatus => {
-                            let status = self.editor.file_watcher.status();
-                            self.editor.set_echo_message(status);
+                    }
+
+                    // Request redraw after key events
+                    if let Some(ref state) = self.state {
+                        state.window.request_redraw();
+                        self.redraw_state.invalidate(DirtyRegion::FullScreen);
+                    }
+                }
+                WindowEvent::CursorMoved { position, .. } => {
+                    // Convert physical to logical coordinates
+                    let scale_factor = self
+                        .state
+                        .as_ref()
+                        .map(|s| s.window.scale_factor())
+                        .unwrap_or(1.0);
+                    let logical_x = position.x / scale_factor;
+                    let logical_y = position.y / scale_factor;
+
+                    self.cursor_position = Some((logical_x, logical_y));
+
+                    // Handle window border dragging (for resizing splits)
+                    if self.editor.mouse_drag_state.is_some() {
+                        self.handle_border_drag(logical_x, logical_y);
+                        if let Some(ref render_state) = self.state {
+                            render_state.window.request_redraw();
+                            self.redraw_state.invalidate(DirtyRegion::FullScreen);
                         }
-                        _ => {}
                     }
-                }
+                    // Handle vertical scrollbar dragging
+                    else if self.scrollbar_dragging.is_some() {
+                        self.handle_scrollbar_drag(logical_y);
+                        if let Some(ref render_state) = self.state {
+                            render_state.window.request_redraw();
+                            self.redraw_state.invalidate(DirtyRegion::FullScreen);
+                        }
+                    }
+                    // Handle horizontal scrollbar dragging
+                    else if self.hscrollbar_dragging.is_some() {
+                        self.handle_hscrollbar_drag(logical_x);
+                        if let Some(ref render_state) = self.state {
+                            render_state.window.request_redraw();
+                            self.redraw_state.invalidate(DirtyRegion::FullScreen);
+                        }
+                    }
+                    // Handle text selection drag
+                    else if self.mouse_dragging {
+                        self.handle_mouse_drag(logical_x, logical_y);
+                        if let Some(ref render_state) = self.state {
+                            render_state.window.request_redraw();
+                            self.redraw_state.invalidate(DirtyRegion::FullScreen);
+                        }
+                    }
 
-                // Request redraw after key events
-                if let Some(ref state) = self.state {
-                    state.window.request_redraw();
-                }
-            }
-            WindowEvent::CursorMoved { position, .. } => {
-                // Convert physical to logical coordinates
-                let scale_factor = self
-                    .state
-                    .as_ref()
-                    .map(|s| s.window.scale_factor())
-                    .unwrap_or(1.0);
-                let logical_x = position.x / scale_factor;
-                let logical_y = position.y / scale_factor;
-
-                self.cursor_position = Some((logical_x, logical_y));
-
-                // Handle window border dragging (for resizing splits)
-                if self.editor.mouse_drag_state.is_some() {
-                    self.handle_border_drag(logical_x, logical_y);
-                    if let Some(ref render_state) = self.state {
-                        render_state.window.request_redraw();
-                    }
-                }
-                // Handle vertical scrollbar dragging
-                else if self.scrollbar_dragging.is_some() {
-                    self.handle_scrollbar_drag(logical_y);
-                    if let Some(ref render_state) = self.state {
-                        render_state.window.request_redraw();
-                    }
-                }
-                // Handle horizontal scrollbar dragging
-                else if self.hscrollbar_dragging.is_some() {
-                    self.handle_hscrollbar_drag(logical_x);
-                    if let Some(ref render_state) = self.state {
-                        render_state.window.request_redraw();
-                    }
-                }
-                // Handle text selection drag
-                else if self.mouse_dragging {
-                    self.handle_mouse_drag(logical_x, logical_y);
-                    if let Some(ref render_state) = self.state {
-                        render_state.window.request_redraw();
-                    }
-                }
-
-                // Update cursor icon based on hover state
-                if let Some(ref state) = self.state {
-                    let cursor = if self.editor.mouse_drag_state.is_some() {
-                        // Check if dragging vertical or horizontal border
-                        if let Some(ref drag_state) = self.editor.mouse_drag_state {
-                            if let Some(ref border_info) = drag_state.border_info {
-                                if border_info.is_vertical {
-                                    CursorIcon::ColResize
+                    // Update cursor icon based on hover state
+                    if let Some(ref state) = self.state {
+                        let cursor = if self.editor.mouse_drag_state.is_some() {
+                            // Check if dragging vertical or horizontal border
+                            if let Some(ref drag_state) = self.editor.mouse_drag_state {
+                                if let Some(ref border_info) = drag_state.border_info {
+                                    if border_info.is_vertical {
+                                        CursorIcon::ColResize
+                                    } else {
+                                        CursorIcon::RowResize
+                                    }
                                 } else {
-                                    CursorIcon::RowResize
+                                    CursorIcon::Default
                                 }
                             } else {
                                 CursorIcon::Default
                             }
+                        } else if self.scrollbar_dragging.is_some()
+                            || self.hscrollbar_dragging.is_some()
+                        {
+                            CursorIcon::Grabbing
+                        } else if let Some((border_info, _)) =
+                            self.check_border_hit(logical_x, logical_y)
+                        {
+                            // Show resize cursor when hovering over draggable borders
+                            if border_info.is_vertical {
+                                CursorIcon::ColResize
+                            } else {
+                                CursorIcon::RowResize
+                            }
+                        } else if self.check_scrollbar_hit(logical_x, logical_y).is_some()
+                            || self.check_hscrollbar_hit(logical_x, logical_y).is_some()
+                        {
+                            CursorIcon::Grab
                         } else {
-                            CursorIcon::Default
-                        }
-                    } else if self.scrollbar_dragging.is_some()
-                        || self.hscrollbar_dragging.is_some()
-                    {
-                        CursorIcon::Grabbing
-                    } else if let Some((border_info, _)) =
-                        self.check_border_hit(logical_x, logical_y)
-                    {
-                        // Show resize cursor when hovering over draggable borders
-                        if border_info.is_vertical {
-                            CursorIcon::ColResize
-                        } else {
-                            CursorIcon::RowResize
-                        }
-                    } else if self.check_scrollbar_hit(logical_x, logical_y).is_some()
-                        || self.check_hscrollbar_hit(logical_x, logical_y).is_some()
-                    {
-                        CursorIcon::Grab
-                    } else {
-                        CursorIcon::Text
-                    };
-                    state.window.set_cursor(cursor);
+                            CursorIcon::Text
+                        };
+                        state.window.set_cursor(cursor);
+                    }
                 }
-            }
-            WindowEvent::MouseInput { state, button, .. } => {
-                if button == MouseButton::Left {
-                    match state {
-                        ElementState::Pressed => {
-                            if let Some((x, y)) = self.cursor_position {
-                                // Check if click is on a window border (for resizing splits)
-                                if let Some((border_info, target_window)) =
-                                    self.check_border_hit(x, y)
-                                {
-                                    let char_width = self.text_renderer.char_width() as f64;
-                                    let line_height = self.text_renderer.line_height() as f64;
-                                    let grid_x = (x / char_width) as u16;
-                                    let grid_y = (y / line_height) as u16;
+                WindowEvent::MouseInput { state, button, .. } => {
+                    if button == MouseButton::Left {
+                        match state {
+                            ElementState::Pressed => {
+                                if let Some((x, y)) = self.cursor_position {
+                                    // Check if click is on a window border (for resizing splits)
+                                    if let Some((border_info, target_window)) =
+                                        self.check_border_hit(x, y)
+                                    {
+                                        let char_width = self.text_renderer.char_width() as f64;
+                                        let line_height = self.text_renderer.line_height() as f64;
+                                        let grid_x = (x / char_width) as u16;
+                                        let grid_y = (y / line_height) as u16;
 
-                                    self.editor.mouse_drag_state = Some(MouseDragState {
-                                        drag_type: DragType::WindowBorder,
-                                        start_pos: (grid_x, grid_y),
-                                        last_pos: (grid_x, grid_y),
-                                        current_pos: (grid_x, grid_y),
-                                        target_window: Some(target_window),
-                                        border_info: Some(border_info.clone()),
-                                    });
-                                    if let Some(ref state) = self.state {
-                                        let cursor = if border_info.is_vertical {
-                                            CursorIcon::ColResize
-                                        } else {
-                                            CursorIcon::RowResize
-                                        };
-                                        state.window.set_cursor(cursor);
+                                        self.editor.mouse_drag_state = Some(MouseDragState {
+                                            drag_type: DragType::WindowBorder,
+                                            start_pos: (grid_x, grid_y),
+                                            last_pos: (grid_x, grid_y),
+                                            current_pos: (grid_x, grid_y),
+                                            target_window: Some(target_window),
+                                            border_info: Some(border_info.clone()),
+                                        });
+                                        if let Some(ref state) = self.state {
+                                            let cursor = if border_info.is_vertical {
+                                                CursorIcon::ColResize
+                                            } else {
+                                                CursorIcon::RowResize
+                                            };
+                                            state.window.set_cursor(cursor);
+                                        }
                                     }
-                                }
-                                // Check if click is on vertical scrollbar
-                                else if let Some((window_id, ratio)) =
-                                    self.check_scrollbar_hit(x, y)
-                                {
-                                    self.handle_scrollbar_click(window_id, ratio);
-                                    self.scrollbar_dragging = Some(window_id);
-                                    if let Some(ref state) = self.state {
-                                        state.window.set_cursor(CursorIcon::Grabbing);
+                                    // Check if click is on vertical scrollbar
+                                    else if let Some((window_id, ratio)) =
+                                        self.check_scrollbar_hit(x, y)
+                                    {
+                                        self.handle_scrollbar_click(window_id, ratio);
+                                        self.scrollbar_dragging = Some(window_id);
+                                        if let Some(ref state) = self.state {
+                                            state.window.set_cursor(CursorIcon::Grabbing);
+                                        }
                                     }
-                                }
-                                // Check horizontal scrollbar
-                                else if let Some((window_id, ratio)) =
-                                    self.check_hscrollbar_hit(x, y)
-                                {
-                                    self.handle_hscrollbar_click(window_id, ratio);
-                                    self.hscrollbar_dragging = Some(window_id);
-                                    if let Some(ref state) = self.state {
-                                        state.window.set_cursor(CursorIcon::Grabbing);
+                                    // Check horizontal scrollbar
+                                    else if let Some((window_id, ratio)) =
+                                        self.check_hscrollbar_hit(x, y)
+                                    {
+                                        self.handle_hscrollbar_click(window_id, ratio);
+                                        self.hscrollbar_dragging = Some(window_id);
+                                        if let Some(ref state) = self.state {
+                                            state.window.set_cursor(CursorIcon::Grabbing);
+                                        }
+                                    } else {
+                                        // Normal text click
+                                        self.handle_mouse_click(x, y).await;
+                                        // Save cursor position for potential drag selection
+                                        let cursor =
+                                            self.editor.windows[self.editor.active_window].cursor;
+                                        self.drag_start_cursor = Some(cursor);
+                                        self.mouse_dragging = true;
                                     }
-                                } else {
-                                    // Normal text click
-                                    self.handle_mouse_click(x, y).await;
-                                    // Save cursor position for potential drag selection
-                                    let cursor =
-                                        self.editor.windows[self.editor.active_window].cursor;
-                                    self.drag_start_cursor = Some(cursor);
-                                    self.mouse_dragging = true;
-                                }
-                                if let Some(ref render_state) = self.state {
-                                    render_state.window.request_redraw();
+                                    if let Some(ref render_state) = self.state {
+                                        render_state.window.request_redraw();
+                                        self.redraw_state.invalidate(DirtyRegion::FullScreen);
+                                    }
                                 }
                             }
-                        }
-                        ElementState::Released => {
-                            self.mouse_dragging = false;
-                            self.drag_start_cursor = None;
-                            self.scrollbar_dragging = None;
-                            self.hscrollbar_dragging = None;
-                            // Clear border drag state
-                            if self.editor.mouse_drag_state.is_some() {
-                                self.editor.mouse_drag_state = None;
+                            ElementState::Released => {
+                                self.mouse_dragging = false;
+                                self.drag_start_cursor = None;
+                                self.scrollbar_dragging = None;
+                                self.hscrollbar_dragging = None;
+                                // Clear border drag state
+                                if self.editor.mouse_drag_state.is_some() {
+                                    self.editor.mouse_drag_state = None;
+                                }
                             }
                         }
                     }
                 }
+                _ => {}
             }
-            _ => {}
-        }
         });
     }
 }

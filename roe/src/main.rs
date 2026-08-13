@@ -18,8 +18,8 @@ use crossterm::event::{
 use crossterm::execute;
 use crossterm::terminal::disable_raw_mode;
 use roe_core::{
-    buffer_host, command_registry, editor, kill_ring, mode, Buffer, BufferId,
-    ConfigurableBindings, Editor, Frame, KeyState, Mode, ModeId, Renderer, Window, WindowId,
+    buffer_host, command_registry, editor, kill_ring, mode, Buffer, BufferId, ConfigurableBindings,
+    Editor, Frame, KeyState, Mode, ModeId, Renderer, Window, WindowId,
 };
 use roe_terminal::{TerminalRenderer, ECHO_AREA_HEIGHT};
 use slotmap::SlotMap;
@@ -146,8 +146,7 @@ async fn terminal_main<W: Write>(stdout: W, config: EditorConfig) -> Result<(), 
             .expect("MessagesMode should exist in modes SlotMap");
         let mode_list = vec![(welcome_mode_id, "welcome".to_string(), welcome_mode)];
 
-        let buffer_client =
-            buffer_host::create_buffer_host(buffer, mode_list, buffer_id);
+        let buffer_client = buffer_host::create_buffer_host(buffer, mode_list, buffer_id);
         buffer_hosts.insert(buffer_id, buffer_client);
     } else {
         // Create buffers for all specified files
@@ -183,8 +182,7 @@ async fn terminal_main<W: Write>(stdout: W, config: EditorConfig) -> Result<(), 
             let mode_list = vec![(file_mode_id, "file".to_string(), file_mode)];
 
             // Create BufferHost and client
-            let buffer_client =
-                buffer_host::create_buffer_host(buffer, mode_list, buffer_id);
+            let buffer_client = buffer_host::create_buffer_host(buffer, mode_list, buffer_id);
             buffer_hosts.insert(buffer_id, buffer_client);
         }
     }
@@ -278,6 +276,7 @@ async fn terminal_main<W: Write>(stdout: W, config: EditorConfig) -> Result<(), 
         buffer_history: Vec::new(),
         echo_message: String::new(),
         echo_message_time: None,
+        clock: std::sync::Arc::new(roe_core::native_services::SystemClock),
         current_key_chord: Vec::new(),
         mouse_drag_state: None,
         messages_buffer_id: None,

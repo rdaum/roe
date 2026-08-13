@@ -166,3 +166,33 @@ impl Mode for BufferSwitchMode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keys::CursorDirection;
+    use slotmap::SlotMap;
+
+    #[test]
+    fn switch_workflow_filters_selects_and_confirms() {
+        let mut ids: SlotMap<BufferId, ()> = SlotMap::with_key();
+        let command = ids.insert(());
+        let first = ids.insert(());
+        let second = ids.insert(());
+        let mut mode = BufferSwitchMode::new();
+        mode.init_with_buffer(
+            command,
+            vec![(first, "alpha".to_string()), (second, "beta".to_string())],
+        );
+
+        assert!(matches!(
+            mode.perform(&KeyAction::Cursor(CursorDirection::Down)),
+            ModeResult::Consumed(_)
+        ));
+        assert_eq!(mode.get_selected_buffer(), Some(second));
+        assert_eq!(
+            mode.perform(&KeyAction::Enter),
+            ModeResult::Consumed(vec![ModeAction::SwitchToBuffer(second)])
+        );
+    }
+}

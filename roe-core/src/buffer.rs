@@ -162,8 +162,13 @@ impl BufferInner {
     }
 
     pub fn to_char_index(&self, col: u16, line: u16) -> usize {
-        let linestart_pos = self.buffer.line_to_char(line as usize);
-        linestart_pos + col as usize
+        let line = (line as usize).min(self.buffer.len_lines().saturating_sub(1));
+        let line_start = self.buffer.line_to_char(line);
+        let line_slice = self.buffer.line(line);
+        let content_len = line_slice.len_chars().saturating_sub(usize::from(
+            line_slice.len_chars() > 0 && line_slice.char(line_slice.len_chars() - 1) == '\n',
+        ));
+        line_start + (col as usize).min(content_len)
     }
 
     // === PHASE 1: CLEAN CHARACTER-POSITION API ===
@@ -1010,6 +1015,17 @@ mod tests {
         let (col, line) = buffer.to_column_line(12);
         assert_eq!(col, 0);
         assert_eq!(line, 2);
+    }
+
+    #[test]
+    fn test_position_conversions_clamp_invalid_line_and_column() {
+        let mut buffer = BufferInner::new(&[]);
+        buffer.load_str("abc\n\u{03bb}\u{03bc}\nlast");
+
+        assert_eq!(buffer.to_char_index(99, 0), 3);
+        assert_eq!(buffer.to_char_index(99, 1), 6);
+        assert_eq!(buffer.to_char_index(99, 99), buffer.buffer.len_chars());
+        assert_eq!(buffer.to_column_line(usize::MAX), (4, 2));
     }
 
     #[test]

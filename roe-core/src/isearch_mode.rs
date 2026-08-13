@@ -135,15 +135,21 @@ impl IsearchMode {
 
         let content = self.target_buffer.content();
         let needle_lower = self.search_term.to_lowercase();
-        let content_lower = content.to_lowercase();
-
-        // Find all matches using byte positions (for span highlighting)
-        let mut byte_start = 0;
-        while let Some(byte_pos) = content_lower[byte_start..].find(&needle_lower) {
-            let abs_byte_start = byte_start + byte_pos;
-            let abs_byte_end = abs_byte_start + needle_lower.len();
-            self.matches.push((abs_byte_start, abs_byte_end));
-            byte_start = abs_byte_start + 1;
+        // Match at original UTF-8 character boundaries. Lowercasing can change
+        // byte length, so positions in a lowercased copy cannot safely be used
+        // as spans in the original content.
+        for (start, _) in content.char_indices() {
+            let mut folded = String::new();
+            for (relative_end, character) in content[start..].char_indices() {
+                folded.extend(character.to_lowercase());
+                if folded.len() >= needle_lower.len() {
+                    if folded == needle_lower {
+                        self.matches
+                            .push((start, start + relative_end + character.len_utf8()));
+                    }
+                    break;
+                }
+            }
         }
 
         // Find the first match at or after original cursor position (for forward)
@@ -343,4 +349,43 @@ fn char_to_byte_pos(s: &str, char_pos: usize) -> usize {
 /// Convert a byte position to character position in a string
 pub fn byte_to_char_pos(s: &str, byte_pos: usize) -> usize {
     s[..byte_pos.min(s.len())].chars().count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use slotmap::SlotMap;
+
+    #[test]
+    fn unicode_search_workflow_updates_and_accepts() {
+        let mut buffers: SlotMap<BufferId, ()> = SlotMap::with_key();
+        let buffer_id = buffers.insert(());
+        let mut windows: SlotMap<WindowId, ()> = SlotMap::with_key();
+        let window_id = windows.insert(());
+        let buffer = Buffer::new(&[]);
+        buffer.load_str("zero \u{03bb} one \u{03bb}");
+        let mut mode = IsearchMode::new(
+            SearchDirection::Forward,
+            buffer_id,
+            window_id,
+            0,
+            buffer,
+            None,
+        );
+
+        let result = mode.perform(&KeyAction::AlphaNumeric('\u{03bb}'));
+        assert!(matches!(result, ModeResult::Consumed(_)));
+        assert_eq!(mode.matches().len(), 2);
+        assert_eq!(mode.current_match_index(), Some(0));
+
+        mode.perform(&KeyAction::Cursor(crate::keys::CursorDirection::Down));
+        assert_eq!(mode.current_match_index(), Some(1));
+        assert_eq!(
+            mode.perform(&KeyAction::Enter),
+            ModeResult::Consumed(vec![ModeAction::AcceptIsearch {
+                target_buffer_id: buffer_id,
+                search_term: "\u{03bb}".to_string(),
+            }])
+        );
+    }
 }

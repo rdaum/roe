@@ -21,12 +21,14 @@ use crate::keys::KeyAction::ChordNext;
 use crate::keys::{Bindings, CursorDirection, KeyAction, KeyState, LogicalKey};
 use crate::kill_ring::KillRing;
 use crate::mode::{ActionPosition, MessagesMode, Mode};
+use crate::native_services::Clock;
 use crate::renderer::{DirtyRegion, ModelineComponent};
 use crate::{BufferId, ModeId, WindowId};
 use compio::buf::BufResult;
 use compio::io::AsyncWriteAtExt;
 use slotmap::SlotMap;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// How long echo messages remain visible (in seconds)
@@ -223,6 +225,7 @@ pub struct Editor {
     pub echo_message: String,
     /// When the echo message was set (for auto-clearing)
     pub echo_message_time: Option<Instant>,
+    pub clock: Arc<dyn Clock>,
     /// Current key chord being typed (for echo area display)
     pub current_key_chord: Vec<LogicalKey>,
     /// Mouse drag state for window resizing
@@ -481,11 +484,8 @@ impl Editor {
                 .expect("Mode should exist in SlotMap"),
         )];
 
-        let buffer_client = crate::buffer_host::create_buffer_host(
-            command_buffer,
-            mode_list,
-            command_buffer_id,
-        );
+        let buffer_client =
+            crate::buffer_host::create_buffer_host(command_buffer, mode_list, command_buffer_id);
 
         // Insert the BufferHost using the buffer ID as the key for easy lookup/cleanup
         self.buffer_hosts.insert(command_buffer_id, buffer_client);
@@ -637,11 +637,8 @@ impl Editor {
             Box::new(isearch_mode) as Box<dyn Mode>,
         )];
 
-        let buffer_client = crate::buffer_host::create_buffer_host(
-            command_buffer,
-            mode_list,
-            command_buffer_id,
-        );
+        let buffer_client =
+            crate::buffer_host::create_buffer_host(command_buffer, mode_list, command_buffer_id);
 
         self.buffer_hosts.insert(command_buffer_id, buffer_client);
 
@@ -832,8 +829,7 @@ impl Editor {
                 .remove(mode_id)
                 .expect("Mode should exist in SlotMap"),
         )];
-        let buffer_client =
-            crate::buffer_host::create_buffer_host(buffer, mode_list, buffer_id);
+        let buffer_client = crate::buffer_host::create_buffer_host(buffer, mode_list, buffer_id);
         self.buffer_hosts.insert(buffer_id, buffer_client);
 
         Some(buffer_id)
@@ -842,7 +838,7 @@ impl Editor {
     /// Set the echo area message (this will override any chord display)
     pub fn set_echo_message(&mut self, message: String) {
         self.echo_message = message.clone();
-        self.echo_message_time = Some(Instant::now());
+        self.echo_message_time = Some(self.clock.now());
         // Clear chord since we're showing a different message
         self.current_key_chord.clear();
 
@@ -873,7 +869,9 @@ impl Editor {
     /// Returns true if the message was cleared
     pub fn check_and_clear_expired_echo(&mut self) -> bool {
         if let Some(echo_time) = self.echo_message_time {
-            if echo_time.elapsed() >= Duration::from_secs(ECHO_TIMEOUT_SECS) {
+            if self.clock.now().saturating_duration_since(echo_time)
+                >= Duration::from_secs(ECHO_TIMEOUT_SECS)
+            {
                 self.clear_echo_message();
                 return true;
             }
@@ -1840,7 +1838,9 @@ impl Editor {
                         let context = self.create_command_context();
                         if let Some(command) = self.command_registry.get_command(command_name) {
                             match command.execute(context).await {
-                                Ok(actions) => return Ok(self.process_chrome_actions(actions).await),
+                                Ok(actions) => {
+                                    return Ok(self.process_chrome_actions(actions).await)
+                                }
                                 Err(error_msg) => {
                                     return Ok(vec![ChromeAction::Echo(format!(
                                         "Error: {error_msg}"
@@ -2102,12 +2102,11 @@ impl Editor {
                                             .remove(scratch_mode_id)
                                             .expect("Scratch mode should exist"),
                                     )];
-                                    let buffer_client =
-                                        buffer_host::create_buffer_host(
-                                            scratch_buffer,
-                                            mode_list,
-                                            scratch_buffer_id,
-                                        );
+                                    let buffer_client = buffer_host::create_buffer_host(
+                                        scratch_buffer,
+                                        mode_list,
+                                        scratch_buffer_id,
+                                    );
                                     self.buffer_hosts.insert(scratch_buffer_id, buffer_client);
 
                                     // Switch all windows using the killed buffer to the new scratch buffer
@@ -3023,8 +3022,7 @@ impl Editor {
         let mode_list = vec![(file_mode_id, "file".to_string(), file_mode)];
 
         // Create BufferHost and client
-        let buffer_client =
-            crate::buffer_host::create_buffer_host(buffer, mode_list, buffer_id);
+        let buffer_client = crate::buffer_host::create_buffer_host(buffer, mode_list, buffer_id);
         self.buffer_hosts.insert(buffer_id, buffer_client);
 
         // Switch the window to the new buffer
@@ -3040,7 +3038,10 @@ impl Editor {
 
     /// Create a CommandContext from the current editor state
     /// Process ChromeActions and handle those that need editor state changes
-    pub async fn process_chrome_actions(&mut self, actions: Vec<ChromeAction>) -> Vec<ChromeAction> {
+    pub async fn process_chrome_actions(
+        &mut self,
+        actions: Vec<ChromeAction>,
+    ) -> Vec<ChromeAction> {
         let mut result_actions = Vec::new();
 
         for action in actions {
@@ -3485,6 +3486,16 @@ mod tests {
 
     static COMPIO_RUNTIME_LOCK: Mutex<()> = Mutex::new(());
 
+    struct TestClock {
+        now: Mutex<Instant>,
+    }
+
+    impl Clock for TestClock {
+        fn now(&self) -> Instant {
+            *self.now.lock().unwrap()
+        }
+    }
+
     fn test_editor() -> Editor {
         let scratch_mode = Box::new(ScratchMode {});
         let mut modes: SlotMap<ModeId, Box<dyn Mode>> = SlotMap::default();
@@ -3526,6 +3537,7 @@ mod tests {
             buffer_history: vec![],
             echo_message: "".to_string(),
             echo_message_time: None,
+            clock: Arc::new(crate::native_services::SystemClock),
             current_key_chord: vec![],
             mouse_drag_state: None,
             messages_buffer_id: None,
@@ -3538,43 +3550,60 @@ mod tests {
     fn test_cursor_move_right() {
         let _runtime_guard = COMPIO_RUNTIME_LOCK.lock().unwrap();
         compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mut editor = test_editor();
-        let window = &editor.windows[editor.active_window];
-        let initial_cursor = window.cursor;
+            let mut editor = test_editor();
+            let window = &editor.windows[editor.active_window];
+            let initial_cursor = window.cursor;
 
-        // Move cursor right
-        let actions = editor.key_event(vec![LogicalKey::Right]).await.unwrap();
+            // Move cursor right
+            let actions = editor.key_event(vec![LogicalKey::Right]).await.unwrap();
 
-        // Should get a CursorMove action
-        assert!(actions
-            .iter()
-            .any(|action| matches!(action, ChromeAction::CursorMove(_))));
+            // Should get a CursorMove action
+            assert!(actions
+                .iter()
+                .any(|action| matches!(action, ChromeAction::CursorMove(_))));
 
-        // Cursor should have moved
-        let window = &editor.windows[editor.active_window];
-        assert_eq!(window.cursor, initial_cursor + 1);
+            // Cursor should have moved
+            let window = &editor.windows[editor.active_window];
+            assert_eq!(window.cursor, initial_cursor + 1);
         });
+    }
+
+    #[test]
+    fn test_echo_expiry_uses_injected_clock() {
+        let start = Instant::now();
+        let clock = Arc::new(TestClock {
+            now: Mutex::new(start),
+        });
+        let mut editor = test_editor();
+        editor.clock = clock.clone();
+        editor.echo_message = "hello".to_string();
+        editor.echo_message_time = Some(start);
+
+        assert!(!editor.check_and_clear_expired_echo());
+        *clock.now.lock().unwrap() = start + Duration::from_secs(ECHO_TIMEOUT_SECS);
+        assert!(editor.check_and_clear_expired_echo());
+        assert!(editor.echo_message.is_empty());
     }
 
     #[test]
     fn test_cursor_move_down() {
         let _runtime_guard = COMPIO_RUNTIME_LOCK.lock().unwrap();
         compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mut editor = test_editor();
+            let mut editor = test_editor();
 
-        // Move cursor down
-        let actions = editor.key_event(vec![LogicalKey::Down]).await.unwrap();
+            // Move cursor down
+            let actions = editor.key_event(vec![LogicalKey::Down]).await.unwrap();
 
-        // Should get a CursorMove action
-        assert!(actions
-            .iter()
-            .any(|action| matches!(action, ChromeAction::CursorMove(_))));
+            // Should get a CursorMove action
+            assert!(actions
+                .iter()
+                .any(|action| matches!(action, ChromeAction::CursorMove(_))));
 
-        // Cursor should have moved to next line
-        let window = &editor.windows[editor.active_window];
-        let buffer = &editor.buffers[window.active_buffer];
-        let (_, line) = buffer.to_column_line(window.cursor);
-        assert_eq!(line, 1);
+            // Cursor should have moved to next line
+            let window = &editor.windows[editor.active_window];
+            let buffer = &editor.buffers[window.active_buffer];
+            let (_, line) = buffer.to_column_line(window.cursor);
+            assert_eq!(line, 1);
         });
     }
 
@@ -3582,23 +3611,23 @@ mod tests {
     fn test_cursor_move_beyond_buffer() {
         let _runtime_guard = COMPIO_RUNTIME_LOCK.lock().unwrap();
         compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mut editor = test_editor();
-        let buffer_len = {
+            let mut editor = test_editor();
+            let buffer_len = {
+                let window = &editor.windows[editor.active_window];
+                let buffer = &editor.buffers[window.active_buffer];
+                buffer.buffer_len_chars()
+            };
+
+            // Move cursor to end of buffer
+            let window = &mut editor.windows[editor.active_window];
+            window.cursor = buffer_len;
+
+            // Try to move right beyond end
+            let _actions = editor.key_event(vec![LogicalKey::Right]).await.unwrap();
+
+            // Cursor should stay at end
             let window = &editor.windows[editor.active_window];
-            let buffer = &editor.buffers[window.active_buffer];
-            buffer.buffer_len_chars()
-        };
-
-        // Move cursor to end of buffer
-        let window = &mut editor.windows[editor.active_window];
-        window.cursor = buffer_len;
-
-        // Try to move right beyond end
-        let _actions = editor.key_event(vec![LogicalKey::Right]).await.unwrap();
-
-        // Cursor should stay at end
-        let window = &editor.windows[editor.active_window];
-        assert_eq!(window.cursor, buffer_len);
+            assert_eq!(window.cursor, buffer_len);
         });
     }
 
@@ -3606,25 +3635,25 @@ mod tests {
     fn test_cursor_position_calculation() {
         let _runtime_guard = COMPIO_RUNTIME_LOCK.lock().unwrap();
         compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mut editor = test_editor();
+            let mut editor = test_editor();
 
-        // Move to a specific position
-        let window = &mut editor.windows[editor.active_window];
-        window.cursor = 7; // Should be at "World" line, column 1
+            // Move to a specific position
+            let window = &mut editor.windows[editor.active_window];
+            window.cursor = 7; // Should be at "World" line, column 1
 
-        let actions = editor.key_event(vec![LogicalKey::Right]).await.unwrap();
+            let actions = editor.key_event(vec![LogicalKey::Right]).await.unwrap();
 
-        // Check the CursorMove action has correct coordinates
-        if let Some(ChromeAction::CursorMove((x, y))) = actions
-            .iter()
-            .find(|a| matches!(a, ChromeAction::CursorMove(_)))
-        {
-            // Should be at column 2 of line 1, plus border offset (+1, +1)
-            assert_eq!(*x, 3);
-            assert_eq!(*y, 2);
-        } else {
-            panic!("Expected CursorMove action");
-        }
+            // Check the CursorMove action has correct coordinates
+            if let Some(ChromeAction::CursorMove((x, y))) = actions
+                .iter()
+                .find(|a| matches!(a, ChromeAction::CursorMove(_)))
+            {
+                // Should be at column 2 of line 1, plus border offset (+1, +1)
+                assert_eq!(*x, 3);
+                assert_eq!(*y, 2);
+            } else {
+                panic!("Expected CursorMove action");
+            }
         });
     }
 

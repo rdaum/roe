@@ -65,8 +65,15 @@ impl VelloRenderer {
         self.needs_redraw || self.dirty_tracker.is_dirty()
     }
 
+    /// Invalidate part of the production Vello presentation.
+    pub fn invalidate(&mut self, region: DirtyRegion) {
+        self.dirty_tracker.mark_dirty(region);
+        self.needs_redraw = true;
+    }
+
     /// Mark that a redraw has been performed
     pub fn redraw_complete(&mut self) {
+        self.dirty_tracker.clear();
         self.needs_redraw = false;
     }
 }
@@ -75,8 +82,7 @@ impl Renderer for VelloRenderer {
     type Error = std::io::Error;
 
     fn mark_dirty(&mut self, region: DirtyRegion) {
-        self.dirty_tracker.mark_dirty(region);
-        self.needs_redraw = true;
+        self.invalidate(region);
     }
 
     fn render_incremental(&mut self, _editor: &Editor) -> Result<(), Self::Error> {

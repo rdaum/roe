@@ -14,8 +14,8 @@
 //! Roe editor with Vello/GPU rendering backend.
 
 use roe_core::{
-    buffer_host, command_registry, editor, kill_ring, mode, Buffer, BufferId,
-    ConfigurableBindings, Editor, Frame, KeyState, Mode, ModeId, Window, WindowId,
+    buffer_host, command_registry, editor, kill_ring, mode, Buffer, BufferId, ConfigurableBindings,
+    Editor, Frame, KeyState, Mode, ModeId, Window, WindowId,
 };
 use slotmap::SlotMap;
 use std::collections::HashMap;
@@ -122,8 +122,7 @@ async fn create_editor(config: EditorConfig) -> Editor {
             .expect("MessagesMode should exist");
         let mode_list = vec![(welcome_mode_id, "welcome".to_string(), welcome_mode)];
 
-        let buffer_client =
-            buffer_host::create_buffer_host(buffer, mode_list, buffer_id);
+        let buffer_client = buffer_host::create_buffer_host(buffer, mode_list, buffer_id);
         buffer_hosts.insert(buffer_id, buffer_client);
     } else {
         // Create buffers for all specified files
@@ -151,8 +150,7 @@ async fn create_editor(config: EditorConfig) -> Editor {
             let file_mode = modes.remove(file_mode_id).expect("FileMode should exist");
             let mode_list = vec![(file_mode_id, "file".to_string(), file_mode)];
 
-            let buffer_client =
-                buffer_host::create_buffer_host(buffer, mode_list, buffer_id);
+            let buffer_client = buffer_host::create_buffer_host(buffer, mode_list, buffer_id);
             buffer_hosts.insert(buffer_id, buffer_client);
         }
     }
@@ -195,6 +193,7 @@ async fn create_editor(config: EditorConfig) -> Editor {
         buffer_history: Vec::new(),
         echo_message: String::new(),
         echo_message_time: None,
+        clock: std::sync::Arc::new(roe_core::native_services::SystemClock),
         current_key_chord: Vec::new(),
         mouse_drag_state: None,
         messages_buffer_id: None,
@@ -224,8 +223,7 @@ async fn create_editor(config: EditorConfig) -> Editor {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = parse_args();
 
-    let runtime =
-        compio::runtime::Runtime::new().expect("Failed to create compio runtime");
+    let runtime = compio::runtime::Runtime::new().expect("Failed to create compio runtime");
 
     let mut editor = runtime.block_on(create_editor(config));
 

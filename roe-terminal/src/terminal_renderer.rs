@@ -1471,7 +1471,7 @@ pub async fn event_loop_with_renderer<W: Write>(
                     initial_content,
                 } => {
                     // Create a new buffer with the specified mode
-                    let cursor_pos = initial_content.len();
+                    let cursor_pos = initial_content.chars().count();
                     if let Some(buffer_id) =
                         editor.create_buffer_with_mode(buffer_name, mode_name, initial_content)
                     {

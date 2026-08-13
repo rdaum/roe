@@ -27,6 +27,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use crate::native_services::{Clock, SystemClock};
 use crate::BufferId;
 
 /// Represents a change to a specific line range
@@ -73,31 +74,29 @@ pub struct BufferSyncState {
 }
 
 impl BufferSyncState {
-    pub fn new(file_path: PathBuf, content: String) -> Self {
+    pub fn new(file_path: PathBuf, content: String, now: Instant) -> Self {
         Self {
             file_path,
             base_content: content,
-            base_timestamp: Instant::now(),
+            base_timestamp: now,
             ignore_until: None,
         }
     }
 
     /// Update the base content after a successful merge or save
-    pub fn update_base(&mut self, content: String) {
+    pub fn update_base(&mut self, content: String, now: Instant) {
         self.base_content = content;
-        self.base_timestamp = Instant::now();
+        self.base_timestamp = now;
     }
 
     /// Temporarily ignore file changes (call before saving)
-    pub fn ignore_for(&mut self, duration: Duration) {
-        self.ignore_until = Some(Instant::now() + duration);
+    pub fn ignore_for(&mut self, duration: Duration, now: Instant) {
+        self.ignore_until = Some(now + duration);
     }
 
     /// Check if we should ignore current changes
-    pub fn should_ignore(&self) -> bool {
-        self.ignore_until
-            .map(|until| Instant::now() < until)
-            .unwrap_or(false)
+    pub fn should_ignore(&self, now: Instant) -> bool {
+        self.ignore_until.is_some_and(|until| now < until)
     }
 }
 
@@ -118,18 +117,24 @@ pub struct FileWatcher {
     event_rx: Receiver<FileChangeEvent>,
     /// Map of file paths to buffer IDs (Arc for sharing with callback)
     path_to_buffer: Arc<RwLock<HashMap<PathBuf, BufferId>>>,
+    clock: Arc<dyn Clock>,
     /// Sync state per buffer
     sync_states: HashMap<BufferId, BufferSyncState>,
 }
 
 impl FileWatcher {
     pub fn new() -> Self {
+        Self::with_clock(Arc::new(SystemClock))
+    }
+
+    pub fn with_clock(clock: Arc<dyn Clock>) -> Self {
         let (event_tx, event_rx) = channel();
         Self {
             watcher: None,
             event_tx,
             event_rx,
             path_to_buffer: Arc::new(RwLock::new(HashMap::new())),
+            clock,
             sync_states: HashMap::new(),
         }
     }
@@ -194,7 +199,7 @@ impl FileWatcher {
         }
         self.sync_states.insert(
             buffer_id,
-            BufferSyncState::new(canonical.clone(), initial_content),
+            BufferSyncState::new(canonical.clone(), initial_content, self.clock.now()),
         );
 
         // Start watching the parent directory
@@ -226,10 +231,11 @@ impl FileWatcher {
     /// Poll for file change events (non-blocking)
     pub fn poll_events(&self) -> Vec<FileChangeEvent> {
         let mut events = Vec::new();
+        let now = self.clock.now();
         while let Ok(event) = self.event_rx.try_recv() {
             // Check if we should ignore this event
             if let Some(state) = self.sync_states.get(&event.buffer_id) {
-                if !state.should_ignore() {
+                if !state.should_ignore(now) {
                     events.push(event);
                 }
             }
@@ -249,15 +255,17 @@ impl FileWatcher {
 
     /// Update base content after save or merge
     pub fn update_base(&mut self, buffer_id: BufferId, content: String) {
+        let now = self.clock.now();
         if let Some(state) = self.sync_states.get_mut(&buffer_id) {
-            state.update_base(content);
+            state.update_base(content, now);
         }
     }
 
     /// Mark that we're about to save, so ignore imminent file change events
     pub fn mark_saving(&mut self, buffer_id: BufferId) {
+        let now = self.clock.now();
         if let Some(state) = self.sync_states.get_mut(&buffer_id) {
-            state.ignore_for(Duration::from_millis(500));
+            state.ignore_for(Duration::from_millis(500), now);
         }
     }
 
@@ -552,6 +560,95 @@ fn merge_with_conflicts(_base: &str, local: &str, external: &str) -> (String, us
 #[cfg(test)]
 mod tests {
     use super::*;
+    use slotmap::SlotMap;
+    use std::sync::Mutex;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestClock {
+        now: Mutex<Instant>,
+    }
+
+    impl Clock for TestClock {
+        fn now(&self) -> Instant {
+            *self.now.lock().unwrap()
+        }
+    }
+
+    #[test]
+    fn test_save_suppression_uses_injected_clock() {
+        let start = Instant::now();
+        let clock = Arc::new(TestClock {
+            now: Mutex::new(start),
+        });
+        let mut watcher = FileWatcher::with_clock(clock.clone());
+        let mut ids: SlotMap<BufferId, ()> = SlotMap::with_key();
+        let buffer_id = ids.insert(());
+        let path = PathBuf::from("/virtual/file");
+        watcher.sync_states.insert(
+            buffer_id,
+            BufferSyncState::new(path.clone(), String::new(), start),
+        );
+
+        watcher.mark_saving(buffer_id);
+        watcher
+            .event_tx
+            .send(FileChangeEvent {
+                buffer_id,
+                file_path: path.clone(),
+            })
+            .unwrap();
+        assert!(watcher.poll_events().is_empty());
+
+        *clock.now.lock().unwrap() = start + Duration::from_secs(1);
+        watcher
+            .event_tx
+            .send(FileChangeEvent {
+                buffer_id,
+                file_path: path,
+            })
+            .unwrap();
+        assert_eq!(watcher.poll_events().len(), 1);
+    }
+
+    #[test]
+    fn test_real_file_change_delivery() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("roe-file-watcher-{unique}"));
+        let path = directory.join("watched.txt");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(&path, "before").unwrap();
+
+        let mut ids: SlotMap<BufferId, ()> = SlotMap::with_key();
+        let buffer_id = ids.insert(());
+        let mut watcher = FileWatcher::new();
+        watcher
+            .watch_file(buffer_id, &path, "before".to_string())
+            .unwrap();
+
+        std::fs::write(&path, "after").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let delivered = loop {
+            let events = watcher.poll_events();
+            if events.iter().any(|event| event.buffer_id == buffer_id) {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        watcher.unwatch_file(buffer_id);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&directory).unwrap();
+        assert!(
+            delivered,
+            "notify did not deliver the file change within 2s"
+        );
+    }
 
     #[test]
     fn test_no_changes() {
