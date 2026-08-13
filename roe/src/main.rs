@@ -26,6 +26,17 @@ use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+fn required_argument(args: &[String], index: usize, option: &str, operands: &str) -> String {
+    args.get(index)
+        .filter(|argument| !argument.starts_with('-'))
+        .cloned()
+        .unwrap_or_else(|| {
+            eprintln!("Error: {option} requires {operands}");
+            print_help();
+            std::process::exit(2);
+        })
+}
+
 /// Parse command line arguments
 fn parse_args() -> EditorConfig {
     let args: Vec<String> = std::env::args().collect();
@@ -42,31 +53,19 @@ fn parse_args() -> EditorConfig {
             "--mica-check" => {
                 i += 1;
                 recovery.push(StartupRecoveryOperation::CheckFile(
-                    args.get(i).expect("--mica-check requires FILE").into(),
+                    required_argument(&args, i, "--mica-check", "FILE").into(),
                 ));
                 i += 1;
             }
             "--mica-replace" => {
-                let unit = args
-                    .get(i + 1)
-                    .expect("--mica-replace requires UNIT FILE")
-                    .clone();
-                let path = args
-                    .get(i + 2)
-                    .expect("--mica-replace requires UNIT FILE")
-                    .into();
+                let unit = required_argument(&args, i + 1, "--mica-replace", "UNIT FILE");
+                let path = required_argument(&args, i + 2, "--mica-replace", "UNIT FILE").into();
                 recovery.push(StartupRecoveryOperation::ReplaceUnit { unit, path });
                 i += 3;
             }
             "--mica-export" => {
-                let unit = args
-                    .get(i + 1)
-                    .expect("--mica-export requires UNIT FILE")
-                    .clone();
-                let path = args
-                    .get(i + 2)
-                    .expect("--mica-export requires UNIT FILE")
-                    .into();
+                let unit = required_argument(&args, i + 1, "--mica-export", "UNIT FILE");
+                let path = required_argument(&args, i + 2, "--mica-export", "UNIT FILE").into();
                 recovery.push(StartupRecoveryOperation::ExportUnit { unit, path });
                 i += 3;
             }
@@ -76,10 +75,7 @@ fn parse_args() -> EditorConfig {
             }
             "--mica-enable-package" | "--mica-disable-package" => {
                 let enabled = args[i] == "--mica-enable-package";
-                let package = args
-                    .get(i + 1)
-                    .expect("package option requires PACKAGE")
-                    .clone();
+                let package = required_argument(&args, i + 1, args[i].as_str(), "PACKAGE");
                 recovery.push(StartupRecoveryOperation::SetPackageEnabled { package, enabled });
                 i += 2;
             }

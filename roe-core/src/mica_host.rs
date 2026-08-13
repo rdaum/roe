@@ -120,6 +120,7 @@ pub enum MicaPromptTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MicaPromptUpdate {
     pub kind: String,
+    pub value_kind: Option<String>,
     pub prompt: String,
     pub query: String,
     pub selected: usize,
@@ -656,7 +657,8 @@ impl MicaHost {
                 ],
             )
             .await?;
-        let mut result = self.wait_for_task(submitted.task_id).await?;
+        let selector_name = selector.name().unwrap_or("<unnamed-selector>");
+        let mut result = self.wait_for_task(submitted.task_id, selector_name).await?;
         if had_prefix && result.key == MicaKeyResult::Unbound {
             result.key = MicaKeyResult::Failed(format!("{sequence} is undefined"));
         }
@@ -752,7 +754,7 @@ impl MicaHost {
             .driver
             .submit_invocation_for_endpoint(self.endpoint, sym(selector), arguments)
             .await?;
-        let result = self.wait_for_task(submitted.task_id).await?;
+        let result = self.wait_for_task(submitted.task_id, selector).await?;
         match result.key {
             MicaKeyResult::Failed(message) => Err(MicaHostError::Policy(message)),
             _ => Ok(result.events),
@@ -788,7 +790,10 @@ impl MicaHost {
                 ],
             )
             .await?;
-        Ok(self.wait_for_task(submitted.task_id).await?.events)
+        Ok(self
+            .wait_for_task(submitted.task_id, "roe/publish_policy")
+            .await?
+            .events)
     }
 
     pub async fn check_source(&self, source: String) -> Result<(), MicaHostError> {
@@ -812,7 +817,10 @@ impl MicaHost {
         Ok(())
     }
 
-    pub async fn export_unit(&self, unit: &str) -> Result<String, MicaHostError> {
+    pub async fn export_unit(&mut self, unit: &str) -> Result<String, MicaHostError> {
+        if unit == "roe/first-wave" {
+            self.ensure_first_wave().await?;
+        }
         Ok(self.driver.fileout_unit(sym(unit)).await?)
     }
 
@@ -1271,6 +1279,7 @@ end
     async fn wait_for_task(
         &mut self,
         task_id: TaskId,
+        selector: &str,
     ) -> Result<MicaDispatchResult, MicaHostError> {
         let mut batch = MicaEventBatch::default();
         loop {
@@ -1336,7 +1345,7 @@ end
                         error,
                     } if aborted == task_id => {
                         key = Some(MicaKeyResult::Failed(format!(
-                            "Mica task {task_id} endpoint={} session={} failure_class=aborted: {}",
+                            "Mica task {task_id} selector={selector} endpoint={} session={} failure_class=aborted: {}",
                             self.driver.format_value(&Value::identity(self.endpoint)),
                             self.driver.format_value(&Value::identity(self.session)),
                             self.driver.format_value(&error)
@@ -1347,7 +1356,7 @@ end
                         error,
                     } if failed == task_id => {
                         key = Some(MicaKeyResult::Failed(format!(
-                            "Mica task {task_id} endpoint={} session={} failure_class=failed: {error}",
+                            "Mica task {task_id} selector={selector} endpoint={} session={} failure_class=failed: {error}",
                             self.driver.format_value(&Value::identity(self.endpoint)),
                             self.driver.format_value(&Value::identity(self.session))
                         )));
@@ -1357,7 +1366,7 @@ end
                         reason,
                     } if cancelled == task_id => {
                         key = Some(MicaKeyResult::Failed(format!(
-                            "Mica task {task_id} endpoint={} session={} failure_class=cancelled: {reason:?}",
+                            "Mica task {task_id} selector={selector} endpoint={} session={} failure_class=cancelled: {reason:?}",
                             self.driver.format_value(&Value::identity(self.endpoint)),
                             self.driver.format_value(&Value::identity(self.session))
                         )));
@@ -1587,6 +1596,10 @@ end
             .as_symbol()?
             .name()?
             .to_owned();
+        let value_kind = map_value(value, "value_kind")
+            .and_then(|value| value.as_symbol())
+            .and_then(Symbol::name)
+            .map(str::to_owned);
         let prompt = map_value(value, "prompt")
             .and_then(|value| value.with_str(str::to_owned))
             .unwrap_or_default();
@@ -1608,28 +1621,28 @@ end
                     .find_map(|(buffer, identity)| (*identity == logical).then_some(*buffer))?;
                 MicaPromptTarget::Buffer(buffer)
             } else if kind == "command_argument" {
-                if let Some(logical) = raw.as_identity() {
-                    if let Some(view) = self
-                        .view_ids
-                        .iter()
-                        .find_map(|(view, identity)| (*identity == logical).then_some(*view))
-                    {
+                match value_kind.as_deref() {
+                    Some("logical_view") => {
+                        let logical = raw.as_identity()?;
+                        let view = self
+                            .view_ids
+                            .iter()
+                            .find_map(|(view, identity)| (*identity == logical).then_some(*view))?;
                         MicaPromptTarget::View(view)
-                    } else if let Some(buffer) = self
-                        .buffer_ids
-                        .iter()
-                        .find_map(|(buffer, identity)| (*identity == logical).then_some(*buffer))
-                    {
-                        MicaPromptTarget::Buffer(buffer)
-                    } else {
-                        MicaPromptTarget::Opaque(self.driver.format_value(&raw))
                     }
-                } else if let Some(selector) = raw.as_symbol().and_then(Symbol::name) {
-                    MicaPromptTarget::Selector(selector.to_owned())
-                } else if let Some(path) = raw.with_str(str::to_owned) {
-                    MicaPromptTarget::Path(path)
-                } else {
-                    MicaPromptTarget::Opaque(self.driver.format_value(&raw))
+                    Some("logical_buffer") => {
+                        let logical = raw.as_identity()?;
+                        let buffer = self.buffer_ids.iter().find_map(|(buffer, identity)| {
+                            (*identity == logical).then_some(*buffer)
+                        })?;
+                        MicaPromptTarget::Buffer(buffer)
+                    }
+                    Some("selector") => {
+                        MicaPromptTarget::Selector(raw.as_symbol()?.name()?.to_owned())
+                    }
+                    Some("path") => MicaPromptTarget::Path(raw.with_str(str::to_owned)?),
+                    Some("opaque") => MicaPromptTarget::Opaque(self.driver.format_value(&raw)),
+                    _ => return None,
                 }
             } else {
                 MicaPromptTarget::Path(raw.with_str(str::to_owned)?)
@@ -1638,6 +1651,7 @@ end
         }
         Some(MicaPromptUpdate {
             kind,
+            value_kind,
             prompt,
             query,
             selected,

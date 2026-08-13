@@ -156,6 +156,7 @@ assert roe/NativeEditingAction(:kill_word)
 assert roe/NativeEditingAction(:backward_kill_word)
 assert roe/NativeEditingAction(:undo)
 assert roe/NativeEditingAction(:redo)
+assert roe/NativeBufferReadAction(:copy_region)
 
 verb roe/publish_policy(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor
@@ -331,6 +332,7 @@ assert roe/CommandName(#roe/select_window, "select-window")
 assert roe/CommandArgument(#roe/select_window, 2, :window, :logical_view)
 assert roe/ArgumentPrompt(#roe/select_window, 2, "Window")
 assert roe/ArgumentCompletion(#roe/select_window, 2, :visible_views)
+assert roe/ArgumentCandidateKind(:visible_views, :logical_view)
 assert roe/PackageCommand(#roe/core_package, #roe/select_window)
 assert RoleCanInvoke(#roe/editor_role, :roe/select_window)
 assert RoleCanInvoke(#roe/editor_role, :roe/select_window_value)
@@ -343,6 +345,9 @@ end
 
 verb roe/begin_argument_prompt(actor, session, command, position)
   let acquisition = invoke(:roe/acquire_argument, {:actor -> actor, :session -> session, :command -> command, :position -> position, :supplied -> nothing})
+  if acquisition == :invalid_completion_type
+    return :argument_unavailable
+  end
   acquisition[:kind] == :argument_required || return :argument_unavailable
   assert roe/PromptState(session, :command_argument, "", 0, nothing, [command, position, acquisition[:value_kind], acquisition[:prompt]])
   return roe/refresh_prompt(actor, session)
@@ -541,7 +546,11 @@ verb roe/refresh_prompt(actor, session)
   if state[:prompt_kind] == :command_argument
     prompt = state[:aux][3]
   end
-  emit(session, {:kind -> :prompt_update, :prompt_kind -> state[:prompt_kind], :prompt -> prompt, :query -> state[:query], :selected -> selected, :candidates -> candidates})
+  if state[:prompt_kind] == :command_argument
+    emit(session, {:kind -> :prompt_update, :prompt_kind -> state[:prompt_kind], :value_kind -> state[:aux][2], :prompt -> prompt, :query -> state[:query], :selected -> selected, :candidates -> candidates})
+  else
+    emit(session, {:kind -> :prompt_update, :prompt_kind -> state[:prompt_kind], :prompt -> prompt, :query -> state[:query], :selected -> selected, :candidates -> candidates})
+  end
   return :ok
 end
 

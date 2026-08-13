@@ -38,6 +38,7 @@ make_functional_relation(:roe/CommandImplementation, 2, [0])
 make_relation(:roe/CommandArgument, 4)
 make_relation(:roe/ArgumentPrompt, 3)
 make_relation(:roe/ArgumentCompletion, 3)
+make_functional_relation(:roe/ArgumentCandidateKind, 2, [0])
 make_relation(:roe/ArgumentCandidate, 5)
 make_relation(:roe/Keymap, 1)
 make_relation(:roe/KeymapParent, 2)
@@ -45,6 +46,7 @@ make_relation(:roe/KeyBinding, 4)
 make_relation(:roe/KeyPrefix, 1)
 make_relation(:roe/NativeBinding, 3)
 make_relation(:roe/NativeEditingAction, 1)
+make_relation(:roe/NativeBufferReadAction, 1)
 make_relation(:roe/MajorMode, 1)
 make_relation(:roe/MinorMode, 1)
 make_functional_relation(:roe/ModeName, 2, [0])
@@ -339,6 +341,7 @@ assert RoleCanRead(#roe/editor_role, :roe/EffectiveBinding)
 assert RoleCanRead(#roe/editor_role, :roe/KeyPrefix)
 assert RoleCanRead(#roe/editor_role, :roe/NativeBinding)
 assert RoleCanRead(#roe/editor_role, :roe/NativeEditingAction)
+assert RoleCanRead(#roe/editor_role, :roe/NativeBufferReadAction)
 assert RoleCanRead(#roe/editor_role, :roe/PromptState)
 assert RoleCanRead(#roe/editor_role, :roe/PromptLast)
 assert RoleCanRead(#roe/editor_role, :roe/FileCandidate)
@@ -349,6 +352,7 @@ assert RoleCanRead(#roe/editor_role, :roe/CommandImplementation)
 assert RoleCanRead(#roe/editor_role, :roe/CommandArgument)
 assert RoleCanRead(#roe/editor_role, :roe/ArgumentPrompt)
 assert RoleCanRead(#roe/editor_role, :roe/ArgumentCompletion)
+assert RoleCanRead(#roe/editor_role, :roe/ArgumentCandidateKind)
 assert RoleCanRead(#roe/editor_role, :roe/ArgumentCandidate)
 assert RoleCanRead(#roe/editor_role, :roe/DiscoverableCommand)
 assert RoleCanRead(#roe/editor_role, :roe/NextView)
@@ -485,6 +489,12 @@ verb roe/run_native_action(actor, session, action)
     let view = one roe/ActiveView(session, ?view)
     let buffer = one roe/ViewBuffer(view, ?buffer)
     roe/CanUseBuffer(actor, buffer) || return :buffer_denied
+  end
+  if roe/NativeBufferReadAction(action)
+    roe/CanRequestService(actor, :text_read) || return :text_read_denied
+    let read_view = one roe/ActiveView(session, ?view)
+    let read_buffer = one roe/ViewBuffer(read_view, ?buffer)
+    roe/CanUseBuffer(actor, read_buffer) || return :buffer_denied
   end
   if action == :kill_line || action == :kill_region || action == :copy_region || action == :kill_word || action == :backward_kill_word
     roe/CanRequestService(actor, :clipboard_write) || return :clipboard_write_denied
@@ -642,6 +652,10 @@ verb roe/acquire_argument(actor, session, command, position, supplied)
     return :missing_prompt
   end
   let completion = one roe/ArgumentCompletion(command, position, ?selector)
+  let candidate_kind = one roe/ArgumentCandidateKind(completion, ?value_kind)
+  if completion != nothing && candidate_kind != argument[:value_kind]
+    return :invalid_completion_type
+  end
   return {:kind -> :argument_required, :name -> argument[:name], :value_kind -> argument[:value_kind], :prompt -> prompt, :completion -> completion}
 end
 
@@ -658,5 +672,19 @@ verb roe/accept_argument_candidate(actor, session, command, position, candidate)
   if selected == nothing
     return :invalid_candidate
   end
-  return {:kind -> :argument_value, :value -> candidate, :label -> selected}
+  let argument = one roe/CommandArgument(command, position, ?name, ?value_kind)
+  argument != nothing || return :missing_argument
+  let candidate_kind = one roe/ArgumentCandidateKind(completion, ?value_kind)
+  candidate_kind != nothing || return :invalid_candidate_type
+  candidate_kind == argument[:value_kind] || return :invalid_candidate_type
+  if argument[:value_kind] == :logical_view
+    roe/SessionLeafView(session, candidate) || return :invalid_candidate_type
+  elseif argument[:value_kind] == :logical_buffer
+    roe/VisibleBuffer(session, candidate) || return :invalid_candidate_type
+  elseif argument[:value_kind] == :selector
+    CanInvoke(actor, candidate) || return :invalid_candidate_type
+  elseif argument[:value_kind] != :path && argument[:value_kind] != :opaque
+    return :unsupported_candidate_type
+  end
+  return {:kind -> :argument_value, :value -> candidate, :label -> selected, :value_kind -> argument[:value_kind]}
 end

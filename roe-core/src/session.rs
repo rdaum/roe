@@ -1048,9 +1048,9 @@ impl HostSession {
             .await
     }
 
-    pub async fn export_mica_unit(&self, unit: &str) -> Result<String, MicaHostError> {
+    pub async fn export_mica_unit(&mut self, unit: &str) -> Result<String, MicaHostError> {
         self.mica
-            .as_ref()
+            .as_mut()
             .ok_or(MicaHostError::Closed)?
             .export_unit(unit)
             .await
@@ -2463,7 +2463,7 @@ fn mica_native_capabilities(name: &str) -> &'static [Capability] {
         "kill_line" | "kill_region" | "kill_word" | "backward_kill_word" => {
             &[Capability::TextWrite, Capability::ClipboardWrite]
         }
-        "copy_region" => &[Capability::ClipboardWrite],
+        "copy_region" => &[Capability::TextRead, Capability::ClipboardWrite],
         "yank" => &[Capability::TextWrite, Capability::ClipboardRead],
         "insert_text" | "backspace" | "delete" | "enter" | "indent" | "undo" | "redo" => {
             &[Capability::TextWrite]
@@ -3282,7 +3282,7 @@ mod tests {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let mut session = HostSession::open_with_mica(
                 test_editor(),
-                CapabilityGrants::new([Capability::TextRead]),
+                CapabilityGrants::new([Capability::ClipboardWrite]),
             )
             .unwrap();
 
@@ -3343,6 +3343,23 @@ mod tests {
                         error.contains("direct native requests are disabled")
                     })
             }));
+
+            session.editor.windows[session.editor.active_window].cursor = 5;
+            session.editor.buffers[active].set_mark(0);
+            let copy = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![
+                    LogicalKey::Modifier(crate::keys::KeyModifier::Meta(
+                        crate::keys::Side::Left,
+                    )),
+                    LogicalKey::AlphaNumeric('w'),
+                ])))
+                .await
+                .unwrap();
+            assert!(copy.lifecycle.iter().any(|event| matches!(
+                event,
+                LifecycleEvent::Error(message) if message.contains("text_read") || message.contains("TextRead")
+            )));
+            assert!(session.editor.kill_ring.current().is_none());
 
             session
                 .dispatch(session.envelope(InputEvent::Close))
@@ -3589,6 +3606,36 @@ mod tests {
             assert_eq!(
                 snapshot(&selected_argument).active_view,
                 session.view_ids[&other]
+            );
+
+            let mismatched_provider = include_str!("../../mica/roe-first-wave.mica").replace(
+                "assert roe/ArgumentCandidateKind(:visible_views, :logical_view)",
+                "assert roe/ArgumentCandidateKind(:visible_views, :logical_buffer)",
+            );
+            session
+                .replace_mica_first_wave(mismatched_provider)
+                .await
+                .unwrap();
+            session
+                .dispatch(
+                    session.envelope(InputEvent::Keys(vec![meta, LogicalKey::AlphaNumeric('x')])),
+                )
+                .await
+                .unwrap();
+            session
+                .dispatch(session.envelope(InputEvent::Text("select-window".to_owned())))
+                .await
+                .unwrap();
+            let rejected_argument_prompt = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Enter])))
+                .await
+                .unwrap();
+            assert!(
+                snapshot(&rejected_argument_prompt)
+                    .views
+                    .iter()
+                    .all(|view| !view.command_view),
+                "mismatched candidate provider kind opened a prompt: {rejected_argument_prompt:#?}"
             );
 
             session
@@ -3948,6 +3995,11 @@ mod tests {
             assert!(snapshot(&failed)
                 .echo_area
                 .contains("intentional command failure"));
+            assert!(failed.lifecycle.iter().any(|event| matches!(
+                event,
+                LifecycleEvent::Error(message)
+                    if message.contains("selector=roe/dispatch_key")
+            )));
 
             session.restore_mica_first_wave().await.unwrap();
             let recovered = session
@@ -3990,6 +4042,30 @@ mod tests {
             )));
             assert!(!session.closed);
 
+            let recovery_dir = std::env::temp_dir().join(format!(
+                "roe-recovery-{}-{}",
+                std::process::id(),
+                session.epoch.0
+            ));
+            std::fs::create_dir(&recovery_dir).unwrap();
+            let export_path = recovery_dir.join("first-wave.mica");
+            let reports = session
+                .execute_startup_recovery(&[
+                    StartupRecoveryOperation::Inspect,
+                    StartupRecoveryOperation::ExportUnit {
+                        unit: "roe/first-wave".to_owned(),
+                        path: export_path.clone(),
+                    },
+                ])
+                .await
+                .unwrap();
+            assert!(reports[0].contains("endpoint="));
+            assert!(
+                std::fs::read_to_string(&export_path)
+                    .unwrap()
+                    .contains("insert_current_time")
+            );
+
             let installed = session
                 .dispatch(
                     session.envelope(InputEvent::Recovery(RecoveryOperation::ReplaceUnit {
@@ -4027,13 +4103,6 @@ mod tests {
                     if source.contains("insert_current_time")
             )));
 
-            let recovery_dir = std::env::temp_dir().join(format!(
-                "roe-recovery-{}-{}",
-                std::process::id(),
-                session.epoch.0
-            ));
-            std::fs::create_dir(&recovery_dir).unwrap();
-            let export_path = recovery_dir.join("first-wave.mica");
             let reports = session
                 .execute_startup_recovery(&[
                     StartupRecoveryOperation::Inspect,
