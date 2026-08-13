@@ -2425,6 +2425,7 @@ dependencies = [
  "roe-core",
  "roe-terminal",
  "slotmap",
+ "thiserror 2.0.20",
  "tracing",
  "tracing-subscriber",
  "vello",

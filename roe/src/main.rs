@@ -373,12 +373,17 @@ async fn terminal_main<W: Write>(
     renderer.render_full(&editor)?;
 
     // Event loop with renderer
-    roe_terminal::terminal_renderer::event_loop_with_renderer(
+    let event_loop_result = roe_terminal::terminal_renderer::event_loop_with_renderer(
         &mut renderer,
         &mut editor,
         shutdown_requested,
     )
-    .await?;
+    .await;
+
+    for error in editor.shutdown_native_work() {
+        tracing::warn!(%error, "editor shutdown warning");
+    }
+    event_loop_result?;
 
     Ok(())
 }

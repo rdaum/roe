@@ -2132,12 +2132,25 @@ impl Editor {
                                 // Remove the buffer host
                                 self.buffer_hosts.remove(&buffer_id);
 
+                                let unwatch_error = self
+                                    .file_watcher
+                                    .unwatch_file(buffer_id)
+                                    .err()
+                                    .map(|error| {
+                                        format!(
+                                            "Killed buffer, but failed to stop watching it: {error}"
+                                        )
+                                    });
+
                                 // Remove the buffer itself
                                 self.buffers.remove(buffer_id);
 
                                 actions.push(ChromeAction::Echo(format!(
                                     "Killed buffer: {buffer_name}"
                                 )));
+                                if let Some(unwatch_error) = unwatch_error {
+                                    actions.push(ChromeAction::Echo(unwatch_error));
+                                }
                                 actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
                             } else {
                                 actions.push(ChromeAction::Echo(
@@ -2146,51 +2159,7 @@ impl Editor {
                             }
                         }
                         EditorAction::OpenFile { path, open_type } => {
-                            // Close the file selector window after selection
-                            if let Some(command_window_id) = self.find_command_window() {
-                                self.close_command_window(command_window_id);
-                                actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
-                            }
-
-                            // Determine which window to open the file in
-                            let window_to_open =
-                                if let Some(prev_window_id) = self.previous_active_window {
-                                    if self.windows.contains_key(prev_window_id) {
-                                        prev_window_id
-                                    } else {
-                                        self.active_window
-                                    }
-                                } else {
-                                    self.active_window
-                                };
-
-                            // Visit-file replaces the selected window's buffer only after the
-                            // fallible open succeeds. Retain a buffer still displayed elsewhere.
-                            let replaced_buffer = (open_type == OpenType::Visit)
-                                .then(|| self.windows[window_to_open].active_buffer)
-                                .filter(|buffer_id| !self.is_command_buffer(*buffer_id));
-
-                            // Open the file in the determined window
-                            match self.open_file_in_window(path, window_to_open).await {
-                                Ok(message) => {
-                                    if let Some(replaced_buffer) = replaced_buffer
-                                        && !self
-                                            .windows
-                                            .values()
-                                            .any(|window| window.active_buffer == replaced_buffer)
-                                    {
-                                        self.buffer_hosts.remove(&replaced_buffer);
-                                        self.buffers.remove(replaced_buffer);
-                                    }
-                                    actions.push(ChromeAction::Echo(message));
-                                    actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
-                                }
-                                Err(error) => {
-                                    actions.push(ChromeAction::Echo(format!(
-                                        "Error opening file: {error}"
-                                    )));
-                                }
-                            }
+                            actions.extend(self.handle_open_file_action(path, open_type).await);
                         }
                         EditorAction::KillLine => {
                             // Delegate to kill_line method which handles kill-ring
@@ -2350,7 +2319,23 @@ impl Editor {
                 actions
             }
             BufferResponse::Saved(file_path) => {
-                vec![ChromeAction::Echo(format!("Saved: {file_path}"))]
+                let buffer_id = self.windows[self.active_window].active_buffer;
+                let watch_error = self.buffers.get(buffer_id).and_then(|buffer| {
+                    self.file_watcher
+                        .watch_file(
+                            buffer_id,
+                            std::path::Path::new(&file_path),
+                            buffer.content(),
+                        )
+                        .err()
+                });
+                let mut actions = vec![ChromeAction::Echo(format!("Saved: {file_path}"))];
+                if let Some(error) = watch_error {
+                    actions.push(ChromeAction::Echo(format!(
+                        "Saved {file_path}, but failed to watch it: {error}"
+                    )));
+                }
+                actions
             }
             BufferResponse::Error(error) => {
                 vec![ChromeAction::Echo(format!("Error: {error}"))]
@@ -2959,6 +2944,67 @@ impl Editor {
         self.insert_text(text, position)
     }
 
+    async fn handle_open_file_action(
+        &mut self,
+        path: std::path::PathBuf,
+        open_type: OpenType,
+    ) -> Vec<ChromeAction> {
+        let mut actions = Vec::new();
+        if let Some(command_window_id) = self.find_command_window() {
+            self.close_command_window(command_window_id);
+            actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
+        }
+
+        let window_to_open = self
+            .previous_active_window
+            .filter(|window_id| self.windows.contains_key(*window_id))
+            .unwrap_or(self.active_window);
+        let replaced_buffer = (open_type == OpenType::Visit)
+            .then(|| self.windows[window_to_open].active_buffer)
+            .filter(|buffer_id| !self.is_command_buffer(*buffer_id));
+
+        match self.open_file_in_window(path.clone(), window_to_open).await {
+            Ok(message) => {
+                let opened_buffer = self.windows[window_to_open].active_buffer;
+                let watch_error = if path.exists()
+                    && let Some(buffer) = self.buffers.get(opened_buffer)
+                {
+                    self.file_watcher
+                        .watch_file(opened_buffer, &path, buffer.content())
+                        .err()
+                        .map(|error| {
+                            format!("Opened {}, but failed to watch it: {error}", path.display())
+                        })
+                } else {
+                    None
+                };
+
+                let unwatch_error = if let Some(replaced_buffer) = replaced_buffer
+                    && !self
+                        .windows
+                        .values()
+                        .any(|window| window.active_buffer == replaced_buffer)
+                {
+                    let error = self.file_watcher.unwatch_file(replaced_buffer).err();
+                    self.buffer_hosts.remove(&replaced_buffer);
+                    self.buffers.remove(replaced_buffer);
+                    error.map(|error| {
+                        format!("Replaced buffer, but failed to stop watching it: {error}")
+                    })
+                } else {
+                    None
+                };
+
+                actions.push(ChromeAction::Echo(message));
+                actions.extend(watch_error.into_iter().map(ChromeAction::Echo));
+                actions.extend(unwatch_error.into_iter().map(ChromeAction::Echo));
+                actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
+            }
+            Err(error) => actions.push(ChromeAction::Echo(format!("Error opening file: {error}"))),
+        }
+        actions
+    }
+
     /// Open a file in the specified window
     async fn open_file_in_window(
         &mut self,
@@ -3455,7 +3501,18 @@ impl Editor {
 
     /// Stop watching a buffer's file (call when closing a buffer)
     pub fn unwatch_buffer(&mut self, buffer_id: BufferId) {
-        self.file_watcher.unwatch_file(buffer_id);
+        if let Err(error) = self.file_watcher.unwatch_file(buffer_id) {
+            self.set_echo_message(format!("Warning: Failed to stop watching file: {error}"));
+        }
+    }
+
+    /// Stop native delivery before platform and renderer resources are released.
+    pub fn shutdown_native_work(&mut self) -> Vec<String> {
+        tracing::info!("shutting down editor native work");
+        let errors = self.file_watcher.shutdown();
+        self.buffer_hosts.clear();
+        self.modes.clear();
+        errors
     }
 
     /// Mark that we're about to save a buffer (prevents false external change detection)
@@ -3657,9 +3714,26 @@ mod tests {
                 editor.windows[editor.active_window].active_buffer,
                 original_buffer
             );
+            let visited_buffer = editor.windows[editor.active_window].active_buffer;
+            assert!(editor.file_watcher.get_sync_state(visited_buffer).is_some());
             assert_eq!(editor.windows[other_window_id].active_buffer, original_buffer);
             assert!(editor.buffers.contains_key(original_buffer));
 
+            let visited_path = editor.file_watcher.get_sync_state(visited_buffer).unwrap().file_path.clone();
+            std::fs::write(&visited_path, "external").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while editor.buffers[visited_buffer].content() != "external"
+                && Instant::now() < deadline
+            {
+                editor.poll_file_changes();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(editor.buffers[visited_buffer].content(), "external");
+
+            assert!(editor.shutdown_native_work().is_empty());
+            assert!(editor.buffer_hosts.is_empty());
+            assert!(editor.modes.is_empty());
+            assert!(editor.file_watcher.get_sync_state(visited_buffer).is_none());
             std::fs::remove_dir_all(directory).unwrap();
         });
     }

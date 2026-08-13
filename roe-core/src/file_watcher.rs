@@ -21,7 +21,7 @@
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use similar::{ChangeTag, TextDiff};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, RwLock};
@@ -120,13 +120,15 @@ pub struct FileWatcher {
     /// Receiver for file change events (polled by editor)
     event_rx: Receiver<FileChangeEvent>,
     /// Map of file paths to buffer IDs (Arc for sharing with callback)
-    path_to_buffer: Arc<RwLock<HashMap<PathBuf, BufferId>>>,
+    path_to_buffer: Arc<RwLock<HashMap<PathBuf, HashSet<BufferId>>>>,
     wake_handler: Arc<RwLock<Option<Arc<dyn FrontendWake>>>>,
     /// Latest backend error; a single replaceable slot bounds failure delivery.
     backend_error: Arc<Mutex<Option<String>>>,
     clock: Arc<dyn Clock>,
     /// Sync state per buffer
     sync_states: HashMap<BufferId, BufferSyncState>,
+    /// Backend directory watches shared by files in the same parent.
+    watched_parent_counts: HashMap<PathBuf, usize>,
 }
 
 impl FileWatcher {
@@ -145,6 +147,7 @@ impl FileWatcher {
             backend_error: Arc::new(Mutex::new(None)),
             clock,
             sync_states: HashMap::new(),
+            watched_parent_counts: HashMap::new(),
         }
     }
 
@@ -185,25 +188,29 @@ impl FileWatcher {
                 let Ok(map) = path_to_buffer.read() else {
                     continue;
                 };
-                let Some(buffer_id) = map.get(&canonical) else {
+                let Some(buffer_ids) = map.get(&canonical) else {
                     continue;
                 };
+                let buffer_ids: Vec<_> = buffer_ids.iter().copied().collect();
+                drop(map);
 
-                let change = FileChangeEvent {
-                    buffer_id: *buffer_id,
-                    file_path: canonical,
-                };
-                match tx.try_send(change) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(change)) => {
-                        tracing::warn!(
-                            buffer_id = ?change.buffer_id,
-                            path = %change.file_path.display(),
-                            capacity = EVENT_QUEUE_CAPACITY,
-                            "file notification queue is full; dropping notification hint"
-                        );
+                for buffer_id in buffer_ids {
+                    let change = FileChangeEvent {
+                        buffer_id,
+                        file_path: canonical.clone(),
+                    };
+                    match tx.try_send(change) {
+                        Ok(()) => {}
+                        Err(TrySendError::Full(change)) => {
+                            tracing::warn!(
+                                buffer_id = ?change.buffer_id,
+                                path = %change.file_path.display(),
+                                capacity = EVENT_QUEUE_CAPACITY,
+                                "file notification queue is full; dropping notification hint"
+                            );
+                        }
+                        Err(TrySendError::Disconnected(_)) => return,
                     }
-                    Err(TrySendError::Disconnected(_)) => return,
                 }
 
                 if let Ok(handler) = wake_handler.read()
@@ -222,6 +229,26 @@ impl FileWatcher {
         if let Ok(mut current) = self.wake_handler.write() {
             *current = Some(handler);
         }
+    }
+
+    pub fn clear_wake_handler(&mut self) {
+        if let Ok(mut current) = self.wake_handler.write() {
+            *current = None;
+        }
+    }
+
+    /// Release all logical associations and backend watches deterministically.
+    pub fn shutdown(&mut self) -> Vec<String> {
+        self.clear_wake_handler();
+        let buffer_ids: Vec<_> = self.sync_states.keys().copied().collect();
+        let mut errors = Vec::new();
+        for buffer_id in buffer_ids {
+            if let Err(error) = self.unwatch_file(buffer_id) {
+                errors.push(error.to_string());
+            }
+        }
+        self.watcher = None;
+        errors
     }
 
     /// Take the latest backend failure for one-time presentation by the host.
@@ -248,39 +275,70 @@ impl FileWatcher {
             .canonicalize()
             .unwrap_or_else(|_| file_path.to_path_buf());
 
-        // Add to our tracking maps (using write lock for Arc)
-        if let Ok(mut map) = self.path_to_buffer.write() {
-            map.insert(canonical.clone(), buffer_id);
+        let now = self.clock.now();
+        if let Some(existing) = self.sync_states.get_mut(&buffer_id) {
+            if existing.file_path == canonical {
+                existing.update_base(initial_content, now);
+                return Ok(());
+            }
+            self.unwatch_file(buffer_id)?;
         }
-        self.sync_states.insert(
-            buffer_id,
-            BufferSyncState::new(canonical.clone(), initial_content, self.clock.now()),
-        );
 
-        // Start watching the parent directory
-        if let Some(ref mut watcher) = self.watcher
-            && let Some(parent) = canonical.parent()
+        // Establish the fallible backend watch before publishing any logical
+        // association. Files in one directory share one backend watch.
+        let parent = canonical.parent().map(Path::to_path_buf);
+        if let Some(parent) = parent.as_ref()
+            && !self.watched_parent_counts.contains_key(parent)
+            && let Some(ref mut watcher) = self.watcher
         {
             watcher.watch(parent, RecursiveMode::NonRecursive)?;
         }
+
+        if let Some(parent) = parent {
+            *self.watched_parent_counts.entry(parent).or_insert(0) += 1;
+        }
+        if let Ok(mut map) = self.path_to_buffer.write() {
+            map.entry(canonical.clone()).or_default().insert(buffer_id);
+        }
+        self.sync_states.insert(
+            buffer_id,
+            BufferSyncState::new(canonical, initial_content, now),
+        );
 
         Ok(())
     }
 
     /// Stop watching a file
-    pub fn unwatch_file(&mut self, buffer_id: BufferId) {
+    pub fn unwatch_file(&mut self, buffer_id: BufferId) -> Result<(), notify::Error> {
         if let Some(state) = self.sync_states.remove(&buffer_id) {
             // Remove from path_to_buffer using write lock
-            if let Ok(mut map) = self.path_to_buffer.write() {
-                map.remove(&state.file_path);
+            if let Ok(mut map) = self.path_to_buffer.write()
+                && let Some(buffer_ids) = map.get_mut(&state.file_path)
+            {
+                buffer_ids.remove(&buffer_id);
+                if buffer_ids.is_empty() {
+                    map.remove(&state.file_path);
+                }
             }
 
-            if let Some(ref mut watcher) = self.watcher
-                && let Some(parent) = state.file_path.parent()
-            {
-                let _ = watcher.unwatch(parent);
+            if let Some(parent) = state.file_path.parent() {
+                let remove_backend_watch = match self.watched_parent_counts.get_mut(parent) {
+                    Some(count) if *count > 1 => {
+                        *count -= 1;
+                        false
+                    }
+                    Some(_) => true,
+                    None => false,
+                };
+                if remove_backend_watch {
+                    self.watched_parent_counts.remove(parent);
+                    if let Some(ref mut watcher) = self.watcher {
+                        watcher.unwatch(parent)?;
+                    }
+                }
             }
         }
+        Ok(())
     }
 
     /// Poll for file change events (non-blocking)
@@ -707,7 +765,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         };
 
-        watcher.unwatch_file(buffer_id);
+        watcher.unwatch_file(buffer_id).unwrap();
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_dir(&directory).unwrap();
         assert!(
@@ -718,6 +776,71 @@ mod tests {
             wake_count.0.load(Ordering::Acquire) > 0,
             "notify delivery did not wake the frontend"
         );
+    }
+
+    #[test]
+    fn failed_backend_watch_does_not_publish_logical_state() {
+        let mut ids: SlotMap<BufferId, ()> = SlotMap::with_key();
+        let buffer_id = ids.insert(());
+        let mut watcher = FileWatcher::new();
+        let missing = std::env::temp_dir()
+            .join(format!("roe-missing-watch-{}", std::process::id()))
+            .join("file.txt");
+
+        assert!(
+            watcher
+                .watch_file(buffer_id, &missing, String::new())
+                .is_err()
+        );
+        assert!(watcher.get_sync_state(buffer_id).is_none());
+        assert!(watcher.watched_parent_counts.is_empty());
+        assert!(watcher.path_to_buffer.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn files_in_one_directory_share_backend_watch_ownership() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("roe-shared-watch-{unique}"));
+        let first_path = directory.join("first.txt");
+        let second_path = directory.join("second.txt");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(&first_path, "first").unwrap();
+        std::fs::write(&second_path, "second").unwrap();
+
+        let mut ids: SlotMap<BufferId, ()> = SlotMap::with_key();
+        let first = ids.insert(());
+        let second = ids.insert(());
+        let mut watcher = FileWatcher::new();
+        watcher
+            .watch_file(first, &first_path, "first".to_string())
+            .unwrap();
+        watcher
+            .watch_file(second, &second_path, "second".to_string())
+            .unwrap();
+        assert_eq!(watcher.watched_parent_counts.get(&directory), Some(&2));
+
+        watcher.unwatch_file(first).unwrap();
+        assert_eq!(watcher.watched_parent_counts.get(&directory), Some(&1));
+        std::fs::write(&second_path, "changed").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !watcher
+            .poll_events()
+            .iter()
+            .any(|event| event.buffer_id == second)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "shared backend watch was removed"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        watcher.unwatch_file(second).unwrap();
+        assert!(watcher.watched_parent_counts.is_empty());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

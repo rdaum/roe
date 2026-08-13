@@ -89,6 +89,7 @@ impl BufferInner {
 
     pub fn insert_pos(&mut self, fragment: String, position: usize) {
         let len = fragment.chars().count();
+        tracing::trace!(position, inserted_chars = len, object = %self.object, "buffer mutation: insert");
         // Record for undo before modifying
         self.undo_manager.record_insert(position, fragment.clone());
         self.buffer.insert(position, &fragment);
@@ -119,6 +120,13 @@ impl BufferInner {
         }
 
         let deleted = self.buffer.slice(start as usize..end as usize).to_string();
+        tracing::trace!(
+            start,
+            end,
+            deleted_chars = deleted.chars().count(),
+            object = %self.object,
+            "buffer mutation: delete"
+        );
         // Record for undo before modifying
         self.undo_manager
             .record_delete(start as usize, deleted.clone());

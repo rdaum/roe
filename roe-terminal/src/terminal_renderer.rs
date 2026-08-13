@@ -603,6 +603,7 @@ impl<W: Write> Renderer for TerminalRenderer<W> {
     }
 
     fn render_full(&mut self, editor: &Editor) -> Result<(), std::io::Error> {
+        tracing::trace!("terminal redraw requested");
         self.presentation_snapshot = Some(PresentationSnapshot::capture(editor));
         // Hide cursor during redraw
         queue!(&mut self.device, cursor::Hide)?;

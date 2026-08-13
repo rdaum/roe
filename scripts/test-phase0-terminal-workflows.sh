@@ -115,11 +115,17 @@ printf 'selected\n' >"$selected_file"
 start_session file-select
 tmux -L "$tmux_socket" send-keys -t file-select C-x C-f
 tmux -L "$tmux_socket" send-keys -t file-select -l selected.txt
-tmux -L "$tmux_socket" send-keys -t file-select Enter End
+tmux -L "$tmux_socket" send-keys -t file-select Enter
+sleep 0.2
+printf 'external\n' >"$selected_file"
+sleep 1.2
+file_select_pane="$(tmux -L "$tmux_socket" capture-pane -p -t file-select)"
+[[ "$file_select_pane" == *external* ]]
+tmux -L "$tmux_socket" send-keys -t file-select End
 tmux -L "$tmux_socket" send-keys -t file-select -l F
 tmux -L "$tmux_socket" send-keys -t file-select C-x C-s
 finish_session file-select
-[[ "$(sed -n '1p' "$selected_file")" == 'selectedF' ]]
+[[ "$(sed -n '1p' "$selected_file")" == 'externalF' ]]
 
 # Incremental search moves to a Unicode-safe character position before editing.
 search_file="$probe_dir/search.txt"

@@ -41,6 +41,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use text::TextRenderer;
+use thiserror::Error;
 use vello::kurbo::{Affine, Rect};
 use vello::peniko::{BlendMode, Color, Fill};
 use vello::util::{RenderContext, RenderSurface};
@@ -56,6 +57,22 @@ use winit::window::{CursorIcon, Window};
 /// Default window dimensions
 const DEFAULT_WIDTH: u32 = 1200;
 const DEFAULT_HEIGHT: u32 = 800;
+
+#[derive(Debug, Error)]
+pub enum FrontendError {
+    #[error("failed to create Vello window: {0}")]
+    Window(#[source] winit::error::OsError),
+    #[error("failed to create Vello render surface: {0}")]
+    Surface(#[source] vello::Error),
+    #[error("Vello renderer failed: {0}")]
+    Renderer(#[source] vello::Error),
+    #[error("failed to capture logical presentation: {0}")]
+    Presentation(#[source] std::io::Error),
+    #[error("Vello renderer state is inconsistent: {0}")]
+    InvalidState(&'static str),
+    #[error("Vello event loop failed: {0}")]
+    EventLoop(#[source] winit::error::EventLoopError),
+}
 
 #[derive(Debug, Clone, Copy)]
 enum HostEvent {
@@ -153,6 +170,7 @@ pub struct RoeVelloApp<'a> {
     state: Option<RenderState<'a>>,
     /// Coalesces host wakeups to at most one queued Winit user event.
     wake_state: Arc<WakeState>,
+    fatal_error: Option<FrontendError>,
     /// The scene to render
     scene: Scene,
     /// The theme
@@ -202,6 +220,7 @@ impl<'a> RoeVelloApp<'a> {
             redraw_state: VelloRenderer::with_theme(theme.clone()),
             state: None,
             wake_state,
+            fatal_error: None,
             scene: Scene::new(),
             text_renderer: TextRenderer::new(font_size, font_family),
             theme,
@@ -259,11 +278,11 @@ impl<'a> RoeVelloApp<'a> {
         event_loop.create_window(attrs).map(Arc::new)
     }
 
-    fn render(&mut self) {
+    fn render(&mut self) -> Result<(), FrontendError> {
         // Extract surface info first to avoid borrow conflicts
         let (width, height, dev_id, scale_factor) = {
             let Some(ref state) = self.state else {
-                return;
+                return Ok(());
             };
             (
                 state.surface.config.width,
@@ -286,10 +305,9 @@ impl<'a> RoeVelloApp<'a> {
         let lines = (logical_height as f32 / line_height).floor() as u16;
         self.editor
             .handle_resize(cols.max(1), lines.saturating_sub(1).max(1)); // -1 for echo area
-        if let Err(error) = self.redraw_state.render_full(self.editor) {
-            tracing::error!(%error, "failed to capture Vello presentation");
-            return;
-        }
+        self.redraw_state
+            .render_full(self.editor)
+            .map_err(FrontendError::Presentation)?;
 
         // Build the scene in logical coordinates, then scale for physical rendering
         self.scene.reset();
@@ -304,17 +322,19 @@ impl<'a> RoeVelloApp<'a> {
 
         // Now get the surface texture
         let Some(ref mut state) = self.state else {
-            return;
+            return Ok(());
         };
         let surface_texture = match state.surface.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(texture)
             | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => return,
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                return Ok(());
+            }
             wgpu::CurrentSurfaceTexture::Outdated
             | wgpu::CurrentSurfaceTexture::Lost
             | wgpu::CurrentSurfaceTexture::Validation => {
                 self.redraw_state.invalidate(DirtyRegion::FullScreen);
-                return;
+                return Ok(());
             }
         };
 
@@ -325,7 +345,7 @@ impl<'a> RoeVelloApp<'a> {
             self.renderers.resize_with(dev_id + 1, || None);
         }
         if self.renderers[dev_id].is_none() {
-            let renderer = match vello::Renderer::new(
+            let renderer = vello::Renderer::new(
                 &device_handle.device,
                 RendererOptions {
                     use_cpu: false,
@@ -333,41 +353,29 @@ impl<'a> RoeVelloApp<'a> {
                     num_init_threads: None,
                     pipeline_cache: None,
                 },
-            ) {
-                Ok(renderer) => renderer,
-                Err(error) => {
-                    tracing::error!(%error, "failed to create Vello renderer");
-                    self.editor
-                        .set_echo_message(format!("Renderer unavailable: {error}"));
-                    return;
-                }
-            };
+            )
+            .map_err(FrontendError::Renderer)?;
             self.renderers[dev_id] = Some(renderer);
         }
 
         let Some(renderer) = self.renderers[dev_id].as_mut() else {
-            tracing::error!(device_id = dev_id, "renderer slot unexpectedly empty");
-            return;
+            return Err(FrontendError::InvalidState("renderer slot is empty"));
         };
 
-        if let Err(error) = renderer.render_to_texture(
-            &device_handle.device,
-            &device_handle.queue,
-            &self.scene,
-            &state.surface.target_view,
-            &RenderParams {
-                base_color: self.theme.bg_color,
-                width,
-                height,
-                antialiasing_method: AaConfig::Msaa16,
-            },
-        ) {
-            tracing::error!(%error, "failed to render Vello scene");
-            self.editor
-                .set_echo_message(format!("Renderer failed: {error}"));
-            self.redraw_state.invalidate(DirtyRegion::FullScreen);
-            return;
-        }
+        renderer
+            .render_to_texture(
+                &device_handle.device,
+                &device_handle.queue,
+                &self.scene,
+                &state.surface.target_view,
+                &RenderParams {
+                    base_color: self.theme.bg_color,
+                    width,
+                    height,
+                    antialiasing_method: AaConfig::Msaa16,
+                },
+            )
+            .map_err(FrontendError::Renderer)?;
 
         self.redraw_state.redraw_complete();
 
@@ -388,6 +396,7 @@ impl<'a> RoeVelloApp<'a> {
         );
         device_handle.queue.submit(Some(encoder.finish()));
         surface_texture.present();
+        Ok(())
     }
 
     fn build_scene(&mut self, width: u32, height: u32) {
@@ -1522,7 +1531,7 @@ impl<'a> ApplicationHandler<HostEvent> for RoeVelloApp<'a> {
         let window = match self.create_window(event_loop) {
             Ok(window) => window,
             Err(error) => {
-                tracing::error!(%error, "failed to create Vello window");
+                self.fatal_error = Some(FrontendError::Window(error));
                 event_loop.exit();
                 return;
             }
@@ -1536,7 +1545,7 @@ impl<'a> ApplicationHandler<HostEvent> for RoeVelloApp<'a> {
         )) {
             Ok(surface) => surface,
             Err(error) => {
-                tracing::error!(%error, "failed to create Vello surface");
+                self.fatal_error = Some(FrontendError::Surface(error));
                 event_loop.exit();
                 return;
             }
@@ -1571,8 +1580,11 @@ impl<'a> ApplicationHandler<HostEvent> for RoeVelloApp<'a> {
                     self.request_redraw(DirtyRegion::FullScreen);
                 }
                 WindowEvent::RedrawRequested => {
-                    if self.redraw_state.needs_redraw() {
-                        self.render();
+                    if self.redraw_state.needs_redraw()
+                        && let Err(error) = self.render()
+                    {
+                        self.fatal_error = Some(error);
+                        event_loop.exit();
                     }
                 }
                 WindowEvent::KeyboardInput { event, .. } => {
@@ -1914,12 +1926,14 @@ fn adjust_window_tree_ratio_incremental(
 pub fn run_vello(
     editor: &mut Editor,
     runtime: compio::runtime::Runtime,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), FrontendError> {
     // Theme configuration will come from the scripting runtime (mica) once
     // integrated; use defaults for now.
     let theme = VelloTheme::default();
 
-    let event_loop = EventLoop::<HostEvent>::with_user_event().build()?;
+    let event_loop = EventLoop::<HostEvent>::with_user_event()
+        .build()
+        .map_err(FrontendError::EventLoop)?;
     let wake_proxy = event_loop.create_proxy();
     let wake_state = Arc::new(WakeState::default());
     editor.file_watcher.set_wake_handler(Arc::new(WinitWake {
@@ -1931,7 +1945,15 @@ pub fn run_vello(
     ));
 
     let mut app = RoeVelloApp::new(editor, theme, runtime, wake_state);
-    event_loop.run_app(&mut app)?;
+    let event_loop_result = event_loop.run_app(&mut app);
+    let fatal_error = app.fatal_error.take();
+    for error in app.editor.shutdown_native_work() {
+        tracing::warn!(%error, "editor shutdown warning");
+    }
+    if let Some(error) = fatal_error {
+        return Err(error);
+    }
+    event_loop_result.map_err(FrontendError::EventLoop)?;
 
     Ok(())
 }
