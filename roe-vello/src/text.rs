@@ -14,7 +14,7 @@
 //! Text rendering with Parley.
 
 use parley::layout::{Alignment, AlignmentOptions, Layout};
-use parley::style::{FontFamily, FontStack, StyleProperty};
+use parley::style::{FontFamily, StyleProperty};
 use parley::{FontContext, LayoutContext};
 use std::borrow::Cow;
 use vello::kurbo::Affine;
@@ -35,6 +35,14 @@ fn brush_from_color(color: Color) -> TextBrush {
 
 fn color_from_brush(brush: TextBrush) -> Color {
     Color::from_rgba8(brush[0], brush[1], brush[2], brush[3])
+}
+
+fn resolved_font_family(family: Option<&str>) -> FontFamily<'static> {
+    let source = family.map_or_else(
+        || "monospace".to_string(),
+        |name| format!("\"{}\", monospace", name.replace('"', "\\\"")),
+    );
+    FontFamily::Source(Cow::Owned(source))
 }
 
 /// A styled span for rendering text with syntax highlighting
@@ -126,16 +134,7 @@ impl TextRenderer {
 
         builder.push_default(StyleProperty::FontSize(font_size));
 
-        if let Some(family_name) = font_family {
-            builder.push_default(StyleProperty::FontStack(FontStack::List(Cow::Borrowed(&[
-                FontFamily::Named(Cow::Owned(family_name.to_string())),
-                FontFamily::Generic(parley::style::GenericFamily::Monospace),
-            ]))));
-        } else {
-            builder.push_default(StyleProperty::FontStack(FontStack::Single(
-                FontFamily::Generic(parley::style::GenericFamily::Monospace),
-            )));
-        }
+        builder.push_default(StyleProperty::FontFamily(resolved_font_family(font_family)));
 
         builder.push_default(StyleProperty::Brush(brush_from_color(Color::WHITE)));
 
@@ -202,17 +201,9 @@ impl TextRenderer {
         builder.push_default(StyleProperty::FontSize(self.font_size));
 
         // Use custom font family if specified, otherwise fall back to system monospace
-        if let Some(ref family_name) = self.font_family {
-            // Create a font stack with the named font, falling back to monospace
-            builder.push_default(StyleProperty::FontStack(FontStack::List(Cow::Borrowed(&[
-                FontFamily::Named(Cow::Owned(family_name.clone())),
-                FontFamily::Generic(parley::style::GenericFamily::Monospace),
-            ]))));
-        } else {
-            builder.push_default(StyleProperty::FontStack(FontStack::Single(
-                FontFamily::Generic(parley::style::GenericFamily::Monospace),
-            )));
-        }
+        builder.push_default(StyleProperty::FontFamily(resolved_font_family(
+            self.font_family.as_deref(),
+        )));
 
         builder.push_default(StyleProperty::Brush(brush_from_color(color)));
 
@@ -221,7 +212,7 @@ impl TextRenderer {
         // Don't wrap lines - let clipping handle overflow
         // For proper wrapping we'd need to pre-calculate visual line counts
         layout.break_all_lines(None);
-        layout.align(None, Alignment::Start, AlignmentOptions::default());
+        layout.align(Alignment::Start, AlignmentOptions::default());
 
         // Render glyphs
         self.render_layout(scene, &layout, x, y);
@@ -250,16 +241,9 @@ impl TextRenderer {
         builder.push_default(StyleProperty::FontSize(self.font_size));
 
         // Use custom font family if specified, otherwise fall back to system monospace
-        if let Some(ref family_name) = self.font_family {
-            builder.push_default(StyleProperty::FontStack(FontStack::List(Cow::Borrowed(&[
-                FontFamily::Named(Cow::Owned(family_name.clone())),
-                FontFamily::Generic(parley::style::GenericFamily::Monospace),
-            ]))));
-        } else {
-            builder.push_default(StyleProperty::FontStack(FontStack::Single(
-                FontFamily::Generic(parley::style::GenericFamily::Monospace),
-            )));
-        }
+        builder.push_default(StyleProperty::FontFamily(resolved_font_family(
+            self.font_family.as_deref(),
+        )));
 
         builder.push_default(StyleProperty::Brush(brush_from_color(default_color)));
 
@@ -313,7 +297,7 @@ impl TextRenderer {
 
         // Don't wrap lines - let clipping handle overflow
         layout.break_all_lines(None);
-        layout.align(None, Alignment::Start, AlignmentOptions::default());
+        layout.align(Alignment::Start, AlignmentOptions::default());
 
         // Render glyphs
         self.render_layout(scene, &layout, x, y);

@@ -39,7 +39,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use text::TextRenderer;
 use vello::kurbo::{Affine, Rect};
-use vello::peniko::Color;
+use vello::peniko::{BlendMode, Color, Fill};
 use vello::util::{RenderContext, RenderSurface};
 use vello::wgpu;
 use vello::{AaConfig, RenderParams, RendererOptions, Scene};
@@ -222,11 +222,17 @@ impl<'a> RoeVelloApp<'a> {
         let Some(ref mut state) = self.state else {
             return;
         };
-        let surface_texture = state
-            .surface
-            .surface
-            .get_current_texture()
-            .expect("Failed to get surface texture");
+        let surface_texture = match state.surface.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(texture)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => return,
+            wgpu::CurrentSurfaceTexture::Outdated
+            | wgpu::CurrentSurfaceTexture::Lost
+            | wgpu::CurrentSurfaceTexture::Validation => {
+                self.redraw_state.invalidate(DirtyRegion::FullScreen);
+                return;
+            }
+        };
 
         let device_handle = &self.render_cx.devices[dev_id];
 
@@ -530,7 +536,8 @@ impl<'a> RoeVelloApp<'a> {
             content_y + (content_height as f64 * line_height),
         );
         self.scene.push_layer(
-            vello::peniko::BlendMode::default(),
+            Fill::NonZero,
+            BlendMode::default(),
             1.0,
             Affine::IDENTITY,
             &clip_rect,

@@ -17,18 +17,18 @@ path = "src/bin/roe-vello.rs"
 roe-core = { path = "../roe-core" }
 
 # Rendering
-vello = "0.6"
+vello = "0.9"
 # Note: wgpu version must match what vello uses.
 
 # Windowing
 winit = "0.30"
 
 # Text
-parley = "0.7"
+parley = "0.11"
 
 # Async
 compio = { workspace = true }
-pollster = "0.4"
+pollster = "1.0"
 
 # Utilities
 slotmap = { workspace = true }
