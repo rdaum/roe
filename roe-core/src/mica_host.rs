@@ -402,13 +402,36 @@ end
     }
 
     #[cfg(test)]
-    pub async fn fill_event_queue_for_test(&self) -> Result<(), MicaHostError> {
+    async fn fill_event_queue_for_test(&self) -> Result<(), MicaHostError> {
         for value in 0..EVENT_QUEUE_CAPACITY {
             self.driver
                 .submit_root_source_report(format!("return {value}"))
                 .await?;
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub async fn verify_event_backpressure_and_refill_for_test(
+        &self,
+    ) -> Result<bool, MicaHostError> {
+        self.fill_event_queue_for_test().await?;
+        let producer_driver = self.driver.clone();
+        let producer = compio::runtime::spawn(async move {
+            producer_driver
+                .submit_root_source_report("return 999".to_owned())
+                .await
+        });
+        compio::time::sleep(Duration::from_millis(10)).await;
+        let was_backpressured = !producer.is_finished();
+
+        self.driver.drain_events();
+        producer
+            .await
+            .map_err(|_| DriverError::Join("event producer task panicked".to_owned()))??;
+        self.driver.drain_events();
+        self.fill_event_queue_for_test().await?;
+        Ok(was_backpressured)
     }
 
     fn synchronize_context(

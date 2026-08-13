@@ -1670,13 +1670,15 @@ mod tests {
                 .start_pending_test_request()
                 .await
                 .unwrap();
-            session
-                .mica
-                .as_ref()
-                .unwrap()
-                .fill_event_queue_for_test()
-                .await
-                .unwrap();
+            assert!(
+                session
+                    .mica
+                    .as_ref()
+                    .unwrap()
+                    .verify_event_backpressure_and_refill_for_test()
+                    .await
+                    .unwrap()
+            );
 
             let close = session
                 .dispatch(session.envelope(InputEvent::Close))
