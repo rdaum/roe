@@ -81,6 +81,7 @@ fn fixture() -> Editor {
         buffer_history: Vec::new(),
         echo_message: String::new(),
         echo_message_time: None,
+        clock: Arc::new(roe_core::native_services::SystemClock),
         current_key_chord: Vec::new(),
         mouse_drag_state: None,
         messages_buffer_id: None,
@@ -104,8 +105,8 @@ fn resident_memory_kib() -> Option<usize> {
 fn main() -> io::Result<()> {
     let process_started = Instant::now();
     let editor = fixture();
-    let fixture_ready = process_started.elapsed();
-    let idle_rss_kib = resident_memory_kib();
+    let fixture_construction = process_started.elapsed();
+    let post_fixture_rss_kib = resident_memory_kib();
 
     let buffer_id = editor.windows[editor.active_window].active_buffer;
     let buffer = &editor.buffers[buffer_id];
@@ -129,11 +130,14 @@ fn main() -> io::Result<()> {
     let redraw_elapsed = redraw_started.elapsed();
 
     println!("fixture_lines={FIXTURE_LINES}");
-    println!("fixture_startup_us={}", fixture_ready.as_micros());
-    if let Some(rss_kib) = idle_rss_kib {
-        println!("fixture_idle_rss_kib={rss_kib}");
+    println!(
+        "fixture_construction_us={}",
+        fixture_construction.as_micros()
+    );
+    if let Some(rss_kib) = post_fixture_rss_kib {
+        println!("post_fixture_rss_kib={rss_kib}");
     } else {
-        println!("fixture_idle_rss_kib=unavailable");
+        println!("post_fixture_rss_kib=unavailable");
     }
     println!("edit_iterations={EDIT_ITERATIONS}");
     println!(

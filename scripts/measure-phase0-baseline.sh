@@ -9,12 +9,14 @@ set -euo pipefail
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 baseline_binary="$project_root/target/release/examples/phase0_baseline"
+roe_binary="$project_root/target/release/roe"
 
 cargo build \
     --release \
     --manifest-path "$project_root/Cargo.toml" \
     --package roe-terminal \
     --example phase0_baseline
+cargo build --release --manifest-path "$project_root/Cargo.toml" --bin roe
 
 if [[ -x /usr/bin/time ]]; then
     /usr/bin/time \
@@ -22,4 +24,21 @@ if [[ -x /usr/bin/time ]]; then
         "$baseline_binary"
 else
     "$baseline_binary"
+fi
+
+if [[ -x /usr/bin/time ]]; then
+    /usr/bin/time \
+        --format='roe_cli_startup_seconds=%e\nroe_cli_max_rss_kib=%M' \
+        "$roe_binary" --help >/dev/null
+fi
+
+if [[ -x /usr/bin/time ]] && command -v script >/dev/null && command -v timeout >/dev/null; then
+    idle_metrics="$(mktemp)"
+    TERM=xterm-256color script -qec \
+        "/usr/bin/time --output=$idle_metrics --format='roe_terminal_idle_seconds=%e\nroe_terminal_idle_max_rss_kib=%M' timeout 1 $roe_binary" \
+        /dev/null >/dev/null 2>&1 || true
+    if [[ -s "$idle_metrics" ]]; then
+        sed 's/^Command exited with non-zero status 124$//' "$idle_metrics"
+    fi
+    rm -f "$idle_metrics"
 fi
