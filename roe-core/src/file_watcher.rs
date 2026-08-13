@@ -248,6 +248,13 @@ impl FileWatcher {
             }
         }
         self.watcher = None;
+        // Dropping the backend releases any watch whose explicit unwatch
+        // failed. The session is closing, so logical ownership ends here too.
+        self.sync_states.clear();
+        self.watched_parent_counts.clear();
+        if let Ok(mut map) = self.path_to_buffer.write() {
+            map.clear();
+        }
         errors
     }
 
@@ -281,7 +288,11 @@ impl FileWatcher {
                 existing.update_base(initial_content, now);
                 return Ok(());
             }
-            self.unwatch_file(buffer_id)?;
+            return Err(notify::Error::generic(
+                "a live buffer watch cannot be rebound to a different path",
+            )
+            .add_path(existing.file_path.clone())
+            .add_path(canonical));
         }
 
         // Establish the fallible backend watch before publishing any logical
@@ -310,32 +321,37 @@ impl FileWatcher {
 
     /// Stop watching a file
     pub fn unwatch_file(&mut self, buffer_id: BufferId) -> Result<(), notify::Error> {
-        if let Some(state) = self.sync_states.remove(&buffer_id) {
-            // Remove from path_to_buffer using write lock
-            if let Ok(mut map) = self.path_to_buffer.write()
-                && let Some(buffer_ids) = map.get_mut(&state.file_path)
-            {
-                buffer_ids.remove(&buffer_id);
-                if buffer_ids.is_empty() {
-                    map.remove(&state.file_path);
-                }
-            }
+        let Some(state) = self.sync_states.get(&buffer_id).cloned() else {
+            return Ok(());
+        };
 
-            if let Some(parent) = state.file_path.parent() {
-                let remove_backend_watch = match self.watched_parent_counts.get_mut(parent) {
-                    Some(count) if *count > 1 => {
-                        *count -= 1;
-                        false
-                    }
-                    Some(_) => true,
-                    None => false,
-                };
-                if remove_backend_watch {
-                    self.watched_parent_counts.remove(parent);
-                    if let Some(ref mut watcher) = self.watcher {
-                        watcher.unwatch(parent)?;
-                    }
+        let parent = state.file_path.parent().map(Path::to_path_buf);
+        let remove_backend_watch = parent
+            .as_ref()
+            .is_some_and(|parent| self.watched_parent_counts.get(parent).copied() == Some(1));
+        // The only fallible step happens before logical state mutation.
+        if remove_backend_watch
+            && let (Some(watcher), Some(parent)) = (self.watcher.as_mut(), parent.as_ref())
+        {
+            watcher.unwatch(parent)?;
+        }
+
+        self.sync_states.remove(&buffer_id);
+        if let Ok(mut map) = self.path_to_buffer.write()
+            && let Some(buffer_ids) = map.get_mut(&state.file_path)
+        {
+            buffer_ids.remove(&buffer_id);
+            if buffer_ids.is_empty() {
+                map.remove(&state.file_path);
+            }
+        }
+        if let Some(parent) = parent {
+            match self.watched_parent_counts.get_mut(&parent) {
+                Some(count) if *count > 1 => *count -= 1,
+                Some(_) => {
+                    self.watched_parent_counts.remove(&parent);
                 }
+                None => {}
             }
         }
         Ok(())
@@ -840,6 +856,84 @@ mod tests {
 
         watcher.unwatch_file(second).unwrap();
         assert!(watcher.watched_parent_counts.is_empty());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn failed_backend_unwatch_preserves_logical_ownership() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("roe-unwatch-failure-{unique}"));
+        let path = directory.join("watched.txt");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(&path, "content").unwrap();
+
+        let mut ids: SlotMap<BufferId, ()> = SlotMap::with_key();
+        let buffer_id = ids.insert(());
+        let mut watcher = FileWatcher::new();
+        watcher
+            .watch_file(buffer_id, &path, "content".to_string())
+            .unwrap();
+
+        // Desynchronize only the backend to force the production unwatch call
+        // to fail. The logical transaction must remain intact for retry/drop.
+        watcher
+            .watcher
+            .as_mut()
+            .unwrap()
+            .unwatch(&directory)
+            .unwrap();
+        assert!(watcher.unwatch_file(buffer_id).is_err());
+        assert!(watcher.get_sync_state(buffer_id).is_some());
+        assert_eq!(watcher.watched_parent_counts.get(&directory), Some(&1));
+        assert!(
+            watcher
+                .path_to_buffer
+                .read()
+                .unwrap()
+                .get(&path)
+                .is_some_and(|ids| ids.contains(&buffer_id))
+        );
+
+        let errors = watcher.shutdown();
+        assert!(!errors.is_empty());
+        assert!(watcher.get_sync_state(buffer_id).is_none());
+        assert!(watcher.path_to_buffer.read().unwrap().is_empty());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rebind_rejection_preserves_the_original_watch() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("roe-rebind-{unique}"));
+        let original = directory.join("original.txt");
+        let replacement = directory.join("replacement.txt");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(&original, "original").unwrap();
+        std::fs::write(&replacement, "replacement").unwrap();
+
+        let mut ids: SlotMap<BufferId, ()> = SlotMap::with_key();
+        let buffer_id = ids.insert(());
+        let mut watcher = FileWatcher::new();
+        watcher
+            .watch_file(buffer_id, &original, "original".to_string())
+            .unwrap();
+        assert!(
+            watcher
+                .watch_file(buffer_id, &replacement, "replacement".to_string())
+                .is_err()
+        );
+        assert_eq!(
+            watcher.get_sync_state(buffer_id).unwrap().file_path,
+            original
+        );
+
+        watcher.shutdown();
         std::fs::remove_dir_all(directory).unwrap();
     }
 
