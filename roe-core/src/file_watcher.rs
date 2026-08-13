@@ -182,7 +182,7 @@ impl FileWatcher {
                             buffer_id = ?change.buffer_id,
                             path = %change.file_path.display(),
                             capacity = EVENT_QUEUE_CAPACITY,
-                            "file notification queue is full; dropping redundant hint"
+                            "file notification queue is full; dropping notification hint"
                         );
                     }
                     Err(TrySendError::Disconnected(_)) => return,
