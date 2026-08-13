@@ -19,7 +19,11 @@
 //! The dirty tracking is still useful to know when to request redraws.
 
 use roe_core::Editor;
-use roe_core::renderer::{DirtyRegion, DirtyTracker, PresentationSnapshot, Renderer};
+use roe_core::renderer::{
+    DirtyRegion, DirtyTracker, PresentationSnapshot, PresentationStreamError,
+    PresentationStreamState, Renderer,
+};
+use roe_core::session::PresentationUpdate;
 
 use crate::theme::VelloTheme;
 
@@ -36,6 +40,7 @@ pub struct VelloRenderer {
     /// Whether a redraw is needed
     needs_redraw: bool,
     presentation_snapshot: Option<PresentationSnapshot>,
+    session_presentation: PresentationStreamState,
 }
 
 impl Default for VelloRenderer {
@@ -51,7 +56,19 @@ impl VelloRenderer {
             theme: VelloTheme::default(),
             needs_redraw: true,
             presentation_snapshot: None,
+            session_presentation: PresentationStreamState::default(),
         }
+    }
+
+    pub fn apply_session_presentation(
+        &mut self,
+        update: &PresentationUpdate,
+    ) -> Result<(), PresentationStreamError> {
+        self.session_presentation.apply(update)
+    }
+
+    pub fn session_presentation(&self) -> &PresentationStreamState {
+        &self.session_presentation
     }
 
     pub fn with_theme(theme: VelloTheme) -> Self {
@@ -60,6 +77,7 @@ impl VelloRenderer {
             theme,
             needs_redraw: true,
             presentation_snapshot: None,
+            session_presentation: PresentationStreamState::default(),
         }
     }
 

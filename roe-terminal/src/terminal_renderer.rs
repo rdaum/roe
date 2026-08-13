@@ -18,13 +18,18 @@ use crossterm::event::{
 use crossterm::style::{Color, Print, Stylize};
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::{cursor, queue};
-use roe_core::editor::{BorderInfo, ChromeAction, DragType, Frame, MouseDragState, Window};
+use roe_core::editor::{Frame, Window};
 use roe_core::gutter::{
     GutterConfig, LineStatus, calculate_gutter_width, format_line_number, get_line_status,
 };
 use roe_core::keys::{KeyModifier, LogicalKey, Side};
 use roe_core::renderer::{
-    DirtyRegion, DirtyTracker, ModelineComponent, PresentationSnapshot, Renderer,
+    DirtyRegion, DirtyTracker, ModelineComponent, PresentationSnapshot, PresentationStreamState,
+    Renderer,
+};
+use roe_core::session::{
+    HostSession, InputEvent, LifecycleEvent, PointerButton, PointerEvent, PointerKind,
+    PresentationColor, PresentationUpdate, PresentedView, SessionOutput, StyleDefinition,
 };
 use roe_core::syntax::Color as SyntaxColor;
 use roe_core::syntax::face_registry;
@@ -68,6 +73,74 @@ fn truncate_echo(message: &str, available_width: usize) -> Cow<'_, str> {
     let mut truncated: String = message.chars().take(available_width - 3).collect();
     truncated.push_str("...");
     Cow::Owned(truncated)
+}
+
+fn cursor_in_visible_slice(view: &PresentedView) -> (u16, u16) {
+    let target = view
+        .cursor
+        .saturating_sub(view.visible_start_char)
+        .min(view.visible_text.chars().count());
+    let mut column = 0u16;
+    let mut line = 0u16;
+    for character in view.visible_text.chars().take(target) {
+        if character == '\n' {
+            line = line.saturating_add(1);
+            column = 0;
+        } else {
+            column = column.saturating_add(1);
+        }
+    }
+    (column, line)
+}
+
+fn session_style(
+    position: usize,
+    ranges: &[roe_core::session::StyledRange],
+    styles: &[StyleDefinition],
+    theme: &CachedTheme,
+) -> (Color, Color) {
+    let style_id = ranges
+        .iter()
+        .rev()
+        .find(|range| position >= range.start && position < range.end)
+        .map(|range| range.style);
+    let Some(style) = style_id.and_then(|id| styles.iter().find(|style| style.id == id)) else {
+        return (theme.fg_color, theme.bg_color);
+    };
+    (
+        style
+            .foreground
+            .as_ref()
+            .map(|color| session_color(color, theme.fg_color))
+            .unwrap_or(theme.fg_color),
+        style
+            .background
+            .as_ref()
+            .map(|color| session_color(color, theme.bg_color))
+            .unwrap_or(theme.bg_color),
+    )
+}
+
+fn session_color(color: &PresentationColor, default: Color) -> Color {
+    match color {
+        PresentationColor::Rgb { r, g, b } => Color::Rgb {
+            r: *r,
+            g: *g,
+            b: *b,
+        },
+        PresentationColor::Named(name) => match name.as_str() {
+            "black" => Color::Black,
+            "white" => Color::White,
+            "red" => Color::Red,
+            "green" => Color::Green,
+            "blue" => Color::Blue,
+            "yellow" => Color::Yellow,
+            "cyan" => Color::Cyan,
+            "magenta" => Color::Magenta,
+            _ => default,
+        },
+        PresentationColor::Inherit => default,
+    }
 }
 
 // Gutter colors
@@ -144,6 +217,7 @@ pub struct TerminalRenderer<W: Write> {
     dirty_tracker: DirtyTracker,
     theme: CachedTheme,
     presentation_snapshot: Option<PresentationSnapshot>,
+    session_presentation: PresentationStreamState,
 }
 
 impl<W: Write> TerminalRenderer<W> {
@@ -153,6 +227,7 @@ impl<W: Write> TerminalRenderer<W> {
             dirty_tracker: DirtyTracker::new(),
             theme: CachedTheme::default(),
             presentation_snapshot: None,
+            session_presentation: PresentationStreamState::default(),
         }
     }
 
@@ -162,7 +237,204 @@ impl<W: Write> TerminalRenderer<W> {
             dirty_tracker: DirtyTracker::new(),
             theme,
             presentation_snapshot: None,
+            session_presentation: PresentationStreamState::default(),
         }
+    }
+
+    pub fn apply_session_presentation(
+        &mut self,
+        update: &PresentationUpdate,
+    ) -> Result<(), std::io::Error> {
+        self.session_presentation
+            .apply(update)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
+    pub fn session_presentation(&self) -> &PresentationStreamState {
+        &self.session_presentation
+    }
+
+    /// Realize the authoritative transport-neutral presentation. Production
+    /// frontends use this path; the older `Renderer<Editor>` implementation is
+    /// retained only as a Phase 0 compatibility/conformance surface.
+    pub fn render_session(&mut self) -> Result<(), std::io::Error> {
+        let snapshot = self
+            .session_presentation
+            .current()
+            .cloned()
+            .ok_or_else(|| std::io::Error::other("session has no presentation snapshot"))?;
+        queue!(&mut self.device, cursor::Hide, Clear(ClearType::All))?;
+
+        for view in &snapshot.views {
+            self.draw_session_view(view, &snapshot.styles)?;
+        }
+        if !snapshot.echo_area.is_empty() {
+            let message = truncate_echo(&snapshot.echo_area, snapshot.columns as usize);
+            queue!(
+                &mut self.device,
+                cursor::MoveTo(0, snapshot.rows),
+                Clear(ClearType::CurrentLine),
+                Print(
+                    message
+                        .as_ref()
+                        .with(self.theme.fg_color)
+                        .on(self.theme.bg_color)
+                )
+            )?;
+        }
+
+        if let Some(view) = snapshot.views.iter().find(|view| view.active) {
+            let (column, line) = cursor_in_visible_slice(view);
+            let gutter = if view.show_gutter {
+                calculate_gutter_width(
+                    view.visible_text.lines().count().max(1),
+                    &GutterConfig::default(),
+                ) as u16
+            } else {
+                0
+            };
+            let x = view
+                .geometry
+                .x
+                .saturating_add(1)
+                .saturating_add(gutter)
+                .saturating_add(column.saturating_sub(view.scroll.start_column));
+            let y = view.geometry.y.saturating_add(1).saturating_add(line);
+            queue!(&mut self.device, cursor::MoveTo(x, y))?;
+            if view.command_view {
+                queue!(&mut self.device, cursor::Hide)?;
+            } else {
+                queue!(&mut self.device, cursor::Show)?;
+            }
+        }
+        self.device.flush()
+    }
+
+    fn draw_session_view(
+        &mut self,
+        view: &PresentedView,
+        styles: &[StyleDefinition],
+    ) -> Result<(), std::io::Error> {
+        let geometry = view.geometry;
+        if geometry.columns < 2 || geometry.rows < 2 {
+            return Ok(());
+        }
+        let border = if view.active {
+            self.theme.active_border_color
+        } else {
+            self.theme.border_color
+        };
+        let right = geometry.x + geometry.columns - 1;
+        let bottom = geometry.y + geometry.rows - 1;
+        queue!(
+            &mut self.device,
+            cursor::MoveTo(geometry.x, geometry.y),
+            Print(BORDER_TOP_LEFT.with(border)),
+            cursor::MoveTo(right, geometry.y),
+            Print(BORDER_TOP_RIGHT.with(border)),
+            cursor::MoveTo(geometry.x, bottom),
+            Print(BORDER_BOTTOM_LEFT.with(border)),
+            cursor::MoveTo(right, bottom),
+            Print(BORDER_BOTTOM_RIGHT.with(border))
+        )?;
+        if geometry.columns > 2 {
+            queue!(
+                &mut self.device,
+                cursor::MoveTo(geometry.x + 1, geometry.y),
+                Print(
+                    BORDER_HORIZONTAL
+                        .repeat((geometry.columns - 2) as usize)
+                        .with(border)
+                )
+            )?;
+        }
+        for row in geometry.y + 1..bottom {
+            queue!(
+                &mut self.device,
+                cursor::MoveTo(geometry.x, row),
+                Print(BORDER_VERTICAL.with(border)),
+                cursor::MoveTo(right, row),
+                Print(BORDER_VERTICAL.with(border))
+            )?;
+        }
+
+        let content_rows = geometry.rows.saturating_sub(2) as usize;
+        let total_width = geometry.columns.saturating_sub(2) as usize;
+        let visible_line_count = view.visible_text.lines().count().max(1);
+        let gutter_width = if view.show_gutter {
+            calculate_gutter_width(visible_line_count, &GutterConfig::default())
+        } else {
+            0
+        };
+        let text_width = total_width.saturating_sub(gutter_width);
+        let mut absolute = view.visible_start_char;
+        let lines: Vec<&str> = view.visible_text.split_inclusive('\n').collect();
+        for row in 0..content_rows {
+            let y = geometry.y + 1 + row as u16;
+            queue!(
+                &mut self.device,
+                cursor::MoveTo(geometry.x + 1, y),
+                Print(
+                    " ".repeat(total_width)
+                        .with(self.theme.fg_color)
+                        .on(self.theme.bg_color)
+                )
+            )?;
+            let line = lines.get(row).copied().unwrap_or("");
+            let line = line.trim_end_matches('\n');
+            if view.show_gutter {
+                let number = usize::from(view.scroll.start_line) + row + 1;
+                let digits = gutter_width.saturating_sub(2);
+                let gutter = format!(" {}│", format_line_number(number, digits));
+                queue!(
+                    &mut self.device,
+                    cursor::MoveTo(geometry.x + 1, y),
+                    Print(gutter.with(GUTTER_FG_COLOR).on(GUTTER_BG_COLOR))
+                )?;
+            }
+            queue!(
+                &mut self.device,
+                cursor::MoveTo(geometry.x + 1 + gutter_width as u16, y)
+            )?;
+            for (offset, character) in line
+                .chars()
+                .skip(usize::from(view.scroll.start_column))
+                .take(text_width)
+                .enumerate()
+            {
+                let position = absolute + usize::from(view.scroll.start_column) + offset;
+                let selected = view.selection.is_some_and(|selection| {
+                    let start = selection.anchor.min(selection.active);
+                    let end = selection.anchor.max(selection.active);
+                    position >= start && position < end
+                });
+                let (foreground, background) = if selected {
+                    (Color::Black, self.theme.selection_color)
+                } else {
+                    session_style(position, &view.styled_ranges, styles, &self.theme)
+                };
+                queue!(
+                    &mut self.device,
+                    Print(character.to_string().with(foreground).on(background))
+                )?;
+            }
+            absolute += line.chars().count()
+                + usize::from(lines.get(row).is_some_and(|l| l.ends_with('\n')));
+        }
+
+        let modeline_bg = if view.active {
+            self.theme.mode_line_bg_color
+        } else {
+            self.theme.inactive_mode_line_bg_color
+        };
+        let modeline = truncate_echo(&view.modeline, total_width);
+        let padded = format!("{:<width$}", modeline, width = total_width);
+        queue!(
+            &mut self.device,
+            cursor::MoveTo(geometry.x + 1, bottom),
+            Print(padded.with(self.theme.fg_color).on(modeline_bg))
+        )?;
+        Ok(())
     }
 
     /// Render a single line with proper highlighting (region + syntax)
@@ -1303,233 +1575,124 @@ pub fn echo(
     Ok(())
 }
 
-pub async fn event_loop_with_renderer<W: Write>(
+pub async fn session_event_loop_with_renderer<W: Write>(
     renderer: &mut TerminalRenderer<W>,
-    editor: &mut Editor,
+    session: &mut HostSession,
     shutdown_requested: &AtomicBool,
 ) -> Result<(), std::io::Error> {
-    // Compio owns progress. Crossterm is polled non-blockingly after each tick,
-    // so timers, watcher notifications, signals, and later host completions do
-    // not depend on incidental keyboard input to wake the runtime.
     let mut event_tick = interval(Duration::from_millis(20));
 
     loop {
         event_tick.tick().await;
-
-        // Always poll for file changes and expired echo (every event, not just timer)
-        {
-            let mut needs_redraw = false;
-
-            // Check for expired echo messages
-            if editor.check_and_clear_expired_echo() {
-                needs_redraw = true;
-            }
-
-            // Poll for external file changes
-            let file_change_actions = editor.poll_file_changes();
-            if !file_change_actions.is_empty() {
-                for action in file_change_actions {
-                    match action {
-                        roe_core::editor::ChromeAction::Echo(msg) => {
-                            editor.set_echo_message(msg.clone());
-                            echo(&mut renderer.device, editor, &msg, &renderer.theme)?;
-                        }
-                        roe_core::editor::ChromeAction::MarkDirty(_) => {
-                            needs_redraw = true;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            if needs_redraw {
-                renderer.render_full(editor)?;
-            }
+        let tick = session.envelope(InputEvent::Timer { token: 0 });
+        let output = session.dispatch(tick).await.map_err(session_io_error)?;
+        if apply_session_output(renderer, output)? {
+            return Ok(());
         }
 
         if shutdown_requested.load(Ordering::Acquire) {
             tracing::info!("terminal shutdown requested");
             return Ok(());
         }
-
         if !crossterm::event::poll(Duration::ZERO)? {
             continue;
         }
 
-        let event = crossterm::event::read()?;
-        let keys = match event {
-            Event::Key(keystroke) => {
-                let key = crossterm_key_translate(&keystroke.code, keystroke.modifiers);
-
-                let mut keys = vec![];
-
-                // Modifiers first
-                if keystroke.modifiers.contains(KeyModifiers::CONTROL) {
-                    keys.push(LogicalKey::Modifier(KeyModifier::Control(Side::Left)));
-                }
-                if keystroke.modifiers.contains(KeyModifiers::ALT) {
-                    keys.push(LogicalKey::Modifier(KeyModifier::Meta(Side::Left)));
-                }
-                if keystroke.modifiers.contains(KeyModifiers::SHIFT) {
-                    keys.push(LogicalKey::Modifier(KeyModifier::Shift(Side::Left)));
-                }
-                if keystroke.modifiers.contains(KeyModifiers::SUPER) {
-                    keys.push(LogicalKey::Modifier(KeyModifier::Super(Side::Left)));
-                }
-
-                // Then key.
-                keys.push(key);
-                keys
-            }
-            Event::Resize(width, height) => {
-                // Handle terminal resize event - subtract echo area height
-                editor.handle_resize(width, height.saturating_sub(ECHO_AREA_HEIGHT));
-                // Trigger full screen redraw
-                renderer.mark_dirty(DirtyRegion::FullScreen);
-                // No keys to process for resize event
-                vec![]
-            }
-            Event::Mouse(mouse_event) => {
-                // Handle mouse events for window resizing
-                handle_mouse_event(editor, renderer, mouse_event).await;
-                // No keys to process for mouse events
-                vec![]
-            }
-            _ => vec![],
+        let Some(input) = normalize_terminal_event(crossterm::event::read()?) else {
+            continue;
         };
-
-        // Display the keys pressed in echo with - between, using as_display_string, but only if there's
-        // modifiers in play
-        let mut actions: std::collections::VecDeque<_> = if keys.is_empty() {
-            // No keys to process (e.g., mouse events, resize events)
-            std::collections::VecDeque::new()
-        } else {
-            editor.key_event(keys).await?.into()
-        };
-
-        while let Some(action) = actions.pop_front() {
-            match action {
-                ChromeAction::Echo(message) => {
-                    // Set the echo message in the editor and render it
-                    editor.set_echo_message(message.clone());
-                    echo(&mut renderer.device, editor, &message, &renderer.theme)?;
-                }
-
-                ChromeAction::OpenFile(_) => {}
-                ChromeAction::CommandMode => {}
-                ChromeAction::SwitchBuffer => {}
-                ChromeAction::KillBuffer => {}
-                ChromeAction::Save => {}
-                ChromeAction::Huh => {}
-                ChromeAction::Quit => {
-                    return Ok(());
-                }
-                ChromeAction::CursorMove((_col, _line)) => {}
-                ChromeAction::MarkDirty(dirty_region) => {
-                    renderer.mark_dirty(dirty_region);
-                }
-                ChromeAction::SplitHorizontal => {
-                    editor.split_horizontal();
-                    renderer.mark_dirty(DirtyRegion::FullScreen);
-                }
-                ChromeAction::SplitVertical => {
-                    editor.split_vertical();
-                    renderer.mark_dirty(DirtyRegion::FullScreen);
-                }
-                ChromeAction::SwitchWindow => {
-                    editor.switch_window();
-                    renderer.mark_dirty(DirtyRegion::FullScreen);
-                }
-                ChromeAction::DeleteWindow => {
-                    if editor.delete_window() {
-                        renderer.mark_dirty(DirtyRegion::FullScreen);
-                    }
-                }
-                ChromeAction::DeleteOtherWindows => {
-                    if editor.delete_other_windows() {
-                        renderer.mark_dirty(DirtyRegion::FullScreen);
-                    }
-                }
-                ChromeAction::ShowMessages => {
-                    // Switch to the Messages buffer
-                    let messages_buffer_id = editor.get_messages_buffer();
-                    if let Some(current_window) = editor.windows.get_mut(editor.active_window) {
-                        current_window.active_buffer = messages_buffer_id;
-                        current_window.cursor = 0; // Start at beginning of messages
-                    }
-                    renderer.mark_dirty(DirtyRegion::FullScreen);
-                }
-                ChromeAction::NewBufferWithMode {
-                    buffer_name,
-                    mode_name,
-                    initial_content,
-                } => {
-                    // Create a new buffer with the specified mode
-                    let cursor_pos = initial_content.chars().count();
-                    if let Some(buffer_id) =
-                        editor.create_buffer_with_mode(buffer_name, mode_name, initial_content)
-                    {
-                        // Switch current window to the new buffer
-                        if let Some(current_window) = editor.windows.get_mut(editor.active_window) {
-                            current_window.active_buffer = buffer_id;
-                            current_window.cursor = cursor_pos; // Position cursor at end of initial content
-                        }
-                        renderer.mark_dirty(DirtyRegion::FullScreen);
-                    }
-                }
-                ChromeAction::BufferOps(_) => {
-                    // Buffer operations are handled in Editor::process_chrome_actions
-                    // This case should not be reached, but we handle it for completeness
-                }
-                ChromeAction::DumpMessages(_) => {
-                    // Handled in Editor::process_chrome_actions
-                }
-                ChromeAction::BufferChanged {
-                    buffer_id: _,
-                    start: _,
-                    old_end: _,
-                    new_end: _,
-                } => {
-                    // Major mode after-change hooks will be dispatched here once
-                    // the scripting runtime (mica) is integrated.
-                }
-                ChromeAction::ExecuteCommand(command_name) => {
-                    // Execute another command via the command registry
-                    let context = editor.create_command_context();
-                    match roe_core::command_mode::CommandMode::execute_command(
-                        &command_name,
-                        &editor.command_registry,
-                        context,
-                    )
-                    .await
-                    {
-                        Ok(command_actions) => {
-                            // Process through editor to handle BufferOps etc.
-                            let processed = editor.process_chrome_actions(command_actions).await;
-                            for a in processed {
-                                actions.push_back(a);
-                            }
-                        }
-                        Err(error_msg) => {
-                            editor.set_echo_message(format!("Command error: {error_msg}"));
-                        }
-                    }
-                }
-                ChromeAction::FileWatcherStatus => {
-                    let status = editor.file_watcher.status();
-                    editor.set_echo_message(status.clone());
-                    echo(&mut renderer.device, editor, &status, &renderer.theme)?;
-                }
-                ChromeAction::ISearchForward | ChromeAction::ISearchBackward => {
-                    // Handled in Editor::process_chrome_actions
-                }
-            }
+        let envelope = session.envelope(input);
+        let output = session.dispatch(envelope).await.map_err(session_io_error)?;
+        if apply_session_output(renderer, output)? {
+            return Ok(());
         }
-
-        // Render any dirty regions
-        renderer.render_incremental(editor)?;
-        renderer.clear_dirty();
     }
+}
+
+fn normalize_terminal_event(event: Event) -> Option<InputEvent> {
+    match event {
+        Event::Key(keystroke) => {
+            let mut keys = Vec::new();
+            if keystroke.modifiers.contains(KeyModifiers::CONTROL) {
+                keys.push(LogicalKey::Modifier(KeyModifier::Control(Side::Left)));
+            }
+            if keystroke.modifiers.contains(KeyModifiers::ALT) {
+                keys.push(LogicalKey::Modifier(KeyModifier::Meta(Side::Left)));
+            }
+            if keystroke.modifiers.contains(KeyModifiers::SHIFT) {
+                keys.push(LogicalKey::Modifier(KeyModifier::Shift(Side::Left)));
+            }
+            if keystroke.modifiers.contains(KeyModifiers::SUPER) {
+                keys.push(LogicalKey::Modifier(KeyModifier::Super(Side::Left)));
+            }
+            keys.push(crossterm_key_translate(
+                &keystroke.code,
+                keystroke.modifiers,
+            ));
+            Some(InputEvent::Keys(keys))
+        }
+        Event::Resize(columns, rows) => Some(InputEvent::Resize {
+            columns,
+            rows: rows.saturating_sub(ECHO_AREA_HEIGHT),
+        }),
+        Event::Mouse(mouse) => normalize_terminal_pointer(mouse),
+        Event::FocusGained => Some(InputEvent::Focus(true)),
+        Event::FocusLost => Some(InputEvent::Focus(false)),
+        Event::Paste(text) => Some(InputEvent::Text(text)),
+    }
+}
+
+fn normalize_terminal_pointer(mouse: MouseEvent) -> Option<InputEvent> {
+    let (kind, button) = match mouse.kind {
+        MouseEventKind::Down(button) => (PointerKind::Down, pointer_button(button)),
+        MouseEventKind::Drag(button) => (PointerKind::Move, pointer_button(button)),
+        MouseEventKind::Up(button) => (PointerKind::Up, pointer_button(button)),
+        MouseEventKind::Moved => (PointerKind::Move, PointerButton::None),
+        MouseEventKind::ScrollDown
+        | MouseEventKind::ScrollUp
+        | MouseEventKind::ScrollLeft
+        | MouseEventKind::ScrollRight => return None,
+    };
+    Some(InputEvent::Pointer(PointerEvent {
+        column: mouse.column,
+        row: mouse.row,
+        kind,
+        button,
+    }))
+}
+
+fn pointer_button(button: MouseButton) -> PointerButton {
+    match button {
+        MouseButton::Left => PointerButton::Primary,
+        MouseButton::Right => PointerButton::Secondary,
+        MouseButton::Middle => PointerButton::Middle,
+    }
+}
+
+fn apply_session_output<W: Write>(
+    renderer: &mut TerminalRenderer<W>,
+    output: SessionOutput,
+) -> Result<bool, std::io::Error> {
+    let quit = output
+        .lifecycle
+        .iter()
+        .any(|event| matches!(event, LifecycleEvent::QuitRequested));
+    for event in &output.lifecycle {
+        match event {
+            LifecycleEvent::Warning(message) => tracing::warn!(%message, "session warning"),
+            LifecycleEvent::Error(message) => tracing::error!(%message, "session error"),
+            _ => {}
+        }
+    }
+    if let Some(update) = output.presentation.as_ref() {
+        renderer.apply_session_presentation(update)?;
+        renderer.render_session()?;
+    }
+    Ok(quit)
+}
+
+fn session_io_error(error: roe_core::session::SessionError) -> std::io::Error {
+    std::io::Error::other(error)
 }
 
 /// Draw the command window overlay
@@ -1546,333 +1709,6 @@ fn draw_command_window(
     draw_window(device, editor, window, theme)?;
 
     Ok(())
-}
-
-/// Handle mouse events for window resizing
-async fn handle_mouse_event<W: Write>(
-    editor: &mut Editor,
-    renderer: &mut TerminalRenderer<W>,
-    mouse_event: MouseEvent,
-) {
-    match mouse_event.kind {
-        MouseEventKind::Down(MouseButton::Left) => {
-            if let Some((border_info, target_window)) =
-                detect_border_click(editor, mouse_event.column, mouse_event.row)
-            {
-                editor.mouse_drag_state = Some(MouseDragState {
-                    drag_type: DragType::WindowBorder,
-                    start_pos: (mouse_event.column, mouse_event.row),
-                    last_pos: (mouse_event.column, mouse_event.row),
-                    current_pos: (mouse_event.column, mouse_event.row),
-                    target_window: Some(target_window),
-                    border_info: Some(border_info),
-                });
-                return;
-            }
-
-            let Some(window_id) =
-                find_window_at_position(editor, mouse_event.column, mouse_event.row)
-            else {
-                return;
-            };
-
-            if editor.active_window != window_id {
-                editor.previous_active_window = Some(editor.active_window);
-                editor.active_window = window_id;
-                renderer.mark_dirty(DirtyRegion::FullScreen);
-            }
-
-            let window = &editor.windows[window_id];
-            let relative_x = mouse_event.column.saturating_sub(window.x + 1);
-            let relative_y = mouse_event.row.saturating_sub(window.y + 1);
-            let buffer_row = relative_y + window.start_line;
-            let buffer_col = relative_x;
-
-            let mode_mouse_event = roe_core::mode::MouseEvent {
-                position: (buffer_col, buffer_row),
-                event_type: roe_core::mode::MouseEventType::LeftClick,
-            };
-
-            let Some(actions) = handle_mode_mouse_event(editor, window_id, &mode_mouse_event).await
-            else {
-                return;
-            };
-
-            for action in actions {
-                if let ChromeAction::MarkDirty(dirty_region) = action {
-                    renderer.mark_dirty(dirty_region);
-                }
-            }
-        }
-        MouseEventKind::Drag(MouseButton::Left) => {
-            let Some(drag_state) = editor.mouse_drag_state.clone() else {
-                return;
-            };
-
-            let new_pos = (mouse_event.column, mouse_event.row);
-            let dx = new_pos.0 as i32 - drag_state.last_pos.0 as i32;
-            let dy = new_pos.1 as i32 - drag_state.last_pos.1 as i32;
-
-            if dx == 0 && dy == 0 {
-                return;
-            }
-
-            if let Some(ref mut drag_state_mut) = editor.mouse_drag_state {
-                drag_state_mut.current_pos = new_pos;
-                drag_state_mut.last_pos = new_pos;
-            }
-
-            let Some(border_info) = drag_state.border_info else {
-                return;
-            };
-
-            update_window_resize_incremental(
-                editor,
-                drag_state.target_window,
-                &border_info,
-                dx,
-                dy,
-            );
-            renderer.mark_dirty(DirtyRegion::FullScreen);
-        }
-        MouseEventKind::Up(MouseButton::Left) if editor.mouse_drag_state.is_some() => {
-            // End dragging
-            editor.mouse_drag_state = None;
-            renderer.mark_dirty(DirtyRegion::FullScreen);
-        }
-        _ => {
-            // Ignore other mouse events for now
-        }
-    }
-}
-
-/// Find which window contains the given screen position
-fn find_window_at_position(editor: &Editor, x: u16, y: u16) -> Option<WindowId> {
-    for (window_id, window) in &editor.windows {
-        // Check if position is within window content area (not on borders)
-        let content_left = window.x + 1; // +1 for left border
-        let content_right = window.x + window.width_chars - 1; // -1 for right border
-        let content_top = window.y;
-        let content_bottom = window.y + window.height_chars - 1;
-
-        if x >= content_left && x < content_right && y >= content_top && y <= content_bottom {
-            return Some(window_id);
-        }
-    }
-    None
-}
-
-/// Handle mouse events for modes
-async fn handle_mode_mouse_event(
-    editor: &mut Editor,
-    window_id: WindowId,
-    mouse_event: &roe_core::mode::MouseEvent,
-) -> Option<Vec<roe_core::editor::ChromeAction>> {
-    let window = &editor.windows[window_id];
-    let buffer_id = window.active_buffer;
-    let cursor_pos = window.cursor;
-
-    if let Some(buffer_host) = editor.buffer_hosts.get(&buffer_id) {
-        // Send mouse event to buffer host and wait for response
-        if let Ok(response) = buffer_host
-            .handle_mouse(mouse_event.clone(), cursor_pos)
-            .await
-        {
-            // Process the response like key events do
-            return Some(editor.handle_buffer_response(response).await);
-        }
-    }
-    None
-}
-
-/// Detect if a mouse click is on a window border
-fn detect_border_click(editor: &Editor, x: u16, y: u16) -> Option<(BorderInfo, WindowId)> {
-    // Check all windows to see if the click is on a border
-    for (window_id, window) in &editor.windows {
-        // Check if click is on window borders
-        let left_border = window.x;
-        let right_border = window.x + window.width_chars - 1;
-        let top_border = window.y;
-        let bottom_border = window.y + window.height_chars - 1;
-
-        // Check vertical borders (left and right sides)
-        if (x == left_border || x == right_border) && y >= top_border && y <= bottom_border {
-            // This is a vertical border
-            if let Some(split_info) = find_split_for_border(editor, window_id, x, true) {
-                return Some((
-                    BorderInfo {
-                        is_vertical: true,
-                        split_node_path: split_info.0,
-                        original_ratio: split_info.1,
-                    },
-                    window_id,
-                ));
-            }
-        }
-
-        // Check horizontal borders (top and bottom sides)
-        if (y == top_border || y == bottom_border) && x >= left_border && x <= right_border {
-            // This is a horizontal border
-            if let Some(split_info) = find_split_for_border(editor, window_id, y, false) {
-                return Some((
-                    BorderInfo {
-                        is_vertical: false,
-                        split_node_path: split_info.0,
-                        original_ratio: split_info.1,
-                    },
-                    window_id,
-                ));
-            }
-        }
-    }
-
-    None
-}
-
-/// Find the split node that controls the given border
-fn find_split_for_border(
-    editor: &Editor,
-    window_id: WindowId,
-    border_coordinate: u16,
-    is_vertical_border: bool,
-) -> Option<(Vec<usize>, f32)> {
-    let window = editor.windows.get(window_id)?;
-    let (leading_edge, trailing_edge) = if is_vertical_border {
-        (window.x, window.x + window.width_chars.saturating_sub(1))
-    } else {
-        (window.y, window.y + window.height_chars.saturating_sub(1))
-    };
-    let required_branch = if border_coordinate == leading_edge {
-        1
-    } else if border_coordinate == trailing_edge {
-        0
-    } else {
-        return None;
-    };
-    let direction = if is_vertical_border {
-        roe_core::editor::SplitDirection::Vertical
-    } else {
-        roe_core::editor::SplitDirection::Horizontal
-    };
-
-    find_split_path(&editor.window_tree, window_id, direction, required_branch)
-}
-
-fn find_split_path(
-    tree: &roe_core::editor::WindowNode,
-    window_id: WindowId,
-    direction: roe_core::editor::SplitDirection,
-    required_branch: usize,
-) -> Option<(Vec<usize>, f32)> {
-    use roe_core::editor::WindowNode;
-
-    fn leaf_path(node: &WindowNode, target: WindowId, path: &mut Vec<usize>) -> bool {
-        match node {
-            WindowNode::Leaf { window_id } => *window_id == target,
-            WindowNode::Split { first, second, .. } => {
-                path.push(0);
-                if leaf_path(first, target, path) {
-                    return true;
-                }
-                path.pop();
-                path.push(1);
-                if leaf_path(second, target, path) {
-                    return true;
-                }
-                path.pop();
-                false
-            }
-        }
-    }
-
-    let mut leaf = Vec::new();
-    if !leaf_path(tree, window_id, &mut leaf) {
-        return None;
-    }
-
-    let mut node = tree;
-    let mut node_path = Vec::new();
-    let mut candidate = None;
-    for branch in leaf {
-        let WindowNode::Split {
-            direction: node_direction,
-            ratio,
-            first,
-            second,
-        } = node
-        else {
-            return None;
-        };
-        if *node_direction == direction && branch == required_branch {
-            candidate = Some((node_path.clone(), *ratio));
-        }
-        node = if branch == 0 { first } else { second };
-        node_path.push(branch);
-    }
-    candidate
-}
-
-/// Update window layout based on incremental mouse drag
-fn update_window_resize_incremental(
-    editor: &mut Editor,
-    target_window_id: Option<WindowId>,
-    border_info: &BorderInfo,
-    dx: i32,
-    dy: i32,
-) {
-    // Use incremental changes with much finer granularity
-    if target_window_id.is_some() {
-        // Use a sensitivity factor to make resizing smoother
-        // Each pixel of mouse movement = 0.5% ratio change (adjustable)
-        const SENSITIVITY: f32 = 0.005;
-
-        // Calculate the incremental ratio change
-        if border_info.is_vertical && dx != 0 {
-            // For vertical borders, adjust the split ratio based on horizontal movement
-            let ratio_change = dx as f32 * SENSITIVITY;
-            adjust_window_tree_ratio_at_path(
-                &mut editor.window_tree,
-                &border_info.split_node_path,
-                ratio_change,
-            );
-        } else if !border_info.is_vertical && dy != 0 {
-            // For horizontal borders, adjust the split ratio based on vertical movement
-            let ratio_change = dy as f32 * SENSITIVITY;
-            adjust_window_tree_ratio_at_path(
-                &mut editor.window_tree,
-                &border_info.split_node_path,
-                ratio_change,
-            );
-        }
-
-        // Recalculate layout to apply the new ratios
-        editor.calculate_window_layout();
-    }
-}
-
-/// Adjust exactly the split identified when the drag began.
-fn adjust_window_tree_ratio_at_path(
-    node: &mut roe_core::editor::WindowNode,
-    path: &[usize],
-    ratio_change: f32,
-) {
-    use roe_core::editor::WindowNode;
-
-    if path.is_empty() {
-        if let WindowNode::Split { ratio, .. } = node {
-            *ratio = (*ratio + ratio_change).clamp(0.15, 0.85);
-        }
-        return;
-    }
-
-    match node {
-        WindowNode::Leaf { .. } => {}
-        WindowNode::Split { first, second, .. } => match path[0] {
-            0 => adjust_window_tree_ratio_at_path(first, &path[1..], ratio_change),
-            1 => adjust_window_tree_ratio_at_path(second, &path[1..], ratio_change),
-            _ => {}
-        },
-    }
 }
 
 #[cfg(test)]
@@ -1905,54 +1741,5 @@ mod tests {
         assert_eq!(truncate_echo("λé猫abc", 5), "λé...");
         assert_eq!(truncate_echo("λé", 5), "λé");
         assert_eq!(truncate_echo("λé", 1), ".");
-    }
-
-    #[test]
-    fn nested_border_resize_targets_only_the_controlling_split() {
-        use roe_core::editor::{SplitDirection, WindowNode};
-
-        let mut ids: slotmap::SlotMap<WindowId, ()> = slotmap::SlotMap::with_key();
-        let left = ids.insert(());
-        let middle = ids.insert(());
-        let bottom = ids.insert(());
-        let mut tree = WindowNode::new_split(
-            SplitDirection::Horizontal,
-            0.5,
-            WindowNode::new_split(
-                SplitDirection::Vertical,
-                0.4,
-                WindowNode::new_leaf(left),
-                WindowNode::new_leaf(middle),
-            ),
-            WindowNode::new_leaf(bottom),
-        );
-
-        assert_eq!(
-            find_split_path(&tree, middle, SplitDirection::Vertical, 1),
-            Some((vec![0], 0.4))
-        );
-        assert_eq!(
-            find_split_path(&tree, left, SplitDirection::Horizontal, 0),
-            Some((vec![], 0.5))
-        );
-
-        adjust_window_tree_ratio_at_path(&mut tree, &[0], 0.1);
-        let WindowNode::Split {
-            ratio: root_ratio,
-            first,
-            ..
-        } = tree
-        else {
-            unreachable!();
-        };
-        let WindowNode::Split {
-            ratio: nested_ratio,
-            ..
-        } = *first
-        else {
-            unreachable!();
-        };
-        assert_eq!(root_ratio, 0.5);
-        assert!((nested_ratio - 0.5).abs() < f32::EPSILON);
     }
 }

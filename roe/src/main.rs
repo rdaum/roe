@@ -17,9 +17,11 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::disable_raw_mode;
+use roe_core::native_kernel::CapabilityGrants;
+use roe_core::session::{HostSession, InputEvent, LifecycleEvent};
 use roe_core::{
-    Buffer, BufferId, ConfigurableBindings, Editor, Frame, KeyState, Mode, ModeId, Renderer,
-    Window, WindowId, buffer_host, command_registry, editor, kill_ring, mode,
+    Buffer, BufferId, ConfigurableBindings, Editor, Frame, KeyState, Mode, ModeId, Window,
+    WindowId, buffer_host, command_registry, editor, kill_ring, mode,
 };
 use roe_terminal::{ECHO_AREA_HEIGHT, TerminalRenderer};
 use slotmap::SlotMap;
@@ -368,20 +370,31 @@ async fn terminal_main<W: Write>(
     let theme = roe_terminal::terminal_renderer::CachedTheme::default();
 
     let mut renderer = TerminalRenderer::new_with_theme(stdout, theme);
+    let mut session = HostSession::open(editor, CapabilityGrants::editor_default());
 
-    // Initial full render
-    renderer.render_full(&editor)?;
+    let initial = session.initial_output();
+    if let Some(update) = initial.presentation.as_ref() {
+        renderer.apply_session_presentation(update)?;
+    }
+    renderer.render_session()?;
 
-    // Event loop with renderer
-    let event_loop_result = roe_terminal::terminal_renderer::event_loop_with_renderer(
+    let event_loop_result = roe_terminal::terminal_renderer::session_event_loop_with_renderer(
         &mut renderer,
-        &mut editor,
+        &mut session,
         shutdown_requested,
     )
     .await;
 
-    for error in editor.shutdown_native_work() {
-        tracing::warn!(%error, "editor shutdown warning");
+    let close = session.envelope(InputEvent::Close);
+    match session.dispatch(close).await {
+        Ok(output) => {
+            for event in output.lifecycle {
+                if let LifecycleEvent::Warning(error) = event {
+                    tracing::warn!(%error, "editor shutdown warning");
+                }
+            }
+        }
+        Err(error) => tracing::warn!(%error, "session shutdown warning"),
     }
     event_loop_result?;
 

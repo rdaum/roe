@@ -11,8 +11,82 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
+use crate::session::{
+    PresentationSnapshot as SessionPresentationSnapshot, PresentationUpdate, Revision, SessionEpoch,
+};
 use crate::{BufferId, Editor, WindowId};
 use std::collections::{HashMap, HashSet};
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum PresentationStreamError {
+    #[error("presentation snapshot metadata does not match its envelope")]
+    SnapshotMismatch,
+    #[error("presentation delta belongs to epoch {received:?}, expected {expected:?}")]
+    EpochGap {
+        received: SessionEpoch,
+        expected: SessionEpoch,
+    },
+    #[error("presentation delta starts at {received:?}, expected {expected:?}")]
+    RevisionGap {
+        received: Revision,
+        expected: Revision,
+    },
+    #[error("presentation revision did not advance by one from {base:?} to {revision:?}")]
+    NonMonotonic { base: Revision, revision: Revision },
+}
+
+/// Revision gate shared by every renderer. A delta can only be applied to the
+/// exact snapshot it names; a full snapshot is the explicit resynchronization
+/// mechanism after a gap or reconnect.
+#[derive(Debug, Clone, Default)]
+pub struct PresentationStreamState {
+    current: Option<SessionPresentationSnapshot>,
+}
+
+impl PresentationStreamState {
+    pub fn apply(&mut self, update: &PresentationUpdate) -> Result<(), PresentationStreamError> {
+        let snapshot = match update {
+            PresentationUpdate::Full(snapshot) => snapshot.clone(),
+            PresentationUpdate::Delta(delta) => {
+                if delta.snapshot.epoch != delta.epoch || delta.snapshot.revision != delta.revision
+                {
+                    return Err(PresentationStreamError::SnapshotMismatch);
+                }
+                let Some(current) = self.current.as_ref() else {
+                    return Err(PresentationStreamError::RevisionGap {
+                        received: delta.base_revision,
+                        expected: Revision(0),
+                    });
+                };
+                if delta.epoch != current.epoch {
+                    return Err(PresentationStreamError::EpochGap {
+                        received: delta.epoch,
+                        expected: current.epoch,
+                    });
+                }
+                if delta.base_revision != current.revision {
+                    return Err(PresentationStreamError::RevisionGap {
+                        received: delta.base_revision,
+                        expected: current.revision,
+                    });
+                }
+                if delta.revision.0 != delta.base_revision.0.saturating_add(1) {
+                    return Err(PresentationStreamError::NonMonotonic {
+                        base: delta.base_revision,
+                        revision: delta.revision,
+                    });
+                }
+                delta.snapshot.clone()
+            }
+        };
+        self.current = Some(snapshot);
+        Ok(())
+    }
+
+    pub fn current(&self) -> Option<&SessionPresentationSnapshot> {
+        self.current.as_ref()
+    }
+}
 
 /// Renderer-neutral observation of the logical state presented by a frontend.
 ///

@@ -239,10 +239,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("starting Vello frontend");
     let runtime = compio::runtime::Runtime::new()?;
 
-    let mut editor = runtime.block_on(create_editor(config))?;
+    let editor = runtime.block_on(create_editor(config))?;
 
     // Run with Vello renderer
-    roe_vello::run_vello(&mut editor, runtime)?;
+    roe_vello::run_vello(editor, runtime)?;
     tracing::info!("Vello frontend stopped");
 
     Ok(())

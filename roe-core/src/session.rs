@@ -12,7 +12,9 @@
 //! transport.
 
 use crate::command_mode::CommandMode;
-use crate::editor::{ChromeAction, WindowType};
+use crate::editor::{
+    BorderInfo, ChromeAction, DragType, MouseDragState, SplitDirection, WindowNode, WindowType,
+};
 use crate::keys::LogicalKey;
 use crate::native_kernel::{
     Capability, CapabilityGrants, KernelError, NativeKernel, NativeOperation, NativeResult,
@@ -51,10 +53,20 @@ pub struct InputEnvelope {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionTranscript {
+    pub events: Vec<InputEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum InputEvent {
     Keys(Vec<LogicalKey>),
     Text(String),
     Pointer(PointerEvent),
+    SetViewScroll {
+        view: ViewId,
+        start_line: Option<u16>,
+        start_column: Option<u16>,
+    },
     Resize {
         columns: u16,
         rows: u16,
@@ -191,6 +203,8 @@ pub struct PresentedView {
     pub visible_text: String,
     pub visible_start_char: usize,
     pub visible_end_char: usize,
+    pub total_lines: usize,
+    pub max_line_chars: usize,
     pub cursor: usize,
     pub selection: Option<TextSelection>,
     pub geometry: ViewGeometry,
@@ -276,6 +290,7 @@ pub struct HostSession {
     buffer_resources: HashMap<BufferId, ResourceId>,
     view_ids: HashMap<WindowId, ViewId>,
     next_view_id: u64,
+    pointer_selection: Option<(WindowId, usize)>,
     closed: bool,
 }
 
@@ -291,6 +306,7 @@ impl HostSession {
             buffer_resources: HashMap::new(),
             view_ids: HashMap::new(),
             next_view_id: 1,
+            pointer_selection: None,
             closed: false,
         };
         session.synchronize_identities();
@@ -312,13 +328,6 @@ impl HostSession {
             sequence: self.next_sequence,
             event,
         }
-    }
-
-    /// Compatibility realization view. Frontends may pass this read-only state
-    /// to existing Rust renderers, but may not execute policy through it. Phase
-    /// 2 presentation updates are the authoritative logical view contract.
-    pub fn realization_state(&self) -> &Editor {
-        &self.editor
     }
 
     pub fn initial_output(&mut self) -> SessionOutput {
@@ -368,6 +377,44 @@ impl HostSession {
             InputEvent::Pointer(pointer) => {
                 self.apply_pointer(pointer);
                 invalidations.push(Invalidation::Full);
+            }
+            InputEvent::SetViewScroll {
+                view,
+                start_line,
+                start_column,
+            } => {
+                let window_id = self
+                    .view_ids
+                    .iter()
+                    .find_map(|(window, id)| (*id == view).then_some(*window));
+                if let Some(window_id) = window_id {
+                    let buffer_id = self.editor.windows[window_id].active_buffer;
+                    let buffer = &self.editor.buffers[buffer_id];
+                    let max_line = buffer
+                        .buffer_len_lines()
+                        .saturating_sub(1)
+                        .min(u16::MAX as usize) as u16;
+                    let max_column = buffer
+                        .buffer_lines()
+                        .into_iter()
+                        .map(|line| line.trim_end_matches('\n').chars().count())
+                        .max()
+                        .unwrap_or(0)
+                        .min(u16::MAX as usize) as u16;
+                    let window = &mut self.editor.windows[window_id];
+                    if let Some(line) = start_line {
+                        window.start_line = line.min(max_line);
+                    }
+                    if let Some(column) = start_column {
+                        window.start_column = column.min(max_column);
+                    }
+                    invalidations.push(Invalidation::View(view));
+                } else {
+                    lifecycle.push(LifecycleEvent::Warning(format!(
+                        "view {} is no longer live",
+                        view.0
+                    )));
+                }
             }
             InputEvent::Resize { columns, rows } => {
                 self.editor.handle_resize(columns, rows);
@@ -449,6 +496,20 @@ impl HostSession {
             native_completions: completions,
             lifecycle,
         })
+    }
+
+    /// Replay a deterministic list of normalized inputs through the same
+    /// ordered endpoint used by interactive frontends.
+    pub async fn replay(
+        &mut self,
+        transcript: &SessionTranscript,
+    ) -> Result<Vec<SessionOutput>, SessionError> {
+        let mut outputs = Vec::with_capacity(transcript.events.len());
+        for event in transcript.events.iter().cloned() {
+            let envelope = self.envelope(event);
+            outputs.push(self.dispatch(envelope).await?);
+        }
+        Ok(outputs)
     }
 
     fn validate_envelope(&self, envelope: &InputEnvelope) -> Result<(), SessionError> {
@@ -606,9 +667,53 @@ impl HostSession {
     }
 
     fn apply_pointer(&mut self, pointer: PointerEvent) {
-        if pointer.kind != PointerKind::Down || pointer.button != PointerButton::Primary {
+        if pointer.button != PointerButton::Primary && pointer.kind != PointerKind::Move {
             return;
         }
+        if pointer.kind == PointerKind::Up {
+            self.editor.mouse_drag_state = None;
+            self.pointer_selection = None;
+            return;
+        }
+
+        if pointer.kind == PointerKind::Move {
+            if let Some(drag_state) = self.editor.mouse_drag_state.clone() {
+                let position = (pointer.column, pointer.row);
+                let dx = i32::from(position.0) - i32::from(drag_state.last_pos.0);
+                let dy = i32::from(position.1) - i32::from(drag_state.last_pos.1);
+                if let Some(state) = self.editor.mouse_drag_state.as_mut() {
+                    state.last_pos = position;
+                    state.current_pos = position;
+                }
+                if let Some(border) = drag_state.border_info.as_ref() {
+                    update_layout_drag(&mut self.editor, border, dx, dy);
+                }
+                return;
+            }
+            if let Some((window_id, anchor)) = self.pointer_selection {
+                let cursor = cursor_at(&self.editor, window_id, pointer.column, pointer.row);
+                let buffer_id = self.editor.windows[window_id].active_buffer;
+                self.editor.buffers[buffer_id].set_mark(anchor);
+                self.editor.windows[window_id].cursor = cursor;
+            }
+            return;
+        }
+
+        if let Some((border_info, target_window)) =
+            detect_border(&self.editor, pointer.column, pointer.row)
+        {
+            self.editor.mouse_drag_state = Some(MouseDragState {
+                drag_type: DragType::WindowBorder,
+                start_pos: (pointer.column, pointer.row),
+                last_pos: (pointer.column, pointer.row),
+                current_pos: (pointer.column, pointer.row),
+                target_window: Some(target_window),
+                border_info: Some(border_info),
+            });
+            self.pointer_selection = None;
+            return;
+        }
+
         let selected = self
             .editor
             .windows
@@ -633,18 +738,11 @@ impl HostSession {
             self.editor.previous_active_window = Some(self.editor.active_window);
             self.editor.active_window = window_id;
         }
-        let window = &self.editor.windows[window_id];
-        let buffer = &self.editor.buffers[window.active_buffer];
-        let line = pointer
-            .row
-            .saturating_sub(window.y.saturating_add(1))
-            .saturating_add(window.start_line);
-        let column = pointer
-            .column
-            .saturating_sub(window.x.saturating_add(1))
-            .saturating_add(window.start_column);
-        let cursor = buffer.to_char_index(column, line);
+        let cursor = cursor_at(&self.editor, window_id, pointer.column, pointer.row);
+        let buffer_id = self.editor.windows[window_id].active_buffer;
+        self.editor.buffers[buffer_id].clear_mark();
         self.editor.windows[window_id].cursor = cursor;
+        self.pointer_selection = Some((window_id, cursor));
     }
 
     fn synchronize_identities(&mut self) {
@@ -755,6 +853,13 @@ impl HostSession {
                 visible_text,
                 visible_start_char,
                 visible_end_char,
+                total_lines,
+                max_line_chars: buffer
+                    .buffer_lines()
+                    .into_iter()
+                    .map(|line| line.trim_end_matches('\n').chars().count())
+                    .max()
+                    .unwrap_or(0),
                 cursor: window.cursor,
                 selection,
                 geometry: ViewGeometry {
@@ -807,6 +912,177 @@ fn capability_list(grants: &CapabilityGrants) -> Vec<Capability> {
     .collect()
 }
 
+fn cursor_at(editor: &Editor, window_id: WindowId, column: u16, row: u16) -> usize {
+    let window = &editor.windows[window_id];
+    let buffer = &editor.buffers[window.active_buffer];
+    let line = row
+        .saturating_sub(window.y.saturating_add(1))
+        .saturating_add(window.start_line);
+    let column = column
+        .saturating_sub(window.x.saturating_add(1))
+        .saturating_add(window.start_column);
+    buffer.to_char_index(column, line)
+}
+
+fn detect_border(editor: &Editor, x: u16, y: u16) -> Option<(BorderInfo, WindowId)> {
+    for (window_id, window) in &editor.windows {
+        let right = window
+            .x
+            .saturating_add(window.width_chars.saturating_sub(1));
+        let bottom = window
+            .y
+            .saturating_add(window.height_chars.saturating_sub(1));
+        if (x == window.x || x == right)
+            && y >= window.y
+            && y <= bottom
+            && let Some((path, ratio)) = find_split_for_border(editor, window_id, x, true)
+        {
+            return Some((
+                BorderInfo {
+                    is_vertical: true,
+                    split_node_path: path,
+                    original_ratio: ratio,
+                },
+                window_id,
+            ));
+        }
+        if (y == window.y || y == bottom)
+            && x >= window.x
+            && x <= right
+            && let Some((path, ratio)) = find_split_for_border(editor, window_id, y, false)
+        {
+            return Some((
+                BorderInfo {
+                    is_vertical: false,
+                    split_node_path: path,
+                    original_ratio: ratio,
+                },
+                window_id,
+            ));
+        }
+    }
+    None
+}
+
+fn find_split_for_border(
+    editor: &Editor,
+    window_id: WindowId,
+    coordinate: u16,
+    vertical: bool,
+) -> Option<(Vec<usize>, f32)> {
+    let window = editor.windows.get(window_id)?;
+    let (leading, trailing) = if vertical {
+        (
+            window.x,
+            window
+                .x
+                .saturating_add(window.width_chars.saturating_sub(1)),
+        )
+    } else {
+        (
+            window.y,
+            window
+                .y
+                .saturating_add(window.height_chars.saturating_sub(1)),
+        )
+    };
+    let required_branch = if coordinate == leading {
+        1
+    } else if coordinate == trailing {
+        0
+    } else {
+        return None;
+    };
+    let direction = if vertical {
+        SplitDirection::Vertical
+    } else {
+        SplitDirection::Horizontal
+    };
+    find_split_path(&editor.window_tree, window_id, direction, required_branch)
+}
+
+fn find_split_path(
+    tree: &WindowNode,
+    window_id: WindowId,
+    direction: SplitDirection,
+    required_branch: usize,
+) -> Option<(Vec<usize>, f32)> {
+    fn leaf_path(node: &WindowNode, target: WindowId, path: &mut Vec<usize>) -> bool {
+        match node {
+            WindowNode::Leaf { window_id } => *window_id == target,
+            WindowNode::Split { first, second, .. } => {
+                path.push(0);
+                if leaf_path(first, target, path) {
+                    return true;
+                }
+                path.pop();
+                path.push(1);
+                if leaf_path(second, target, path) {
+                    return true;
+                }
+                path.pop();
+                false
+            }
+        }
+    }
+
+    let mut leaf = Vec::new();
+    if !leaf_path(tree, window_id, &mut leaf) {
+        return None;
+    }
+    let mut node = tree;
+    let mut node_path = Vec::new();
+    let mut candidate = None;
+    for branch in leaf {
+        let WindowNode::Split {
+            direction: node_direction,
+            ratio,
+            first,
+            second,
+        } = node
+        else {
+            return None;
+        };
+        if *node_direction == direction && branch == required_branch {
+            candidate = Some((node_path.clone(), *ratio));
+        }
+        node = if branch == 0 { first } else { second };
+        node_path.push(branch);
+    }
+    candidate
+}
+
+fn update_layout_drag(editor: &mut Editor, border: &BorderInfo, dx: i32, dy: i32) {
+    const SENSITIVITY: f32 = 0.005;
+    let change = if border.is_vertical {
+        dx as f32 * SENSITIVITY
+    } else {
+        dy as f32 * SENSITIVITY
+    };
+    if change == 0.0 {
+        return;
+    }
+    adjust_ratio_at_path(&mut editor.window_tree, &border.split_node_path, change);
+    editor.calculate_window_layout();
+}
+
+fn adjust_ratio_at_path(node: &mut WindowNode, path: &[usize], change: f32) {
+    if path.is_empty() {
+        if let WindowNode::Split { ratio, .. } = node {
+            *ratio = (*ratio + change).clamp(0.15, 0.85);
+        }
+        return;
+    }
+    match node {
+        WindowNode::Leaf { .. } => {}
+        WindowNode::Split { first, second, .. } => match path[0] {
+            0 => adjust_ratio_at_path(first, &path[1..], change),
+            1 => adjust_ratio_at_path(second, &path[1..], change),
+            _ => {}
+        },
+    }
+}
+
 fn native_operation_text_size(operation: &NativeOperation) -> usize {
     match operation {
         NativeOperation::CreateText { name, initial } => {
@@ -852,7 +1128,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    fn test_session() -> HostSession {
+    fn test_session_with_grants(grants: CapabilityGrants) -> HostSession {
         let mut buffers: SlotMap<BufferId, Buffer> = SlotMap::default();
         let buffer = Buffer::new(&[]);
         buffer.set_object("*test*".to_string());
@@ -907,7 +1183,11 @@ mod tests {
             file_watcher: crate::file_watcher::FileWatcher::new(),
             last_search_term: String::new(),
         };
-        HostSession::open(editor, CapabilityGrants::editor_default())
+        HostSession::open(editor, grants)
+    }
+
+    fn test_session() -> HostSession {
+        test_session_with_grants(CapabilityGrants::editor_default())
     }
 
     fn snapshot(output: &SessionOutput) -> &PresentationSnapshot {
@@ -967,21 +1247,22 @@ mod tests {
     #[test]
     fn native_capability_denial_is_a_typed_completion_not_endpoint_failure() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
-            let mut session = test_session();
+            let mut session = test_session_with_grants(CapabilityGrants::new([]));
             let output = session
                 .dispatch(session.envelope(InputEvent::NativeRequest {
                     request_id: RequestId(7),
-                    operation: NativeOperation::Snapshot {
-                        resource: ResourceId {
-                            slot: u32::MAX,
-                            generation: 1,
-                        },
-                    },
+                    operation: NativeOperation::ReadClockMillis,
                 }))
                 .await
                 .unwrap();
             assert_eq!(output.native_completions[0].request_id, RequestId(7));
-            assert!(output.native_completions[0].result.is_err());
+            assert!(
+                output.native_completions[0]
+                    .result
+                    .as_ref()
+                    .unwrap_err()
+                    .contains("was not granted")
+            );
             assert!(output.lifecycle.is_empty());
         });
     }
@@ -1024,5 +1305,69 @@ mod tests {
                 .unwrap();
             assert_eq!(snapshot(&resync).revision.0, revision.0 + 1);
         });
+    }
+
+    #[test]
+    fn headless_transcript_replays_the_same_ordered_presentation_path() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut session = test_session();
+            let transcript = SessionTranscript {
+                events: vec![
+                    InputEvent::Text("!".to_string()),
+                    InputEvent::Text("?".to_string()),
+                    InputEvent::RequestSnapshot { after: None },
+                ],
+            };
+            let outputs = session.replay(&transcript).await.unwrap();
+            assert_eq!(snapshot(&outputs[0]).views[0].visible_text, "hello!");
+            assert_eq!(snapshot(&outputs[1]).views[0].visible_text, "hello!?");
+            assert_eq!(snapshot(&outputs[2]).views[0].visible_text, "hello!?");
+            assert!(
+                outputs
+                    .windows(2)
+                    .all(|pair| snapshot(&pair[0]).revision.0 < snapshot(&pair[1]).revision.0)
+            );
+        });
+    }
+
+    #[test]
+    fn nested_layout_drag_changes_only_the_identified_split() {
+        let mut ids: SlotMap<WindowId, ()> = SlotMap::with_key();
+        let left = ids.insert(());
+        let middle = ids.insert(());
+        let bottom = ids.insert(());
+        let mut tree = WindowNode::new_split(
+            SplitDirection::Horizontal,
+            0.5,
+            WindowNode::new_split(
+                SplitDirection::Vertical,
+                0.4,
+                WindowNode::new_leaf(left),
+                WindowNode::new_leaf(middle),
+            ),
+            WindowNode::new_leaf(bottom),
+        );
+        assert_eq!(
+            find_split_path(&tree, middle, SplitDirection::Vertical, 1),
+            Some((vec![0], 0.4))
+        );
+        adjust_ratio_at_path(&mut tree, &[0], 0.1);
+        let WindowNode::Split {
+            ratio: root_ratio,
+            first,
+            ..
+        } = tree
+        else {
+            unreachable!();
+        };
+        let WindowNode::Split {
+            ratio: nested_ratio,
+            ..
+        } = *first
+        else {
+            unreachable!();
+        };
+        assert_eq!(root_ratio, 0.5);
+        assert!((nested_ratio - 0.5).abs() < f32::EPSILON);
     }
 }

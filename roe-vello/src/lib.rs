@@ -25,25 +25,22 @@ pub use renderer::VelloRenderer;
 pub use text::StyledSpan;
 pub use theme::VelloTheme;
 
-use roe_core::editor::{
-    BorderInfo, ChromeAction, DragType, MouseDragState, SplitDirection, WindowNode,
-};
-use roe_core::gutter::{
-    GutterConfig, LineStatus, calculate_gutter_width, format_line_number, get_line_status,
-};
+use roe_core::Editor;
+use roe_core::gutter::{GutterConfig, calculate_gutter_width, format_line_number};
+use roe_core::native_kernel::{CapabilityGrants, ViewId};
 use roe_core::native_services::FrontendWake;
-use roe_core::renderer::{DirtyRegion, Renderer};
-use roe_core::syntax::Color as SyntaxColor;
-use roe_core::syntax::face_registry;
-use roe_core::{Editor, WindowId};
-use std::collections::HashSet;
+use roe_core::renderer::DirtyRegion;
+use roe_core::session::{
+    HostSession, InputEvent, LifecycleEvent, PointerButton, PointerEvent, PointerKind,
+    PresentationColor, PresentedView, SessionOutput, StyleDefinition,
+};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use text::TextRenderer;
 use thiserror::Error;
 use vello::kurbo::{Affine, Rect};
-use vello::peniko::{BlendMode, Color, Fill};
+use vello::peniko::{Color, Fill};
 use vello::util::{RenderContext, RenderSurface};
 use vello::wgpu;
 use vello::{AaConfig, RenderParams, RendererOptions, Scene};
@@ -68,6 +65,8 @@ pub enum FrontendError {
     Renderer(#[source] vello::Error),
     #[error("failed to capture logical presentation: {0}")]
     Presentation(#[source] std::io::Error),
+    #[error("editor session failed: {0}")]
+    Session(#[source] roe_core::session::SessionError),
     #[error("Vello renderer state is inconsistent: {0}")]
     InvalidState(&'static str),
     #[error("Vello event loop failed: {0}")]
@@ -125,22 +124,21 @@ fn pump_runtime(runtime: &compio::runtime::Runtime) {
     });
 }
 
-/// Convert a syntax color to Vello Color
-fn syntax_color_to_vello(color: &SyntaxColor, default: Color) -> Color {
+fn session_vello_color(color: &PresentationColor, default: Color) -> Color {
     match color {
-        SyntaxColor::Rgb { r, g, b } => Color::from_rgba8(*r, *g, *b, 255),
-        SyntaxColor::Named(name) => match name.to_lowercase().as_str() {
+        PresentationColor::Rgb { r, g, b } => Color::from_rgb8(*r, *g, *b),
+        PresentationColor::Named(name) => match name.as_str() {
             "black" => Color::BLACK,
-            "red" => Color::from_rgba8(255, 0, 0, 255),
-            "green" => Color::from_rgba8(0, 255, 0, 255),
-            "yellow" => Color::from_rgba8(255, 255, 0, 255),
-            "blue" => Color::from_rgba8(0, 0, 255, 255),
-            "magenta" => Color::from_rgba8(255, 0, 255, 255),
-            "cyan" => Color::from_rgba8(0, 255, 255, 255),
             "white" => Color::WHITE,
+            "red" => Color::from_rgb8(255, 0, 0),
+            "green" => Color::from_rgb8(0, 255, 0),
+            "blue" => Color::from_rgb8(0, 0, 255),
+            "yellow" => Color::from_rgb8(255, 255, 0),
+            "cyan" => Color::from_rgb8(0, 255, 255),
+            "magenta" => Color::from_rgb8(255, 0, 255),
             _ => default,
         },
-        SyntaxColor::Inherit => default,
+        PresentationColor::Inherit => default,
     }
 }
 
@@ -148,17 +146,12 @@ fn syntax_color_to_vello(color: &SyntaxColor, default: Color) -> Color {
 const SCROLLBAR_WIDTH: f64 = 14.0;
 
 /// Gutter colors
-const GUTTER_BG_COLOR: Color = Color::from_rgba8(0x14, 0x14, 0x14, 0xFF); // Slightly darker than bg
 const GUTTER_FG_COLOR: Color = Color::from_rgba8(0x60, 0x60, 0x60, 0xFF); // Dimmed line numbers
-const GUTTER_SEPARATOR_COLOR: Color = Color::from_rgba8(0x40, 0x40, 0x40, 0xFF);
-const GUTTER_MODIFIED_COLOR: Color = Color::from_rgba8(0xFF, 0xD7, 0x00, 0xFF); // Yellow
-const GUTTER_SAVED_COLOR: Color = Color::from_rgba8(0x00, 0xC8, 0x00, 0xFF); // Green
-const GUTTER_CONFLICT_COLOR: Color = Color::from_rgba8(0xFF, 0x40, 0x40, 0xFF); // Red
 
 /// Application state for the Vello renderer
 pub struct RoeVelloApp<'a> {
-    /// The editor state
-    editor: &'a mut Editor,
+    /// The shared editor host/session boundary.
+    session: HostSession,
     /// The compio runtime driving buffer host tasks
     runtime: compio::runtime::Runtime,
     /// Vello render context
@@ -185,12 +178,11 @@ pub struct RoeVelloApp<'a> {
     cursor_position: Option<(f64, f64)>,
     /// Whether mouse is being dragged for selection
     mouse_dragging: bool,
-    /// Position where mouse drag started (to set mark on first movement)
-    drag_start_cursor: Option<usize>,
     /// Whether vertical scrollbar is being dragged
-    scrollbar_dragging: Option<roe_core::WindowId>,
+    scrollbar_dragging: Option<ViewId>,
     /// Whether horizontal scrollbar is being dragged
-    hscrollbar_dragging: Option<roe_core::WindowId>,
+    hscrollbar_dragging: Option<ViewId>,
+    border_dragging: Option<bool>,
 }
 
 struct RenderState<'s> {
@@ -200,7 +192,7 @@ struct RenderState<'s> {
 
 impl<'a> RoeVelloApp<'a> {
     fn new(
-        editor: &'a mut Editor,
+        editor: Editor,
         theme: VelloTheme,
         runtime: compio::runtime::Runtime,
         wake_state: Arc<WakeState>,
@@ -212,12 +204,21 @@ impl<'a> RoeVelloApp<'a> {
             Some(theme.font_family.clone())
         };
 
+        let mut session = HostSession::open(editor, CapabilityGrants::editor_default());
+        let initial = session.initial_output();
+        let mut redraw_state = VelloRenderer::with_theme(theme.clone());
+        if let Some(update) = initial.presentation.as_ref() {
+            redraw_state
+                .apply_session_presentation(update)
+                .expect("initial session snapshot must be valid");
+        }
+
         Self {
-            editor,
+            session,
             runtime,
             render_cx: RenderContext::new(),
             renderers: vec![],
-            redraw_state: VelloRenderer::with_theme(theme.clone()),
+            redraw_state,
             state: None,
             wake_state,
             fatal_error: None,
@@ -228,9 +229,9 @@ impl<'a> RoeVelloApp<'a> {
             modifiers: ModifiersState::empty(),
             cursor_position: None,
             mouse_dragging: false,
-            drag_start_cursor: None,
             scrollbar_dragging: None,
             hscrollbar_dragging: None,
+            border_dragging: None,
         }
     }
 
@@ -244,19 +245,12 @@ impl<'a> RoeVelloApp<'a> {
 
     fn drive_background(&mut self) {
         pump_runtime(&self.runtime);
-
-        let file_change_actions = self.editor.poll_file_changes();
-        for action in file_change_actions {
-            match action {
-                ChromeAction::Echo(message) => {
-                    self.editor.set_echo_message(message);
-                    self.redraw_state.invalidate(DirtyRegion::FullScreen);
-                }
-                ChromeAction::MarkDirty(region) => self.redraw_state.invalidate(region),
-                ChromeAction::BufferChanged { .. } => {
-                    tracing::trace!("external buffer change delivered");
-                }
-                _ => {}
+        let envelope = self.session.envelope(InputEvent::Timer { token: 0 });
+        match self.runtime.block_on(self.session.dispatch(envelope)) {
+            Ok(output) => self.apply_session_output(output),
+            Err(error) => {
+                self.fatal_error = Some(FrontendError::Session(error));
+                self.quit_requested = true;
             }
         }
 
@@ -264,6 +258,30 @@ impl<'a> RoeVelloApp<'a> {
             && let Some(state) = self.state.as_ref()
         {
             state.window.request_redraw();
+        }
+    }
+
+    fn apply_session_output(&mut self, output: SessionOutput) {
+        for event in output.lifecycle {
+            match event {
+                LifecycleEvent::QuitRequested | LifecycleEvent::EndpointClosed => {
+                    self.quit_requested = true;
+                }
+                LifecycleEvent::Warning(message) => tracing::warn!(%message, "session warning"),
+                LifecycleEvent::Error(message) => tracing::error!(%message, "session error"),
+                LifecycleEvent::Ready { .. } | LifecycleEvent::Heartbeat => {}
+            }
+        }
+        if let Some(update) = output.presentation {
+            if let Err(error) = self.redraw_state.apply_session_presentation(&update) {
+                self.fatal_error = Some(FrontendError::Presentation(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    error,
+                )));
+                self.quit_requested = true;
+                return;
+            }
+            self.redraw_state.invalidate(DirtyRegion::FullScreen);
         }
     }
 
@@ -296,22 +314,9 @@ impl<'a> RoeVelloApp<'a> {
         let logical_width = (width as f64 / scale_factor) as u32;
         let logical_height = (height as f64 / scale_factor) as u32;
 
-        // Get dimensions from text renderer
-        let char_width = self.text_renderer.char_width();
-        let line_height = self.text_renderer.line_height();
-
-        // Update editor frame dimensions (using logical dimensions)
-        let cols = (logical_width as f32 / char_width).floor() as u16;
-        let lines = (logical_height as f32 / line_height).floor() as u16;
-        self.editor
-            .handle_resize(cols.max(1), lines.saturating_sub(1).max(1)); // -1 for echo area
-        self.redraw_state
-            .render_full(self.editor)
-            .map_err(FrontendError::Presentation)?;
-
         // Build the scene in logical coordinates, then scale for physical rendering
         self.scene.reset();
-        self.build_scene(logical_width, logical_height);
+        self.build_session_scene(logical_width, logical_height)?;
 
         // Apply scale factor transform to the scene
         if scale_factor != 1.0 {
@@ -399,1126 +404,368 @@ impl<'a> RoeVelloApp<'a> {
         Ok(())
     }
 
-    fn build_scene(&mut self, width: u32, height: u32) {
-        // Draw background
-        let bg_rect = Rect::new(0.0, 0.0, width as f64, height as f64);
+    fn build_session_scene(&mut self, width: u32, height: u32) -> Result<(), FrontendError> {
+        let snapshot = self
+            .redraw_state
+            .session_presentation()
+            .current()
+            .cloned()
+            .ok_or(FrontendError::InvalidState(
+                "session has no logical presentation",
+            ))?;
+        let background = Rect::new(0.0, 0.0, width as f64, height as f64);
         self.scene.fill(
-            vello::peniko::Fill::NonZero,
-            Affine::IDENTITY,
-            self.theme.bg_color,
-            None,
-            &bg_rect,
-        );
-
-        // Draw each window
-        for window_id in self.editor.windows.keys().collect::<Vec<_>>() {
-            self.draw_window(window_id);
-        }
-
-        // Draw echo area at bottom
-        self.draw_echo_area(width, height);
-    }
-
-    fn draw_window(&mut self, window_id: roe_core::WindowId) {
-        let char_width = self.text_renderer.char_width() as f64;
-        let line_height = self.text_renderer.line_height() as f64;
-
-        let window = &self.editor.windows[window_id];
-        let is_active = window_id == self.editor.active_window;
-
-        // Calculate window bounds in pixels
-        let x = window.x as f64 * char_width;
-        let y = window.y as f64 * line_height;
-        let w = window.width_chars as f64 * char_width;
-        let h = window.height_chars as f64 * line_height;
-
-        // Draw window background
-        let window_rect = Rect::new(x, y, x + w, y + h);
-        self.scene.fill(
-            vello::peniko::Fill::NonZero,
-            Affine::IDENTITY,
-            self.theme.bg_color,
-            None,
-            &window_rect,
-        );
-
-        // Draw border
-        let border_color = if is_active {
-            self.theme.active_border_color
-        } else {
-            self.theme.border_color
-        };
-
-        // Top border
-        let top_border = Rect::new(x, y, x + w, y + 2.0);
-        self.scene.fill(
-            vello::peniko::Fill::NonZero,
-            Affine::IDENTITY,
-            border_color,
-            None,
-            &top_border,
-        );
-
-        // Bottom border / modeline background
-        let modeline_y = y + h - line_height;
-        let modeline_rect = Rect::new(x, modeline_y, x + w, modeline_y + line_height);
-        let modeline_color = if is_active {
-            self.theme.mode_line_bg_color
-        } else {
-            self.theme.inactive_mode_line_bg_color
-        };
-        self.scene.fill(
-            vello::peniko::Fill::NonZero,
-            Affine::IDENTITY,
-            modeline_color,
-            None,
-            &modeline_rect,
-        );
-
-        // Left border
-        let left_border = Rect::new(x, y, x + 2.0, y + h);
-        self.scene.fill(
-            vello::peniko::Fill::NonZero,
-            Affine::IDENTITY,
-            border_color,
-            None,
-            &left_border,
-        );
-
-        // Right border
-        let right_border = Rect::new(x + w - 2.0, y, x + w, y + h);
-        self.scene.fill(
-            vello::peniko::Fill::NonZero,
-            Affine::IDENTITY,
-            border_color,
-            None,
-            &right_border,
-        );
-
-        // Get buffer info - guard against stale buffer IDs
-        let Some(buffer) = self.editor.buffers.get(window.active_buffer) else {
-            // Buffer no longer exists (likely replaced by visit-file), skip rendering
-            return;
-        };
-        let base_content_x = x + char_width;
-        let content_y = y + line_height;
-        // Reserve space for horizontal scrollbar at bottom
-        let content_height = window.height_chars.saturating_sub(3) as usize; // -3 for top border, modeline, h-scrollbar
-        let start_line = window.start_line as usize;
-        let start_column = window.start_column as usize;
-
-        // Check if gutter should be shown (controlled by major mode)
-        let show_gutter = buffer.show_gutter();
-
-        // Calculate gutter width and get modified lines
-        let (gutter_width_chars, modified_lines): (usize, HashSet<usize>) = if show_gutter {
-            let total_lines = buffer.buffer_len_lines();
-            let config = GutterConfig::default();
-            let width = calculate_gutter_width(total_lines, &config);
-            let buffer_content = buffer.content();
-            let modified = self
-                .editor
-                .file_watcher
-                .get_modified_lines(window.active_buffer, &buffer_content);
-            (width, modified)
-        } else {
-            (0, HashSet::new())
-        };
-
-        let gutter_width_px = gutter_width_chars as f64 * char_width;
-        let content_x = base_content_x + gutter_width_px;
-
-        // Account for scrollbar width and gutter in content area
-        let content_width_px = w - (2.0 * char_width) - SCROLLBAR_WIDTH - 4.0 - gutter_width_px;
-        let content_width = content_width_px as f32;
-        let content_width_chars = (content_width_px / char_width) as usize;
-
-        // Calculate line number width for formatting
-        let line_number_width = gutter_width_chars.saturating_sub(2); // Subtract status indicator and separator
-
-        // For tracking merged lines (TODO: track separately)
-        let merged_lines: HashSet<usize> = HashSet::new();
-
-        // Draw gutter background and content (outside clip region)
-        if show_gutter {
-            // Gutter background
-            let gutter_rect = Rect::new(
-                base_content_x,
-                content_y,
-                base_content_x + gutter_width_px,
-                content_y + (content_height as f64 * line_height),
-            );
-            self.scene.fill(
-                vello::peniko::Fill::NonZero,
-                Affine::IDENTITY,
-                GUTTER_BG_COLOR,
-                None,
-                &gutter_rect,
-            );
-
-            // Gutter separator line
-            let separator_x = base_content_x + gutter_width_px - 1.0;
-            let separator_rect = Rect::new(
-                separator_x,
-                content_y,
-                separator_x + 1.0,
-                content_y + (content_height as f64 * line_height),
-            );
-            self.scene.fill(
-                vello::peniko::Fill::NonZero,
-                Affine::IDENTITY,
-                GUTTER_SEPARATOR_COLOR,
-                None,
-                &separator_rect,
-            );
-
-            // Draw line numbers and status indicators for visible lines
-            let total_buffer_lines = buffer.buffer_len_lines();
-            for visual_row in 0..content_height {
-                let buffer_line = start_line + visual_row;
-                let gutter_y = content_y + (visual_row as f64 * line_height);
-
-                if buffer_line < total_buffer_lines {
-                    // Get line content for status check
-                    let line_text = buffer.buffer_line(buffer_line);
-                    let line_status =
-                        get_line_status(&line_text, buffer_line, &modified_lines, &merged_lines);
-
-                    // Draw status indicator bar
-                    let status_color = match line_status {
-                        LineStatus::Clean => None,
-                        LineStatus::Modified => Some(GUTTER_MODIFIED_COLOR),
-                        LineStatus::ModifiedSaved => Some(GUTTER_SAVED_COLOR),
-                        LineStatus::Conflict => Some(GUTTER_CONFLICT_COLOR),
-                    };
-
-                    if let Some(color) = status_color {
-                        let status_rect = Rect::new(
-                            base_content_x,
-                            gutter_y,
-                            base_content_x + 3.0, // 3px wide bar
-                            gutter_y + line_height,
-                        );
-                        self.scene.fill(
-                            vello::peniko::Fill::NonZero,
-                            Affine::IDENTITY,
-                            color,
-                            None,
-                            &status_rect,
-                        );
-                    }
-
-                    // Draw line number (right-aligned)
-                    let line_num_str = format_line_number(buffer_line + 1, line_number_width);
-                    let line_num_x = base_content_x + char_width; // After status indicator
-                    self.text_renderer.render_line(
-                        &mut self.scene,
-                        &line_num_str,
-                        line_num_x as f32,
-                        gutter_y as f32,
-                        GUTTER_FG_COLOR,
-                        None,
-                    );
-                } else {
-                    // Empty line (past end of buffer) - show tilde
-                    let tilde_str = format!("{:>width$}", "~", width = line_number_width);
-                    let line_num_x = base_content_x + char_width;
-                    self.text_renderer.render_line(
-                        &mut self.scene,
-                        &tilde_str,
-                        line_num_x as f32,
-                        gutter_y as f32,
-                        GUTTER_FG_COLOR,
-                        None,
-                    );
-                }
-            }
-        }
-
-        // Set up clipping region for content area (prevents text overflow)
-        let clip_rect = Rect::new(
-            content_x,
-            content_y,
-            content_x + content_width_px,
-            content_y + (content_height as f64 * line_height),
-        );
-        self.scene.push_layer(
             Fill::NonZero,
-            BlendMode::default(),
-            1.0,
             Affine::IDENTITY,
-            &clip_rect,
-        );
-
-        // Get selection region (only for active window)
-        let region_bounds = if is_active {
-            buffer.get_region(window.cursor)
-        } else {
-            None
-        };
-
-        // Collect lines to render with their buffer positions, track max width
-        let mut max_line_len: usize = 0;
-        let lines_to_render: Vec<(usize, usize, String)> = buffer
-            .buffer_lines()
-            .into_iter()
-            .enumerate()
-            .inspect(|(_, text)| {
-                let len = text.trim_end_matches('\n').chars().count();
-                if len > max_line_len {
-                    max_line_len = len;
-                }
-            })
-            .filter(|(idx, _)| *idx >= start_line && (*idx - start_line) < content_height)
-            .map(|(idx, text)| {
-                let line_start_pos = buffer.to_char_index(0, idx as u16);
-                (
-                    idx - start_line,
-                    line_start_pos,
-                    text.trim_end_matches('\n').to_string(),
-                )
-            })
-            .collect();
-
-        // Draw selection highlights first (behind text), accounting for horizontal scroll
-        if let Some((region_start, region_end)) = region_bounds {
-            let selection_color = self.theme.selection_color;
-            for (visual_line, line_start_pos, line_text) in &lines_to_render {
-                let line_char_len = line_text.chars().count();
-                let line_end_pos = line_start_pos + line_char_len;
-
-                // Check if this line intersects with selection
-                if *line_start_pos < region_end && line_end_pos > region_start {
-                    // Calculate selection bounds within this line
-                    let sel_start_in_line = if region_start > *line_start_pos {
-                        region_start - line_start_pos
-                    } else {
-                        0
-                    };
-                    let sel_end_in_line = if region_end < line_end_pos {
-                        region_end - line_start_pos
-                    } else {
-                        line_char_len
-                    };
-
-                    // Adjust for horizontal scroll
-                    let visible_sel_start = sel_start_in_line.saturating_sub(start_column);
-                    let visible_sel_end = sel_end_in_line.saturating_sub(start_column);
-
-                    if visible_sel_end > 0 && visible_sel_start < content_width_chars {
-                        let sel_x = content_x + (visible_sel_start as f64 * char_width);
-                        let sel_y = content_y + (*visual_line as f64 * line_height);
-                        let sel_width = (visible_sel_end - visible_sel_start) as f64 * char_width;
-
-                        let sel_rect =
-                            Rect::new(sel_x, sel_y, sel_x + sel_width, sel_y + line_height);
-                        self.scene.fill(
-                            vello::peniko::Fill::NonZero,
-                            Affine::IDENTITY,
-                            selection_color,
-                            None,
-                            &sel_rect,
-                        );
-                    }
-                }
-            }
-        }
-
-        // Render each line of text with horizontal scroll offset and syntax highlighting
-        let fg_color = self.theme.fg_color;
-        let face_registry_guard = face_registry().lock().ok();
-
-        for (visual_line, line_start_char, line_text) in lines_to_render {
-            // Apply horizontal scroll - skip start_column characters
-            let visible_text: String = line_text.chars().skip(start_column).collect();
-            if visible_text.is_empty() {
-                continue;
-            }
-
-            let text_x = content_x as f32;
-            let text_y = content_y as f32 + (visual_line as f32) * line_height as f32;
-
-            let line_char_count = line_text.chars().count();
-            let line_end_char = line_start_char + line_char_count;
-            let syntax_spans = buffer.spans_in_range(line_start_char..line_end_char);
-
-            // Draw background rectangles for spans with background colors
-            let visible_char_count = visible_text.chars().count();
-            if let Some(ref registry) = face_registry_guard {
-                for span in &syntax_spans {
-                    if let Some(face) = registry.get(span.face_id)
-                        && let Some(ref bg_color) = face.background
-                    {
-                        let span_start_in_line = span.start.saturating_sub(line_start_char);
-                        let span_end_in_line = span
-                            .end
-                            .saturating_sub(line_start_char)
-                            .min(line_char_count);
-
-                        // Adjust for horizontal scroll
-                        if span_end_in_line <= start_column
-                            || span_start_in_line >= start_column + visible_char_count
-                        {
-                            continue; // Span is not visible
-                        }
-
-                        let visible_start = span_start_in_line.saturating_sub(start_column);
-                        let visible_end = span_end_in_line
-                            .saturating_sub(start_column)
-                            .min(visible_char_count);
-
-                        if visible_start >= visible_end {
-                            continue;
-                        }
-
-                        // Draw background rectangle
-                        let bg_x = text_x + (visible_start as f32 * char_width as f32);
-                        let bg_w = (visible_end - visible_start) as f32 * char_width as f32;
-                        let bg_rect = Rect::new(
-                            bg_x as f64,
-                            text_y as f64,
-                            (bg_x + bg_w) as f64,
-                            (text_y + line_height as f32) as f64,
-                        );
-                        let vello_bg = syntax_color_to_vello(bg_color, self.theme.bg_color);
-                        self.scene.fill(
-                            vello::peniko::Fill::NonZero,
-                            Affine::IDENTITY,
-                            vello_bg,
-                            None,
-                            &bg_rect,
-                        );
-                    }
-                }
-            }
-
-            // Convert buffer spans to StyledSpans for rendering
-            let styled_spans: Vec<StyledSpan> = if let Some(ref registry) = face_registry_guard {
-                syntax_spans
-                    .iter()
-                    .filter_map(|span| {
-                        let face = registry.get(span.face_id)?;
-                        let span_start_in_line = span.start.saturating_sub(line_start_char);
-                        let span_end_in_line = span
-                            .end
-                            .saturating_sub(line_start_char)
-                            .min(line_char_count);
-
-                        // Adjust for horizontal scroll
-                        if span_end_in_line <= start_column
-                            || span_start_in_line >= start_column + visible_char_count
-                        {
-                            return None; // Span is not visible
-                        }
-
-                        let visible_start = span_start_in_line.saturating_sub(start_column);
-                        let visible_end = span_end_in_line
-                            .saturating_sub(start_column)
-                            .min(visible_char_count);
-
-                        if visible_start >= visible_end {
-                            return None;
-                        }
-
-                        let color = face
-                            .foreground
-                            .as_ref()
-                            .map(|c| syntax_color_to_vello(c, fg_color))
-                            .unwrap_or(fg_color);
-
-                        Some(
-                            StyledSpan::new(visible_start, visible_end, color)
-                                .with_bold(face.bold)
-                                .with_italic(face.italic),
-                        )
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-
-            // Use styled rendering if we have spans, otherwise plain rendering
-            if styled_spans.is_empty() {
-                self.text_renderer.render_line(
-                    &mut self.scene,
-                    &visible_text,
-                    text_x,
-                    text_y,
-                    fg_color,
-                    Some(content_width),
-                );
-            } else {
-                self.text_renderer.render_line_with_styles(
-                    &mut self.scene,
-                    &visible_text,
-                    text_x,
-                    text_y,
-                    fg_color,
-                    &styled_spans,
-                );
-            }
-        }
-
-        // Draw cursor (inside clipping region), accounting for horizontal scroll
-        if is_active {
-            let (col, line) = buffer.to_column_line(window.cursor);
-            let line = line as usize;
-            let col = col as usize;
-            if line >= start_line {
-                let cursor_visual_line = line - start_line;
-                // Check if cursor is horizontally visible
-                if cursor_visual_line < content_height
-                    && col >= start_column
-                    && col < start_column + content_width_chars
-                {
-                    let visual_col = col - start_column;
-                    let cursor_x = content_x + (visual_col as f64 * char_width);
-                    let cursor_y = content_y + (cursor_visual_line as f64) * line_height;
-
-                    let cursor_rect =
-                        Rect::new(cursor_x, cursor_y, cursor_x + 2.0, cursor_y + line_height);
-                    self.scene.fill(
-                        vello::peniko::Fill::NonZero,
-                        Affine::IDENTITY,
-                        self.theme.cursor_color,
-                        None,
-                        &cursor_rect,
-                    );
-                }
-            }
-        }
-
-        // Pop the clipping layer (content area done)
-        self.scene.pop_layer();
-
-        // Draw modeline text (outside clip)
-        let buffer_name = buffer.object();
-        let (col, line) = buffer.to_column_line(window.cursor);
-        let major_mode_str = buffer
-            .major_mode()
-            .map(|m| format!("({}) ", m))
-            .unwrap_or_default();
-        let modeline_text = if is_active {
-            format!(
-                " ᚱᛟ {} {}{}:{}",
-                buffer_name,
-                major_mode_str,
-                line + 1,
-                col + 1
-            )
-        } else {
-            format!(
-                "    {} {}{}:{}",
-                buffer_name,
-                major_mode_str,
-                line + 1,
-                col + 1
-            )
-        };
-
-        self.text_renderer.render_line(
-            &mut self.scene,
-            &modeline_text,
-            (x + char_width) as f32,
-            modeline_y as f32,
-            self.theme.fg_color,
-            Some(content_width),
-        );
-
-        // Draw scrollbar
-        let total_lines = buffer.buffer_len_lines().max(1);
-        let scrollbar_x = x + w - SCROLLBAR_WIDTH - 2.0; // Inside right border
-        let scrollbar_top = y + 2.0; // Below top border
-        let scrollbar_height = h - line_height - 4.0; // Above modeline
-
-        // Draw scrollbar track (subtle background)
-        let track_rect = Rect::new(
-            scrollbar_x,
-            scrollbar_top,
-            scrollbar_x + SCROLLBAR_WIDTH,
-            scrollbar_top + scrollbar_height,
-        );
-        self.scene.fill(
-            vello::peniko::Fill::NonZero,
-            Affine::IDENTITY,
-            Color::from_rgba8(0x40, 0x40, 0x40, 0x80),
+            self.theme.bg_color,
             None,
-            &track_rect,
+            &background,
         );
-
-        // Calculate thumb position and size
-        let visible_ratio = (content_height as f64 / total_lines as f64).min(1.0);
-        let thumb_height = (scrollbar_height * visible_ratio).max(20.0); // Minimum thumb size
-        let scroll_ratio = if total_lines > content_height {
-            start_line as f64 / (total_lines - content_height) as f64
-        } else {
-            0.0
-        };
-        let thumb_y = scrollbar_top + scroll_ratio * (scrollbar_height - thumb_height);
-
-        // Draw thumb
-        let thumb_rect = Rect::new(
-            scrollbar_x + 2.0,
-            thumb_y,
-            scrollbar_x + SCROLLBAR_WIDTH - 2.0,
-            thumb_y + thumb_height,
-        );
-        let thumb_color = if is_active {
-            Color::from_rgba8(0x80, 0x80, 0x80, 0xC0)
-        } else {
-            Color::from_rgba8(0x60, 0x60, 0x60, 0xA0)
-        };
-        self.scene.fill(
-            vello::peniko::Fill::NonZero,
-            Affine::IDENTITY,
-            thumb_color,
-            None,
-            &thumb_rect,
-        );
-
-        // Draw horizontal scrollbar (only if content exceeds visible width)
-        if max_line_len > content_width_chars {
-            let hscroll_y = y + h - line_height - SCROLLBAR_WIDTH - 2.0; // Above modeline
-            let hscroll_x = x + 2.0; // After left border
-            let hscroll_width = w - SCROLLBAR_WIDTH - 6.0; // Before vertical scrollbar
-
-            // Draw horizontal scrollbar track
-            let htrack_rect = Rect::new(
-                hscroll_x,
-                hscroll_y,
-                hscroll_x + hscroll_width,
-                hscroll_y + SCROLLBAR_WIDTH,
-            );
-            self.scene.fill(
-                vello::peniko::Fill::NonZero,
-                Affine::IDENTITY,
-                Color::from_rgba8(0x40, 0x40, 0x40, 0x80),
-                None,
-                &htrack_rect,
-            );
-
-            // Calculate horizontal thumb position and size
-            let h_visible_ratio = (content_width_chars as f64 / max_line_len as f64).min(1.0);
-            let hthumb_width = (hscroll_width * h_visible_ratio).max(20.0);
-            let h_scroll_ratio = if max_line_len > content_width_chars {
-                start_column as f64 / (max_line_len - content_width_chars) as f64
-            } else {
-                0.0
-            };
-            let hthumb_x = hscroll_x + h_scroll_ratio * (hscroll_width - hthumb_width);
-
-            // Draw horizontal thumb
-            let hthumb_rect = Rect::new(
-                hthumb_x,
-                hscroll_y + 2.0,
-                hthumb_x + hthumb_width,
-                hscroll_y + SCROLLBAR_WIDTH - 2.0,
-            );
-            self.scene.fill(
-                vello::peniko::Fill::NonZero,
-                Affine::IDENTITY,
-                thumb_color,
-                None,
-                &hthumb_rect,
-            );
+        for view in &snapshot.views {
+            self.draw_session_view(view, &snapshot.styles);
         }
-    }
 
-    fn draw_echo_area(&mut self, width: u32, height: u32) {
-        let line_height = self.text_renderer.line_height() as f64;
+        let line_height = f64::from(self.text_renderer.line_height());
         let echo_y = height as f64 - line_height;
-
-        // Echo area background
         let echo_rect = Rect::new(0.0, echo_y, width as f64, height as f64);
         self.scene.fill(
-            vello::peniko::Fill::NonZero,
+            Fill::NonZero,
             Affine::IDENTITY,
             self.theme.bg_color,
             None,
             &echo_rect,
         );
-
-        // Draw echo message text
-        if !self.editor.echo_message.is_empty() {
-            let message = self.editor.echo_message.clone();
-            let fg_color = self.theme.fg_color;
+        if !snapshot.echo_area.is_empty() {
             self.text_renderer.render_line(
                 &mut self.scene,
-                &message,
-                4.0, // Small left padding
+                &snapshot.echo_area,
+                4.0,
                 echo_y as f32,
-                fg_color,
+                self.theme.fg_color,
                 Some(width as f32 - 8.0),
             );
         }
+        Ok(())
     }
 
-    async fn handle_key_event(&mut self, event: winit::event::KeyEvent) -> Vec<ChromeAction> {
+    fn draw_session_view(&mut self, view: &PresentedView, styles: &[StyleDefinition]) {
+        let char_width = f64::from(self.text_renderer.char_width());
+        let line_height = f64::from(self.text_renderer.line_height());
+        let x = f64::from(view.geometry.x) * char_width;
+        let y = f64::from(view.geometry.y) * line_height;
+        let width = f64::from(view.geometry.columns) * char_width;
+        let height = f64::from(view.geometry.rows) * line_height;
+        let border = if view.active {
+            self.theme.active_border_color
+        } else {
+            self.theme.border_color
+        };
+        self.scene.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            self.theme.bg_color,
+            None,
+            &Rect::new(x, y, x + width, y + height),
+        );
+        for rect in [
+            Rect::new(x, y, x + width, y + 2.0),
+            Rect::new(x, y, x + 2.0, y + height),
+            Rect::new(x + width - 2.0, y, x + width, y + height),
+        ] {
+            self.scene
+                .fill(Fill::NonZero, Affine::IDENTITY, border, None, &rect);
+        }
+        let modeline_y = y + height - line_height;
+        let modeline_color = if view.active {
+            self.theme.mode_line_bg_color
+        } else {
+            self.theme.inactive_mode_line_bg_color
+        };
+        self.scene.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            modeline_color,
+            None,
+            &Rect::new(x, modeline_y, x + width, modeline_y + line_height),
+        );
+        self.text_renderer.render_line(
+            &mut self.scene,
+            &view.modeline,
+            (x + 4.0) as f32,
+            modeline_y as f32,
+            self.theme.fg_color,
+            Some((width - 8.0) as f32),
+        );
+
+        let gutter_chars = if view.show_gutter {
+            calculate_gutter_width(view.total_lines, &GutterConfig::default())
+        } else {
+            0
+        };
+        let content_x = x + char_width * (1 + gutter_chars) as f64;
+        let content_width_chars = view
+            .geometry
+            .columns
+            .saturating_sub(2 + gutter_chars as u16) as usize;
+        let content_rows = view.geometry.rows.saturating_sub(2) as usize;
+        let mut absolute = view.visible_start_char;
+        for (row, raw_line) in view
+            .visible_text
+            .split_inclusive('\n')
+            .take(content_rows)
+            .enumerate()
+        {
+            let line = raw_line.trim_end_matches('\n');
+            let displayed: String = line
+                .chars()
+                .skip(usize::from(view.scroll.start_column))
+                .take(content_width_chars)
+                .collect();
+            let line_y = y + line_height * (row + 1) as f64;
+            if view.show_gutter {
+                let line_number = usize::from(view.scroll.start_line) + row + 1;
+                let label = format_line_number(line_number, gutter_chars.saturating_sub(2));
+                self.text_renderer.render_line(
+                    &mut self.scene,
+                    &format!(" {label}│"),
+                    (x + char_width) as f32,
+                    line_y as f32,
+                    GUTTER_FG_COLOR,
+                    None,
+                );
+            }
+            let visible_column = usize::from(view.scroll.start_column);
+            let spans: Vec<StyledSpan> = view
+                .styled_ranges
+                .iter()
+                .filter_map(|range| {
+                    let start = range.start.max(absolute + visible_column);
+                    let end = range
+                        .end
+                        .min(absolute + visible_column + displayed.chars().count());
+                    if start >= end {
+                        return None;
+                    }
+                    let style = styles.iter().find(|style| style.id == range.style)?;
+                    let color = style
+                        .foreground
+                        .as_ref()
+                        .map(|color| session_vello_color(color, self.theme.fg_color))
+                        .unwrap_or(self.theme.fg_color);
+                    Some(
+                        StyledSpan::new(
+                            start - absolute - visible_column,
+                            end - absolute - visible_column,
+                            color,
+                        )
+                        .with_bold(style.bold)
+                        .with_italic(style.italic),
+                    )
+                })
+                .collect();
+            self.text_renderer.render_line_with_styles(
+                &mut self.scene,
+                &displayed,
+                content_x as f32,
+                line_y as f32,
+                self.theme.fg_color,
+                &spans,
+            );
+            absolute += line.chars().count() + usize::from(raw_line.ends_with('\n'));
+        }
+    }
+
+    async fn handle_key_event(&mut self, event: winit::event::KeyEvent) {
         if event.state != ElementState::Pressed {
-            return vec![];
+            return;
         }
 
         let keys = key_translate::translate_key_event(&event, self.modifiers);
         if keys.is_empty() {
-            return vec![];
+            return;
         }
 
-        self.editor.key_event(keys).await.unwrap_or_default()
+        let envelope = self.session.envelope(InputEvent::Keys(keys));
+        match self.session.dispatch(envelope).await {
+            Ok(output) => self.apply_session_output(output),
+            Err(error) => {
+                self.fatal_error = Some(FrontendError::Session(error));
+                self.quit_requested = true;
+            }
+        }
     }
 
     /// Handle mouse click at the given pixel position
     async fn handle_mouse_click(&mut self, x: f64, y: f64) {
-        let char_width = self.text_renderer.char_width() as f64;
-        let line_height = self.text_renderer.line_height() as f64;
-
-        // Convert pixel position to character grid position
-        let grid_x = (x / char_width) as u16;
-        let grid_y = (y / line_height) as u16;
-
-        // Find which window was clicked
-        let clicked_window = self.find_window_at_position(grid_x, grid_y);
-
-        let Some(window_id) = clicked_window else {
-            return;
-        };
-
-        // Switch to clicked window if different from active
-        if self.editor.active_window != window_id {
-            self.editor.previous_active_window = Some(self.editor.active_window);
-            self.editor.active_window = window_id;
-        }
-
-        // Calculate cursor position within the buffer
-        let window = &self.editor.windows[window_id];
-        let buffer = &self.editor.buffers[window.active_buffer];
-
-        // Position relative to window content area (+1 for border)
-        let relative_x = grid_x.saturating_sub(window.x + 1);
-        let relative_y = grid_y.saturating_sub(window.y + 1);
-
-        // Convert to buffer position (account for scroll offsets)
-        let buffer_line = relative_y as usize + window.start_line as usize;
-        let buffer_col = relative_x as usize + window.start_column as usize;
-
-        // Clamp line to valid range
-        let total_lines = buffer.buffer_len_lines();
-        if total_lines == 0 {
-            // Empty buffer - set cursor to 0
-            let window = self.editor.windows.get_mut(window_id).unwrap();
-            window.cursor = 0;
-            return;
-        }
-        let clamped_line = buffer_line.min(total_lines - 1);
-
-        // Get line length to clamp column
-        let line_text = buffer
-            .buffer_lines()
-            .into_iter()
-            .nth(clamped_line)
-            .unwrap_or_default();
-        let line_len = line_text.trim_end_matches('\n').chars().count();
-        let clamped_col = buffer_col.min(line_len);
-
-        // Get the new cursor position using clamped values
-        let new_cursor = buffer.to_char_index(clamped_col as u16, clamped_line as u16);
-
-        // Final safety clamp to buffer length
-        let buffer_len = buffer.buffer_len_chars();
-        let clamped_cursor = new_cursor.min(buffer_len);
-
-        // Update cursor in window
-        let window = self.editor.windows.get_mut(window_id).unwrap();
-        window.cursor = clamped_cursor;
-
-        // Clear any existing mark (simple click shouldn't start selection)
-        buffer.clear_mark();
-    }
-
-    /// Handle mouse drag to update selection
-    fn handle_mouse_drag(&mut self, x: f64, y: f64) {
-        let char_width = self.text_renderer.char_width() as f64;
-        let line_height = self.text_renderer.line_height() as f64;
-
-        // Convert pixel position to character grid position
-        let grid_x = (x / char_width) as u16;
-        let grid_y = (y / line_height) as u16;
-
-        // Only update cursor in the active window during drag
-        let window_id = self.editor.active_window;
-        let window = &self.editor.windows[window_id];
-        let buffer = &self.editor.buffers[window.active_buffer];
-
-        // Position relative to window content area (+1 for border)
-        let relative_x = grid_x.saturating_sub(window.x + 1);
-        let relative_y = grid_y.saturating_sub(window.y + 1);
-
-        // Convert to buffer position (account for scroll offsets)
-        let buffer_line = relative_y as usize + window.start_line as usize;
-        let buffer_col = relative_x as usize + window.start_column as usize;
-
-        // Clamp line to valid range
-        let total_lines = buffer.buffer_len_lines();
-        if total_lines == 0 {
-            return;
-        }
-        let clamped_line = buffer_line.min(total_lines - 1);
-
-        // Get line length to clamp column
-        let line_text = buffer
-            .buffer_lines()
-            .into_iter()
-            .nth(clamped_line)
-            .unwrap_or_default();
-        let line_len = line_text.trim_end_matches('\n').chars().count();
-        let clamped_col = buffer_col.min(line_len);
-
-        // Get the new cursor position using clamped values
-        let new_cursor = buffer.to_char_index(clamped_col as u16, clamped_line as u16);
-
-        // Final safety clamp to buffer length
-        let buffer_len = buffer.buffer_len_chars();
-        let clamped_cursor = new_cursor.min(buffer_len);
-
-        // On first drag movement, set the mark at the starting position
-        if let Some(start_cursor) = self.drag_start_cursor.take() {
-            buffer.set_mark(start_cursor);
-        }
-
-        // Update cursor in window
-        let window = self.editor.windows.get_mut(window_id).unwrap();
-        window.cursor = clamped_cursor;
-    }
-
-    /// Find which window contains the given grid position
-    fn find_window_at_position(&self, x: u16, y: u16) -> Option<roe_core::WindowId> {
-        for (window_id, window) in &self.editor.windows {
-            // Check if position is within window content area
-            let content_left = window.x + 1; // +1 for left border
-            let content_right = window.x + window.width_chars - 1;
-            let content_top = window.y;
-            let content_bottom = window.y + window.height_chars - 1;
-
-            if x >= content_left && x < content_right && y >= content_top && y <= content_bottom {
-                return Some(window_id);
+        let column = (x / f64::from(self.text_renderer.char_width())) as u16;
+        let row = (y / f64::from(self.text_renderer.line_height())) as u16;
+        let envelope = self.session.envelope(InputEvent::Pointer(PointerEvent {
+            column,
+            row,
+            kind: PointerKind::Down,
+            button: PointerButton::Primary,
+        }));
+        match self.session.dispatch(envelope).await {
+            Ok(output) => self.apply_session_output(output),
+            Err(error) => {
+                self.fatal_error = Some(FrontendError::Session(error));
+                self.quit_requested = true;
             }
         }
-        None
     }
 
-    /// Check if a pixel position is in a window's scrollbar, returns (window_id, relative_y_ratio)
-    fn check_scrollbar_hit(&self, px: f64, py: f64) -> Option<(roe_core::WindowId, f64)> {
-        let char_width = self.text_renderer.char_width() as f64;
-        let line_height = self.text_renderer.line_height() as f64;
+    fn presented_view(&self, id: ViewId) -> Option<&PresentedView> {
+        self.redraw_state
+            .session_presentation()
+            .current()?
+            .views
+            .iter()
+            .find(|view| view.id == id)
+    }
 
-        for (window_id, window) in &self.editor.windows {
-            let x = window.x as f64 * char_width;
-            let y = window.y as f64 * line_height;
-            let w = window.width_chars as f64 * char_width;
-            let h = window.height_chars as f64 * line_height;
-
-            let scrollbar_x = x + w - SCROLLBAR_WIDTH - 2.0;
-            let scrollbar_top = y + 2.0;
-            let scrollbar_height = h - line_height - 4.0;
-
-            // Check if position is in scrollbar area
+    fn check_scrollbar_hit(&self, px: f64, py: f64) -> Option<(ViewId, f64)> {
+        let char_width = f64::from(self.text_renderer.char_width());
+        let line_height = f64::from(self.text_renderer.line_height());
+        for view in &self.redraw_state.session_presentation().current()?.views {
+            let x = f64::from(view.geometry.x) * char_width;
+            let y = f64::from(view.geometry.y) * line_height;
+            let width = f64::from(view.geometry.columns) * char_width;
+            let height = f64::from(view.geometry.rows) * line_height;
+            let scrollbar_x = x + width - SCROLLBAR_WIDTH - 2.0;
+            let top = y + 2.0;
+            let extent = height - line_height - 4.0;
             if px >= scrollbar_x
                 && px <= scrollbar_x + SCROLLBAR_WIDTH
-                && py >= scrollbar_top
-                && py <= scrollbar_top + scrollbar_height
+                && py >= top
+                && py <= top + extent
             {
-                // Return ratio of position within scrollbar
-                let ratio = (py - scrollbar_top) / scrollbar_height;
-                return Some((window_id, ratio.clamp(0.0, 1.0)));
+                return Some((view.id, ((py - top) / extent).clamp(0.0, 1.0)));
             }
         }
         None
     }
 
-    /// Handle scrollbar click - scroll to position
-    fn handle_scrollbar_click(&mut self, window_id: roe_core::WindowId, ratio: f64) {
-        let window = &self.editor.windows[window_id];
-        let buffer = &self.editor.buffers[window.active_buffer];
-        let total_lines = buffer.buffer_len_lines();
-        let content_height = window.height_chars.saturating_sub(2) as usize;
-
-        if total_lines <= content_height {
-            return; // No scrolling needed
-        }
-
-        // Calculate new start line based on click ratio
-        let max_start = total_lines.saturating_sub(content_height);
-        let new_start = ((max_start as f64) * ratio).round() as usize;
-
-        let window = self.editor.windows.get_mut(window_id).unwrap();
-        window.start_line = new_start as u16;
-    }
-
-    /// Handle scrollbar drag
-    fn handle_scrollbar_drag(&mut self, py: f64) {
-        let Some(window_id) = self.scrollbar_dragging else {
+    async fn handle_scrollbar_click(&mut self, view_id: ViewId, ratio: f64) {
+        let Some(view) = self.presented_view(view_id).cloned() else {
             return;
         };
-
-        let line_height = self.text_renderer.line_height() as f64;
-
-        let window = &self.editor.windows[window_id];
-        let y = window.y as f64 * line_height;
-        let h = window.height_chars as f64 * line_height;
-
-        let scrollbar_top = y + 2.0;
-        let scrollbar_height = h - line_height - 4.0;
-
-        // Calculate ratio from pixel position
-        let ratio = ((py - scrollbar_top) / scrollbar_height).clamp(0.0, 1.0);
-
-        // Scroll to that position
-        let buffer = &self.editor.buffers[window.active_buffer];
-        let total_lines = buffer.buffer_len_lines();
-        let content_height = window.height_chars.saturating_sub(2) as usize;
-
-        if total_lines <= content_height {
+        let visible = view.geometry.rows.saturating_sub(2) as usize;
+        if view.total_lines <= visible {
             return;
         }
-
-        let max_start = total_lines.saturating_sub(content_height);
-        let new_start = ((max_start as f64) * ratio).round() as usize;
-
-        let window = self.editor.windows.get_mut(window_id).unwrap();
-        window.start_line = new_start as u16;
+        let max_start = view.total_lines.saturating_sub(visible);
+        let start = ((max_start as f64) * ratio).round() as usize;
+        self.set_view_scroll(view_id, Some(start.min(u16::MAX as usize) as u16), None)
+            .await;
     }
 
-    /// Check if a pixel position is in a window's horizontal scrollbar
-    fn check_hscrollbar_hit(&self, px: f64, py: f64) -> Option<(roe_core::WindowId, f64)> {
-        let char_width = self.text_renderer.char_width() as f64;
-        let line_height = self.text_renderer.line_height() as f64;
+    async fn handle_scrollbar_drag(&mut self, py: f64) {
+        let Some(view_id) = self.scrollbar_dragging else {
+            return;
+        };
+        let Some(view) = self.presented_view(view_id).cloned() else {
+            return;
+        };
+        let line_height = f64::from(self.text_renderer.line_height());
+        let top = f64::from(view.geometry.y) * line_height + 2.0;
+        let extent = f64::from(view.geometry.rows) * line_height - line_height - 4.0;
+        self.handle_scrollbar_click(view_id, ((py - top) / extent).clamp(0.0, 1.0))
+            .await;
+    }
 
-        for (window_id, window) in &self.editor.windows {
-            let x = window.x as f64 * char_width;
-            let y = window.y as f64 * line_height;
-            let w = window.width_chars as f64 * char_width;
-            let h = window.height_chars as f64 * line_height;
-
-            let hscroll_y = y + h - line_height - SCROLLBAR_WIDTH - 2.0;
-            let hscroll_x = x + 2.0;
-            let hscroll_width = w - SCROLLBAR_WIDTH - 6.0;
-
-            // Check if position is in horizontal scrollbar area
-            if px >= hscroll_x
-                && px <= hscroll_x + hscroll_width
-                && py >= hscroll_y
-                && py <= hscroll_y + SCROLLBAR_WIDTH
-            {
-                let ratio = (px - hscroll_x) / hscroll_width;
-                return Some((window_id, ratio.clamp(0.0, 1.0)));
+    fn check_hscrollbar_hit(&self, px: f64, py: f64) -> Option<(ViewId, f64)> {
+        let char_width = f64::from(self.text_renderer.char_width());
+        let line_height = f64::from(self.text_renderer.line_height());
+        for view in &self.redraw_state.session_presentation().current()?.views {
+            let x = f64::from(view.geometry.x) * char_width;
+            let y = f64::from(view.geometry.y) * line_height;
+            let width = f64::from(view.geometry.columns) * char_width;
+            let height = f64::from(view.geometry.rows) * line_height;
+            let bar_y = y + height - line_height - SCROLLBAR_WIDTH - 2.0;
+            let bar_x = x + 2.0;
+            let extent = width - SCROLLBAR_WIDTH - 6.0;
+            if px >= bar_x && px <= bar_x + extent && py >= bar_y && py <= bar_y + SCROLLBAR_WIDTH {
+                return Some((view.id, ((px - bar_x) / extent).clamp(0.0, 1.0)));
             }
         }
         None
     }
 
-    /// Get max line length for a buffer
-    fn get_max_line_len(&self, window_id: roe_core::WindowId) -> usize {
-        let window = &self.editor.windows[window_id];
-        let buffer = &self.editor.buffers[window.active_buffer];
-        buffer
-            .buffer_lines()
-            .into_iter()
-            .map(|line| line.trim_end_matches('\n').chars().count())
-            .max()
-            .unwrap_or(0)
-    }
-
-    /// Handle horizontal scrollbar click
-    fn handle_hscrollbar_click(&mut self, window_id: roe_core::WindowId, ratio: f64) {
-        let char_width = self.text_renderer.char_width() as f64;
-        let window = &self.editor.windows[window_id];
-        let w = window.width_chars as f64 * char_width;
-        let content_width_px = w - (2.0 * char_width) - SCROLLBAR_WIDTH - 4.0;
-        let content_width_chars = (content_width_px / char_width) as usize;
-
-        let max_line_len = self.get_max_line_len(window_id);
-        if max_line_len <= content_width_chars {
-            return; // No horizontal scrolling needed
-        }
-
-        let max_start = max_line_len.saturating_sub(content_width_chars);
-        let new_start = ((max_start as f64) * ratio).round() as usize;
-
-        let window = self.editor.windows.get_mut(window_id).unwrap();
-        window.start_column = new_start as u16;
-    }
-
-    /// Handle horizontal scrollbar drag
-    fn handle_hscrollbar_drag(&mut self, px: f64) {
-        let Some(window_id) = self.hscrollbar_dragging else {
+    async fn handle_hscrollbar_click(&mut self, view_id: ViewId, ratio: f64) {
+        let Some(view) = self.presented_view(view_id).cloned() else {
             return;
         };
-
-        let char_width = self.text_renderer.char_width() as f64;
-        let window = &self.editor.windows[window_id];
-        let x = window.x as f64 * char_width;
-        let w = window.width_chars as f64 * char_width;
-
-        let hscroll_x = x + 2.0;
-        let hscroll_width = w - SCROLLBAR_WIDTH - 6.0;
-
-        let ratio = ((px - hscroll_x) / hscroll_width).clamp(0.0, 1.0);
-
-        let content_width_px = w - (2.0 * char_width) - SCROLLBAR_WIDTH - 4.0;
-        let content_width_chars = (content_width_px / char_width) as usize;
-
-        let max_line_len = self.get_max_line_len(window_id);
-        if max_line_len <= content_width_chars {
+        let char_width = f64::from(self.text_renderer.char_width());
+        let width = f64::from(view.geometry.columns) * char_width;
+        let visible =
+            ((width - (2.0 * char_width) - SCROLLBAR_WIDTH - 4.0) / char_width).max(0.0) as usize;
+        if view.max_line_chars <= visible {
             return;
         }
-
-        let max_start = max_line_len.saturating_sub(content_width_chars);
-        let new_start = ((max_start as f64) * ratio).round() as usize;
-
-        let window = self.editor.windows.get_mut(window_id).unwrap();
-        window.start_column = new_start as u16;
+        let max_start = view.max_line_chars.saturating_sub(visible);
+        let start = ((max_start as f64) * ratio).round() as usize;
+        self.set_view_scroll(view_id, None, Some(start.min(u16::MAX as usize) as u16))
+            .await;
     }
 
-    /// Check if a pixel position is on a window border that can be dragged to resize
-    fn check_border_hit(&self, px: f64, py: f64) -> Option<(BorderInfo, WindowId)> {
-        let char_width = self.text_renderer.char_width() as f64;
-        let line_height = self.text_renderer.line_height() as f64;
+    async fn handle_hscrollbar_drag(&mut self, px: f64) {
+        let Some(view_id) = self.hscrollbar_dragging else {
+            return;
+        };
+        let Some(view) = self.presented_view(view_id).cloned() else {
+            return;
+        };
+        let char_width = f64::from(self.text_renderer.char_width());
+        let left = f64::from(view.geometry.x) * char_width + 2.0;
+        let extent = f64::from(view.geometry.columns) * char_width - SCROLLBAR_WIDTH - 6.0;
+        self.handle_hscrollbar_click(view_id, ((px - left) / extent).clamp(0.0, 1.0))
+            .await;
+    }
 
-        // Convert to grid coordinates
-        let grid_x = (px / char_width) as u16;
-        let grid_y = (py / line_height) as u16;
-
-        // Check all windows to see if the click is on a border
-        for (window_id, window) in &self.editor.windows {
-            let left_border = window.x;
-            let right_border = window.x + window.width_chars - 1;
-            let top_border = window.y;
-            let bottom_border = window.y + window.height_chars - 1;
-
-            // Check vertical borders (left and right sides)
-            if (grid_x == left_border || grid_x == right_border)
-                && grid_y >= top_border
-                && grid_y <= bottom_border
-            {
-                // This is a vertical border
-                if let Some(split_info) = self.find_split_for_border(window_id, true) {
-                    return Some((
-                        BorderInfo {
-                            is_vertical: true,
-                            split_node_path: split_info.0,
-                            original_ratio: split_info.1,
-                        },
-                        window_id,
-                    ));
-                }
-            }
-
-            // Check horizontal borders (top and bottom sides)
-            if (grid_y == top_border || grid_y == bottom_border)
-                && grid_x >= left_border
-                && grid_x <= right_border
-            {
-                // This is a horizontal border
-                if let Some(split_info) = self.find_split_for_border(window_id, false) {
-                    return Some((
-                        BorderInfo {
-                            is_vertical: false,
-                            split_node_path: split_info.0,
-                            original_ratio: split_info.1,
-                        },
-                        window_id,
-                    ));
-                }
+    async fn set_view_scroll(
+        &mut self,
+        view: ViewId,
+        start_line: Option<u16>,
+        start_column: Option<u16>,
+    ) {
+        let envelope = self.session.envelope(InputEvent::SetViewScroll {
+            view,
+            start_line,
+            start_column,
+        });
+        match self.session.dispatch(envelope).await {
+            Ok(output) => self.apply_session_output(output),
+            Err(error) => {
+                self.fatal_error = Some(FrontendError::Session(error));
+                self.quit_requested = true;
             }
         }
+    }
 
+    /// Return the orientation of a shared logical border under the pointer.
+    fn check_border_hit(&self, px: f64, py: f64) -> Option<bool> {
+        let char_width = f64::from(self.text_renderer.char_width());
+        let line_height = f64::from(self.text_renderer.line_height());
+        let column = (px / char_width) as u16;
+        let row = (py / line_height) as u16;
+        let views = &self.redraw_state.session_presentation().current()?.views;
+        for view in views {
+            let right = view.geometry.x + view.geometry.columns.saturating_sub(1);
+            let bottom = view.geometry.y + view.geometry.rows.saturating_sub(1);
+            let vertical = (column == view.geometry.x || column == right)
+                && row >= view.geometry.y
+                && row <= bottom;
+            if vertical && views.len() > 1 {
+                return Some(true);
+            }
+            let horizontal = (row == view.geometry.y || row == bottom)
+                && column >= view.geometry.x
+                && column <= right;
+            if horizontal && views.len() > 1 {
+                return Some(false);
+            }
+        }
         None
-    }
-
-    /// Find the split node that controls the given border
-    fn find_split_for_border(
-        &self,
-        window_id: WindowId,
-        is_vertical_border: bool,
-    ) -> Option<(Vec<usize>, f32)> {
-        // Find if this window has a sibling that shares the border
-        for (other_window_id, other_window) in &self.editor.windows {
-            if other_window_id == window_id {
-                continue;
-            }
-
-            let window = &self.editor.windows[window_id];
-
-            if is_vertical_border {
-                // Check if windows are horizontally adjacent
-                if (window.x + window.width_chars == other_window.x
-                    || other_window.x + other_window.width_chars == window.x)
-                    && window.y < other_window.y + other_window.height_chars
-                    && other_window.y < window.y + window.height_chars
-                {
-                    return Some((vec![0], 0.5)); // Simplified path and ratio
-                }
-            } else {
-                // Check if windows are vertically adjacent
-                if (window.y + window.height_chars == other_window.y
-                    || other_window.y + other_window.height_chars == window.y)
-                    && window.x < other_window.x + other_window.width_chars
-                    && other_window.x < window.x + window.width_chars
-                {
-                    return Some((vec![0], 0.5)); // Simplified path and ratio
-                }
-            }
-        }
-
-        None
-    }
-
-    /// Handle border drag for window resizing
-    fn handle_border_drag(&mut self, px: f64, py: f64) {
-        let Some(ref drag_state) = self.editor.mouse_drag_state else {
-            return;
-        };
-
-        let char_width = self.text_renderer.char_width() as f64;
-        let line_height = self.text_renderer.line_height() as f64;
-
-        // Convert to grid coordinates
-        let grid_x = (px / char_width) as u16;
-        let grid_y = (py / line_height) as u16;
-
-        let new_pos = (grid_x, grid_y);
-        let dx = new_pos.0 as i32 - drag_state.last_pos.0 as i32;
-        let dy = new_pos.1 as i32 - drag_state.last_pos.1 as i32;
-
-        if dx == 0 && dy == 0 {
-            return;
-        }
-
-        let border_info = drag_state.border_info.clone();
-        let target_window = drag_state.target_window;
-
-        // Update drag state positions
-        if let Some(ref mut drag_state_mut) = self.editor.mouse_drag_state {
-            drag_state_mut.current_pos = new_pos;
-            drag_state_mut.last_pos = new_pos;
-        }
-
-        let Some(border_info) = border_info else {
-            return;
-        };
-
-        // Apply the resize
-        update_window_resize_incremental(
-            &mut self.editor.window_tree,
-            &mut self.editor.windows,
-            &self.editor.frame,
-            target_window,
-            &border_info,
-            dx,
-            dy,
-        );
-
-        // Recalculate window layout
-        self.editor.calculate_window_layout();
     }
 }
 
@@ -1577,6 +824,28 @@ impl<'a> ApplicationHandler<HostEvent> for RoeVelloApp<'a> {
                         self.render_cx
                             .resize_surface(&mut state.surface, size.width, size.height);
                     }
+                    let scale_factor = self
+                        .state
+                        .as_ref()
+                        .map(|state| state.window.scale_factor())
+                        .unwrap_or(1.0);
+                    let columns = ((size.width as f64 / scale_factor)
+                        / f64::from(self.text_renderer.char_width()))
+                    .floor() as u16;
+                    let rows = ((size.height as f64 / scale_factor)
+                        / f64::from(self.text_renderer.line_height()))
+                    .floor() as u16;
+                    let envelope = self.session.envelope(InputEvent::Resize {
+                        columns: columns.max(1),
+                        rows: rows.saturating_sub(1).max(1),
+                    });
+                    match self.session.dispatch(envelope).await {
+                        Ok(output) => self.apply_session_output(output),
+                        Err(error) => {
+                            self.fatal_error = Some(FrontendError::Session(error));
+                            event_loop.exit();
+                        }
+                    }
                     self.request_redraw(DirtyRegion::FullScreen);
                 }
                 WindowEvent::RedrawRequested => {
@@ -1588,110 +857,12 @@ impl<'a> ApplicationHandler<HostEvent> for RoeVelloApp<'a> {
                     }
                 }
                 WindowEvent::KeyboardInput { event, .. } => {
-                    let mut actions: std::collections::VecDeque<_> =
-                        self.handle_key_event(event).await.into();
-
-                    while let Some(action) = actions.pop_front() {
-                        match action {
-                            ChromeAction::Quit => {
-                                self.quit_requested = true;
-                                event_loop.exit();
-                            }
-                            ChromeAction::SplitHorizontal => {
-                                self.editor.split_horizontal();
-                            }
-                            ChromeAction::SplitVertical => {
-                                self.editor.split_vertical();
-                            }
-                            ChromeAction::SwitchWindow => {
-                                self.editor.switch_window();
-                            }
-                            ChromeAction::DeleteWindow => {
-                                self.editor.delete_window();
-                            }
-                            ChromeAction::DeleteOtherWindows => {
-                                self.editor.delete_other_windows();
-                            }
-                            ChromeAction::Echo(msg) => {
-                                self.editor.set_echo_message(msg);
-                            }
-                            ChromeAction::NewBufferWithMode {
-                                buffer_name,
-                                mode_name,
-                                initial_content,
-                            } => {
-                                // Create a new buffer with the specified mode
-                                let cursor_pos = initial_content.chars().count();
-                                if let Some(buffer_id) = self.editor.create_buffer_with_mode(
-                                    buffer_name,
-                                    mode_name,
-                                    initial_content,
-                                ) {
-                                    // Switch current window to the new buffer
-                                    if let Some(current_window) =
-                                        self.editor.windows.get_mut(self.editor.active_window)
-                                    {
-                                        current_window.active_buffer = buffer_id;
-                                        current_window.cursor = cursor_pos;
-                                    }
-                                }
-                            }
-                            ChromeAction::ShowMessages => {
-                                // Create or show messages buffer
-                                let messages_buffer_id = self.editor.get_messages_buffer();
-                                if let Some(current_window) =
-                                    self.editor.windows.get_mut(self.editor.active_window)
-                                {
-                                    current_window.active_buffer = messages_buffer_id;
-                                    current_window.cursor = 0;
-                                }
-                            }
-                            ChromeAction::BufferChanged {
-                                buffer_id: _,
-                                start: _,
-                                old_end: _,
-                                new_end: _,
-                            } => {
-                                // Major mode after-change hooks will be dispatched here once
-                                // the scripting runtime (mica) is integrated.
-                            }
-                            ChromeAction::ExecuteCommand(command_name) => {
-                                // Execute another command via the command registry
-                                let context = self.editor.create_command_context();
-                                match roe_core::command_mode::CommandMode::execute_command(
-                                    &command_name,
-                                    &self.editor.command_registry,
-                                    context,
-                                )
-                                .await
-                                {
-                                    Ok(command_actions) => {
-                                        // Process through editor to handle BufferOps etc.
-                                        let processed = self
-                                            .editor
-                                            .process_chrome_actions(command_actions)
-                                            .await;
-                                        for a in processed {
-                                            actions.push_back(a);
-                                        }
-                                    }
-                                    Err(error_msg) => {
-                                        self.editor.set_echo_message(format!(
-                                            "Command error: {error_msg}"
-                                        ));
-                                    }
-                                }
-                            }
-                            ChromeAction::FileWatcherStatus => {
-                                let status = self.editor.file_watcher.status();
-                                self.editor.set_echo_message(status);
-                            }
-                            _ => {}
-                        }
+                    self.handle_key_event(event).await;
+                    if self.quit_requested {
+                        event_loop.exit();
+                    } else if self.redraw_state.needs_redraw() {
+                        self.request_redraw(DirtyRegion::FullScreen);
                     }
-
-                    // Request redraw after key events
-                    self.request_redraw(DirtyRegion::FullScreen);
                 }
                 WindowEvent::CursorMoved { position, .. } => {
                     // Convert physical to logical coordinates
@@ -1706,52 +877,73 @@ impl<'a> ApplicationHandler<HostEvent> for RoeVelloApp<'a> {
                     self.cursor_position = Some((logical_x, logical_y));
 
                     // Handle window border dragging (for resizing splits)
-                    if self.editor.mouse_drag_state.is_some() {
-                        self.handle_border_drag(logical_x, logical_y);
+                    if self.border_dragging.is_some() {
+                        let column =
+                            (logical_x / f64::from(self.text_renderer.char_width())) as u16;
+                        let row = (logical_y / f64::from(self.text_renderer.line_height())) as u16;
+                        let envelope = self.session.envelope(InputEvent::Pointer(PointerEvent {
+                            column,
+                            row,
+                            kind: PointerKind::Move,
+                            button: PointerButton::Primary,
+                        }));
+                        match self.session.dispatch(envelope).await {
+                            Ok(output) => self.apply_session_output(output),
+                            Err(error) => {
+                                self.fatal_error = Some(FrontendError::Session(error));
+                                event_loop.exit();
+                            }
+                        }
                         self.request_redraw(DirtyRegion::FullScreen);
                     }
                     // Handle vertical scrollbar dragging
                     else if self.scrollbar_dragging.is_some() {
-                        self.handle_scrollbar_drag(logical_y);
+                        self.handle_scrollbar_drag(logical_y).await;
                         self.request_redraw(DirtyRegion::FullScreen);
                     }
                     // Handle horizontal scrollbar dragging
                     else if self.hscrollbar_dragging.is_some() {
-                        self.handle_hscrollbar_drag(logical_x);
+                        self.handle_hscrollbar_drag(logical_x).await;
                         self.request_redraw(DirtyRegion::FullScreen);
                     }
                     // Handle text selection drag
                     else if self.mouse_dragging {
-                        self.handle_mouse_drag(logical_x, logical_y);
+                        let column =
+                            (logical_x / f64::from(self.text_renderer.char_width())) as u16;
+                        let row = (logical_y / f64::from(self.text_renderer.line_height())) as u16;
+                        let envelope = self.session.envelope(InputEvent::Pointer(PointerEvent {
+                            column,
+                            row,
+                            kind: PointerKind::Move,
+                            button: PointerButton::Primary,
+                        }));
+                        match self.session.dispatch(envelope).await {
+                            Ok(output) => self.apply_session_output(output),
+                            Err(error) => {
+                                self.fatal_error = Some(FrontendError::Session(error));
+                                event_loop.exit();
+                            }
+                        }
                         self.request_redraw(DirtyRegion::FullScreen);
                     }
 
                     // Update cursor icon based on hover state
                     if let Some(ref state) = self.state {
-                        let cursor = if self.editor.mouse_drag_state.is_some() {
-                            // Check if dragging vertical or horizontal border
-                            if let Some(ref drag_state) = self.editor.mouse_drag_state {
-                                if let Some(ref border_info) = drag_state.border_info {
-                                    if border_info.is_vertical {
-                                        CursorIcon::ColResize
-                                    } else {
-                                        CursorIcon::RowResize
-                                    }
-                                } else {
-                                    CursorIcon::Default
-                                }
+                        let cursor = if let Some(is_vertical) = self.border_dragging {
+                            if is_vertical {
+                                CursorIcon::ColResize
                             } else {
-                                CursorIcon::Default
+                                CursorIcon::RowResize
                             }
                         } else if self.scrollbar_dragging.is_some()
                             || self.hscrollbar_dragging.is_some()
                         {
                             CursorIcon::Grabbing
-                        } else if let Some((border_info, _)) =
+                        } else if let Some(is_vertical) =
                             self.check_border_hit(logical_x, logical_y)
                         {
                             // Show resize cursor when hovering over draggable borders
-                            if border_info.is_vertical {
+                            if is_vertical {
                                 CursorIcon::ColResize
                             } else {
                                 CursorIcon::RowResize
@@ -1775,24 +967,11 @@ impl<'a> ApplicationHandler<HostEvent> for RoeVelloApp<'a> {
                         ElementState::Pressed => {
                             if let Some((x, y)) = self.cursor_position {
                                 // Check if click is on a window border (for resizing splits)
-                                if let Some((border_info, target_window)) =
-                                    self.check_border_hit(x, y)
-                                {
-                                    let char_width = self.text_renderer.char_width() as f64;
-                                    let line_height = self.text_renderer.line_height() as f64;
-                                    let grid_x = (x / char_width) as u16;
-                                    let grid_y = (y / line_height) as u16;
-
-                                    self.editor.mouse_drag_state = Some(MouseDragState {
-                                        drag_type: DragType::WindowBorder,
-                                        start_pos: (grid_x, grid_y),
-                                        last_pos: (grid_x, grid_y),
-                                        current_pos: (grid_x, grid_y),
-                                        target_window: Some(target_window),
-                                        border_info: Some(border_info.clone()),
-                                    });
+                                if let Some(is_vertical) = self.check_border_hit(x, y) {
+                                    self.handle_mouse_click(x, y).await;
+                                    self.border_dragging = Some(is_vertical);
                                     if let Some(ref state) = self.state {
-                                        let cursor = if border_info.is_vertical {
+                                        let cursor = if is_vertical {
                                             CursorIcon::ColResize
                                         } else {
                                             CursorIcon::RowResize
@@ -1804,7 +983,7 @@ impl<'a> ApplicationHandler<HostEvent> for RoeVelloApp<'a> {
                                 else if let Some((window_id, ratio)) =
                                     self.check_scrollbar_hit(x, y)
                                 {
-                                    self.handle_scrollbar_click(window_id, ratio);
+                                    self.handle_scrollbar_click(window_id, ratio).await;
                                     self.scrollbar_dragging = Some(window_id);
                                     if let Some(ref state) = self.state {
                                         state.window.set_cursor(CursorIcon::Grabbing);
@@ -1814,7 +993,7 @@ impl<'a> ApplicationHandler<HostEvent> for RoeVelloApp<'a> {
                                 else if let Some((window_id, ratio)) =
                                     self.check_hscrollbar_hit(x, y)
                                 {
-                                    self.handle_hscrollbar_click(window_id, ratio);
+                                    self.handle_hscrollbar_click(window_id, ratio).await;
                                     self.hscrollbar_dragging = Some(window_id);
                                     if let Some(ref state) = self.state {
                                         state.window.set_cursor(CursorIcon::Grabbing);
@@ -1822,24 +1001,35 @@ impl<'a> ApplicationHandler<HostEvent> for RoeVelloApp<'a> {
                                 } else {
                                     // Normal text click
                                     self.handle_mouse_click(x, y).await;
-                                    // Save cursor position for potential drag selection
-                                    let cursor =
-                                        self.editor.windows[self.editor.active_window].cursor;
-                                    self.drag_start_cursor = Some(cursor);
                                     self.mouse_dragging = true;
                                 }
                                 self.request_redraw(DirtyRegion::FullScreen);
                             }
                         }
                         ElementState::Released => {
+                            if let Some((x, y)) = self.cursor_position {
+                                let column =
+                                    (x / f64::from(self.text_renderer.char_width())) as u16;
+                                let row = (y / f64::from(self.text_renderer.line_height())) as u16;
+                                let envelope =
+                                    self.session.envelope(InputEvent::Pointer(PointerEvent {
+                                        column,
+                                        row,
+                                        kind: PointerKind::Up,
+                                        button: PointerButton::Primary,
+                                    }));
+                                match self.session.dispatch(envelope).await {
+                                    Ok(output) => self.apply_session_output(output),
+                                    Err(error) => {
+                                        self.fatal_error = Some(FrontendError::Session(error));
+                                        event_loop.exit();
+                                    }
+                                }
+                            }
                             self.mouse_dragging = false;
-                            self.drag_start_cursor = None;
                             self.scrollbar_dragging = None;
                             self.hscrollbar_dragging = None;
-                            // Clear border drag state
-                            if self.editor.mouse_drag_state.is_some() {
-                                self.editor.mouse_drag_state = None;
-                            }
+                            self.border_dragging = None;
                         }
                     }
                 }
@@ -1861,70 +1051,9 @@ impl<'a> ApplicationHandler<HostEvent> for RoeVelloApp<'a> {
     }
 }
 
-/// Update window layout based on incremental mouse drag
-fn update_window_resize_incremental(
-    window_tree: &mut WindowNode,
-    _windows: &mut slotmap::SlotMap<WindowId, roe_core::editor::Window>,
-    _frame: &roe_core::editor::Frame,
-    _target_window_id: Option<WindowId>,
-    border_info: &BorderInfo,
-    dx: i32,
-    dy: i32,
-) {
-    // Use a sensitivity factor to make resizing smoother
-    // Each pixel of mouse movement = 0.5% ratio change
-    const SENSITIVITY: f32 = 0.005;
-
-    // Calculate the incremental ratio change
-    if border_info.is_vertical && dx != 0 {
-        // For vertical borders, adjust the split ratio based on horizontal movement
-        let ratio_change = dx as f32 * SENSITIVITY;
-        adjust_window_tree_ratio_incremental(window_tree, ratio_change, true);
-    } else if !border_info.is_vertical && dy != 0 {
-        // For horizontal borders, adjust the split ratio based on vertical movement
-        let ratio_change = dy as f32 * SENSITIVITY;
-        adjust_window_tree_ratio_incremental(window_tree, ratio_change, false);
-    }
-}
-
-/// Recursively adjust window tree ratios for incremental resizing
-fn adjust_window_tree_ratio_incremental(
-    node: &mut WindowNode,
-    ratio_change: f32,
-    is_vertical: bool,
-) {
-    match node {
-        WindowNode::Leaf { .. } => {
-            // Nothing to adjust for leaf nodes
-        }
-        WindowNode::Split {
-            direction,
-            ratio,
-            first,
-            second,
-        } => {
-            // Only adjust if the split direction matches the resize direction
-            let should_adjust = match direction {
-                SplitDirection::Vertical => is_vertical,
-                SplitDirection::Horizontal => !is_vertical,
-            };
-
-            if should_adjust {
-                // Adjust the ratio incrementally, keeping it within bounds
-                // Use tighter bounds to prevent extreme layouts
-                *ratio = (*ratio + ratio_change).clamp(0.15, 0.85);
-            } else {
-                // Recurse into child nodes
-                adjust_window_tree_ratio_incremental(first, ratio_change, is_vertical);
-                adjust_window_tree_ratio_incremental(second, ratio_change, is_vertical);
-            }
-        }
-    }
-}
-
 /// Run the editor with the Vello renderer
 pub fn run_vello(
-    editor: &mut Editor,
+    mut editor: Editor,
     runtime: compio::runtime::Runtime,
 ) -> Result<(), FrontendError> {
     // Theme configuration will come from the scripting runtime (mica) once
@@ -1947,8 +1076,13 @@ pub fn run_vello(
     let mut app = RoeVelloApp::new(editor, theme, runtime, wake_state);
     let event_loop_result = event_loop.run_app(&mut app);
     let fatal_error = app.fatal_error.take();
-    for error in app.editor.shutdown_native_work() {
-        tracing::warn!(%error, "editor shutdown warning");
+    let close = app.session.envelope(InputEvent::Close);
+    if let Ok(output) = app.runtime.block_on(app.session.dispatch(close)) {
+        for event in output.lifecycle {
+            if let LifecycleEvent::Warning(error) = event {
+                tracing::warn!(%error, "editor shutdown warning");
+            }
+        }
     }
     if let Some(error) = fatal_error {
         return Err(error);
