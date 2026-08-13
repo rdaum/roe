@@ -35,11 +35,12 @@ without leaving stale Rust projections.
 ### Commands, discovery, invocation, and keymaps
 
 Mica owns `Command`, `CommandName`, `CommandSummary`, `CommandSelector`, `PackageCommand`,
-`KeyBinding`, `NativeBinding`, `KeyPrefix`, `SessionKeymap`, `EffectiveSessionKeymap`, and
-`EffectiveBinding`. `roe/dispatch_key` resolves combined keymap/binding precedence, detects equal
-precedence ambiguity, invokes named commands, and selects bounded native editing actions. Printable
-characters are also selected by this verb, so ordinary insertion has no production Rust binding
-fallback.
+`CommandArgument`, `ArgumentPrompt`, `ArgumentCompletion`, `CommandImplementation`, `KeyBinding`,
+`NativeBinding`, `KeyPrefix`, `SessionKeymap`, `EffectiveSessionKeymap`, and `EffectiveBinding`.
+`roe/dispatch_key` resolves command and native actions in one combined precedence comparison,
+detects equal-precedence ambiguity, invokes named commands, and selects bounded native editing
+actions. Printable characters are also selected by this verb, so ordinary insertion has no
+production Rust binding fallback.
 
 `roe/DiscoverableCommand` filters M-x candidates through active packages and endpoint authority.
 M-x invokes the selected Mica selector directly; commands do not require a shadow Rust registry or
@@ -52,9 +53,12 @@ to realize Mica's decision.
 
 `PromptState`, `PromptLast`, `FileCandidate`, `ArgumentCandidate`, and the
 `roe/prompt_key`, `roe/refresh_prompt`, and `roe/search_prompt_key` verbs own prompt text,
-selection, cancellation, command argument acquisition, history, and filtering. Command, buffer,
-and file candidates are computed in Mica and capped at 256 entries. Search state and selection live
-in Mica; the native `text_search` request returns at most 1,024 character-indexed matches.
+selection, cancellation, command argument acquisition, history, and filtering. The generic
+argument path is exercised by `select-window`: its declared `:window`/`:logical_view` argument
+opens a completion prompt, validates the chosen logical view, and invokes the declared command
+implementation. Command, buffer, view, and file candidates are computed in Mica and capped at 256
+entries. Search state and selection live in Mica; the native `text_search` request returns at most
+1,024 character-indexed matches.
 
 Rust retains directory enumeration, Rope searching, fallible file open/save, file watching, and a
 passive prompt view used by both renderers. It receives the selected identity or path only after
@@ -65,13 +69,17 @@ The deleted Rust owners are `CommandMode`, `SelectionMenu`, `BufferSwitchMode`,
 
 ### Modes, hooks, faces, syntax, indentation, and configuration
 
-Mica owns `BufferMajorMode`, `BufferMinorMode`, `ModeKeymap`, `ModeHook`, `Face`,
-`FaceAttribute`, `FaceParent`, `SyntaxRule`, `Configuration`, and their `Effective*` rules.
+Mica owns `DefaultMajorMode`, `BufferMajorMode`, `BufferMinorMode`, `ModeKeymap`, `ModeHook`,
+`Face`, `FaceAttribute`, `FaceParent`, `SyntaxRule`, `Configuration`, and their `Effective*` rules.
+The host publishes logical buffers but does not assign `fundamental`; Mica derives the configured
+default unless an explicit buffer major mode overrides it.
 `roe/publish_policy` emits a reset followed by a bounded projection of effective mode, face,
 syntax, and configuration facts. `roe/dispatch_key` emits ordered effective hooks after editing.
-Tab width comes from `EffectiveConfiguration`; word editing consumes Mica's effective syntax rule;
-search highlighting consumes Mica face attributes. Hook invalidation reaches the common
-presentation stream, not either renderer directly.
+Higher-precedence hooks run first. Tab width comes from `EffectiveConfiguration`; word editing
+interprets the highest-precedence Mica character-class rule and visibly rejects unsupported or
+ambiguous rules rather than using a Rust fallback; search highlighting consumes Mica face
+attributes. Hook invalidation reaches the common presentation stream, not either renderer
+directly.
 
 Rust retains renderer-ready style records, character ranges, native text mutation, and redraw cache
 invalidation. It no longer stores a buffer major mode or owns a mode trait, mode actor, face
@@ -149,16 +157,25 @@ closed those gaps and passed the deletion gate.
 | `8e1caf5` | Add check, replacement, export, restore, and package recovery operations. |
 | `ad98565` | Delete the superseded Rust policy stack and old renderer path. |
 | `8ed36b8` | Measure editing and redraw through the production Mica session. |
+| `d12aa81` | Remove Rust insertion fallback from Mica-owned input. |
+| `f023522` | Move pointer/view decisions into Mica and enforce native effect authority. |
+| `3dd8f77` | Bound native resources and expose pre-policy recovery operations. |
+| `45fd49d` | Exercise generic command argument acquisition through logical-view selection. |
+| `1c89b1f` | Make default modes, binding precedence, hook order, and syntax policy authoritative. |
+| `8c088ba` | Exercise both frontend realizations with the production Mica session stream. |
+| `03731c9` | Authorize and test relational layout dragging through Mica. |
 
 ## Verification and measurements
 
 | Evidence | Result |
 | -------- | ------ |
-| `./scripts/check.sh` | Formatting, all-target checks, strict Clippy, dependency policy, and 150 tests pass. |
-| `cargo test -p roe-core mica_ -- --test-threads=1` | 11 focused Mica authority, policy, prompt, lifecycle, replacement, and shutdown tests pass. |
+| `./scripts/check.sh` | Formatting, all-target checks, strict Clippy, dependency policy, and 156 tests pass. |
+| `cargo test -p roe-core mica_ -- --test-threads=1` | 14 focused Mica authority, precedence, syntax, prompt, lifecycle, replacement, and shutdown tests pass. |
 | `./scripts/test-phase0-terminal-workflows.sh` | Release terminal workflows pass through the production Mica session. |
+| `cargo test -p roe-vello production_mica_session_builds_a_vello_scene_without_a_display` | A real Mica session produces the headless Vello scene before and after an edit. |
+| `cargo test -p roe-vello --test session_conformance` | Terminal and Vello consume the same real full/delta Mica session stream. |
 | `cargo build --release --bin roe-vello` | The production Vello frontend builds with the Mica session path; a display-host smoke remains an open platform obligation. |
-| `./scripts/measure-phase0-baseline.sh` | Completes against the production Mica path. In the recorded run: 85.022 ms Mica-session readiness, 2.224 ms per Mica insert/delete pair, 267 us per snapshot/redraw, and 23,924 KiB idle terminal RSS. |
+| `./scripts/measure-phase0-baseline.sh` | Completes against the production Mica path. In the recorded run: 196.171 ms Mica-session readiness, 2.397 ms per Mica insert/delete pair, 271 us per snapshot/redraw, 33,332 KiB idle terminal RSS, and 0 KiB measured RSS growth across the edit/redraw workload. |
 
 The measurements are coarse regression evidence, not optimization claims. Unlike the earlier
 Phase 0 harness, the editing metric includes two complete Mica dispatch transactions and the redraw
