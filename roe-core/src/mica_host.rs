@@ -6,16 +6,17 @@
 
 use crate::editor::{SplitDirection, WindowNode};
 use crate::native_kernel::{KernelError, NativeKernel, NativeOperation, NativeResult, ResourceId};
+use crate::native_services::FrontendWake;
 use crate::{BufferId, Editor, WindowId};
 use mica_driver::{
-    CompioTaskDriver, DriverError, DriverEvent, DriverResources, ExternalRequestContext,
-    ExternalRequestFuture, ExternalRequestHandler, FileinMode, Identity, RelationAcceleration,
-    Symbol, TaskId, TaskLimits, Value,
+    DriverAdministrator, DriverClient, DriverError, DriverEvent, DriverEventPump, DriverOwner,
+    DriverResources, EndpointConfiguration, EndpointSession, ExternalRequestContext,
+    ExternalRequestFuture, ExternalRequestHandler, FileinMode, Identity, InvocationHandle,
+    InvocationOutcome, RelationAcceleration, Symbol, TaskId, TaskLimits, Value,
 };
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 #[derive(Debug, Clone)]
 enum LayoutFact {
@@ -75,6 +76,10 @@ const FIRST_WAVE_SOURCE: &str = include_str!("../../mica/roe-first-wave.mica");
 const EVENT_QUEUE_CAPACITY: usize = 256;
 const EXTERNAL_REQUEST_CAPACITY: usize = 16;
 const SUBSCRIPTION_QUEUE_BUDGET: usize = 64;
+const ACTIVE_TASK_CAPACITY: usize = 128;
+const SUSPENDED_TASK_CAPACITY: usize = 64;
+const TIMER_CAPACITY: usize = 64;
+const TERMINAL_TASK_RETENTION: usize = 256;
 const MAX_PROMPT_CANDIDATES: usize = 256;
 const MAX_SEARCH_MATCHES: usize = 1_024;
 const MAX_POLICY_FACTS: usize = 256;
@@ -190,24 +195,6 @@ pub struct MicaEventBatch {
 }
 
 impl MicaEventBatch {
-    fn extend(&mut self, mut other: Self) {
-        self.effects.append(&mut other.effects);
-        self.host_actions.append(&mut other.host_actions);
-        self.native_actions.append(&mut other.native_actions);
-        self.policy_reset |= other.policy_reset;
-        for policy in other.policy_facts.drain(..) {
-            self.push_policy(policy);
-        }
-        self.prompt_updates.append(&mut other.prompt_updates);
-        self.prompt_close |= other.prompt_close;
-        self.search_updates.append(&mut other.search_updates);
-        self.search_finishes.append(&mut other.search_finishes);
-        self.errors.append(&mut other.errors);
-        self.cancelled_tasks.append(&mut other.cancelled_tasks);
-        self.ready_subscriptions
-            .append(&mut other.ready_subscriptions);
-    }
-
     fn push_policy(&mut self, policy: MicaPolicyFact) {
         if self.policy_facts.len() < MAX_POLICY_FACTS {
             self.policy_facts.push(policy);
@@ -232,6 +219,14 @@ pub struct MicaDispatchResult {
 struct NativeBridge {
     kernel: Arc<Mutex<NativeKernel>>,
     state: Mutex<NativeBridgeState>,
+}
+
+struct MicaFrontendWake(Arc<dyn FrontendWake>);
+
+impl mica_driver::DriverWake for MicaFrontendWake {
+    fn wake(&self) {
+        self.0.wake();
+    }
 }
 
 #[derive(Default)]
@@ -386,7 +381,11 @@ impl NativeBridge {
 }
 
 pub struct MicaHost {
-    driver: CompioTaskDriver,
+    owner: DriverOwner,
+    client: DriverClient,
+    administrator: DriverAdministrator,
+    event_pump: Option<DriverEventPump>,
+    endpoint_session: Option<EndpointSession>,
     bridge: Arc<NativeBridge>,
     endpoint: Identity,
     actor: Identity,
@@ -412,12 +411,28 @@ pub struct MicaHost {
 }
 
 impl MicaHost {
+    pub fn set_wake_handler(&mut self, handler: Arc<dyn FrontendWake>) {
+        if let Some(pump) = self.event_pump.as_mut() {
+            pump.set_wake_handler(Arc::new(MicaFrontendWake(handler)));
+        }
+    }
+
+    fn endpoint_session(&self) -> &EndpointSession {
+        self.endpoint_session
+            .as_ref()
+            .expect("open Mica host retains its endpoint session")
+    }
+
+    fn format_value(&self, value: &Value) -> String {
+        self.client.format_value(value)
+    }
+
     pub fn recovery_diagnostics(&self) -> String {
         format!(
             "endpoint={} actor={} session={} first_wave_loaded={} buffers={} views={} disabled_packages={} closed={}",
-            self.driver.format_value(&Value::identity(self.endpoint)),
-            self.driver.format_value(&Value::identity(self.actor)),
-            self.driver.format_value(&Value::identity(self.session)),
+            self.format_value(&Value::identity(self.endpoint)),
+            self.format_value(&Value::identity(self.actor)),
+            self.format_value(&Value::identity(self.session)),
             self.first_wave_loaded,
             self.buffer_ids.len(),
             self.view_ids.len(),
@@ -454,27 +469,34 @@ impl MicaHost {
         resources.event_queue_capacity = NonZeroUsize::new(EVENT_QUEUE_CAPACITY).unwrap();
         resources.external_request_capacity = NonZeroUsize::new(EXTERNAL_REQUEST_CAPACITY).unwrap();
         resources.subscription_queue_budget = NonZeroUsize::new(SUBSCRIPTION_QUEUE_BUDGET).unwrap();
+        resources.active_task_capacity = NonZeroUsize::new(ACTIVE_TASK_CAPACITY).unwrap();
+        resources.suspended_task_capacity = NonZeroUsize::new(SUSPENDED_TASK_CAPACITY).unwrap();
+        resources.timer_capacity = NonZeroUsize::new(TIMER_CAPACITY).unwrap();
+        resources.terminal_task_retention = NonZeroUsize::new(TERMINAL_TASK_RETENTION).unwrap();
         resources.relation_acceleration = RelationAcceleration::Disabled;
 
-        let driver = CompioTaskDriver::builder(resources)
+        let mut owner = mica_driver::DriverOwner::builder(resources)
             .initial_filein_unit(sym("roe/core"), CORE_SOURCE, FileinMode::Add, None)
             .external_request_handler(external_handler)
             .build()?;
+        let event_pump = owner.take_event_pump()?;
+        let client = owner.client();
+        let administrator = owner.administrator();
 
-        let endpoint = driver.allocate_ephemeral_identity()?;
-        let actor = driver.allocate_ephemeral_identity()?;
-        let session = driver.allocate_ephemeral_identity()?;
-        let frame = driver.allocate_ephemeral_identity()?;
-        let editor_role = driver.named_identity(sym("roe/editor_role"))?;
-        let global_map = driver.named_identity(sym("roe/global_map"))?;
+        let endpoint = client.allocate_ephemeral_identity()?;
+        let actor = client.allocate_ephemeral_identity()?;
+        let session = client.allocate_ephemeral_identity()?;
+        let frame = client.allocate_ephemeral_identity()?;
+        let editor_role = client.named_identity(sym("roe/editor_role"))?;
+        let global_map = client.named_identity(sym("roe/global_map"))?;
 
         let mut buffer_ids = HashMap::new();
         let mut buffer_names = HashMap::new();
         let mut native_ids = HashMap::new();
         let mut bridge_resources = HashMap::new();
         for (buffer_id, _buffer) in &editor.buffers {
-            let buffer = driver.allocate_ephemeral_identity()?;
-            let native = driver.allocate_ephemeral_identity()?;
+            let buffer = client.allocate_ephemeral_identity()?;
+            let native = client.allocate_ephemeral_identity()?;
             let resource = *resource_ids
                 .get(&buffer_id)
                 .ok_or(MicaHostError::MissingIdentity)?;
@@ -488,7 +510,7 @@ impl MicaHost {
         let mut view_buffers = HashMap::new();
         let mut view_cursors = HashMap::new();
         for (window_id, window) in &editor.windows {
-            view_ids.insert(window_id, driver.allocate_ephemeral_identity()?);
+            view_ids.insert(window_id, client.allocate_ephemeral_identity()?);
             view_buffers.insert(window_id, window.active_buffer);
             view_cursors.insert(window_id, window.cursor);
         }
@@ -571,19 +593,18 @@ impl MicaHost {
         }
         let mut layout_nodes = HashMap::new();
         let layout_tuples = build_layout_tuples(
-            &driver,
+            &client,
             frame,
             &editor.window_tree,
             &view_ids,
             &mut layout_nodes,
         )?;
         tuples.extend(layout_named_tuples!(&layout_tuples));
-        driver.open_endpoint_with_context_and_volatile_tuples_named(
-            endpoint,
-            None,
-            Some(actor),
-            sym("roe/session-v1"),
-            tuples,
+        let endpoint_session = client.open_endpoint(
+            EndpointConfiguration::new(sym("roe/session-v1"))
+                .endpoint(endpoint)
+                .actor(actor)
+                .volatile_facts(tuples),
         )?;
         bridge.configure(
             actor,
@@ -598,7 +619,11 @@ impl MicaHost {
         );
 
         Ok(Self {
-            driver,
+            owner,
+            client,
+            administrator,
+            event_pump: Some(event_pump),
+            endpoint_session: Some(endpoint_session),
             bridge,
             endpoint,
             actor,
@@ -645,10 +670,9 @@ impl MicaHost {
         } else {
             sym("roe/dispatch_key")
         };
-        let submitted = self
-            .driver
-            .submit_invocation_for_endpoint(
-                self.endpoint,
+        let invocation = self
+            .endpoint_session()
+            .invoke(
                 selector,
                 vec![
                     (sym("actor"), Value::identity(self.actor)),
@@ -658,7 +682,7 @@ impl MicaHost {
             )
             .await?;
         let selector_name = selector.name().unwrap_or("<unnamed-selector>");
-        let mut result = self.wait_for_task(submitted.task_id, selector_name).await?;
+        let mut result = self.wait_for_task(&invocation, selector_name).await?;
         if had_prefix && result.key == MicaKeyResult::Unbound {
             result.key = MicaKeyResult::Failed(format!("{sequence} is undefined"));
         }
@@ -750,11 +774,11 @@ impl MicaHost {
         }
         arguments.push((sym("actor"), Value::identity(self.actor)));
         arguments.push((sym("session"), Value::identity(self.session)));
-        let submitted = self
-            .driver
-            .submit_invocation_for_endpoint(self.endpoint, sym(selector), arguments)
+        let invocation = self
+            .endpoint_session()
+            .invoke(sym(selector), arguments)
             .await?;
-        let result = self.wait_for_task(submitted.task_id, selector).await?;
+        let result = self.wait_for_task(&invocation, selector).await?;
         match result.key {
             MicaKeyResult::Failed(message) => Err(MicaHostError::Policy(message)),
             _ => Ok(result.events),
@@ -763,7 +787,12 @@ impl MicaHost {
 
     pub fn drain_background_events(&mut self) -> MicaEventBatch {
         let mut batch = MicaEventBatch::default();
-        for event in self.driver.drain_events() {
+        let events = self
+            .event_pump
+            .as_mut()
+            .map(DriverEventPump::drain)
+            .unwrap_or_default();
+        for event in events {
             self.record_background_event(event, &mut batch);
         }
         batch
@@ -779,10 +808,9 @@ impl MicaHost {
         }
         self.ensure_first_wave().await?;
         self.synchronize_context(editor, resource_ids)?;
-        let submitted = self
-            .driver
-            .submit_invocation_for_endpoint(
-                self.endpoint,
+        let invocation = self
+            .endpoint_session()
+            .invoke(
                 sym("roe/publish_policy"),
                 vec![
                     (sym("actor"), Value::identity(self.actor)),
@@ -791,24 +819,26 @@ impl MicaHost {
             )
             .await?;
         Ok(self
-            .wait_for_task(submitted.task_id, "roe/publish_policy")
+            .wait_for_task(&invocation, "roe/publish_policy")
             .await?
             .events)
     }
 
     pub async fn check_source(&self, source: String) -> Result<(), MicaHostError> {
-        self.driver.check_filein(source, None).await?;
+        self.administrator.check_filein(source, None).await?;
         Ok(())
     }
 
     pub async fn replace_unit(&mut self, unit: &str, source: String) -> Result<(), MicaHostError> {
-        self.driver.check_filein(source.clone(), None).await?;
+        self.administrator
+            .check_filein(source.clone(), None)
+            .await?;
         let mode = if unit == "roe/first-wave" && !self.first_wave_loaded {
             FileinMode::Add
         } else {
             FileinMode::Replace
         };
-        self.driver
+        self.administrator
             .filein_unit(sym(unit), source, mode, None)
             .await?;
         if unit == "roe/first-wave" {
@@ -821,7 +851,7 @@ impl MicaHost {
         if unit == "roe/first-wave" {
             self.ensure_first_wave().await?;
         }
-        Ok(self.driver.fileout_unit(sym(unit)).await?)
+        Ok(self.administrator.fileout_unit(sym(unit)).await?)
     }
 
     pub async fn restore_first_wave(&mut self) -> Result<(), MicaHostError> {
@@ -833,10 +863,10 @@ impl MicaHost {
         if self.first_wave_loaded {
             return Ok(());
         }
-        self.driver
+        self.administrator
             .check_filein(FIRST_WAVE_SOURCE.to_owned(), None)
             .await?;
-        self.driver
+        self.administrator
             .filein_unit(
                 sym("roe/first-wave"),
                 FIRST_WAVE_SOURCE.to_owned(),
@@ -853,17 +883,26 @@ impl MicaHost {
         package: &str,
         enabled: bool,
     ) -> Result<(), MicaHostError> {
-        let package = self.driver.named_identity(sym(package))?;
-        let tuple = vec![(
-            sym("roe/PackageDisabled"),
-            [Value::identity(package)].into(),
-        )];
+        let package = self.client.named_identity(sym(package))?;
         if enabled {
-            self.driver.retract_volatile_tuples_named(tuple)?;
             self.disabled_packages.remove(&package);
-        } else if self.disabled_packages.insert(package) {
-            self.driver.assert_volatile_tuples_named(tuple)?;
+        } else {
+            self.disabled_packages.insert(package);
         }
+        let facts = self
+            .disabled_packages
+            .iter()
+            .map(|package| {
+                (
+                    sym("roe/PackageDisabled"),
+                    [Value::identity(*package)].into(),
+                )
+            })
+            .collect();
+        self.endpoint_session
+            .as_mut()
+            .expect("open Mica host retains its endpoint session")
+            .replace_volatile_scope(sym("roe/packages"), facts)?;
         Ok(())
     }
 
@@ -878,7 +917,7 @@ impl MicaHost {
     }
 
     #[cfg(test)]
-    pub async fn start_pending_test_request(&self) -> Result<TaskId, MicaHostError> {
+    pub async fn start_pending_test_request(&mut self) -> Result<TaskId, MicaHostError> {
         const SOURCE: &str = r#"
 assert RoleCanInvoke(#roe/editor_role, :roe/test_pending)
 verb roe/test_pending(actor, session)
@@ -886,7 +925,7 @@ verb roe/test_pending(actor, session)
   return external_request(:test_pending, nothing, 60)
 end
 "#;
-        self.driver
+        self.administrator
             .filein_unit(
                 sym("roe/test-pending"),
                 SOURCE.to_owned(),
@@ -894,10 +933,9 @@ end
                 None,
             )
             .await?;
-        let submitted = self
-            .driver
-            .submit_invocation_for_endpoint(
-                self.endpoint,
+        let invocation = self
+            .endpoint_session()
+            .invoke(
                 sym("roe/test_pending"),
                 vec![
                     (sym("actor"), Value::identity(self.actor)),
@@ -905,12 +943,13 @@ end
                 ],
             )
             .await?;
-        self.driver.drain_events();
-        Ok(submitted.task_id)
+        let task_id = invocation.detach()?;
+        self.drain_background_events();
+        Ok(task_id)
     }
 
     #[cfg(test)]
-    pub async fn start_background_test_task(&self) -> Result<TaskId, MicaHostError> {
+    pub async fn start_background_test_task(&mut self) -> Result<TaskId, MicaHostError> {
         const SOURCE: &str = r#"
 assert RoleCanInvoke(#roe/editor_role, :roe/test_background)
 verb roe/test_background(actor, session)
@@ -923,7 +962,7 @@ verb roe/test_background(actor, session)
   return :done
 end
 "#;
-        self.driver
+        self.administrator
             .filein_unit(
                 sym("roe/test-background"),
                 SOURCE.to_owned(),
@@ -931,10 +970,9 @@ end
                 None,
             )
             .await?;
-        let submitted = self
-            .driver
-            .submit_invocation_for_endpoint(
-                self.endpoint,
+        let invocation = self
+            .endpoint_session()
+            .invoke(
                 sym("roe/test_background"),
                 vec![
                     (sym("actor"), Value::identity(self.actor)),
@@ -942,40 +980,7 @@ end
                 ],
             )
             .await?;
-        Ok(submitted.task_id)
-    }
-
-    #[cfg(test)]
-    async fn fill_event_queue_for_test(&self) -> Result<(), MicaHostError> {
-        for value in 0..EVENT_QUEUE_CAPACITY {
-            self.driver
-                .submit_root_source_report(format!("return {value}"))
-                .await?;
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub async fn verify_event_backpressure_and_refill_for_test(
-        &self,
-    ) -> Result<bool, MicaHostError> {
-        self.fill_event_queue_for_test().await?;
-        let producer_driver = self.driver.clone();
-        let producer = compio::runtime::spawn(async move {
-            producer_driver
-                .submit_root_source_report("return 999".to_owned())
-                .await
-        });
-        compio::time::sleep(Duration::from_millis(10)).await;
-        let was_backpressured = !producer.is_finished();
-
-        self.driver.drain_events();
-        producer
-            .await
-            .map_err(|_| DriverError::Join("event producer task panicked".to_owned()))??;
-        self.driver.drain_events();
-        self.fill_event_queue_for_test().await?;
-        Ok(was_backpressured)
+        Ok(invocation.detach()?)
     }
 
     fn synchronize_context(
@@ -1011,62 +1016,6 @@ end
             .copied()
             .filter(|view| !live_views.contains(view))
             .collect();
-        let mut stale_tuples = Vec::new();
-        for window_id in &stale_views {
-            let view = self.view_ids[window_id];
-            if *window_id == self.active_view {
-                stale_tuples.push((
-                    sym("roe/ActiveView"),
-                    [Value::identity(self.session), Value::identity(view)].into(),
-                ));
-            }
-            stale_tuples.push((sym("roe/View"), [Value::identity(view)].into()));
-            if let Some(buffer_id) = self.view_buffers.get(window_id) {
-                stale_tuples.push((
-                    sym("roe/ViewBuffer"),
-                    [
-                        Value::identity(view),
-                        Value::identity(self.buffer_ids[buffer_id]),
-                    ]
-                    .into(),
-                ));
-            }
-            if let Some(cursor) = self.view_cursors.get(window_id) {
-                stale_tuples.push((
-                    sym("roe/ViewCursor"),
-                    [Value::identity(view), int_value(*cursor)].into(),
-                ));
-            }
-        }
-        for buffer_id in &stale_buffers {
-            let logical = self.buffer_ids[buffer_id];
-            let native = self.native_ids[buffer_id];
-            let resource = self.resource_ids[buffer_id];
-            stale_tuples.extend([
-                (sym("roe/LogicalBuffer"), [Value::identity(logical)].into()),
-                (
-                    sym("roe/BufferName"),
-                    [
-                        Value::identity(logical),
-                        Value::string(&self.buffer_names[buffer_id]),
-                    ]
-                    .into(),
-                ),
-                (
-                    sym("roe/NativeTextResource"),
-                    [Value::identity(logical), Value::identity(native)].into(),
-                ),
-                (
-                    sym("roe/NativeResourceGeneration"),
-                    [Value::identity(native), int_value(resource.generation)].into(),
-                ),
-                (
-                    sym("roe/CanUseBuffer"),
-                    [Value::identity(self.actor), Value::identity(logical)].into(),
-                ),
-            ]);
-        }
-        self.driver.retract_volatile_tuples_named(stale_tuples)?;
         for window_id in stale_views {
             self.view_ids.remove(&window_id);
             self.view_buffers.remove(&window_id);
@@ -1095,15 +1044,12 @@ end
             .windows
             .get(active)
             .ok_or(MicaHostError::MissingIdentity)?;
-        let mut retract = Vec::new();
-        let mut assert = Vec::new();
-
         for buffer_id in &live_buffers {
             if self.buffer_ids.contains_key(buffer_id) {
                 continue;
             }
-            let logical = self.driver.allocate_ephemeral_identity()?;
-            let native = self.driver.allocate_ephemeral_identity()?;
+            let logical = self.client.allocate_ephemeral_identity()?;
+            let native = self.client.allocate_ephemeral_identity()?;
             let resource = *resource_ids
                 .get(buffer_id)
                 .ok_or(MicaHostError::MissingIdentity)?;
@@ -1116,27 +1062,7 @@ end
             self.native_ids.insert(*buffer_id, native);
             self.resource_ids.insert(*buffer_id, resource);
             self.bridge.add_resource(logical, resource);
-            assert.extend([
-                (sym("roe/LogicalBuffer"), [Value::identity(logical)].into()),
-                (
-                    sym("roe/BufferName"),
-                    [Value::identity(logical), Value::string(buffer.object())].into(),
-                ),
-                (
-                    sym("roe/NativeTextResource"),
-                    [Value::identity(logical), Value::identity(native)].into(),
-                ),
-                (
-                    sym("roe/NativeResourceGeneration"),
-                    [Value::identity(native), int_value(resource.generation)].into(),
-                ),
-                (
-                    sym("roe/CanUseBuffer"),
-                    [Value::identity(self.actor), Value::identity(logical)].into(),
-                ),
-            ]);
         }
-        let buffer = self.buffer_ids[&window.active_buffer];
 
         for (window_id, candidate) in &editor.windows {
             if matches!(
@@ -1148,29 +1074,13 @@ end
             if self.view_ids.contains_key(&window_id) {
                 continue;
             }
-            let Some(logical_buffer) = self.buffer_ids.get(&candidate.active_buffer).copied()
-            else {
+            if !self.buffer_ids.contains_key(&candidate.active_buffer) {
                 continue;
-            };
-            let logical_view = self.driver.allocate_ephemeral_identity()?;
+            }
+            let logical_view = self.client.allocate_ephemeral_identity()?;
             self.view_ids.insert(window_id, logical_view);
             self.view_buffers.insert(window_id, candidate.active_buffer);
             self.view_cursors.insert(window_id, candidate.cursor);
-            assert.extend([
-                (sym("roe/View"), [Value::identity(logical_view)].into()),
-                (
-                    sym("roe/ViewBuffer"),
-                    [
-                        Value::identity(logical_view),
-                        Value::identity(logical_buffer),
-                    ]
-                    .into(),
-                ),
-                (
-                    sym("roe/ViewCursor"),
-                    [Value::identity(logical_view), int_value(candidate.cursor)].into(),
-                ),
-            ]);
         }
 
         for (window_id, candidate) in &editor.windows {
@@ -1180,204 +1090,191 @@ end
             ) {
                 continue;
             }
-            let Some(view) = self.view_ids.get(&window_id).copied() else {
+            if !self.view_ids.contains_key(&window_id) {
                 continue;
-            };
-            let Some(logical_buffer) = self.buffer_ids.get(&candidate.active_buffer).copied()
-            else {
+            }
+            if !self.buffer_ids.contains_key(&candidate.active_buffer) {
                 continue;
-            };
+            }
             if self.view_buffers.get(&window_id).copied() != Some(candidate.active_buffer) {
-                if let Some(previous) = self
-                    .view_buffers
-                    .get(&window_id)
-                    .and_then(|previous| self.buffer_ids.get(previous))
-                    .copied()
-                {
-                    retract.push((
-                        sym("roe/ViewBuffer"),
-                        [Value::identity(view), Value::identity(previous)].into(),
-                    ));
-                }
-                assert.push((
-                    sym("roe/ViewBuffer"),
-                    [Value::identity(view), Value::identity(logical_buffer)].into(),
-                ));
                 self.view_buffers.insert(window_id, candidate.active_buffer);
             }
             if self.view_cursors.get(&window_id).copied() != Some(candidate.cursor) {
-                if let Some(previous) = self.view_cursors.get(&window_id).copied() {
-                    retract.push((
-                        sym("roe/ViewCursor"),
-                        [Value::identity(view), int_value(previous)].into(),
-                    ));
-                }
-                assert.push((
-                    sym("roe/ViewCursor"),
-                    [Value::identity(view), int_value(candidate.cursor)].into(),
-                ));
                 self.view_cursors.insert(window_id, candidate.cursor);
             }
         }
 
-        if let std::collections::hash_map::Entry::Vacant(entry) = self.view_ids.entry(active) {
-            let view = self.driver.allocate_ephemeral_identity()?;
-            entry.insert(view);
+        if !self.view_ids.contains_key(&active) {
+            let view = self.client.allocate_ephemeral_identity()?;
+            self.view_ids.insert(active, view);
             self.view_buffers.insert(active, window.active_buffer);
             self.view_cursors.insert(active, window.cursor);
-            assert.push((sym("roe/View"), [Value::identity(view)].into()));
         }
-        let view = self.view_ids[&active];
-        if self.active_view != active
-            && let Some(previous_active) = self.view_ids.get(&self.active_view).copied()
-        {
-            retract.push((
-                sym("roe/ActiveView"),
-                [
-                    Value::identity(self.session),
-                    Value::identity(previous_active),
-                ]
-                .into(),
-            ));
-        }
-        assert.extend([
-            (
-                sym("roe/ActiveView"),
-                [Value::identity(self.session), Value::identity(view)].into(),
-            ),
-            (
-                sym("roe/ViewBuffer"),
-                [Value::identity(view), Value::identity(buffer)].into(),
-            ),
-            (
-                sym("roe/ViewCursor"),
-                [Value::identity(view), int_value(window.cursor)].into(),
-            ),
-        ]);
-        self.driver.retract_volatile_tuples_named(retract)?;
-        self.driver.assert_volatile_tuples_named(assert)?;
+        self.view_buffers.insert(active, window.active_buffer);
+        self.view_cursors.insert(active, window.cursor);
         self.active_view = active;
         self.synchronize_layout(editor)?;
+        let facts = self.volatile_context_facts();
+        self.endpoint_session
+            .as_mut()
+            .expect("open Mica host retains its endpoint session")
+            .replace_volatile_scope(sym("endpoint"), facts)?;
         Ok(())
     }
 
     fn synchronize_layout(&mut self, editor: &Editor) -> Result<(), MicaHostError> {
-        self.driver
-            .retract_volatile_tuples_named(layout_named_tuples!(&self.layout_tuples))?;
         self.layout_tuples = build_layout_tuples(
-            &self.driver,
+            &self.client,
             self.frame,
             &editor.window_tree,
             &self.view_ids,
             &mut self.layout_nodes,
         )?;
-        self.driver
-            .assert_volatile_tuples_named(layout_named_tuples!(&self.layout_tuples))?;
         Ok(())
+    }
+
+    fn volatile_context_facts(&self) -> Vec<(Symbol, mica_driver::Tuple)> {
+        let mut facts = vec![
+            (
+                sym("roe/EditorSession"),
+                [Value::identity(self.session)].into(),
+            ),
+            (
+                sym("roe/SessionActor"),
+                [Value::identity(self.session), Value::identity(self.actor)].into(),
+            ),
+            (
+                sym("roe/SessionEndpoint"),
+                [
+                    Value::identity(self.session),
+                    Value::identity(self.endpoint),
+                ]
+                .into(),
+            ),
+            (sym("roe/Frame"), [Value::identity(self.frame)].into()),
+            (
+                sym("roe/SessionFrame"),
+                [Value::identity(self.session), Value::identity(self.frame)].into(),
+            ),
+        ];
+        facts.extend([
+            (
+                sym("roe/ActorRole"),
+                [
+                    Value::identity(self.actor),
+                    Value::identity(self.editor_role),
+                ]
+                .into(),
+            ),
+            (
+                sym("roe/SessionKeymap"),
+                [
+                    Value::identity(self.session),
+                    Value::identity(self.global_map),
+                    int_value(100),
+                ]
+                .into(),
+            ),
+        ]);
+        if let Some(active) = self.view_ids.get(&self.active_view).copied() {
+            facts.push((
+                sym("roe/ActiveView"),
+                [Value::identity(self.session), Value::identity(active)].into(),
+            ));
+        }
+        for (buffer_id, logical) in &self.buffer_ids {
+            let native = self.native_ids[buffer_id];
+            let resource = self.resource_ids[buffer_id];
+            facts.extend([
+                (sym("roe/LogicalBuffer"), [Value::identity(*logical)].into()),
+                (
+                    sym("roe/BufferName"),
+                    [
+                        Value::identity(*logical),
+                        Value::string(&self.buffer_names[buffer_id]),
+                    ]
+                    .into(),
+                ),
+                (
+                    sym("roe/NativeTextResource"),
+                    [Value::identity(*logical), Value::identity(native)].into(),
+                ),
+                (
+                    sym("roe/NativeResourceGeneration"),
+                    [Value::identity(native), int_value(resource.generation)].into(),
+                ),
+                (
+                    sym("roe/CanUseBuffer"),
+                    [Value::identity(self.actor), Value::identity(*logical)].into(),
+                ),
+            ]);
+        }
+        for (window_id, view) in &self.view_ids {
+            let Some(buffer_id) = self.view_buffers.get(window_id) else {
+                continue;
+            };
+            let Some(cursor) = self.view_cursors.get(window_id) else {
+                continue;
+            };
+            facts.extend([
+                (sym("roe/View"), [Value::identity(*view)].into()),
+                (
+                    sym("roe/ViewBuffer"),
+                    [
+                        Value::identity(*view),
+                        Value::identity(self.buffer_ids[buffer_id]),
+                    ]
+                    .into(),
+                ),
+                (
+                    sym("roe/ViewCursor"),
+                    [Value::identity(*view), int_value(*cursor)].into(),
+                ),
+            ]);
+        }
+        facts.extend(layout_named_tuples!(&self.layout_tuples));
+        facts
     }
 
     async fn wait_for_task(
         &mut self,
-        task_id: TaskId,
+        invocation: &InvocationHandle,
         selector: &str,
     ) -> Result<MicaDispatchResult, MicaHostError> {
         let mut batch = MicaEventBatch::default();
-        loop {
-            let events = {
-                let ready = self.driver.drain_events();
-                if ready.is_empty() {
-                    self.driver.wait_events().await
-                } else {
-                    ready
-                }
-            };
-            let mut key = None;
-            for event in events {
-                match event {
-                    DriverEvent::Effect(effect) => {
-                        if let Some(effect) = self.presentation_effect(effect.target, &effect.value)
-                        {
-                            batch.effects.push(effect);
-                        } else if let Some(update) =
-                            self.prompt_update(effect.target, &effect.value)
-                        {
-                            self.prompt_active = true;
-                            batch.prompt_updates.push(update);
-                        } else if self.prompt_closed(effect.target, &effect.value) {
-                            self.prompt_active = false;
-                            batch.prompt_close = true;
-                        } else if let Some(update) =
-                            self.search_update(effect.target, &effect.value)
-                        {
-                            batch.search_updates.push(update);
-                        } else if let Some(finish) =
-                            self.search_finish(effect.target, &effect.value)
-                        {
-                            batch.search_finishes.push(finish);
-                        } else if self.policy_reset(effect.target, &effect.value) {
-                            batch.policy_reset = true;
-                        } else if let Some(policy) = self.policy_fact(effect.target, &effect.value)
-                        {
-                            batch.push_policy(policy);
-                        } else if let Some(action) =
-                            self.native_action(effect.target, &effect.value)
-                        {
-                            batch.native_actions.push(action);
-                        } else if let Some(action) = self.host_action(effect.target, &effect.value)
-                        {
-                            batch.host_actions.push(action);
-                        }
-                    }
-                    DriverEvent::TaskCompleted {
-                        task_id: completed,
-                        value,
-                    } if completed == task_id => {
-                        if value.as_symbol() == Some(sym("unbound")) {
-                            key = Some(MicaKeyResult::Unbound);
-                        } else if value.as_symbol() == Some(sym("prefix")) {
-                            key = Some(MicaKeyResult::Prefix);
-                        } else {
-                            key = Some(MicaKeyResult::Handled);
-                        }
-                    }
-                    DriverEvent::TaskAborted {
-                        task_id: aborted,
-                        error,
-                    } if aborted == task_id => {
-                        key = Some(MicaKeyResult::Failed(format!(
-                            "Mica task {task_id} selector={selector} endpoint={} session={} failure_class=aborted: {}",
-                            self.driver.format_value(&Value::identity(self.endpoint)),
-                            self.driver.format_value(&Value::identity(self.session)),
-                            self.driver.format_value(&error)
-                        )));
-                    }
-                    DriverEvent::TaskFailed {
-                        task_id: failed,
-                        error,
-                    } if failed == task_id => {
-                        key = Some(MicaKeyResult::Failed(format!(
-                            "Mica task {task_id} selector={selector} endpoint={} session={} failure_class=failed: {error}",
-                            self.driver.format_value(&Value::identity(self.endpoint)),
-                            self.driver.format_value(&Value::identity(self.session))
-                        )));
-                    }
-                    DriverEvent::TaskCancelled {
-                        task_id: cancelled,
-                        reason,
-                    } if cancelled == task_id => {
-                        key = Some(MicaKeyResult::Failed(format!(
-                            "Mica task {task_id} selector={selector} endpoint={} session={} failure_class=cancelled: {reason:?}",
-                            self.driver.format_value(&Value::identity(self.endpoint)),
-                            self.driver.format_value(&Value::identity(self.session))
-                        )));
-                    }
-                    event => self.record_background_event(event, &mut batch),
-                }
+        let mut pump = self
+            .event_pump
+            .take()
+            .expect("open Mica host retains its event pump");
+        let outcome = pump
+            .drive_invocation(invocation, |event| {
+                self.record_background_event(event, &mut batch);
+            })
+            .await;
+        let task_id = invocation.task_id();
+        let endpoint = self.format_value(&Value::identity(self.endpoint));
+        let session = self.format_value(&Value::identity(self.session));
+        let key = match outcome {
+            InvocationOutcome::Completed(value) if value.as_symbol() == Some(sym("unbound")) => {
+                MicaKeyResult::Unbound
             }
-            if let Some(key) = key {
-                return Ok(MicaDispatchResult { key, events: batch });
+            InvocationOutcome::Completed(value) if value.as_symbol() == Some(sym("prefix")) => {
+                MicaKeyResult::Prefix
             }
-        }
+            InvocationOutcome::Completed(_) => MicaKeyResult::Handled,
+            InvocationOutcome::Aborted(error) => MicaKeyResult::Failed(format!(
+                "Mica task {task_id} selector={selector} endpoint={endpoint} session={session} failure_class=aborted: {}",
+                self.format_value(&error)
+            )),
+            InvocationOutcome::Failed(error) => MicaKeyResult::Failed(format!(
+                "Mica task {task_id} selector={selector} endpoint={endpoint} session={session} failure_class=failed: {error}"
+            )),
+            InvocationOutcome::Cancelled(reason) => MicaKeyResult::Failed(format!(
+                "Mica task {task_id} selector={selector} endpoint={endpoint} session={session} failure_class=cancelled: {reason:?}"
+            )),
+        };
+        self.event_pump = Some(pump);
+        Ok(MicaDispatchResult { key, events: batch })
     }
 
     fn record_background_event(&mut self, event: DriverEvent, batch: &mut MicaEventBatch) {
@@ -1407,7 +1304,7 @@ end
             }
             DriverEvent::TaskAborted { task_id, error } => batch.errors.push(format!(
                 "Mica background task {task_id} aborted: {}",
-                self.driver.format_value(&error)
+                self.format_value(&error)
             )),
             DriverEvent::TaskFailed { task_id, error } => batch
                 .errors
@@ -1502,7 +1399,7 @@ end
         let value = raw
             .clone()
             .and_then(|value| value.with_str(str::to_owned))
-            .or_else(|| raw.map(|value| self.driver.format_value(&value)))
+            .or_else(|| raw.map(|value| self.format_value(&value)))
             .unwrap_or_default();
         Some(MicaPolicyFact {
             kind,
@@ -1641,7 +1538,7 @@ end
                         MicaPromptTarget::Selector(raw.as_symbol()?.name()?.to_owned())
                     }
                     Some("path") => MicaPromptTarget::Path(raw.with_str(str::to_owned)?),
-                    Some("opaque") => MicaPromptTarget::Opaque(self.driver.format_value(&raw)),
+                    Some("opaque") => MicaPromptTarget::Opaque(self.format_value(&raw)),
                     _ => return None,
                 }
             } else {
@@ -1711,121 +1608,28 @@ end
         }
         self.closed = true;
         let mut events = self.drain_background_events();
-        let mut tuples = vec![
-            (
-                sym("roe/EditorSession"),
-                [Value::identity(self.session)].into(),
-            ),
-            (
-                sym("roe/SessionActor"),
-                [Value::identity(self.session), Value::identity(self.actor)].into(),
-            ),
-            (
-                sym("roe/SessionEndpoint"),
-                [
-                    Value::identity(self.session),
-                    Value::identity(self.endpoint),
-                ]
-                .into(),
-            ),
-            (
-                sym("roe/ActorRole"),
-                [
-                    Value::identity(self.actor),
-                    Value::identity(self.editor_role),
-                ]
-                .into(),
-            ),
-            (
-                sym("roe/SessionKeymap"),
-                [
-                    Value::identity(self.session),
-                    Value::identity(self.global_map),
-                    int_value(100),
-                ]
-                .into(),
-            ),
-        ];
-        if let Some(active) = self.view_ids.get(&self.active_view).copied() {
-            tuples.push((
-                sym("roe/ActiveView"),
-                [Value::identity(self.session), Value::identity(active)].into(),
-            ));
+        let endpoint = self
+            .endpoint_session
+            .take()
+            .expect("open Mica host retains its endpoint session");
+        let mut pump = self
+            .event_pump
+            .take()
+            .expect("open Mica host retains its event pump");
+        let endpoint_result = endpoint
+            .close_with_pump(&mut pump, |event| {
+                self.record_background_event(event, &mut events);
+            })
+            .await;
+        let mut shutdown_events = Vec::new();
+        let shutdown_result = self
+            .owner
+            .shutdown(&mut pump, |event| shutdown_events.push(event))
+            .await;
+        for event in shutdown_events {
+            self.record_background_event(event, &mut events);
         }
-        for (buffer_id, logical) in &self.buffer_ids {
-            let native = self.native_ids[buffer_id];
-            let resource = self.resource_ids[buffer_id];
-            tuples.push((sym("roe/LogicalBuffer"), [Value::identity(*logical)].into()));
-            tuples.push((
-                sym("roe/BufferName"),
-                [
-                    Value::identity(*logical),
-                    Value::string(&self.buffer_names[buffer_id]),
-                ]
-                .into(),
-            ));
-            tuples.push((
-                sym("roe/NativeTextResource"),
-                [Value::identity(*logical), Value::identity(native)].into(),
-            ));
-            tuples.push((
-                sym("roe/NativeResourceGeneration"),
-                [Value::identity(native), int_value(resource.generation)].into(),
-            ));
-            tuples.push((
-                sym("roe/CanUseBuffer"),
-                [Value::identity(self.actor), Value::identity(*logical)].into(),
-            ));
-        }
-        for (window_id, view) in &self.view_ids {
-            let Some(buffer_id) = self.view_buffers.get(window_id) else {
-                continue;
-            };
-            let Some(cursor) = self.view_cursors.get(window_id) else {
-                continue;
-            };
-            tuples.push((sym("roe/View"), [Value::identity(*view)].into()));
-            tuples.push((
-                sym("roe/ViewBuffer"),
-                [
-                    Value::identity(*view),
-                    Value::identity(self.buffer_ids[buffer_id]),
-                ]
-                .into(),
-            ));
-            tuples.push((
-                sym("roe/ViewCursor"),
-                [Value::identity(*view), int_value(*cursor)].into(),
-            ));
-        }
-        let close_driver = self.driver.clone();
-        let endpoint = self.endpoint;
-        let close = compio::runtime::spawn(async move {
-            close_driver
-                .close_endpoint_and_retract_volatile_tuples_named(endpoint, tuples)
-                .await
-        });
-        while !close.is_finished() {
-            events.extend(self.drain_background_events());
-            compio::time::sleep(Duration::from_millis(1)).await;
-        }
-        let close_result = close
-            .await
-            .map_err(|_| DriverError::Join("endpoint close task panicked".to_owned()))?;
-        events.extend(self.drain_background_events());
-
-        let shutdown_driver = self.driver.clone();
-        let shutdown = compio::runtime::spawn(async move { shutdown_driver.shutdown().await });
-        while !shutdown.is_finished() {
-            events.extend(self.drain_background_events());
-            compio::time::sleep(Duration::from_millis(1)).await;
-        }
-        let shutdown_result = shutdown
-            .await
-            .map_err(|_| DriverError::Join("driver shutdown task panicked".to_owned()))?;
-        events.extend(self.drain_background_events());
-
-        let report = close_result?;
+        let report = endpoint_result?;
         shutdown_result?;
         events.cancelled_tasks.extend(report.cancelled_tasks);
         events.cancelled_tasks.sort_unstable();
@@ -1861,7 +1665,7 @@ fn native_error(message: &str) -> Value {
 }
 
 fn build_layout_tuples(
-    driver: &CompioTaskDriver,
+    driver: &DriverClient,
     frame: Identity,
     root: &WindowNode,
     views: &HashMap<WindowId, Identity>,
@@ -1872,7 +1676,7 @@ fn build_layout_tuples(
         reason = "recursive layout construction carries explicit bounded accumulators"
     )]
     fn visit(
-        driver: &CompioTaskDriver,
+        driver: &DriverClient,
         node: &WindowNode,
         path: &mut Vec<usize>,
         views: &HashMap<WindowId, Identity>,

@@ -1314,15 +1314,19 @@ pub fn run_vello_with_recovery(
         .map_err(FrontendError::EventLoop)?;
     let wake_proxy = event_loop.create_proxy();
     let wake_state = Arc::new(WakeState::default());
-    editor.file_watcher.set_wake_handler(Arc::new(WinitWake {
+    let frontend_wake: Arc<dyn FrontendWake> = Arc::new(WinitWake {
         proxy: wake_proxy,
         state: wake_state.clone(),
-    }));
+    });
+    editor
+        .file_watcher
+        .set_wake_handler(Arc::clone(&frontend_wake));
     event_loop.set_control_flow(ControlFlow::WaitUntil(
         Instant::now() + Duration::from_millis(20),
     ));
 
     let mut app = RoeVelloApp::new(editor, theme, runtime, wake_state, &recovery)?;
+    app.session.set_mica_wake_handler(frontend_wake);
     let event_loop_result = event_loop.run_app(&mut app);
     let fatal_error = app.fatal_error.take();
     let close = app.session.envelope(InputEvent::Close);

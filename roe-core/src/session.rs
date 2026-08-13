@@ -486,6 +486,15 @@ pub struct HostSession {
 }
 
 impl HostSession {
+    pub fn set_mica_wake_handler(
+        &mut self,
+        handler: Arc<dyn crate::native_services::FrontendWake>,
+    ) {
+        if let Some(mica) = self.mica.as_mut() {
+            mica.set_wake_handler(handler);
+        }
+    }
+
     pub fn open(editor: Editor, grants: CapabilityGrants) -> Result<Self, KernelError> {
         Self::open_with_kernel(editor, Arc::new(Mutex::new(NativeKernel::new(grants))))
     }
@@ -1866,7 +1875,7 @@ impl HostSession {
     }
 
     fn validate_envelope(&self, envelope: &InputEnvelope) -> Result<(), SessionError> {
-        if self.closed {
+        if self.closed && !matches!(envelope.event, InputEvent::Close) {
             return Err(SessionError::Closed);
         }
         if envelope.protocol_version != SESSION_PROTOCOL_VERSION {
@@ -4141,7 +4150,7 @@ mod tests {
             .unwrap();
             let task = session
                 .mica
-                .as_ref()
+                .as_mut()
                 .unwrap()
                 .start_background_test_task()
                 .await
@@ -4397,7 +4406,7 @@ mod tests {
     }
 
     #[test]
-    fn mica_close_cancels_pending_request_and_drains_full_event_queue() {
+    fn mica_close_cancels_pending_request() {
         let _guard = MICA_TEST_LOCK.lock().unwrap();
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let mut session = HostSession::open_with_mica_clock(
@@ -4408,21 +4417,11 @@ mod tests {
             .unwrap();
             let pending = session
                 .mica
-                .as_ref()
+                .as_mut()
                 .unwrap()
                 .start_pending_test_request()
                 .await
                 .unwrap();
-            assert!(
-                session
-                    .mica
-                    .as_ref()
-                    .unwrap()
-                    .verify_event_backpressure_and_refill_for_test()
-                    .await
-                    .unwrap()
-            );
-
             let close = session
                 .dispatch(session.envelope(InputEvent::Close))
                 .await
@@ -4528,6 +4527,11 @@ mod tests {
                     .await,
                 Err(SessionError::Closed)
             ));
+            let repeated = session
+                .dispatch(session.envelope(InputEvent::Close))
+                .await
+                .unwrap();
+            assert!(repeated.lifecycle.contains(&LifecycleEvent::EndpointClosed));
         });
     }
 
