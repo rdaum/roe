@@ -11,57 +11,11 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
-use thiserror::Error;
-
-/// A failure at the optional system-clipboard boundary.
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
-pub enum ClipboardError {
-    #[error("failed to write to the system clipboard: {message}")]
-    Write { message: String },
-    #[error("failed to read from the system clipboard: {message}")]
-    Read { message: String },
-}
-
-/// Clipboard operations used by the kill ring.
-///
-/// The boundary is injectable so tests and headless hosts do not read or mutate
-/// the process user's global clipboard.
-pub trait ClipboardBackend: Send {
-    fn set_text(&mut self, text: String) -> Result<(), ClipboardError>;
-    fn get_text(&mut self) -> Result<String, ClipboardError>;
-}
-
-struct SystemClipboard {
-    clipboard: arboard::Clipboard,
-}
-
-impl ClipboardBackend for SystemClipboard {
-    fn set_text(&mut self, text: String) -> Result<(), ClipboardError> {
-        self.clipboard
-            .set_text(text)
-            .map_err(|error| ClipboardError::Write {
-                message: error.to_string(),
-            })
-    }
-
-    fn get_text(&mut self) -> Result<String, ClipboardError> {
-        self.clipboard
-            .get_text()
-            .map_err(|error| ClipboardError::Read {
-                message: error.to_string(),
-            })
-    }
-}
-
-/// Emacs-style kill-ring implementation with system clipboard integration
+/// Emacs-style kill-ring implementation.
 ///
 /// The kill-ring is a circular buffer that stores killed (cut/copied) text.
 /// It maintains a history of killed text that can be yanked (pasted) back.
 /// Multiple consecutive kills are appended together, following Emacs conventions.
-///
-/// Kill operations copy to both the kill-ring and the system clipboard.
-/// Yank operations check the system clipboard first - if it contains text
-/// that differs from the kill-ring head, it's treated as external input.
 pub struct KillRing {
     /// Ring buffer of killed text entries
     entries: Vec<String>,
@@ -71,10 +25,6 @@ pub struct KillRing {
     current_index: usize,
     /// Whether the last operation was a kill (for appending consecutive kills)
     last_was_kill: bool,
-    /// System clipboard handle (optional - clipboard may not be available)
-    clipboard: Option<Box<dyn ClipboardBackend>>,
-    /// Most recent best-effort clipboard failure, for presentation by the host.
-    clipboard_error: Option<ClipboardError>,
 }
 
 impl Default for KillRing {
@@ -86,75 +36,20 @@ impl Default for KillRing {
 impl KillRing {
     /// Create a new kill-ring with default size
     pub fn new() -> Self {
-        Self::with_capacity(60) // Emacs default
+        Self::with_capacity(60)
     }
 
     /// Create a new kill-ring with specified maximum capacity
     pub fn with_capacity(max_size: usize) -> Self {
-        // Try to initialize clipboard, but don't fail if unavailable
-        let clipboard = match arboard::Clipboard::new() {
-            Ok(clipboard) => {
-                Some(Box::new(SystemClipboard { clipboard }) as Box<dyn ClipboardBackend>)
-            }
-            Err(error) => {
-                tracing::warn!(%error, "system clipboard is unavailable");
-                None
-            }
-        };
-
-        Self::with_clipboard(max_size, clipboard)
-    }
-
-    /// Create a kill ring with an explicitly supplied clipboard implementation.
-    pub fn with_clipboard(max_size: usize, clipboard: Option<Box<dyn ClipboardBackend>>) -> Self {
         Self {
             entries: Vec::new(),
             max_size: max_size.max(1),
             current_index: 0,
             last_was_kill: false,
-            clipboard,
-            clipboard_error: None,
         }
     }
 
-    /// Create a deterministic kill ring with no system clipboard integration.
-    pub fn without_clipboard(max_size: usize) -> Self {
-        Self::with_clipboard(max_size, None)
-    }
-
-    /// Copy text to the system clipboard without compromising the internal ring.
-    fn copy_to_clipboard(&mut self, text: &str) {
-        if let Some(ref mut clipboard) = self.clipboard
-            && let Err(error) = clipboard.set_text(text.to_string())
-        {
-            tracing::warn!(%error, "clipboard write failed");
-            self.clipboard_error = Some(error);
-        }
-    }
-
-    /// Get text from system clipboard
-    fn get_from_clipboard(&mut self) -> Option<String> {
-        if let Some(ref mut clipboard) = self.clipboard {
-            match clipboard.get_text() {
-                Ok(text) => Some(text),
-                Err(error) => {
-                    tracing::warn!(%error, "clipboard read failed");
-                    self.clipboard_error = Some(error);
-                    None
-                }
-            }
-        } else {
-            None
-        }
-    }
-
-    /// Take the most recent clipboard failure so a frontend can show it once.
-    pub fn take_clipboard_error(&mut self) -> Option<ClipboardError> {
-        self.clipboard_error.take()
-    }
-
-    /// Admit text already read through the session's capability-checked native
-    /// clipboard boundary. This does not call a platform clipboard itself.
+    /// Admit text supplied by an attachment-local frontend service.
     pub fn import_external_text(&mut self, text: String) {
         if text.is_empty() || self.entries.last() == Some(&text) {
             return;
@@ -167,11 +62,11 @@ impl KillRing {
         self.last_was_kill = false;
     }
 
-    /// Add text to the kill-ring and copy to system clipboard
+    /// Add text to the kill-ring.
     /// If the last operation was also a kill, append to the most recent entry
-    pub fn kill(&mut self, text: String) -> Option<ClipboardError> {
+    pub fn kill(&mut self, text: String) {
         if text.is_empty() {
-            return None;
+            return;
         }
 
         if self.last_was_kill && !self.entries.is_empty() {
@@ -196,20 +91,13 @@ impl KillRing {
             self.entries.len() - 1
         };
         self.last_was_kill = true;
-
-        // Copy the current entry to system clipboard
-        if let Some(entry) = self.entries.last().cloned() {
-            self.copy_to_clipboard(&entry);
-        }
-        self.take_clipboard_error()
     }
 
     /// Add text to the kill-ring, prepending to the most recent entry if last was kill
     /// This is used for backward kills (like C-Backspace)
-    /// Also copies to system clipboard
-    pub fn kill_prepend(&mut self, text: String) -> Option<ClipboardError> {
+    pub fn kill_prepend(&mut self, text: String) {
         if text.is_empty() {
-            return None;
+            return;
         }
 
         if self.last_was_kill && !self.entries.is_empty() {
@@ -234,37 +122,11 @@ impl KillRing {
             self.entries.len() - 1
         };
         self.last_was_kill = true;
-
-        // Copy the current entry to system clipboard
-        if let Some(entry) = self.entries.last().cloned() {
-            self.copy_to_clipboard(&entry);
-        }
-        self.take_clipboard_error()
     }
 
     /// Get the most recent kill for yanking
-    /// Checks system clipboard first - if it contains text different from the
-    /// most recent entry, that text is added to the ring and returned.
     pub fn yank(&mut self) -> Option<&str> {
         self.last_was_kill = false;
-
-        // Check system clipboard for external content
-        if let Some(clipboard_text) = self.get_from_clipboard()
-            && !clipboard_text.is_empty()
-        {
-            // Check if this differs from our most recent entry
-            let is_new = self.entries.last() != Some(&clipboard_text);
-
-            if is_new {
-                // External clipboard content - add to ring
-                self.entries.push(clipboard_text);
-
-                // Maintain ring size limit
-                if self.entries.len() > self.max_size {
-                    self.entries.remove(0);
-                }
-            }
-        }
 
         if self.entries.is_empty() {
             return None;
@@ -344,41 +206,9 @@ impl KillRing {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
-
-    struct TestClipboard {
-        text: Arc<Mutex<String>>,
-    }
-
-    struct FailingClipboard;
-
-    impl ClipboardBackend for TestClipboard {
-        fn set_text(&mut self, text: String) -> Result<(), ClipboardError> {
-            *self.text.lock().unwrap() = text;
-            Ok(())
-        }
-
-        fn get_text(&mut self) -> Result<String, ClipboardError> {
-            Ok(self.text.lock().unwrap().clone())
-        }
-    }
-
-    impl ClipboardBackend for FailingClipboard {
-        fn set_text(&mut self, _text: String) -> Result<(), ClipboardError> {
-            Err(ClipboardError::Write {
-                message: "test write failure".to_string(),
-            })
-        }
-
-        fn get_text(&mut self) -> Result<String, ClipboardError> {
-            Err(ClipboardError::Read {
-                message: "test read failure".to_string(),
-            })
-        }
-    }
 
     fn test_ring() -> KillRing {
-        KillRing::without_clipboard(60)
+        KillRing::with_capacity(60)
     }
 
     #[test]
@@ -387,25 +217,6 @@ mod tests {
 
         ring.kill("hello".to_string());
         assert_eq!(ring.yank(), Some("hello"));
-    }
-
-    #[test]
-    fn clipboard_failure_preserves_internal_kill_ring_and_is_reported() {
-        let mut ring = KillRing::with_clipboard(60, Some(Box::new(FailingClipboard)));
-
-        assert_eq!(
-            ring.kill("hello".to_string()),
-            Some(ClipboardError::Write {
-                message: "test write failure".to_string()
-            })
-        );
-        assert_eq!(ring.yank(), Some("hello"));
-        assert_eq!(
-            ring.take_clipboard_error(),
-            Some(ClipboardError::Read {
-                message: "test read failure".to_string()
-            })
-        );
     }
 
     #[test]
@@ -478,7 +289,7 @@ mod tests {
 
     #[test]
     fn test_max_capacity() {
-        let mut ring = KillRing::without_clipboard(2);
+        let mut ring = KillRing::with_capacity(2);
 
         ring.kill("first".to_string());
         ring.break_kill_sequence();
@@ -514,19 +325,5 @@ mod tests {
         // current() should not change state
         assert_eq!(ring.current(), Some("test"));
         assert_eq!(ring.yank(), Some("test"));
-    }
-
-    #[test]
-    fn test_injected_clipboard_imports_external_text() {
-        let text = Arc::new(Mutex::new(String::new()));
-        let clipboard = TestClipboard { text: text.clone() };
-        let mut ring = KillRing::with_clipboard(60, Some(Box::new(clipboard)));
-
-        ring.kill("internal".to_string());
-        assert_eq!(&*text.lock().unwrap(), "internal");
-
-        *text.lock().unwrap() = "external".to_string();
-        assert_eq!(ring.yank(), Some("external"));
-        assert_eq!(ring.entries(), &["internal", "external"]);
     }
 }

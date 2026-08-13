@@ -18,7 +18,10 @@ use crossterm::event::{
 use crossterm::execute;
 use crossterm::terminal::disable_raw_mode;
 use roe_core::native_kernel::CapabilityGrants;
-use roe_core::session::{HostSession, InputEvent, LifecycleEvent, StartupRecoveryOperation};
+use roe_core::session::{
+    AttachmentConfiguration, DirectSessionClient, LifecycleEvent, SessionClient,
+    StartupRecoveryOperation, WorkspaceHost,
+};
 use roe_core::{Buffer, BufferId, Editor, Frame, Window, WindowId, editor, kill_ring};
 use roe_terminal::{ECHO_AREA_HEIGHT, TerminalRenderer};
 use slotmap::SlotMap;
@@ -289,8 +292,6 @@ async fn terminal_main<W: Write>(
             width_chars: tsize.0,
             height_chars: window_height,
             active_buffer: buffer_ids[0],
-            start_line: 0,
-            start_column: 0,
             cursor: 0,
             window_type: editor::WindowType::Normal,
         };
@@ -303,8 +304,6 @@ async fn terminal_main<W: Write>(
             width_chars: tsize.0,
             height_chars: available_height - window_height,
             active_buffer: buffer_ids[1],
-            start_line: 0,
-            start_column: 0,
             cursor: 0,
             window_type: editor::WindowType::Normal,
         };
@@ -328,8 +327,6 @@ async fn terminal_main<W: Write>(
             width_chars: tsize.0,
             height_chars: tsize.1 - ECHO_AREA_HEIGHT,
             active_buffer,
-            start_line: 0,
-            start_column: 0,
             cursor: 0,
             window_type: editor::WindowType::Normal,
         };
@@ -350,7 +347,7 @@ async fn terminal_main<W: Write>(
         active_window: active_window_id,
         previous_active_window: None,
         window_tree,
-        kill_ring: kill_ring::KillRing::without_clipboard(60),
+        kill_ring: kill_ring::KillRing::with_capacity(60),
         buffer_history: Vec::new(),
         echo_message: String::new(),
         echo_message_time: None,
@@ -384,16 +381,24 @@ async fn terminal_main<W: Write>(
     let theme = roe_terminal::terminal_renderer::CachedTheme::default();
 
     let mut renderer = TerminalRenderer::new_with_theme(stdout, theme);
-    let mut session = HostSession::open_with_mica(editor, CapabilityGrants::editor_default())
-        .map_err(|error| std::io::Error::other(format!("failed to start Mica host: {error}")))?;
+    let attachment = AttachmentConfiguration::local_frontend(
+        editor.frame.available_columns,
+        editor.frame.available_lines,
+    );
+    let mut workspace = WorkspaceHost::open_with_mica(editor, CapabilityGrants::editor_default())
+        .map_err(|error| {
+        std::io::Error::other(format!("failed to start Mica host: {error}"))
+    })?;
 
-    let recovery_reports = session
+    let recovery_reports = workspace
         .execute_startup_recovery(&recovery)
         .await
         .map_err(std::io::Error::other)?;
     if let Some(report) = recovery_reports.last() {
-        session.set_recovery_message(report.clone());
+        workspace.set_recovery_message(report.clone());
     }
+
+    let mut session = DirectSessionClient::new(workspace, attachment);
 
     let initial = session.initial_output().await;
     if let Some(update) = initial.presentation.as_ref() {
@@ -408,8 +413,7 @@ async fn terminal_main<W: Write>(
     )
     .await;
 
-    let close = session.envelope(InputEvent::Close);
-    match session.dispatch(close).await {
+    match session.terminate_workspace().await {
         Ok(output) => {
             for event in output.lifecycle {
                 if let LifecycleEvent::Warning(error) = event {

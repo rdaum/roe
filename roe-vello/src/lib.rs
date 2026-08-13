@@ -31,9 +31,12 @@ use roe_core::native_kernel::{CapabilityGrants, ViewId};
 use roe_core::native_services::FrontendWake;
 use roe_core::renderer::DirtyRegion;
 use roe_core::session::{
-    HostSession, InputEvent, LifecycleEvent, PointerButton, PointerEvent, PointerKind,
-    PresentationColor, PresentedView, SessionOutput, StartupRecoveryOperation, StyleDefinition,
+    AttachmentConfiguration, DirectSessionClient, FrontendServiceRequest, FrontendServiceResponse,
+    FrontendServiceResult, InputEvent, LifecycleEvent, PointerButton, PointerEvent, PointerKind,
+    PresentationColor, PresentedView, SessionClient, SessionOutput, StartupRecoveryOperation,
+    StyleDefinition, WorkspaceHost,
 };
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -217,10 +220,61 @@ fn session_view_metrics(view: &PresentedView, char_width: f64) -> SessionViewMet
 /// Gutter colors
 const GUTTER_FG_COLOR: Color = Color::from_rgba8(0x60, 0x60, 0x60, 0xFF); // Dimmed line numbers
 
+struct LocalFrontendServices {
+    clipboard: Option<arboard::Clipboard>,
+    clipboard_error: Option<String>,
+}
+
+impl LocalFrontendServices {
+    fn new() -> Self {
+        match arboard::Clipboard::new() {
+            Ok(clipboard) => Self {
+                clipboard: Some(clipboard),
+                clipboard_error: None,
+            },
+            Err(error) => Self {
+                clipboard: None,
+                clipboard_error: Some(error.to_string()),
+            },
+        }
+    }
+
+    fn handle(&mut self, request: FrontendServiceRequest) -> FrontendServiceResult {
+        let request_id = request.request_id();
+        let unavailable = self
+            .clipboard_error
+            .clone()
+            .unwrap_or_else(|| "frontend clipboard is unavailable".to_owned());
+        let result = match request {
+            FrontendServiceRequest::ReadClipboard { .. } => self
+                .clipboard
+                .as_mut()
+                .ok_or_else(|| unavailable.clone())
+                .and_then(|clipboard| clipboard.get_text().map_err(|error| error.to_string()))
+                .map(|contents| FrontendServiceResponse::ClipboardContents(Some(contents))),
+            FrontendServiceRequest::WriteClipboard { contents, .. } => self
+                .clipboard
+                .as_mut()
+                .ok_or(unavailable)
+                .and_then(|clipboard| {
+                    clipboard
+                        .set_text(contents)
+                        .map(|()| FrontendServiceResponse::Completed)
+                        .map_err(|error| error.to_string())
+                }),
+            FrontendServiceRequest::Notify { .. } => {
+                Err("frontend notifications are not available".to_owned())
+            }
+        };
+        FrontendServiceResult { request_id, result }
+    }
+}
+
 /// Application state for the Vello renderer
 pub struct RoeVelloApp<'a> {
-    /// The shared editor host/session boundary.
-    session: HostSession,
+    /// The direct attachment to the embedded workspace.
+    session: DirectSessionClient,
+    frontend_services: LocalFrontendServices,
     /// The compio runtime driving buffer host tasks
     runtime: compio::runtime::Runtime,
     /// Vello render context
@@ -265,6 +319,7 @@ impl<'a> RoeVelloApp<'a> {
         theme: VelloTheme,
         runtime: compio::runtime::Runtime,
         wake_state: Arc<WakeState>,
+        frontend_wake: Arc<dyn FrontendWake>,
         recovery: &[StartupRecoveryOperation],
     ) -> Result<Self, FrontendError> {
         let font_size = theme.font_size;
@@ -274,14 +329,21 @@ impl<'a> RoeVelloApp<'a> {
             Some(theme.font_family.clone())
         };
 
-        let mut session = HostSession::open_with_mica(editor, CapabilityGrants::editor_default())
-            .map_err(FrontendError::MicaHost)?;
+        let attachment = AttachmentConfiguration::local_frontend(
+            editor.frame.available_columns,
+            editor.frame.available_lines,
+        );
+        let mut workspace =
+            WorkspaceHost::open_with_mica(editor, CapabilityGrants::editor_default())
+                .map_err(FrontendError::MicaHost)?;
+        workspace.set_mica_wake_handler(frontend_wake);
         let reports = runtime
-            .block_on(session.execute_startup_recovery(recovery))
+            .block_on(workspace.execute_startup_recovery(recovery))
             .map_err(FrontendError::Recovery)?;
         if let Some(report) = reports.last() {
-            session.set_recovery_message(report.clone());
+            workspace.set_recovery_message(report.clone());
         }
+        let mut session = DirectSessionClient::new(workspace, attachment);
         let initial = runtime.block_on(session.initial_output());
         let mut redraw_state = VelloRenderer::with_theme(theme.clone());
         if let Some(update) = initial.presentation.as_ref() {
@@ -292,6 +354,7 @@ impl<'a> RoeVelloApp<'a> {
 
         Ok(Self {
             session,
+            frontend_services: LocalFrontendServices::new(),
             runtime,
             render_cx: RenderContext::new(),
             renderers: vec![],
@@ -322,9 +385,9 @@ impl<'a> RoeVelloApp<'a> {
 
     fn drive_background(&mut self) {
         pump_runtime(&self.runtime);
-        let envelope = self.session.envelope(InputEvent::Timer { token: 0 });
-        match self.runtime.block_on(self.session.dispatch(envelope)) {
-            Ok(output) => self.apply_session_output(output),
+        match self.runtime.block_on(self.session.poll_output()) {
+            Ok(Some(output)) => self.apply_session_output(output),
+            Ok(None) => {}
             Err(error) => {
                 self.fatal_error = Some(FrontendError::Session(error));
                 self.quit_requested = true;
@@ -339,9 +402,33 @@ impl<'a> RoeVelloApp<'a> {
     }
 
     fn apply_session_output(&mut self, output: SessionOutput) {
+        let mut outputs = VecDeque::from([output]);
+        while let Some(mut output) = outputs.pop_front() {
+            let requests = std::mem::take(&mut output.frontend_requests);
+            self.render_session_output(output);
+            for request in requests {
+                let completion = self.frontend_services.handle(request);
+                match self
+                    .runtime
+                    .block_on(self.session.complete_frontend_request(completion))
+                {
+                    Ok(output) => outputs.push_back(output),
+                    Err(error) => {
+                        self.fatal_error = Some(FrontendError::Session(error));
+                        self.quit_requested = true;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    fn render_session_output(&mut self, output: SessionOutput) {
         for event in output.lifecycle {
             match event {
-                LifecycleEvent::QuitRequested | LifecycleEvent::EndpointClosed => {
+                LifecycleEvent::QuitRequested
+                | LifecycleEvent::AttachmentClosed { .. }
+                | LifecycleEvent::WorkspaceTerminated => {
                     self.quit_requested = true;
                 }
                 LifecycleEvent::Warning(message) => tracing::warn!(%message, "session warning"),
@@ -360,6 +447,8 @@ impl<'a> RoeVelloApp<'a> {
                     }
                 },
                 LifecycleEvent::Ready { .. }
+                | LifecycleEvent::AttachmentAttached { .. }
+                | LifecycleEvent::AttachmentDetached { .. }
                 | LifecycleEvent::Heartbeat
                 | LifecycleEvent::MicaTaskCancelled { .. }
                 | LifecycleEvent::MicaSubscriptionReady { .. }
@@ -1325,12 +1414,10 @@ pub fn run_vello_with_recovery(
         Instant::now() + Duration::from_millis(20),
     ));
 
-    let mut app = RoeVelloApp::new(editor, theme, runtime, wake_state, &recovery)?;
-    app.session.set_mica_wake_handler(frontend_wake);
+    let mut app = RoeVelloApp::new(editor, theme, runtime, wake_state, frontend_wake, &recovery)?;
     let event_loop_result = event_loop.run_app(&mut app);
     let fatal_error = app.fatal_error.take();
-    let close = app.session.envelope(InputEvent::Close);
-    if let Ok(output) = app.runtime.block_on(app.session.dispatch(close)) {
+    if let Ok(output) = app.runtime.block_on(app.session.terminate_workspace()) {
         for event in output.lifecycle {
             if let LifecycleEvent::Warning(error) = event {
                 tracing::warn!(%error, "editor shutdown warning");
@@ -1348,6 +1435,12 @@ pub fn run_vello_with_recovery(
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    struct NoopWake;
+
+    impl FrontendWake for NoopWake {
+        fn wake(&self) {}
+    }
     use roe_core::editor::{WindowNode, WindowType};
     use roe_core::file_watcher::FileWatcher;
     use roe_core::keys::{KeyModifier, LogicalKey, Side};
@@ -1430,8 +1523,6 @@ mod lifecycle_tests {
             width_chars: 80,
             height_chars: 23,
             active_buffer: buffer_id,
-            start_line: 0,
-            start_column: 0,
             cursor: 16,
             window_type: WindowType::Normal,
         });
@@ -1441,7 +1532,7 @@ mod lifecycle_tests {
             windows,
             active_window: window_id,
             window_tree: WindowNode::new_leaf(window_id),
-            kill_ring: KillRing::without_clipboard(60),
+            kill_ring: KillRing::with_capacity(60),
             previous_active_window: None,
             buffer_history: vec![buffer_id],
             echo_message: String::new(),
@@ -1461,6 +1552,7 @@ mod lifecycle_tests {
             VelloTheme::default(),
             runtime,
             Arc::new(WakeState::default()),
+            Arc::new(NoopWake),
             &[StartupRecoveryOperation::Inspect],
         )
         .unwrap();

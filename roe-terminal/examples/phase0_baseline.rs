@@ -3,7 +3,9 @@ use roe_core::file_watcher::FileWatcher;
 use roe_core::keys::LogicalKey;
 use roe_core::kill_ring::KillRing;
 use roe_core::native_kernel::CapabilityGrants;
-use roe_core::session::{HostSession, InputEvent};
+use roe_core::session::{
+    AttachmentConfiguration, DirectSessionClient, InputEvent, SessionClient, WorkspaceHost,
+};
 use roe_core::{Buffer, BufferId, Editor, Frame, Window, WindowId};
 use roe_terminal::TerminalRenderer;
 use slotmap::SlotMap;
@@ -52,8 +54,6 @@ fn fixture() -> Editor {
         width_chars: 120,
         height_chars: 39,
         active_buffer: buffer_id,
-        start_line: 0,
-        start_column: 0,
         cursor: 0,
         window_type: WindowType::Normal,
     };
@@ -66,7 +66,7 @@ fn fixture() -> Editor {
         windows,
         active_window: window_id,
         window_tree: WindowNode::new_leaf(window_id),
-        kill_ring: KillRing::without_clipboard(60),
+        kill_ring: KillRing::with_capacity(60),
         previous_active_window: None,
         buffer_history: Vec::new(),
         echo_message: String::new(),
@@ -98,8 +98,10 @@ async fn run() -> io::Result<()> {
     let process_started = Instant::now();
     let editor = fixture();
     let fixture_construction = process_started.elapsed();
-    let mut session = HostSession::open_with_mica(editor, CapabilityGrants::editor_default())
+    let workspace = WorkspaceHost::open_with_mica(editor, CapabilityGrants::editor_default())
         .map_err(io::Error::other)?;
+    let mut session =
+        DirectSessionClient::new(workspace, AttachmentConfiguration::headless(80, 23));
     let initial = session.initial_output().await;
     let ready = process_started.elapsed();
     let post_fixture_rss_kib = resident_memory_kib();

@@ -25,7 +25,7 @@ The production path is:
 ```text
 terminal or Vello platform event
   -> renderer-neutral InputEvent
-  -> ordered HostSession envelope
+  -> ordered attachment envelope
   -> Mica prompt/key/command/policy transaction
   -> bounded native action, external request, or effect
   -> Rust text/file/layout/resource mechanism
@@ -64,9 +64,9 @@ modes, hooks, candidates, packages, or logical targets in the production path.
 
 ### Production constructors
 
-Both shipped frontends use `HostSession::open_with_mica`. `HostSession::open` is intentionally a
-policy-free protocol/native-mechanism test harness. Do not add a Rust policy fallback to either
-constructor.
+Both shipped frontends create a `WorkspaceHost` with `WorkspaceHost::open_with_mica`, then attach a
+`DirectSessionClient`. `WorkspaceHost::open` is intentionally a policy-free workspace/native-
+mechanism test harness. Do not add a Rust policy fallback to either constructor.
 
 ## Workspace Structure
 
@@ -109,7 +109,7 @@ roe/
 ```
 
 The definitive ownership summary is `docs/PHASE-5-POLICY-TRANSFER.md`. Architectural decisions are
-recorded in `docs/adr/0001` through `0005`.
+recorded in `docs/adr/0001` through `0006`.
 
 ## Essential Commands
 
@@ -199,9 +199,17 @@ should use `BufferId` rather than treating file paths as buffer identity.
 
 ### Host session protocol
 
-`HostSession` is the only production frontend endpoint. Every `InputEnvelope` carries protocol
-version, session epoch, and exact sequence number. Accepted inputs are at-most-once; duplicates,
-gaps, stale epochs, and unsupported versions are rejected.
+`SessionClient` is the frontend contract. `DirectSessionClient` is its in-process implementation;
+a remote implementation must preserve the same messages and lifecycle rather than wrapping a
+different editor API. Every `InputEnvelope` carries protocol version, attachment epoch, and exact
+sequence number. Accepted inputs are at-most-once; duplicates, gaps, stale epochs, and unsupported
+versions are rejected.
+
+`WorkspaceHost` owns durable editor state, Mica, native resources, watchers, and processes.
+`Attachment` owns viewport/focus, input ordering, presentation revision, pointer and scroll state,
+and frontend-service grants. Attach, detach, resume, close-attachment, and terminate-workspace are
+distinct operations. Transport loss must detach an attachment and must not terminate its workspace.
+Server-originated output carries no acknowledged input sequence.
 
 `SessionOutput` contains:
 
@@ -315,7 +323,8 @@ For commands, bindings, prompts, modes, hooks, faces, syntax, configuration, or 
 4. use effects for no-result observable changes, external requests for result-bearing native work,
    and subscriptions for settled relation changes;
 5. synchronize endpoint-volatile context through `MicaHost`, not durable source; and
-6. exercise the real `HostSession::open_with_mica` path and both frontend presentation consumers.
+6. exercise the real `WorkspaceHost::open_with_mica` plus `DirectSessionClient` path and both
+   frontend presentation consumers.
 
 Do not create a parallel Rust command, keybinding, mode, face, or syntax owner. `KeyAction` and the
 reduced `ChromeAction` are mechanism/effect vocabularies, not policy registries.
@@ -345,9 +354,10 @@ appropriate.
 
 ### Tests and shared resources
 
-Use `KillRing::without_clipboard` in tests unless the system clipboard is the subject of the test.
-System clipboard tests share process-wide state and can interfere when run in parallel. Focused Mica
-driver tests should use one test thread when they share driver/recovery state.
+Use `KillRing::with_capacity` in core tests. The workspace kill ring never accesses the system
+clipboard; clipboard access belongs to an attachment-local frontend service. Frontend clipboard
+tests share process-wide state and can interfere when run in parallel. Focused Mica driver tests
+should use one test thread when they share driver/recovery state.
 
 ## Dependencies and Tooling
 
@@ -367,8 +377,9 @@ shutdown, terminal workflows, and both frontend presentation paths.
 
 - Durable Mica user/workspace persistence is not enabled. Adding it requires explicit schema,
   migration, backup, export, rollback, and recovery policy.
-- No network, daemon, or subprocess session transport exists yet; protocol messages are merely
-  transport-neutral.
+- No network, daemon, or subprocess session transport exists yet. `SessionClient`, attachment
+  lifecycle, independently pushable output, and frontend-service request/results are the transport-
+  neutral boundary on which one can be built.
 - A real display-host Vello smoke remains an environment-dependent obligation; headless scene and
   conformance tests do not replace it.
 - Production Mica dispatch is materially slower than direct Rope mutation. Preserve the honest

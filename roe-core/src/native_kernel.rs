@@ -61,8 +61,6 @@ pub enum Capability {
     Layout,
     FileRead,
     FileWrite,
-    ClipboardRead,
-    ClipboardWrite,
     ClockRead,
     ProcessSpawn,
     Watch,
@@ -88,8 +86,6 @@ impl CapabilityGrants {
             Capability::Layout,
             Capability::FileRead,
             Capability::FileWrite,
-            Capability::ClipboardRead,
-            Capability::ClipboardWrite,
             Capability::ClockRead,
             Capability::ProcessSpawn,
             Capability::Watch,
@@ -200,10 +196,6 @@ pub enum NativeOperation {
         path: PathBuf,
         contents: String,
     },
-    ReadClipboard,
-    WriteClipboard {
-        contents: String,
-    },
     ReadClockMillis,
     SpawnProcess {
         program: String,
@@ -233,8 +225,6 @@ pub enum NativeResult {
     FileContents(String),
     DirectoryEntries(Vec<PathBuf>),
     FileWritten,
-    ClipboardContents(String),
-    ClipboardWritten,
     ClockMillis(u64),
     ProcessOutput {
         status: Option<i32>,
@@ -263,8 +253,6 @@ pub enum KernelError {
     InvalidLayout(String),
     #[error("native I/O operation failed: {0}")]
     Io(#[from] std::io::Error),
-    #[error("clipboard operation failed: {0}")]
-    Clipboard(String),
     #[error("native file-watch operation failed: {0}")]
     Watch(#[from] notify::Error),
     #[error("native resource was revoked, but cleanup failed: {0}")]
@@ -453,24 +441,6 @@ impl NativeKernel {
                 self.require(Capability::FileWrite)?;
                 std::fs::write(path, contents)?;
                 Ok(NativeResult::FileWritten)
-            }
-            NativeOperation::ReadClipboard => {
-                self.require(Capability::ClipboardRead)?;
-                let mut clipboard = arboard::Clipboard::new()
-                    .map_err(|error| KernelError::Clipboard(error.to_string()))?;
-                let contents = clipboard
-                    .get_text()
-                    .map_err(|error| KernelError::Clipboard(error.to_string()))?;
-                Ok(NativeResult::ClipboardContents(contents))
-            }
-            NativeOperation::WriteClipboard { contents } => {
-                self.require(Capability::ClipboardWrite)?;
-                let mut clipboard = arboard::Clipboard::new()
-                    .map_err(|error| KernelError::Clipboard(error.to_string()))?;
-                clipboard
-                    .set_text(contents)
-                    .map_err(|error| KernelError::Clipboard(error.to_string()))?;
-                Ok(NativeResult::ClipboardWritten)
             }
             NativeOperation::ReadClockMillis => {
                 self.require(Capability::ClockRead)?;

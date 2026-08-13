@@ -15,6 +15,7 @@ path = "src/bin/roe-vello.rs"
 [dependencies]
 # Core roe
 roe-core = { path = "../roe-core" }
+arboard = { workspace = true }
 
 # Rendering
 vello = "0.9"

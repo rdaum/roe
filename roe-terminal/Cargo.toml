@@ -9,6 +9,7 @@ repository.workspace = true
 description = "Terminal rendering for Roe (Ryan's Own Emacs)"
 
 [dependencies]
+arboard = { workspace = true }
 compio = { workspace = true }
 crossterm = { workspace = true }
 roe-core = { path = "../roe-core" }

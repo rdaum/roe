@@ -22,11 +22,13 @@ use roe_core::gutter::{GutterConfig, calculate_gutter_width, format_line_number}
 use roe_core::keys::{KeyModifier, LogicalKey, Side};
 use roe_core::renderer::PresentationStreamState;
 use roe_core::session::{
-    HostSession, InputEvent, LifecycleEvent, PointerButton, PointerEvent, PointerKind,
-    PresentationColor, PresentationSnapshot, PresentationUpdate, PresentedView, SessionOutput,
+    DirectSessionClient, FrontendServiceRequest, FrontendServiceResponse, FrontendServiceResult,
+    InputEvent, LifecycleEvent, PointerButton, PointerEvent, PointerKind, PresentationColor,
+    PresentationSnapshot, PresentationUpdate, PresentedView, SessionClient, SessionOutput,
     StyleDefinition,
 };
 use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -661,16 +663,17 @@ fn crossterm_key_translate(key: &KeyCode, modifiers: KeyModifiers) -> LogicalKey
 
 pub async fn session_event_loop_with_renderer<W: Write>(
     renderer: &mut TerminalRenderer<W>,
-    session: &mut HostSession,
+    session: &mut DirectSessionClient,
     shutdown_requested: &AtomicBool,
 ) -> Result<(), std::io::Error> {
     let mut event_tick = interval(Duration::from_millis(20));
+    let mut frontend_services = LocalFrontendServices::new();
 
     loop {
         event_tick.tick().await;
-        let tick = session.envelope(InputEvent::Timer { token: 0 });
-        let output = session.dispatch(tick).await.map_err(session_io_error)?;
-        if apply_session_output(renderer, output)? {
+        if let Some(output) = session.poll_output().await.map_err(session_io_error)?
+            && apply_session_output(renderer, session, &mut frontend_services, output).await?
+        {
             return Ok(());
         }
 
@@ -687,7 +690,7 @@ pub async fn session_event_loop_with_renderer<W: Write>(
         };
         let envelope = session.envelope(input);
         let output = session.dispatch(envelope).await.map_err(session_io_error)?;
-        if apply_session_output(renderer, output)? {
+        if apply_session_output(renderer, session, &mut frontend_services, output).await? {
             return Ok(());
         }
     }
@@ -754,7 +757,85 @@ fn pointer_button(button: MouseButton) -> PointerButton {
     }
 }
 
-fn apply_session_output<W: Write>(
+struct LocalFrontendServices {
+    clipboard: Option<arboard::Clipboard>,
+    clipboard_error: Option<String>,
+}
+
+impl LocalFrontendServices {
+    fn new() -> Self {
+        match arboard::Clipboard::new() {
+            Ok(clipboard) => Self {
+                clipboard: Some(clipboard),
+                clipboard_error: None,
+            },
+            Err(error) => Self {
+                clipboard: None,
+                clipboard_error: Some(error.to_string()),
+            },
+        }
+    }
+
+    fn handle(&mut self, request: FrontendServiceRequest) -> FrontendServiceResult {
+        let request_id = request.request_id();
+        let result = match request {
+            FrontendServiceRequest::ReadClipboard { .. } => self
+                .clipboard
+                .as_mut()
+                .ok_or_else(|| {
+                    self.clipboard_error
+                        .clone()
+                        .unwrap_or_else(|| "frontend clipboard is unavailable".to_owned())
+                })
+                .and_then(|clipboard| clipboard.get_text().map_err(|error| error.to_string()))
+                .map(|contents| FrontendServiceResponse::ClipboardContents(Some(contents))),
+            FrontendServiceRequest::WriteClipboard { contents, .. } => self
+                .clipboard
+                .as_mut()
+                .ok_or_else(|| {
+                    self.clipboard_error
+                        .clone()
+                        .unwrap_or_else(|| "frontend clipboard is unavailable".to_owned())
+                })
+                .and_then(|clipboard| {
+                    clipboard
+                        .set_text(contents)
+                        .map(|()| FrontendServiceResponse::Completed)
+                        .map_err(|error| error.to_string())
+                }),
+            FrontendServiceRequest::Notify { .. } => {
+                Err("frontend notifications are not available".to_owned())
+            }
+        };
+        FrontendServiceResult { request_id, result }
+    }
+}
+
+async fn apply_session_output<W: Write>(
+    renderer: &mut TerminalRenderer<W>,
+    session: &mut DirectSessionClient,
+    frontend_services: &mut LocalFrontendServices,
+    output: SessionOutput,
+) -> Result<bool, std::io::Error> {
+    let mut outputs = VecDeque::from([output]);
+    let mut quit = false;
+    while let Some(output) = outputs.pop_front() {
+        let requests = output.frontend_requests.clone();
+        quit |= render_session_output(renderer, output)?;
+        for request in requests {
+            let completion = frontend_services.handle(request);
+            outputs.push_back(
+                session
+                    .complete_frontend_request(completion)
+                    .await
+                    .map_err(session_io_error)?,
+            );
+        }
+    }
+    Ok(quit)
+}
+
+fn render_session_output<W: Write>(
     renderer: &mut TerminalRenderer<W>,
     output: SessionOutput,
 ) -> Result<bool, std::io::Error> {
@@ -762,7 +843,8 @@ fn apply_session_output<W: Write>(
         matches!(
             event,
             LifecycleEvent::QuitRequested
-                | LifecycleEvent::EndpointClosed
+                | LifecycleEvent::AttachmentClosed { .. }
+                | LifecycleEvent::WorkspaceTerminated
                 | LifecycleEvent::Fatal(_)
         )
     });

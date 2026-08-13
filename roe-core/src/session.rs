@@ -27,7 +27,7 @@ use crate::native_kernel::{
 use crate::renderer::DirtyRegion;
 use crate::{BufferId, Editor, WindowId};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -37,6 +37,8 @@ pub const MAX_KEYS_PER_INPUT: usize = 64;
 pub const MAX_TEXT_CHARS_PER_INPUT: usize = 65_536;
 pub const MAX_PRESENTATION_CHARS: usize = 1_000_000;
 pub const MAX_NATIVE_RESULT_BYTES: usize = 1_048_576;
+pub const MAX_FRONTEND_REQUESTS: usize = 16;
+pub const MAX_FRONTEND_TEXT_CHARS: usize = 65_536;
 pub const MAX_SESSION_VIEWS: usize = 64;
 pub const MAX_FRAME_COLUMNS: u16 = 1_000;
 pub const MAX_FRAME_ROWS: u16 = 1_000;
@@ -46,6 +48,7 @@ const MICA_PROMPT_CONTEXT_BELOW: usize = 2;
 const MICA_PROMPT_SELECTION_FACE: &str = "completion-selection";
 
 static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
+static NEXT_ATTACHMENT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionEpoch(pub u64);
@@ -55,6 +58,112 @@ pub struct RequestId(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Revision(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AttachmentId(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentViewport {
+    pub columns: u16,
+    pub rows: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum FrontendCapability {
+    ClipboardRead,
+    ClipboardWrite,
+    Notifications,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentConfiguration {
+    pub viewport: AttachmentViewport,
+    pub frontend_capabilities: BTreeSet<FrontendCapability>,
+}
+
+impl AttachmentConfiguration {
+    pub fn headless(columns: u16, rows: u16) -> Self {
+        Self {
+            viewport: AttachmentViewport { columns, rows },
+            frontend_capabilities: BTreeSet::new(),
+        }
+    }
+
+    pub fn local_frontend(columns: u16, rows: u16) -> Self {
+        Self {
+            viewport: AttachmentViewport { columns, rows },
+            frontend_capabilities: [
+                FrontendCapability::ClipboardRead,
+                FrontendCapability::ClipboardWrite,
+            ]
+            .into_iter()
+            .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AttachmentStatus {
+    Attached,
+    Detached,
+    Closed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AttachmentControl {
+    Attach {
+        configuration: AttachmentConfiguration,
+    },
+    Resume {
+        attachment: AttachmentId,
+        epoch: SessionEpoch,
+        after: Option<Revision>,
+    },
+    Detach,
+    CloseAttachment,
+    TerminateWorkspace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct FrontendRequestId(pub u64);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FrontendServiceRequest {
+    ReadClipboard {
+        request_id: FrontendRequestId,
+    },
+    WriteClipboard {
+        request_id: FrontendRequestId,
+        contents: String,
+    },
+    Notify {
+        request_id: FrontendRequestId,
+        title: String,
+        body: String,
+    },
+}
+
+impl FrontendServiceRequest {
+    pub fn request_id(&self) -> FrontendRequestId {
+        match self {
+            Self::ReadClipboard { request_id }
+            | Self::WriteClipboard { request_id, .. }
+            | Self::Notify { request_id, .. } => *request_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrontendServiceResult {
+    pub request_id: FrontendRequestId,
+    pub result: Result<FrontendServiceResponse, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FrontendServiceResponse {
+    ClipboardContents(Option<String>),
+    Completed,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InputEnvelope {
@@ -84,10 +193,7 @@ pub enum InputEvent {
         rows: u16,
     },
     Focus(bool),
-    Timer {
-        token: u64,
-    },
-    NativeNotification(NativeNotification),
+    PlatformWarning(String),
     NativeRequest {
         request_id: RequestId,
         operation: NativeOperation,
@@ -100,7 +206,6 @@ pub enum InputEvent {
     RequestSnapshot {
         after: Option<Revision>,
     },
-    Close,
 }
 
 /// Small non-programmable surface retained when Mica user policy is broken.
@@ -133,6 +238,13 @@ pub struct PointerEvent {
     pub button: PointerButton,
 }
 
+struct MicaPointerInput<'a> {
+    view: WindowId,
+    position: usize,
+    phase: &'a str,
+    button: &'a str,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PointerKind {
     Down,
@@ -148,20 +260,17 @@ pub enum PointerButton {
     None,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum NativeNotification {
-    FilesChanged,
-    Wake,
-    PlatformWarning(String),
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionOutput {
     pub protocol_version: u16,
     pub epoch: SessionEpoch,
-    pub input_sequence: u64,
+    /// The accepted client input which caused this output. Server-originated
+    /// background output carries `None` and therefore never consumes input
+    /// sequence space.
+    pub acknowledged_input: Option<u64>,
     pub presentation: Option<PresentationUpdate>,
     pub native_completions: Vec<NativeCompletion>,
+    pub frontend_requests: Vec<FrontendServiceRequest>,
     pub lifecycle: Vec<LifecycleEvent>,
 }
 
@@ -204,8 +313,17 @@ pub enum LifecycleEvent {
         operation: String,
         result: Result<Option<String>, String>,
     },
+    AttachmentAttached {
+        attachment: AttachmentId,
+    },
+    AttachmentDetached {
+        attachment: AttachmentId,
+    },
+    AttachmentClosed {
+        attachment: AttachmentId,
+    },
+    WorkspaceTerminated,
     QuitRequested,
-    EndpointClosed,
     Heartbeat,
 }
 
@@ -341,8 +459,10 @@ pub enum SessionError {
     Sequence { received: u64, expected: u64 },
     #[error("session input exceeds its bound: {0}")]
     InputTooLarge(String),
-    #[error("the session endpoint is closed")]
-    Closed,
+    #[error("the frontend attachment is not active")]
+    AttachmentUnavailable,
+    #[error("the workspace has terminated")]
+    WorkspaceTerminated,
     #[error("editor input failed: {0}")]
     Editor(#[from] std::io::Error),
     #[error("native kernel failed: {0}")]
@@ -463,18 +583,14 @@ impl SyntaxClass {
     }
 }
 
-/// Direct, ordered in-process session endpoint.
-pub struct HostSession {
+/// Long-lived editor state. A workspace owns buffers, Mica, native resources,
+/// watchers, and processes; it does not own a frontend connection.
+pub struct WorkspaceHost {
     editor: Editor,
     kernel: Arc<Mutex<NativeKernel>>,
-    epoch: SessionEpoch,
-    next_sequence: u64,
-    revision: Revision,
     buffer_resources: HashMap<BufferId, ResourceId>,
     view_ids: HashMap<WindowId, ViewId>,
     next_view_id: u64,
-    pointer_selection: Option<(WindowId, usize)>,
-    pending_pointer_drag: Option<(BorderInfo, WindowId, (u16, u16))>,
     mica: Option<MicaHost>,
     mica_modes: HashMap<BufferId, String>,
     mica_faces: HashMap<String, HashMap<String, String>>,
@@ -482,10 +598,117 @@ pub struct HostSession {
     mica_syntax: HashMap<BufferId, Vec<MicaSyntaxRule>>,
     mica_search_ranges: HashMap<WindowId, Vec<(usize, usize, String)>>,
     mica_styled_lines: HashMap<WindowId, Vec<(usize, String)>>,
-    closed: bool,
+    terminated: bool,
 }
 
-impl HostSession {
+/// State belonging to one frontend attachment. None of these values survive a
+/// closed attachment or grant authority to workspace resources.
+pub struct Attachment {
+    id: AttachmentId,
+    epoch: SessionEpoch,
+    next_sequence: u64,
+    revision: Revision,
+    viewport: AttachmentViewport,
+    focused: bool,
+    status: AttachmentStatus,
+    frontend_capabilities: BTreeSet<FrontendCapability>,
+    view_scroll: HashMap<WindowId, ViewScroll>,
+    presented_cursors: HashMap<WindowId, usize>,
+    pointer_selection: Option<(WindowId, usize)>,
+    pending_pointer_drag: Option<(BorderInfo, WindowId, (u16, u16))>,
+    next_frontend_request: u64,
+    pending_frontend_requests: HashMap<FrontendRequestId, PendingFrontendRequest>,
+    frontend_requests: VecDeque<FrontendServiceRequest>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingFrontendRequest {
+    ReadClipboardForYank,
+    WriteClipboard,
+}
+
+impl Attachment {
+    pub fn id(&self) -> AttachmentId {
+        self.id
+    }
+
+    pub fn epoch(&self) -> SessionEpoch {
+        self.epoch
+    }
+
+    pub fn status(&self) -> AttachmentStatus {
+        self.status
+    }
+
+    fn enqueue_frontend_request(
+        &mut self,
+        pending: PendingFrontendRequest,
+        request: impl FnOnce(FrontendRequestId) -> FrontendServiceRequest,
+    ) -> Result<(), String> {
+        if self.pending_frontend_requests.len() >= MAX_FRONTEND_REQUESTS {
+            return Err(format!(
+                "frontend request limit of {MAX_FRONTEND_REQUESTS} reached"
+            ));
+        }
+        let request_id = FrontendRequestId(self.next_frontend_request);
+        self.next_frontend_request = self.next_frontend_request.saturating_add(1);
+        self.pending_frontend_requests.insert(request_id, pending);
+        self.frontend_requests.push_back(request(request_id));
+        Ok(())
+    }
+}
+
+/// Embedded frontend connection to a [`WorkspaceHost`]. This is the direct
+/// implementation of the same attachment semantics a process transport uses.
+pub struct DirectSessionClient {
+    workspace: WorkspaceHost,
+    attachment: Attachment,
+}
+
+/// Transport-independent frontend contract. A remote client implements this
+/// directly over its transport; the embedded client calls the workspace in
+/// process. Lifecycle methods are asynchronous because a process transport
+/// must receive an authoritative server response.
+#[allow(async_fn_in_trait)]
+pub trait SessionClient {
+    fn attachment_id(&self) -> AttachmentId;
+    fn epoch(&self) -> SessionEpoch;
+    fn next_sequence(&self) -> u64;
+    fn envelope(&self, event: InputEvent) -> InputEnvelope;
+    async fn initial_output(&mut self) -> SessionOutput;
+    async fn dispatch(&mut self, envelope: InputEnvelope) -> Result<SessionOutput, SessionError>;
+    async fn poll_output(&mut self) -> Result<Option<SessionOutput>, SessionError>;
+    async fn complete_frontend_request(
+        &mut self,
+        completion: FrontendServiceResult,
+    ) -> Result<SessionOutput, SessionError>;
+    async fn detach(&mut self) -> Result<SessionOutput, SessionError>;
+    async fn resume(
+        &mut self,
+        configuration: AttachmentConfiguration,
+    ) -> Result<SessionOutput, SessionError>;
+    async fn close_attachment(&mut self) -> Result<SessionOutput, SessionError>;
+    async fn terminate_workspace(&mut self) -> Result<SessionOutput, SessionError>;
+
+    async fn replay(
+        &mut self,
+        transcript: &SessionTranscript,
+    ) -> Result<Vec<SessionOutput>, SessionError> {
+        let mut outputs = Vec::with_capacity(transcript.events.len());
+        for event in transcript.events.iter().cloned() {
+            let envelope = self.envelope(event);
+            outputs.push(self.dispatch(envelope).await?);
+        }
+        Ok(outputs)
+    }
+}
+
+impl WorkspaceHost {
+    fn activate_attachment(&mut self, attachment: &Attachment) {
+        self.editor
+            .handle_resize(attachment.viewport.columns, attachment.viewport.rows);
+    }
+
     pub fn set_mica_wake_handler(
         &mut self,
         handler: Arc<dyn crate::native_services::FrontendWake>,
@@ -503,18 +726,12 @@ impl HostSession {
         editor: Editor,
         kernel: Arc<Mutex<NativeKernel>>,
     ) -> Result<Self, KernelError> {
-        let epoch = SessionEpoch(NEXT_EPOCH.fetch_add(1, Ordering::Relaxed));
-        let mut session = Self {
+        let mut workspace = Self {
             editor,
             kernel,
-            epoch,
-            next_sequence: 0,
-            revision: Revision(0),
             buffer_resources: HashMap::new(),
             view_ids: HashMap::new(),
             next_view_id: 1,
-            pointer_selection: None,
-            pending_pointer_drag: None,
             mica: None,
             mica_modes: HashMap::new(),
             mica_faces: HashMap::new(),
@@ -522,36 +739,36 @@ impl HostSession {
             mica_syntax: HashMap::new(),
             mica_search_ranges: HashMap::new(),
             mica_styled_lines: HashMap::new(),
-            closed: false,
+            terminated: false,
         };
-        for (buffer, value) in &session.editor.buffers {
-            let resource = session
+        for (buffer, value) in &workspace.editor.buffers {
+            let resource = workspace
                 .kernel
                 .lock()
                 .unwrap()
                 .register_buffer(value.clone())?;
-            session.buffer_resources.insert(buffer, resource);
+            workspace.buffer_resources.insert(buffer, resource);
         }
-        for window in session.editor.windows.keys() {
-            session
+        for window in workspace.editor.windows.keys() {
+            workspace
                 .view_ids
-                .insert(window, ViewId(session.next_view_id));
-            session.next_view_id += 1;
+                .insert(window, ViewId(workspace.next_view_id));
+            workspace.next_view_id += 1;
         }
-        Ok(session)
+        Ok(workspace)
     }
 
     /// Open the public-driver Mica endpoint used by the first integration
     /// wave. The ordinary constructor remains available for headless and
     /// protocol and native-mechanism tests that do not need policy dispatch.
     pub fn open_with_mica(editor: Editor, grants: CapabilityGrants) -> Result<Self, MicaHostError> {
-        let mut session = Self::open(editor, grants)?;
-        session.mica = Some(MicaHost::open(
-            &session.editor,
-            Arc::clone(&session.kernel),
-            &session.buffer_resources,
+        let mut workspace = Self::open(editor, grants)?;
+        workspace.mica = Some(MicaHost::open(
+            &workspace.editor,
+            Arc::clone(&workspace.kernel),
+            &workspace.buffer_resources,
         )?);
-        Ok(session)
+        Ok(workspace)
     }
 
     pub fn open_with_mica_clock(
@@ -559,40 +776,65 @@ impl HostSession {
         grants: CapabilityGrants,
         clock: Arc<dyn NativeClock>,
     ) -> Result<Self, MicaHostError> {
-        let mut session = Self::open_with_kernel(
+        let mut workspace = Self::open_with_kernel(
             editor,
             Arc::new(Mutex::new(NativeKernel::with_clock(grants, clock))),
         )?;
-        session.mica = Some(MicaHost::open(
-            &session.editor,
-            Arc::clone(&session.kernel),
-            &session.buffer_resources,
+        workspace.mica = Some(MicaHost::open(
+            &workspace.editor,
+            Arc::clone(&workspace.kernel),
+            &workspace.buffer_resources,
         )?);
-        Ok(session)
+        Ok(workspace)
     }
 
-    pub fn epoch(&self) -> SessionEpoch {
-        self.epoch
-    }
-
-    pub fn next_sequence(&self) -> u64 {
-        self.next_sequence
-    }
-
-    pub fn envelope(&self, event: InputEvent) -> InputEnvelope {
-        InputEnvelope {
-            protocol_version: SESSION_PROTOCOL_VERSION,
-            epoch: self.epoch,
-            sequence: self.next_sequence,
-            event,
+    pub fn attach(&mut self, configuration: AttachmentConfiguration) -> Attachment {
+        self.editor
+            .handle_resize(configuration.viewport.columns, configuration.viewport.rows);
+        let view_scroll = self
+            .editor
+            .windows
+            .keys()
+            .map(|window| {
+                (
+                    window,
+                    ViewScroll {
+                        start_line: 0,
+                        start_column: 0,
+                    },
+                )
+            })
+            .collect();
+        Attachment {
+            id: AttachmentId(NEXT_ATTACHMENT_ID.fetch_add(1, Ordering::Relaxed)),
+            epoch: SessionEpoch(NEXT_EPOCH.fetch_add(1, Ordering::Relaxed)),
+            next_sequence: 0,
+            revision: Revision(0),
+            viewport: configuration.viewport,
+            focused: true,
+            status: AttachmentStatus::Attached,
+            frontend_capabilities: configuration.frontend_capabilities,
+            view_scroll,
+            presented_cursors: HashMap::new(),
+            pointer_selection: None,
+            pending_pointer_drag: None,
+            next_frontend_request: 1,
+            pending_frontend_requests: HashMap::new(),
+            frontend_requests: VecDeque::new(),
         }
     }
 
-    pub async fn initial_output(&mut self) -> SessionOutput {
-        let mut lifecycle = vec![LifecycleEvent::Ready {
-            protocol_version: SESSION_PROTOCOL_VERSION,
-            capabilities: capability_list(self.kernel.lock().unwrap().grants()),
-        }];
+    pub async fn initial_output(&mut self, attachment: &mut Attachment) -> SessionOutput {
+        self.activate_attachment(attachment);
+        let mut lifecycle = vec![
+            LifecycleEvent::AttachmentAttached {
+                attachment: attachment.id,
+            },
+            LifecycleEvent::Ready {
+                protocol_version: SESSION_PROTOCOL_VERSION,
+                capabilities: capability_list(self.kernel.lock().unwrap().grants()),
+            },
+        ];
         if let Some(mut mica) = self.mica.take() {
             let policy = mica
                 .publish_policy(&self.editor, &self.buffer_resources)
@@ -601,43 +843,52 @@ impl HostSession {
             match policy {
                 Ok(events) => {
                     let mut initial_invalidations = Vec::new();
-                    self.apply_mica_events(events, &mut lifecycle, &mut initial_invalidations)
-                        .await;
+                    self.apply_mica_events(
+                        attachment,
+                        events,
+                        &mut lifecycle,
+                        &mut initial_invalidations,
+                    )
+                    .await;
                 }
                 Err(error) => lifecycle.push(LifecycleEvent::Error(format!(
                     "failed to publish initial Mica policy: {error}"
                 ))),
             }
         }
-        self.revision.0 += 1;
+        attachment.revision.0 += 1;
         SessionOutput {
             protocol_version: SESSION_PROTOCOL_VERSION,
-            epoch: self.epoch,
-            input_sequence: self.next_sequence,
-            presentation: Some(PresentationUpdate::Full(self.capture_snapshot())),
+            epoch: attachment.epoch,
+            acknowledged_input: None,
+            presentation: Some(PresentationUpdate::Full(self.capture_snapshot(attachment))),
             native_completions: Vec::new(),
+            frontend_requests: Vec::new(),
             lifecycle,
         }
     }
 
     pub async fn dispatch(
         &mut self,
+        attachment: &mut Attachment,
         envelope: InputEnvelope,
     ) -> Result<SessionOutput, SessionError> {
-        self.validate_envelope(&envelope)?;
+        self.validate_envelope(attachment, &envelope)?;
+        self.activate_attachment(attachment);
         if let Err(SessionError::InputTooLarge(detail)) = self.validate_event_size(&envelope.event)
         {
-            self.next_sequence += 1;
+            attachment.next_sequence += 1;
             return Ok(SessionOutput {
                 protocol_version: SESSION_PROTOCOL_VERSION,
-                epoch: self.epoch,
-                input_sequence: envelope.sequence,
+                epoch: attachment.epoch,
+                acknowledged_input: Some(envelope.sequence),
                 presentation: None,
                 native_completions: Vec::new(),
+                frontend_requests: Vec::new(),
                 lifecycle: vec![LifecycleEvent::Overloaded { detail }],
             });
         }
-        self.next_sequence += 1;
+        attachment.next_sequence += 1;
 
         let mut lifecycle = Vec::new();
         let mut completions = Vec::new();
@@ -646,7 +897,7 @@ impl HostSession {
         if let Some(mut mica) = self.mica.take() {
             let events = mica.drain_background_events();
             self.mica = Some(mica);
-            self.apply_mica_events(events, &mut lifecycle, &mut invalidations)
+            self.apply_mica_events(attachment, events, &mut lifecycle, &mut invalidations)
                 .await;
         }
 
@@ -664,6 +915,7 @@ impl HostSession {
                     match result {
                         Ok(dispatch) => {
                             self.apply_mica_events(
+                                attachment,
                                 dispatch.events,
                                 &mut lifecycle,
                                 &mut invalidations,
@@ -709,13 +961,14 @@ impl HostSession {
                             {
                                 Ok(actions) => {
                                     self.resolve_actions(
+                                        attachment,
                                         actions,
                                         &mut lifecycle,
                                         &mut invalidations,
                                     )
                                     .await;
                                 }
-                                Err(error) => self.fail_endpoint(error, &mut lifecycle),
+                                Err(error) => self.fail_workspace(error, &mut lifecycle),
                             }
                         } else {
                             self.editor.set_echo_message(format!(
@@ -741,6 +994,7 @@ impl HostSession {
                         match result {
                             Ok(dispatch) => {
                                 self.apply_mica_events(
+                                    attachment,
                                     dispatch.events,
                                     &mut lifecycle,
                                     &mut invalidations,
@@ -778,18 +1032,23 @@ impl HostSession {
                         .await
                     {
                         Ok(actions) => {
-                            self.resolve_actions(actions, &mut lifecycle, &mut invalidations)
-                                .await;
+                            self.resolve_actions(
+                                attachment,
+                                actions,
+                                &mut lifecycle,
+                                &mut invalidations,
+                            )
+                            .await;
                         }
                         Err(error) => {
-                            self.fail_endpoint(error, &mut lifecycle);
+                            self.fail_workspace(error, &mut lifecycle);
                             break;
                         }
                     }
                 }
             }
             InputEvent::Pointer(pointer) => {
-                self.apply_pointer(pointer, &mut lifecycle, &mut invalidations)
+                self.apply_pointer(attachment, pointer, &mut lifecycle, &mut invalidations)
                     .await;
             }
             InputEvent::SetViewScroll {
@@ -815,9 +1074,15 @@ impl HostSession {
                         .max()
                         .unwrap_or(0)
                         .min(u16::MAX as usize) as u16;
-                    let window = &self.editor.windows[window_id];
-                    let line = start_line.unwrap_or(window.start_line).min(max_line);
-                    let column = start_column.unwrap_or(window.start_column).min(max_column);
+                    let scroll = attachment
+                        .view_scroll
+                        .entry(window_id)
+                        .or_insert(ViewScroll {
+                            start_line: 0,
+                            start_column: 0,
+                        });
+                    let line = start_line.unwrap_or(scroll.start_line).min(max_line);
+                    let column = start_column.unwrap_or(scroll.start_column).min(max_column);
                     if let Some(mut mica) = self.mica.take() {
                         let result = mica
                             .set_view_scroll(
@@ -831,15 +1096,21 @@ impl HostSession {
                         self.mica = Some(mica);
                         match result {
                             Ok(events) => {
-                                self.apply_mica_events(events, &mut lifecycle, &mut invalidations)
-                                    .await;
+                                self.apply_mica_events(
+                                    attachment,
+                                    events,
+                                    &mut lifecycle,
+                                    &mut invalidations,
+                                )
+                                .await;
                             }
                             Err(error) => lifecycle.push(LifecycleEvent::Error(error.to_string())),
                         }
                     } else {
-                        let window = &mut self.editor.windows[window_id];
-                        window.start_line = line;
-                        window.start_column = column;
+                        *attachment.view_scroll.get_mut(&window_id).unwrap() = ViewScroll {
+                            start_line: line,
+                            start_column: column,
+                        };
                         invalidations.push(Invalidation::View(view));
                     }
                 } else {
@@ -850,33 +1121,11 @@ impl HostSession {
                 }
             }
             InputEvent::Resize { columns, rows } => {
+                attachment.viewport = AttachmentViewport { columns, rows };
                 self.editor.handle_resize(columns, rows);
                 invalidations.push(Invalidation::Full);
             }
-            InputEvent::Timer { .. }
-            | InputEvent::NativeNotification(NativeNotification::FilesChanged)
-            | InputEvent::NativeNotification(NativeNotification::Wake) => {
-                if self.editor.check_and_clear_expired_echo() {
-                    invalidations.push(Invalidation::EchoArea);
-                }
-                let actions = self.editor.poll_file_changes();
-                self.resolve_actions(actions, &mut lifecycle, &mut invalidations)
-                    .await;
-                let kernel = self.kernel.lock().unwrap();
-                for notification in kernel.poll_watch_notifications() {
-                    invalidations.push(Invalidation::Resource(notification.resource));
-                    lifecycle.push(LifecycleEvent::ResourceChanged {
-                        resource: notification.resource,
-                        path: notification.path,
-                    });
-                }
-                if let Some(error) = kernel.take_watch_error() {
-                    lifecycle.push(LifecycleEvent::Error(format!(
-                        "native watcher backend: {error}"
-                    )));
-                }
-            }
-            InputEvent::NativeNotification(NativeNotification::PlatformWarning(warning)) => {
+            InputEvent::PlatformWarning(warning) => {
                 lifecycle.push(LifecycleEvent::Warning(warning));
             }
             InputEvent::NativeRequest {
@@ -974,35 +1223,12 @@ impl HostSession {
             }
             InputEvent::Heartbeat => lifecycle.push(LifecycleEvent::Heartbeat),
             InputEvent::RequestSnapshot { .. } => {}
-            InputEvent::Focus(_) => {}
-            InputEvent::Close => {
-                if let Some(mut mica) = self.mica.take() {
-                    match mica.close().await {
-                        Ok(events) => {
-                            self.apply_mica_events(events, &mut lifecycle, &mut invalidations)
-                                .await
-                        }
-                        Err(error) => lifecycle.push(LifecycleEvent::Warning(format!(
-                            "Mica endpoint shutdown: {error}"
-                        ))),
-                    }
-                }
-                self.closed = true;
-                for warning in self.editor.shutdown_native_work() {
-                    lifecycle.push(LifecycleEvent::Warning(warning));
-                }
-                let (resources, cleanup_warnings) = self.invalidate_all_resources();
-                for warning in cleanup_warnings {
-                    lifecycle.push(LifecycleEvent::Warning(warning));
-                }
-                for resource in resources {
-                    lifecycle.push(LifecycleEvent::ResourceInvalidated { resource });
-                }
-                lifecycle.push(LifecycleEvent::EndpointClosed);
+            InputEvent::Focus(focused) => {
+                attachment.focused = focused;
             }
         }
 
-        if !self.closed {
+        if !self.terminated {
             let (resources, cleanup_warnings) = self.synchronize_identities();
             for warning in cleanup_warnings {
                 lifecycle.push(LifecycleEvent::Warning(warning));
@@ -1011,18 +1237,21 @@ impl HostSession {
                 lifecycle.push(LifecycleEvent::ResourceInvalidated { resource });
             }
         }
-        let presentation = if self.closed || (!force_full && invalidations.is_empty()) {
+        let presentation = if self.terminated
+            || attachment.status != AttachmentStatus::Attached
+            || (!force_full && invalidations.is_empty())
+        {
             None
         } else {
-            self.revision.0 += 1;
-            let snapshot = self.capture_snapshot();
+            attachment.revision.0 += 1;
+            let snapshot = self.capture_snapshot(attachment);
             if force_full {
                 Some(PresentationUpdate::Full(snapshot))
             } else {
                 Some(PresentationUpdate::Delta(PresentationDelta {
-                    epoch: self.epoch,
-                    base_revision: Revision(self.revision.0 - 1),
-                    revision: self.revision,
+                    epoch: attachment.epoch,
+                    base_revision: Revision(attachment.revision.0 - 1),
+                    revision: attachment.revision,
                     invalidations,
                     snapshot,
                 }))
@@ -1031,26 +1260,13 @@ impl HostSession {
 
         Ok(SessionOutput {
             protocol_version: SESSION_PROTOCOL_VERSION,
-            epoch: self.epoch,
-            input_sequence: envelope.sequence,
+            epoch: attachment.epoch,
+            acknowledged_input: Some(envelope.sequence),
             presentation,
             native_completions: completions,
+            frontend_requests: attachment.frontend_requests.drain(..).collect(),
             lifecycle,
         })
-    }
-
-    /// Replay a deterministic list of normalized inputs through the same
-    /// ordered endpoint used by interactive frontends.
-    pub async fn replay(
-        &mut self,
-        transcript: &SessionTranscript,
-    ) -> Result<Vec<SessionOutput>, SessionError> {
-        let mut outputs = Vec::with_capacity(transcript.events.len());
-        for event in transcript.events.iter().cloned() {
-            let envelope = self.envelope(event);
-            outputs.push(self.dispatch(envelope).await?);
-        }
-        Ok(outputs)
     }
 
     pub async fn check_mica_source(&self, source: String) -> Result<(), MicaHostError> {
@@ -1177,6 +1393,7 @@ impl HostSession {
 
     async fn apply_mica_events(
         &mut self,
+        attachment: &mut Attachment,
         events: MicaEventBatch,
         lifecycle: &mut Vec<LifecycleEvent>,
         invalidations: &mut Vec<Invalidation>,
@@ -1250,6 +1467,13 @@ impl HostSession {
                 .editor
                 .update_mica_prompt_window(&prompt.content, prompt.cursor)
             {
+                attachment.view_scroll.insert(
+                    window,
+                    ViewScroll {
+                        start_line: 0,
+                        start_column: 0,
+                    },
+                );
                 self.set_prompt_selected_line(window, prompt.selected_line);
                 if let Some(view) = self.view_ids.get(&window).copied() {
                     invalidations.push(Invalidation::View(view));
@@ -1279,6 +1503,13 @@ impl HostSession {
                     MICA_PROMPT_HEIGHT,
                     prompt.content,
                     prompt.cursor,
+                );
+                attachment.view_scroll.insert(
+                    window,
+                    ViewScroll {
+                        start_line: 0,
+                        start_column: 0,
+                    },
                 );
                 self.set_prompt_selected_line(window, prompt.selected_line);
                 invalidations.push(Invalidation::Full);
@@ -1355,32 +1586,25 @@ impl HostSession {
             if denied {
                 continue;
             }
-            if action.name == "yank" {
-                match self
-                    .kernel
-                    .lock()
-                    .unwrap()
-                    .execute(NativeOperation::ReadClipboard)
-                {
-                    Ok(NativeResult::ClipboardContents(text)) => {
-                        self.editor.kill_ring.import_external_text(text);
-                    }
-                    Ok(other) => lifecycle.push(LifecycleEvent::Error(format!(
-                        "clipboard read returned an unexpected native result: {other:?}"
-                    ))),
-                    Err(error) => {
-                        lifecycle.push(LifecycleEvent::Warning(format!(
-                            "clipboard read failed before yank; using the internal kill ring: {error}"
-                        )));
-                    }
+            if action.name == "yank"
+                && attachment
+                    .frontend_capabilities
+                    .contains(&FrontendCapability::ClipboardRead)
+            {
+                if let Err(detail) = attachment.enqueue_frontend_request(
+                    PendingFrontendRequest::ReadClipboardForYank,
+                    |request_id| FrontendServiceRequest::ReadClipboard { request_id },
+                ) {
+                    lifecycle.push(LifecycleEvent::Overloaded { detail });
                 }
+                continue;
             }
             if action.name == "insert_text" {
                 let actions = self.editor.insert_text(
                     action.text.unwrap_or_default(),
                     &crate::editor::ActionPosition::Cursor,
                 );
-                self.resolve_actions(actions, lifecycle, invalidations)
+                self.resolve_actions(attachment, actions, lifecycle, invalidations)
                     .await;
                 continue;
             }
@@ -1391,7 +1615,7 @@ impl HostSession {
                 match self.mica_word_boundary(action.name == "cursor_word_forward") {
                     Ok(position) => {
                         let actions = self.editor.move_cursor_to(position);
-                        self.resolve_actions(actions, lifecycle, invalidations)
+                        self.resolve_actions(attachment, actions, lifecycle, invalidations)
                             .await;
                     }
                     Err(message) => {
@@ -1405,9 +1629,9 @@ impl HostSession {
                 let action_name = action.name.clone();
                 match self.mica_kill_word(action.name == "kill_word") {
                     Ok(actions) => {
-                        self.resolve_actions(actions, lifecycle, invalidations)
+                        self.resolve_actions(attachment, actions, lifecycle, invalidations)
                             .await;
-                        self.write_kill_ring_to_native(&action_name, lifecycle);
+                        self.write_kill_ring_to_frontend(attachment, &action_name, lifecycle);
                     }
                     Err(message) => {
                         self.editor.set_echo_message(message.clone());
@@ -1425,11 +1649,11 @@ impl HostSession {
             };
             match self.editor.perform_native_action(action).await {
                 Ok(actions) => {
-                    self.resolve_actions(actions, lifecycle, invalidations)
+                    self.resolve_actions(attachment, actions, lifecycle, invalidations)
                         .await;
-                    self.write_kill_ring_to_native(&action_name, lifecycle);
+                    self.write_kill_ring_to_frontend(attachment, &action_name, lifecycle);
                 }
-                Err(error) => self.fail_endpoint(error, lifecycle),
+                Err(error) => self.fail_workspace(error, lifecycle),
             }
         }
         for action in events.host_actions {
@@ -1547,22 +1771,24 @@ impl HostSession {
                         invalidations.push(Invalidation::Full);
                     }
                 }
-                "begin_layout_drag" => match (action.view, self.pending_pointer_drag.take()) {
-                    (Some(view), Some((border, target, position))) if view == target => {
-                        self.editor.mouse_drag_state = Some(MouseDragState {
-                            drag_type: DragType::WindowBorder,
-                            start_pos: position,
-                            last_pos: position,
-                            current_pos: position,
-                            target_window: Some(target),
-                            border_info: Some(border),
-                        });
-                        self.pointer_selection = None;
+                "begin_layout_drag" => {
+                    match (action.view, attachment.pending_pointer_drag.take()) {
+                        (Some(view), Some((border, target, position))) if view == target => {
+                            self.editor.mouse_drag_state = Some(MouseDragState {
+                                drag_type: DragType::WindowBorder,
+                                start_pos: position,
+                                last_pos: position,
+                                current_pos: position,
+                                target_window: Some(target),
+                                border_info: Some(border),
+                            });
+                            attachment.pointer_selection = None;
+                        }
+                        _ => lifecycle.push(LifecycleEvent::Error(
+                            "Mica layout-drag decision lost its native border target".to_owned(),
+                        )),
                     }
-                    _ => lifecycle.push(LifecycleEvent::Error(
-                        "Mica layout-drag decision lost its native border target".to_owned(),
-                    )),
-                },
+                }
                 "pointer_selection" => match action.phase.as_deref() {
                     Some("down") => {
                         if let (Some(view), Some(position), Some(anchor)) =
@@ -1577,7 +1803,7 @@ impl HostSession {
                             let buffer = self.editor.windows[view].active_buffer;
                             self.editor.buffers[buffer].clear_mark();
                             self.editor.windows[view].cursor = position;
-                            self.pointer_selection = Some((view, anchor));
+                            attachment.pointer_selection = Some((view, anchor));
                             for window in [previous, view] {
                                 if let Some(id) = self.view_ids.get(&window).copied()
                                     && !invalidations.contains(&Invalidation::View(id))
@@ -1601,8 +1827,8 @@ impl HostSession {
                     }
                     Some("up") => {
                         self.editor.mouse_drag_state = None;
-                        self.pointer_selection = None;
-                        self.pending_pointer_drag = None;
+                        attachment.pointer_selection = None;
+                        attachment.pending_pointer_drag = None;
                     }
                     _ => lifecycle.push(LifecycleEvent::Error(
                         "Mica pointer decision had an unknown phase".to_owned(),
@@ -1612,9 +1838,13 @@ impl HostSession {
                     if let (Some(view), Some(line), Some(column)) =
                         (action.view, action.line, action.column)
                     {
-                        let window = &mut self.editor.windows[view];
-                        window.start_line = line;
-                        window.start_column = column;
+                        attachment.view_scroll.insert(
+                            view,
+                            ViewScroll {
+                                start_line: line,
+                                start_column: column,
+                            },
+                        );
                         if let Some(id) = self.view_ids.get(&view).copied() {
                             invalidations.push(Invalidation::View(id));
                         }
@@ -1654,13 +1884,18 @@ impl HostSession {
                     }
                 }
                 "save_buffer" => {
-                    self.resolve_actions(vec![ChromeAction::Save], lifecycle, invalidations)
-                        .await;
+                    self.resolve_actions(
+                        attachment,
+                        vec![ChromeAction::Save],
+                        lifecycle,
+                        invalidations,
+                    )
+                    .await;
                 }
                 "switch_buffer_selected" => {
                     if let Some(buffer) = action.buffer {
                         let actions = self.editor.select_mica_buffer(buffer, false);
-                        self.resolve_actions(actions, lifecycle, invalidations)
+                        self.resolve_actions(attachment, actions, lifecycle, invalidations)
                             .await;
                     } else {
                         lifecycle.push(LifecycleEvent::Error(
@@ -1671,7 +1906,7 @@ impl HostSession {
                 "kill_buffer_selected" => {
                     if let Some(buffer) = action.buffer {
                         let actions = self.editor.select_mica_buffer(buffer, true);
-                        self.resolve_actions(actions, lifecycle, invalidations)
+                        self.resolve_actions(attachment, actions, lifecycle, invalidations)
                             .await;
                     } else {
                         lifecycle.push(LifecycleEvent::Error(
@@ -1717,7 +1952,7 @@ impl HostSession {
                             }
                         };
                         let actions = self.editor.open_mica_file(path, open_type, content);
-                        self.resolve_actions(actions, lifecycle, invalidations)
+                        self.resolve_actions(attachment, actions, lifecycle, invalidations)
                             .await;
                     } else {
                         lifecycle.push(LifecycleEvent::Error(
@@ -1847,8 +2082,9 @@ impl HostSession {
         }
     }
 
-    fn write_kill_ring_to_native(
+    fn write_kill_ring_to_frontend(
         &mut self,
+        attachment: &mut Attachment,
         action_name: &str,
         lifecycle: &mut Vec<LifecycleEvent>,
     ) {
@@ -1858,25 +2094,43 @@ impl HostSession {
         let Some(text) = self.editor.kill_ring.current().map(str::to_owned) else {
             return;
         };
-        match self
-            .kernel
-            .lock()
-            .unwrap()
-            .execute(NativeOperation::WriteClipboard { contents: text })
+        if text.chars().count() > MAX_FRONTEND_TEXT_CHARS {
+            lifecycle.push(LifecycleEvent::Overloaded {
+                detail: format!(
+                    "clipboard write after {action_name} exceeds {MAX_FRONTEND_TEXT_CHARS} characters"
+                ),
+            });
+            return;
+        }
+        if !attachment
+            .frontend_capabilities
+            .contains(&FrontendCapability::ClipboardWrite)
         {
-            Ok(NativeResult::ClipboardWritten) => {}
-            Ok(other) => lifecycle.push(LifecycleEvent::Error(format!(
-                "clipboard write returned an unexpected native result: {other:?}"
-            ))),
-            Err(error) => lifecycle.push(LifecycleEvent::Error(format!(
-                "clipboard write failed after {action_name}: {error}"
-            ))),
+            return;
+        }
+        if let Err(detail) = attachment.enqueue_frontend_request(
+            PendingFrontendRequest::WriteClipboard,
+            |request_id| FrontendServiceRequest::WriteClipboard {
+                request_id,
+                contents: text,
+            },
+        ) {
+            lifecycle.push(LifecycleEvent::Overloaded {
+                detail: format!("clipboard write after {action_name}: {detail}"),
+            });
         }
     }
 
-    fn validate_envelope(&self, envelope: &InputEnvelope) -> Result<(), SessionError> {
-        if self.closed && !matches!(envelope.event, InputEvent::Close) {
-            return Err(SessionError::Closed);
+    fn validate_envelope(
+        &self,
+        attachment: &Attachment,
+        envelope: &InputEnvelope,
+    ) -> Result<(), SessionError> {
+        if self.terminated {
+            return Err(SessionError::WorkspaceTerminated);
+        }
+        if attachment.status != AttachmentStatus::Attached {
+            return Err(SessionError::AttachmentUnavailable);
         }
         if envelope.protocol_version != SESSION_PROTOCOL_VERSION {
             return Err(SessionError::ProtocolVersion {
@@ -1884,16 +2138,16 @@ impl HostSession {
                 expected: SESSION_PROTOCOL_VERSION,
             });
         }
-        if envelope.epoch != self.epoch {
+        if envelope.epoch != attachment.epoch {
             return Err(SessionError::StaleEpoch {
                 received: envelope.epoch,
-                expected: self.epoch,
+                expected: attachment.epoch,
             });
         }
-        if envelope.sequence != self.next_sequence {
+        if envelope.sequence != attachment.next_sequence {
             return Err(SessionError::Sequence {
                 received: envelope.sequence,
-                expected: self.next_sequence,
+                expected: attachment.next_sequence,
             });
         }
         Ok(())
@@ -1944,6 +2198,7 @@ impl HostSession {
 
     async fn resolve_actions(
         &mut self,
+        _attachment: &mut Attachment,
         actions: Vec<ChromeAction>,
         lifecycle: &mut Vec<LifecycleEvent>,
         invalidations: &mut Vec<Invalidation>,
@@ -1961,7 +2216,7 @@ impl HostSession {
                 ChromeAction::Save => {
                     pending.extend(self.save_active_buffer_via_kernel(lifecycle));
                 }
-                ChromeAction::CursorMove(_) | ChromeAction::BufferChanged { .. } => {}
+                ChromeAction::BufferChanged { .. } => {}
             }
         }
     }
@@ -2047,8 +2302,8 @@ impl HostSession {
         actions
     }
 
-    fn fail_endpoint(&mut self, error: std::io::Error, lifecycle: &mut Vec<LifecycleEvent>) {
-        self.closed = true;
+    fn fail_workspace(&mut self, error: std::io::Error, lifecycle: &mut Vec<LifecycleEvent>) {
+        self.terminated = true;
         lifecycle.push(LifecycleEvent::Fatal(format!(
             "editor input failed: {error}"
         )));
@@ -2062,24 +2317,25 @@ impl HostSession {
         for resource in resources {
             lifecycle.push(LifecycleEvent::ResourceInvalidated { resource });
         }
-        lifecycle.push(LifecycleEvent::EndpointClosed);
+        lifecycle.push(LifecycleEvent::WorkspaceTerminated);
     }
 
     async fn apply_pointer(
         &mut self,
+        attachment: &mut Attachment,
         pointer: PointerEvent,
         lifecycle: &mut Vec<LifecycleEvent>,
         invalidations: &mut Vec<Invalidation>,
     ) {
         if self.mica.is_none() {
-            self.apply_pointer_without_policy(pointer);
+            self.apply_pointer_without_policy(attachment, pointer);
             invalidations.push(Invalidation::Full);
             return;
         }
 
         let button = pointer_button_name(pointer.button);
         if pointer.kind == PointerKind::Up {
-            let window = self
+            let window = attachment
                 .pointer_selection
                 .map(|(window, _)| window)
                 .or_else(|| {
@@ -2090,8 +2346,18 @@ impl HostSession {
                 })
                 .unwrap_or(self.editor.active_window);
             let position = self.editor.windows[window].cursor;
-            self.dispatch_mica_pointer(window, position, "up", button, lifecycle, invalidations)
-                .await;
+            self.dispatch_mica_pointer(
+                attachment,
+                MicaPointerInput {
+                    view: window,
+                    position,
+                    phase: "up",
+                    button,
+                },
+                lifecycle,
+                invalidations,
+            )
+            .await;
             return;
         }
 
@@ -2128,8 +2394,13 @@ impl HostSession {
                         self.mica = Some(mica);
                         match result {
                             Ok(events) => {
-                                self.apply_mica_events(events, lifecycle, invalidations)
-                                    .await;
+                                self.apply_mica_events(
+                                    attachment,
+                                    events,
+                                    lifecycle,
+                                    invalidations,
+                                )
+                                .await;
                             }
                             Err(error) => lifecycle.push(LifecycleEvent::Error(error.to_string())),
                         }
@@ -2137,13 +2408,22 @@ impl HostSession {
                 }
                 return;
             }
-            if let Some((window, _)) = self.pointer_selection {
-                let position = cursor_at(&self.editor, window, pointer.column, pointer.row);
-                self.dispatch_mica_pointer(
+            if let Some((window, _)) = attachment.pointer_selection {
+                let position = cursor_at(
+                    &self.editor,
+                    attachment,
                     window,
-                    position,
-                    "move",
-                    button,
+                    pointer.column,
+                    pointer.row,
+                );
+                self.dispatch_mica_pointer(
+                    attachment,
+                    MicaPointerInput {
+                        view: window,
+                        position,
+                        phase: "move",
+                        button,
+                    },
                     lifecycle,
                     invalidations,
                 )
@@ -2155,13 +2435,16 @@ impl HostSession {
         if pointer.button == PointerButton::Primary
             && let Some((border, target)) = detect_border(&self.editor, pointer.column, pointer.row)
         {
-            self.pending_pointer_drag = Some((border, target, (pointer.column, pointer.row)));
+            attachment.pending_pointer_drag = Some((border, target, (pointer.column, pointer.row)));
             let position = self.editor.windows[target].cursor;
             self.dispatch_mica_pointer(
-                target,
-                position,
-                "layout_down",
-                button,
+                attachment,
+                MicaPointerInput {
+                    view: target,
+                    position,
+                    phase: "layout_down",
+                    button,
+                },
                 lifecycle,
                 invalidations,
             )
@@ -2187,18 +2470,32 @@ impl HostSession {
             })
             .map(|(id, _)| id);
         if let Some(window) = selected {
-            let position = cursor_at(&self.editor, window, pointer.column, pointer.row);
-            self.dispatch_mica_pointer(window, position, "down", button, lifecycle, invalidations)
-                .await;
+            let position = cursor_at(
+                &self.editor,
+                attachment,
+                window,
+                pointer.column,
+                pointer.row,
+            );
+            self.dispatch_mica_pointer(
+                attachment,
+                MicaPointerInput {
+                    view: window,
+                    position,
+                    phase: "down",
+                    button,
+                },
+                lifecycle,
+                invalidations,
+            )
+            .await;
         }
     }
 
     async fn dispatch_mica_pointer(
         &mut self,
-        view: WindowId,
-        position: usize,
-        phase: &str,
-        button: &str,
+        attachment: &mut Attachment,
+        input: MicaPointerInput<'_>,
         lifecycle: &mut Vec<LifecycleEvent>,
         invalidations: &mut Vec<Invalidation>,
     ) {
@@ -2207,29 +2504,29 @@ impl HostSession {
             .dispatch_pointer(
                 &self.editor,
                 &self.buffer_resources,
-                view,
-                position,
-                phase,
-                button,
+                input.view,
+                input.position,
+                input.phase,
+                input.button,
             )
             .await;
         self.mica = Some(mica);
         match result {
             Ok(events) => {
-                self.apply_mica_events(events, lifecycle, invalidations)
+                self.apply_mica_events(attachment, events, lifecycle, invalidations)
                     .await;
             }
             Err(error) => lifecycle.push(LifecycleEvent::Error(error.to_string())),
         }
     }
 
-    fn apply_pointer_without_policy(&mut self, pointer: PointerEvent) {
+    fn apply_pointer_without_policy(&mut self, attachment: &mut Attachment, pointer: PointerEvent) {
         if pointer.button != PointerButton::Primary && pointer.kind != PointerKind::Move {
             return;
         }
         if pointer.kind == PointerKind::Up {
             self.editor.mouse_drag_state = None;
-            self.pointer_selection = None;
+            attachment.pointer_selection = None;
             return;
         }
 
@@ -2247,8 +2544,14 @@ impl HostSession {
                 }
                 return;
             }
-            if let Some((window_id, anchor)) = self.pointer_selection {
-                let cursor = cursor_at(&self.editor, window_id, pointer.column, pointer.row);
+            if let Some((window_id, anchor)) = attachment.pointer_selection {
+                let cursor = cursor_at(
+                    &self.editor,
+                    attachment,
+                    window_id,
+                    pointer.column,
+                    pointer.row,
+                );
                 let buffer_id = self.editor.windows[window_id].active_buffer;
                 self.editor.buffers[buffer_id].set_mark(anchor);
                 self.editor.windows[window_id].cursor = cursor;
@@ -2267,7 +2570,7 @@ impl HostSession {
                 target_window: Some(target_window),
                 border_info: Some(border_info),
             });
-            self.pointer_selection = None;
+            attachment.pointer_selection = None;
             return;
         }
 
@@ -2295,11 +2598,17 @@ impl HostSession {
             self.editor.previous_active_window = Some(self.editor.active_window);
             self.editor.active_window = window_id;
         }
-        let cursor = cursor_at(&self.editor, window_id, pointer.column, pointer.row);
+        let cursor = cursor_at(
+            &self.editor,
+            attachment,
+            window_id,
+            pointer.column,
+            pointer.row,
+        );
         let buffer_id = self.editor.windows[window_id].active_buffer;
         self.editor.buffers[buffer_id].clear_mark();
         self.editor.windows[window_id].cursor = cursor;
-        self.pointer_selection = Some((window_id, cursor));
+        attachment.pointer_selection = Some((window_id, cursor));
     }
 
     fn synchronize_identities(&mut self) -> (Vec<ResourceId>, Vec<String>) {
@@ -2383,10 +2692,17 @@ impl HostSession {
         (invalidated, cleanup_warnings)
     }
 
-    fn capture_snapshot(&self) -> PresentationSnapshot {
+    fn capture_snapshot(&self, attachment: &mut Attachment) -> PresentationSnapshot {
         let mut styles = Vec::new();
         let mut style_by_name = HashMap::new();
         let mut views = Vec::new();
+        let live_windows: HashSet<_> = self.editor.windows.keys().collect();
+        attachment
+            .view_scroll
+            .retain(|window, _| live_windows.contains(window));
+        attachment
+            .presented_cursors
+            .retain(|window, _| live_windows.contains(window));
 
         for (window_id, window) in &self.editor.windows {
             let Some(buffer) = self.editor.buffers.get(window.active_buffer) else {
@@ -2395,7 +2711,28 @@ impl HostSession {
             let resource = self.buffer_resources[&window.active_buffer];
             let id = self.view_ids[&window_id];
             let total_lines = buffer.buffer_len_lines();
-            let start_line = usize::from(window.start_line).min(total_lines.saturating_sub(1));
+            let (cursor_column, cursor_line) = buffer.to_column_line(window.cursor);
+            let scroll = attachment
+                .view_scroll
+                .entry(window_id)
+                .or_insert(ViewScroll {
+                    start_line: 0,
+                    start_column: 0,
+                });
+            if attachment.presented_cursors.get(&window_id) != Some(&window.cursor) {
+                ensure_cursor_visible(
+                    scroll,
+                    cursor_column,
+                    cursor_line,
+                    window.width_chars.saturating_sub(4),
+                    window.height_chars.saturating_sub(3),
+                );
+                attachment
+                    .presented_cursors
+                    .insert(window_id, window.cursor);
+            }
+            let scroll = *scroll;
+            let start_line = usize::from(scroll.start_line).min(total_lines.saturating_sub(1));
             let visible_lines = usize::from(window.height_chars.saturating_sub(2)).max(1);
             let end_line = (start_line + visible_lines).min(total_lines);
             let visible_start_char = buffer.buffer_line_to_char(start_line);
@@ -2449,7 +2786,7 @@ impl HostSession {
             let selection = buffer
                 .get_region(window.cursor)
                 .map(|(anchor, active)| TextSelection { anchor, active });
-            let (column, line) = buffer.to_column_line(window.cursor);
+            let (column, line) = (cursor_column, cursor_line);
             let mode = self
                 .mica_modes
                 .get(&window.active_buffer)
@@ -2484,8 +2821,8 @@ impl HostSession {
                     rows: window.height_chars,
                 },
                 scroll: ViewScroll {
-                    start_line: window.start_line,
-                    start_column: window.start_column,
+                    start_line: scroll.start_line,
+                    start_column: scroll.start_column,
                 },
                 active: window_id == self.editor.active_window,
                 command_view: matches!(window.window_type, WindowType::Command { .. }),
@@ -2498,15 +2835,417 @@ impl HostSession {
         views.sort_by_key(|view| view.id.0);
 
         PresentationSnapshot {
-            epoch: self.epoch,
-            revision: self.revision,
-            columns: self.editor.frame.columns,
-            rows: self.editor.frame.rows,
+            epoch: attachment.epoch,
+            revision: attachment.revision,
+            columns: attachment.viewport.columns,
+            rows: attachment.viewport.rows,
             active_view: self.view_ids[&self.editor.active_window],
             views,
             styles,
             echo_area: self.editor.echo_message.clone(),
         }
+    }
+
+    fn finish_server_output(
+        &self,
+        attachment: &mut Attachment,
+        invalidations: Vec<Invalidation>,
+        lifecycle: Vec<LifecycleEvent>,
+    ) -> SessionOutput {
+        let presentation =
+            if attachment.status != AttachmentStatus::Attached || invalidations.is_empty() {
+                None
+            } else {
+                attachment.revision.0 += 1;
+                let snapshot = self.capture_snapshot(attachment);
+                Some(PresentationUpdate::Delta(PresentationDelta {
+                    epoch: attachment.epoch,
+                    base_revision: Revision(attachment.revision.0 - 1),
+                    revision: attachment.revision,
+                    invalidations,
+                    snapshot,
+                }))
+            };
+        SessionOutput {
+            protocol_version: SESSION_PROTOCOL_VERSION,
+            epoch: attachment.epoch,
+            acknowledged_input: None,
+            presentation,
+            native_completions: Vec::new(),
+            frontend_requests: attachment.frontend_requests.drain(..).collect(),
+            lifecycle,
+        }
+    }
+
+    pub async fn poll_output(
+        &mut self,
+        attachment: &mut Attachment,
+    ) -> Result<Option<SessionOutput>, SessionError> {
+        if self.terminated {
+            return Err(SessionError::WorkspaceTerminated);
+        }
+        if attachment.status != AttachmentStatus::Attached {
+            return Err(SessionError::AttachmentUnavailable);
+        }
+        self.activate_attachment(attachment);
+
+        let mut lifecycle = Vec::new();
+        let mut invalidations = Vec::new();
+        if let Some(mut mica) = self.mica.take() {
+            let events = mica.drain_background_events();
+            self.mica = Some(mica);
+            self.apply_mica_events(attachment, events, &mut lifecycle, &mut invalidations)
+                .await;
+        }
+        if self.editor.check_and_clear_expired_echo() {
+            invalidations.push(Invalidation::EchoArea);
+        }
+        let actions = self.editor.poll_file_changes();
+        self.resolve_actions(attachment, actions, &mut lifecycle, &mut invalidations)
+            .await;
+        {
+            let kernel = self.kernel.lock().unwrap();
+            for notification in kernel.poll_watch_notifications() {
+                invalidations.push(Invalidation::Resource(notification.resource));
+                lifecycle.push(LifecycleEvent::ResourceChanged {
+                    resource: notification.resource,
+                    path: notification.path,
+                });
+            }
+            if let Some(error) = kernel.take_watch_error() {
+                lifecycle.push(LifecycleEvent::Error(format!(
+                    "native watcher backend: {error}"
+                )));
+            }
+        }
+        let (resources, cleanup_warnings) = self.synchronize_identities();
+        lifecycle.extend(cleanup_warnings.into_iter().map(LifecycleEvent::Warning));
+        lifecycle.extend(
+            resources
+                .into_iter()
+                .map(|resource| LifecycleEvent::ResourceInvalidated { resource }),
+        );
+
+        if invalidations.is_empty()
+            && lifecycle.is_empty()
+            && attachment.frontend_requests.is_empty()
+        {
+            return Ok(None);
+        }
+        Ok(Some(self.finish_server_output(
+            attachment,
+            invalidations,
+            lifecycle,
+        )))
+    }
+
+    pub async fn complete_frontend_request(
+        &mut self,
+        attachment: &mut Attachment,
+        completion: FrontendServiceResult,
+    ) -> Result<SessionOutput, SessionError> {
+        if self.terminated {
+            return Err(SessionError::WorkspaceTerminated);
+        }
+        if attachment.status != AttachmentStatus::Attached {
+            return Err(SessionError::AttachmentUnavailable);
+        }
+        self.activate_attachment(attachment);
+        let Some(pending) = attachment
+            .pending_frontend_requests
+            .remove(&completion.request_id)
+        else {
+            return Ok(self.finish_server_output(
+                attachment,
+                Vec::new(),
+                vec![LifecycleEvent::Warning(format!(
+                    "unknown or completed frontend request {:?}",
+                    completion.request_id
+                ))],
+            ));
+        };
+
+        let mut lifecycle = Vec::new();
+        let mut invalidations = Vec::new();
+        let completion_result = match completion.result {
+            Err(error) if error.chars().count() > MAX_FRONTEND_TEXT_CHARS => Err(format!(
+                "frontend service error exceeds {MAX_FRONTEND_TEXT_CHARS} characters"
+            )),
+            result => result,
+        };
+        match pending {
+            PendingFrontendRequest::ReadClipboardForYank => {
+                match completion_result {
+                    Ok(FrontendServiceResponse::ClipboardContents(Some(text)))
+                        if text.chars().count() <= MAX_FRONTEND_TEXT_CHARS =>
+                    {
+                        self.editor.kill_ring.import_external_text(text);
+                    }
+                    Ok(FrontendServiceResponse::ClipboardContents(Some(_))) => lifecycle.push(
+                        LifecycleEvent::Overloaded {
+                            detail: format!(
+                                "frontend clipboard result exceeds {MAX_FRONTEND_TEXT_CHARS} characters"
+                            ),
+                        },
+                    ),
+                    Ok(FrontendServiceResponse::ClipboardContents(None)) => lifecycle.push(LifecycleEvent::Warning(
+                        "frontend clipboard read returned no text; using the internal kill ring"
+                            .to_owned(),
+                    )),
+                    Ok(FrontendServiceResponse::Completed) => lifecycle.push(LifecycleEvent::Warning(
+                        "frontend clipboard read returned the wrong response type; using the internal kill ring"
+                            .to_owned(),
+                    )),
+                    Err(error) => lifecycle.push(LifecycleEvent::Warning(format!(
+                        "frontend clipboard read failed; using the internal kill ring: {error}"
+                    ))),
+                }
+                match self
+                    .editor
+                    .perform_native_action(KeyAction::Yank(None))
+                    .await
+                {
+                    Ok(actions) => {
+                        self.resolve_actions(
+                            attachment,
+                            actions,
+                            &mut lifecycle,
+                            &mut invalidations,
+                        )
+                        .await;
+                    }
+                    Err(error) => self.fail_workspace(error, &mut lifecycle),
+                }
+            }
+            PendingFrontendRequest::WriteClipboard => match completion_result {
+                Ok(FrontendServiceResponse::Completed) => {}
+                Ok(FrontendServiceResponse::ClipboardContents(_)) => {
+                    lifecycle.push(LifecycleEvent::Warning(
+                        "frontend clipboard write returned the wrong response type".to_owned(),
+                    ))
+                }
+                Err(error) => lifecycle.push(LifecycleEvent::Warning(format!(
+                    "frontend clipboard write failed: {error}"
+                ))),
+            },
+        }
+        Ok(self.finish_server_output(attachment, invalidations, lifecycle))
+    }
+
+    pub fn detach(&self, attachment: &mut Attachment) -> Result<SessionOutput, SessionError> {
+        if self.terminated {
+            return Err(SessionError::WorkspaceTerminated);
+        }
+        if attachment.status != AttachmentStatus::Attached {
+            return Err(SessionError::AttachmentUnavailable);
+        }
+        let attachment_id = attachment.id;
+        attachment.status = AttachmentStatus::Detached;
+        attachment.pointer_selection = None;
+        attachment.pending_pointer_drag = None;
+        attachment.pending_frontend_requests.clear();
+        attachment.frontend_requests.clear();
+        Ok(self.finish_server_output(
+            attachment,
+            Vec::new(),
+            vec![LifecycleEvent::AttachmentDetached {
+                attachment: attachment_id,
+            }],
+        ))
+    }
+
+    pub fn resume(
+        &mut self,
+        attachment: &mut Attachment,
+        configuration: AttachmentConfiguration,
+    ) -> Result<SessionOutput, SessionError> {
+        if self.terminated {
+            return Err(SessionError::WorkspaceTerminated);
+        }
+        if attachment.status != AttachmentStatus::Detached {
+            return Err(SessionError::AttachmentUnavailable);
+        }
+        attachment.epoch = SessionEpoch(NEXT_EPOCH.fetch_add(1, Ordering::Relaxed));
+        attachment.next_sequence = 0;
+        attachment.revision = Revision(1);
+        attachment.viewport = configuration.viewport;
+        attachment.frontend_capabilities = configuration.frontend_capabilities;
+        attachment.focused = true;
+        attachment.status = AttachmentStatus::Attached;
+        attachment.presented_cursors.clear();
+        self.editor
+            .handle_resize(configuration.viewport.columns, configuration.viewport.rows);
+        Ok(SessionOutput {
+            protocol_version: SESSION_PROTOCOL_VERSION,
+            epoch: attachment.epoch,
+            acknowledged_input: None,
+            presentation: Some(PresentationUpdate::Full(self.capture_snapshot(attachment))),
+            native_completions: Vec::new(),
+            frontend_requests: Vec::new(),
+            lifecycle: vec![LifecycleEvent::AttachmentAttached {
+                attachment: attachment.id,
+            }],
+        })
+    }
+
+    pub fn close_attachment(
+        &self,
+        attachment: &mut Attachment,
+    ) -> Result<SessionOutput, SessionError> {
+        if attachment.status == AttachmentStatus::Closed {
+            return Err(SessionError::AttachmentUnavailable);
+        }
+        let attachment_id = attachment.id;
+        attachment.status = AttachmentStatus::Closed;
+        attachment.pointer_selection = None;
+        attachment.pending_pointer_drag = None;
+        attachment.pending_frontend_requests.clear();
+        attachment.frontend_requests.clear();
+        attachment.view_scroll.clear();
+        attachment.presented_cursors.clear();
+        Ok(self.finish_server_output(
+            attachment,
+            Vec::new(),
+            vec![LifecycleEvent::AttachmentClosed {
+                attachment: attachment_id,
+            }],
+        ))
+    }
+
+    pub async fn terminate_workspace(
+        &mut self,
+        attachment: &mut Attachment,
+    ) -> Result<SessionOutput, SessionError> {
+        let mut lifecycle = Vec::new();
+        let mut invalidations = Vec::new();
+        if !self.terminated {
+            if let Some(mut mica) = self.mica.take() {
+                match mica.close().await {
+                    Ok(events) => {
+                        self.apply_mica_events(
+                            attachment,
+                            events,
+                            &mut lifecycle,
+                            &mut invalidations,
+                        )
+                        .await;
+                    }
+                    Err(error) => lifecycle.push(LifecycleEvent::Warning(format!(
+                        "Mica workspace shutdown: {error}"
+                    ))),
+                }
+            }
+            self.terminated = true;
+            lifecycle.extend(
+                self.editor
+                    .shutdown_native_work()
+                    .into_iter()
+                    .map(LifecycleEvent::Warning),
+            );
+            let (resources, cleanup_warnings) = self.invalidate_all_resources();
+            lifecycle.extend(cleanup_warnings.into_iter().map(LifecycleEvent::Warning));
+            lifecycle.extend(
+                resources
+                    .into_iter()
+                    .map(|resource| LifecycleEvent::ResourceInvalidated { resource }),
+            );
+        }
+        attachment.status = AttachmentStatus::Closed;
+        attachment.pointer_selection = None;
+        attachment.pending_pointer_drag = None;
+        attachment.pending_frontend_requests.clear();
+        attachment.frontend_requests.clear();
+        attachment.view_scroll.clear();
+        attachment.presented_cursors.clear();
+        lifecycle.push(LifecycleEvent::WorkspaceTerminated);
+        Ok(self.finish_server_output(attachment, Vec::new(), lifecycle))
+    }
+}
+
+impl SessionClient for DirectSessionClient {
+    fn attachment_id(&self) -> AttachmentId {
+        self.attachment.id
+    }
+
+    fn epoch(&self) -> SessionEpoch {
+        self.attachment.epoch
+    }
+
+    fn next_sequence(&self) -> u64 {
+        self.attachment.next_sequence
+    }
+
+    fn envelope(&self, event: InputEvent) -> InputEnvelope {
+        InputEnvelope {
+            protocol_version: SESSION_PROTOCOL_VERSION,
+            epoch: self.attachment.epoch,
+            sequence: self.attachment.next_sequence,
+            event,
+        }
+    }
+
+    async fn initial_output(&mut self) -> SessionOutput {
+        self.workspace.initial_output(&mut self.attachment).await
+    }
+
+    async fn dispatch(&mut self, envelope: InputEnvelope) -> Result<SessionOutput, SessionError> {
+        self.workspace
+            .dispatch(&mut self.attachment, envelope)
+            .await
+    }
+
+    async fn poll_output(&mut self) -> Result<Option<SessionOutput>, SessionError> {
+        self.workspace.poll_output(&mut self.attachment).await
+    }
+
+    async fn complete_frontend_request(
+        &mut self,
+        completion: FrontendServiceResult,
+    ) -> Result<SessionOutput, SessionError> {
+        self.workspace
+            .complete_frontend_request(&mut self.attachment, completion)
+            .await
+    }
+
+    async fn detach(&mut self) -> Result<SessionOutput, SessionError> {
+        self.workspace.detach(&mut self.attachment)
+    }
+
+    async fn resume(
+        &mut self,
+        configuration: AttachmentConfiguration,
+    ) -> Result<SessionOutput, SessionError> {
+        self.workspace.resume(&mut self.attachment, configuration)
+    }
+
+    async fn close_attachment(&mut self) -> Result<SessionOutput, SessionError> {
+        self.workspace.close_attachment(&mut self.attachment)
+    }
+
+    async fn terminate_workspace(&mut self) -> Result<SessionOutput, SessionError> {
+        self.workspace
+            .terminate_workspace(&mut self.attachment)
+            .await
+    }
+}
+
+impl DirectSessionClient {
+    pub fn new(mut workspace: WorkspaceHost, configuration: AttachmentConfiguration) -> Self {
+        let attachment = workspace.attach(configuration);
+        Self {
+            workspace,
+            attachment,
+        }
+    }
+
+    /// Recover the embedded workspace after permanently closing its attachment,
+    /// allowing a new direct attachment to be created without terminating the
+    /// workspace.
+    pub fn into_workspace(self) -> Result<WorkspaceHost, SessionError> {
+        if self.attachment.status != AttachmentStatus::Closed {
+            return Err(SessionError::AttachmentUnavailable);
+        }
+        Ok(self.workspace)
     }
 }
 
@@ -2561,11 +3300,10 @@ fn mica_native_action(action: &str) -> Option<KeyAction> {
 
 fn mica_native_capabilities(name: &str) -> &'static [Capability] {
     match name {
-        "kill_line" | "kill_region" | "kill_word" | "backward_kill_word" => {
-            &[Capability::TextWrite, Capability::ClipboardWrite]
+        "kill_line" | "kill_region" | "kill_word" | "backward_kill_word" | "yank" => {
+            &[Capability::TextWrite]
         }
-        "copy_region" => &[Capability::TextRead, Capability::ClipboardWrite],
-        "yank" => &[Capability::TextWrite, Capability::ClipboardRead],
+        "copy_region" => &[Capability::TextRead],
         "insert_text" | "backspace" | "delete" | "enter" | "indent" | "undo" | "redo" => {
             &[Capability::TextWrite]
         }
@@ -2686,8 +3424,6 @@ fn capability_list(grants: &CapabilityGrants) -> Vec<Capability> {
         Capability::Layout,
         Capability::FileRead,
         Capability::FileWrite,
-        Capability::ClipboardRead,
-        Capability::ClipboardWrite,
         Capability::ClockRead,
         Capability::ProcessSpawn,
         Capability::Watch,
@@ -2697,15 +3433,50 @@ fn capability_list(grants: &CapabilityGrants) -> Vec<Capability> {
     .collect()
 }
 
-fn cursor_at(editor: &Editor, window_id: WindowId, column: u16, row: u16) -> usize {
+fn ensure_cursor_visible(
+    scroll: &mut ViewScroll,
+    cursor_column: u16,
+    cursor_line: u16,
+    content_columns: u16,
+    content_rows: u16,
+) {
+    let content_columns = content_columns.max(1);
+    let content_rows = content_rows.max(1);
+    if cursor_line >= scroll.start_line.saturating_add(content_rows) {
+        scroll.start_line = cursor_line.saturating_sub(content_rows.saturating_sub(1));
+    } else if cursor_line < scroll.start_line {
+        scroll.start_line = cursor_line;
+    }
+    if cursor_column >= scroll.start_column.saturating_add(content_columns) {
+        scroll.start_column = cursor_column.saturating_sub(content_columns.saturating_sub(1));
+    } else if cursor_column < scroll.start_column {
+        scroll.start_column = cursor_column;
+    }
+}
+
+fn cursor_at(
+    editor: &Editor,
+    attachment: &Attachment,
+    window_id: WindowId,
+    column: u16,
+    row: u16,
+) -> usize {
     let window = &editor.windows[window_id];
     let buffer = &editor.buffers[window.active_buffer];
+    let scroll = attachment
+        .view_scroll
+        .get(&window_id)
+        .copied()
+        .unwrap_or(ViewScroll {
+            start_line: 0,
+            start_column: 0,
+        });
     let line = row
         .saturating_sub(window.y.saturating_add(1))
-        .saturating_add(window.start_line);
+        .saturating_add(scroll.start_line);
     let column = column
         .saturating_sub(window.x.saturating_add(1))
-        .saturating_add(window.start_column);
+        .saturating_add(scroll.start_column);
     buffer.to_char_index(column, line)
 }
 
@@ -2962,8 +3733,7 @@ fn native_operation_text_size(operation: &NativeOperation) -> usize {
         NativeOperation::Insert { text, .. } | NativeOperation::Replace { text, .. } => {
             text.chars().count()
         }
-        NativeOperation::WriteFile { contents, .. }
-        | NativeOperation::WriteClipboard { contents } => contents.chars().count(),
+        NativeOperation::WriteFile { contents, .. } => contents.chars().count(),
         NativeOperation::SpawnProcess { program, args } => {
             args.iter().fold(program.chars().count(), |size, arg| {
                 size.saturating_add(arg.chars().count())
@@ -2976,9 +3746,7 @@ fn native_operation_text_size(operation: &NativeOperation) -> usize {
 fn native_result_size(result: &NativeResult) -> usize {
     match result {
         NativeResult::Snapshot(snapshot) => snapshot.name.len().saturating_add(snapshot.text.len()),
-        NativeResult::FileContents(contents) | NativeResult::ClipboardContents(contents) => {
-            contents.len()
-        }
+        NativeResult::FileContents(contents) => contents.len(),
         NativeResult::DirectoryEntries(entries) => entries.iter().fold(0usize, |size, path| {
             size.saturating_add(path.as_os_str().len())
         }),
@@ -2990,7 +3758,6 @@ fn native_result_size(result: &NativeResult) -> usize {
         | NativeResult::TextChanged { .. }
         | NativeResult::LayoutValidated
         | NativeResult::FileWritten
-        | NativeResult::ClipboardWritten
         | NativeResult::ClockMillis(_)
         | NativeResult::WatchRegistered
         | NativeResult::WatchUnregistered => 0,
@@ -3077,8 +3844,6 @@ mod tests {
             width_chars: 80,
             height_chars: 23,
             active_buffer: buffer_id,
-            start_line: 0,
-            start_column: 0,
             cursor: 5,
             window_type: WindowType::Normal,
         });
@@ -3089,7 +3854,7 @@ mod tests {
             active_window: window_id,
             previous_active_window: None,
             window_tree: WindowNode::new_leaf(window_id),
-            kill_ring: KillRing::without_clipboard(60),
+            kill_ring: KillRing::with_capacity(60),
             buffer_history: vec![buffer_id],
             echo_message: String::new(),
             echo_message_time: None,
@@ -3137,11 +3902,30 @@ mod tests {
         assert!(!prompt.content.contains("command-7"));
     }
 
-    fn test_session_with_grants(grants: CapabilityGrants) -> HostSession {
-        HostSession::open(test_editor(), grants).unwrap()
+    fn attach_test_workspace(workspace: WorkspaceHost) -> DirectSessionClient {
+        DirectSessionClient::new(workspace, AttachmentConfiguration::headless(80, 24))
     }
 
-    fn test_session() -> HostSession {
+    fn test_mica_client(
+        editor: Editor,
+        grants: CapabilityGrants,
+    ) -> Result<DirectSessionClient, MicaHostError> {
+        WorkspaceHost::open_with_mica(editor, grants).map(attach_test_workspace)
+    }
+
+    fn test_mica_client_with_clock(
+        editor: Editor,
+        grants: CapabilityGrants,
+        clock: Arc<dyn NativeClock>,
+    ) -> Result<DirectSessionClient, MicaHostError> {
+        WorkspaceHost::open_with_mica_clock(editor, grants, clock).map(attach_test_workspace)
+    }
+
+    fn test_session_with_grants(grants: CapabilityGrants) -> DirectSessionClient {
+        attach_test_workspace(WorkspaceHost::open(test_editor(), grants).unwrap())
+    }
+
+    fn test_session() -> DirectSessionClient {
         test_session_with_grants(CapabilityGrants::editor_default())
     }
 
@@ -3156,7 +3940,7 @@ mod tests {
     fn mica_keymap_inserts_injected_native_time_and_redraws() {
         let _guard = MICA_TEST_LOCK.lock().unwrap();
         compio::runtime::Runtime::new().unwrap().block_on(async {
-            let mut session = HostSession::open_with_mica_clock(
+            let mut session = test_mica_client_with_clock(
                 test_editor(),
                 CapabilityGrants::editor_default(),
                 Arc::new(FixedNativeClock(1_700_000_000_123)),
@@ -3185,12 +3969,14 @@ mod tests {
             assert!(!delta.invalidations.contains(&Invalidation::Full));
             assert!(
                 session
+                    .workspace
                     .mica_modes
                     .values()
                     .any(|mode| mode == "fundamental")
             );
             assert_eq!(
                 session
+                    .workspace
                     .mica_configuration
                     .get("tab_width")
                     .map(String::as_str),
@@ -3215,11 +4001,12 @@ mod tests {
                     .all(|event| !matches!(event, LifecycleEvent::Error(_)))
             );
 
-            let close = session
-                .dispatch(session.envelope(InputEvent::Close))
-                .await
-                .unwrap();
-            assert!(close.lifecycle.contains(&LifecycleEvent::EndpointClosed));
+            let close = session.terminate_workspace().await.unwrap();
+            assert!(
+                close
+                    .lifecycle
+                    .contains(&LifecycleEvent::WorkspaceTerminated)
+            );
         });
     }
 
@@ -3232,7 +4019,7 @@ mod tests {
             let buffer = editor.windows[window].active_buffer;
             editor.buffers[buffer].load_str("foo-bar baz");
             editor.windows[window].cursor = 0;
-            let mut session = HostSession::open_with_mica_clock(
+            let mut session = test_mica_client_with_clock(
                 editor,
                 CapabilityGrants::editor_default(),
                 Arc::new(FixedNativeClock(42)),
@@ -3253,7 +4040,7 @@ mod tests {
             // than using the legacy Rust mode's non-whitespace definition.
             assert_eq!(snapshot(&output).views[0].visible_text, "bar baz");
             assert!(
-                session.mica_syntax[&buffer]
+                session.workspace.mica_syntax[&buffer]
                     .iter()
                     .any(|rule| rule.kind == "word"
                         && rule.pattern == "[[:alnum:]_]"
@@ -3266,11 +4053,12 @@ mod tests {
                 "assert roe/SyntaxRule(#roe/fundamental_mode, :word, \"[[:alpha:]-]\", 100)",
             );
             session
+                .workspace
                 .replace_mica_first_wave(hyphen_is_word)
                 .await
                 .unwrap();
-            session.editor.buffers[buffer].load_str("foo-bar baz");
-            session.editor.windows[window].cursor = 0;
+            session.workspace.editor.buffers[buffer].load_str("foo-bar baz");
+            session.workspace.editor.windows[window].cursor = 0;
             let moved = session
                 .dispatch(
                     session.envelope(InputEvent::Keys(vec![meta, LogicalKey::AlphaNumeric('f')])),
@@ -3278,7 +4066,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(snapshot(&moved).views[0].cursor, 8);
-            session.editor.windows[window].cursor = 0;
+            session.workspace.editor.windows[window].cursor = 0;
             let replaced = session
                 .dispatch(
                     session.envelope(InputEvent::Keys(vec![meta, LogicalKey::AlphaNumeric('d')])),
@@ -3291,9 +4079,13 @@ mod tests {
                 "assert roe/SyntaxRule(#roe/fundamental_mode, :word, \"[[:alnum:]_]\", 100)",
                 "assert roe/SyntaxRule(#roe/fundamental_mode, :word, \"word\", 100)",
             );
-            session.replace_mica_first_wave(unsupported).await.unwrap();
-            session.editor.buffers[buffer].load_str("unchanged");
-            session.editor.windows[window].cursor = 0;
+            session
+                .workspace
+                .replace_mica_first_wave(unsupported)
+                .await
+                .unwrap();
+            session.workspace.editor.buffers[buffer].load_str("unchanged");
+            session.workspace.editor.windows[window].cursor = 0;
             let rejected = session
                 .dispatch(
                     session.envelope(InputEvent::Keys(vec![meta, LogicalKey::AlphaNumeric('d')])),
@@ -3307,10 +4099,7 @@ mod tests {
                     if message.contains("unsupported Mica word syntax pattern")
             )));
 
-            session
-                .dispatch(session.envelope(InputEvent::Close))
-                .await
-                .unwrap();
+            session.terminate_workspace().await.unwrap();
         });
     }
 
@@ -3318,7 +4107,7 @@ mod tests {
     fn mica_orders_bindings_and_edit_hooks_by_precedence() {
         let _guard = MICA_TEST_LOCK.lock().unwrap();
         compio::runtime::Runtime::new().unwrap().block_on(async {
-            let mut session = HostSession::open_with_mica_clock(
+            let mut session = test_mica_client_with_clock(
                 test_editor(),
                 CapabilityGrants::editor_default(),
                 Arc::new(FixedNativeClock(42)),
@@ -3328,7 +4117,7 @@ mod tests {
             let ordered = format!(
                 "{original}\nassert roe/NativeBinding(\"x\", :cursor_right, 6000)\nassert roe/KeyBinding(#roe/global_map, \"x\", #roe/redraw, 7000)\nassert roe/ModeHook(#roe/fundamental_mode, :low_hook, 10)\nassert roe/ModeHook(#roe/fundamental_mode, :high_hook, 50)\nassert RoleCanInvoke(#roe/editor_role, :low_hook)\nassert RoleCanInvoke(#roe/editor_role, :high_hook)\nverb low_hook(actor, session, view, buffer)\n  emit(session, {{:kind -> :host_action, :action -> :low_hook, :view -> view}})\n  return :ok\nend\nverb high_hook(actor, session, view, buffer)\n  emit(session, {{:kind -> :host_action, :action -> :high_hook, :view -> view}})\n  return :ok\nend\n"
             );
-            session.replace_mica_first_wave(ordered).await.unwrap();
+            session.workspace.replace_mica_first_wave(ordered).await.unwrap();
 
             let command_wins = session
                 .dispatch(session.envelope(InputEvent::Text("x".to_owned())))
@@ -3336,9 +4125,9 @@ mod tests {
                 .unwrap();
             assert_eq!(snapshot(&command_wins).views[0].visible_text, "hello");
 
-            let buffer = session.editor.windows[session.editor.active_window].active_buffer;
-            session.editor.buffers[buffer].load_str("hello");
-            session.editor.windows[session.editor.active_window].cursor = 5;
+            let buffer = session.workspace.editor.windows[session.workspace.editor.active_window].active_buffer;
+            session.workspace.editor.buffers[buffer].load_str("hello");
+            session.workspace.editor.windows[session.workspace.editor.active_window].cursor = 5;
             let with_hooks = session
                 .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Backspace])))
                 .await
@@ -3358,7 +4147,7 @@ mod tests {
             let ambiguous = format!(
                 "{original}\nassert roe/KeyBinding(#roe/global_map, \"x\", #roe/redraw, 7000)\nassert roe/KeyBinding(#roe/global_map, \"x\", #roe/quit, 7000)\n"
             );
-            session.replace_mica_first_wave(ambiguous).await.unwrap();
+            session.workspace.replace_mica_first_wave(ambiguous).await.unwrap();
             let rejected = session
                 .dispatch(session.envelope(InputEvent::Text("x".to_owned())))
                 .await
@@ -3370,7 +4159,7 @@ mod tests {
             assert!(!rejected.lifecycle.contains(&LifecycleEvent::QuitRequested));
 
             session
-                .dispatch(session.envelope(InputEvent::Close))
+                .terminate_workspace()
                 .await
                 .unwrap();
         });
@@ -3380,7 +4169,7 @@ mod tests {
     fn mica_context_tracks_rust_cursor_and_new_active_buffer() {
         let _guard = MICA_TEST_LOCK.lock().unwrap();
         compio::runtime::Runtime::new().unwrap().block_on(async {
-            let mut session = HostSession::open_with_mica_clock(
+            let mut session = test_mica_client_with_clock(
                 test_editor(),
                 CapabilityGrants::editor_default(),
                 Arc::new(FixedNativeClock(42)),
@@ -3401,15 +4190,16 @@ mod tests {
                 "helloé42\n"
             );
 
-            let original_view = session.editor.active_window;
+            let original_view = session.workspace.editor.active_window;
             let buffer = session
+                .workspace
                 .editor
                 .create_buffer("*dynamic*".to_owned(), "new".to_owned());
-            let view = session.editor.split_horizontal();
-            session.editor.active_window = view;
-            session.editor.windows[view].active_buffer = buffer;
-            session.editor.windows[view].cursor = 3;
-            let _ = session.synchronize_identities();
+            let view = session.workspace.editor.split_horizontal();
+            session.workspace.editor.active_window = view;
+            session.workspace.editor.windows[view].active_buffer = buffer;
+            session.workspace.editor.windows[view].cursor = 3;
+            let _ = session.workspace.synchronize_identities();
 
             let dynamic = session
                 .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Function(12)])))
@@ -3423,21 +4213,31 @@ mod tests {
             assert_eq!(active.visible_text, "new42\n");
             assert_eq!(active.cursor, 6);
             assert_eq!(
-                session.mica.as_ref().unwrap().identity_counts_for_test(),
+                session
+                    .workspace
+                    .mica
+                    .as_ref()
+                    .unwrap()
+                    .identity_counts_for_test(),
                 (3, 2)
             );
 
-            session.editor.active_window = original_view;
-            session.editor.windows.remove(view);
-            session.editor.window_tree = WindowNode::new_leaf(original_view);
-            session.editor.buffers.remove(buffer);
-            let _ = session.synchronize_identities();
+            session.workspace.editor.active_window = original_view;
+            session.workspace.editor.windows.remove(view);
+            session.workspace.editor.window_tree = WindowNode::new_leaf(original_view);
+            session.workspace.editor.buffers.remove(buffer);
+            let _ = session.workspace.synchronize_identities();
             let after_removal = session
                 .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Function(12)])))
                 .await
                 .unwrap();
             assert_eq!(
-                session.mica.as_ref().unwrap().identity_counts_for_test(),
+                session
+                    .workspace
+                    .mica
+                    .as_ref()
+                    .unwrap()
+                    .identity_counts_for_test(),
                 (2, 1)
             );
             assert_eq!(
@@ -3445,10 +4245,7 @@ mod tests {
                 "helloé42\n42\n"
             );
 
-            session
-                .dispatch(session.envelope(InputEvent::Close))
-                .await
-                .unwrap();
+            session.terminate_workspace().await.unwrap();
         });
     }
 
@@ -3456,13 +4253,14 @@ mod tests {
     fn mica_native_bridge_enforces_service_authority() {
         let _guard = MICA_TEST_LOCK.lock().unwrap();
         compio::runtime::Runtime::new().unwrap().block_on(async {
-            let mut session = HostSession::open_with_mica_clock(
+            let mut session = test_mica_client_with_clock(
                 test_editor(),
                 CapabilityGrants::editor_default(),
                 Arc::new(FixedNativeClock(42)),
             )
             .unwrap();
             session
+                .workspace
                 .mica
                 .as_ref()
                 .unwrap()
@@ -3478,10 +4276,7 @@ mod tests {
             )));
             assert_eq!(snapshot(&denied).views[0].visible_text, "hello");
 
-            session
-                .dispatch(session.envelope(InputEvent::Close))
-                .await
-                .unwrap();
+            session.terminate_workspace().await.unwrap();
         });
     }
 
@@ -3489,9 +4284,9 @@ mod tests {
     fn mica_host_effects_cannot_bypass_native_capabilities() {
         let _guard = MICA_TEST_LOCK.lock().unwrap();
         compio::runtime::Runtime::new().unwrap().block_on(async {
-            let mut session = HostSession::open_with_mica(
+            let mut session = test_mica_client(
                 test_editor(),
-                CapabilityGrants::new([Capability::ClipboardWrite]),
+                CapabilityGrants::new([]),
             )
             .unwrap();
 
@@ -3499,8 +4294,8 @@ mod tests {
                 .dispatch(session.envelope(InputEvent::Text("x".to_owned())))
                 .await
                 .unwrap();
-            let active = session.editor.windows[session.editor.active_window].active_buffer;
-            assert_eq!(session.editor.buffers[active].content(), "hello");
+            let active = session.workspace.editor.windows[session.workspace.editor.active_window].active_buffer;
+            assert_eq!(session.workspace.editor.buffers[active].content(), "hello");
             assert!(insertion.lifecycle.iter().any(|event| matches!(
                 event,
                 LifecycleEvent::Error(message) if message.contains("text_write") || message.contains("TextWrite")
@@ -3516,7 +4311,7 @@ mod tests {
                 ])))
                 .await
                 .unwrap();
-            assert_eq!(session.editor.windows.len(), 1);
+            assert_eq!(session.workspace.editor.windows.len(), 1);
             assert!(split.lifecycle.iter().any(|event| matches!(
                 event,
                 LifecycleEvent::Error(message) if message.contains("Layout")
@@ -3538,7 +4333,7 @@ mod tests {
                 LifecycleEvent::Error(message) if message.contains("FileWrite")
             )));
 
-            let resource = session.buffer_resources[&active];
+            let resource = session.workspace.buffer_resources[&active];
             let direct = session
                 .dispatch(session.envelope(InputEvent::NativeRequest {
                     request_id: RequestId(77),
@@ -3553,8 +4348,8 @@ mod tests {
                     })
             }));
 
-            session.editor.windows[session.editor.active_window].cursor = 5;
-            session.editor.buffers[active].set_mark(0);
+            session.workspace.editor.windows[session.workspace.editor.active_window].cursor = 5;
+            session.workspace.editor.buffers[active].set_mark(0);
             let copy = session
                 .dispatch(session.envelope(InputEvent::Keys(vec![
                     LogicalKey::Modifier(crate::keys::KeyModifier::Meta(
@@ -3568,10 +4363,10 @@ mod tests {
                 event,
                 LifecycleEvent::Error(message) if message.contains("text_read") || message.contains("TextRead")
             )));
-            assert!(session.editor.kill_ring.current().is_none());
+            assert!(session.workspace.editor.kill_ring.current().is_none());
 
             session
-                .dispatch(session.envelope(InputEvent::Close))
+                .terminate_workspace()
                 .await
                 .unwrap();
         });
@@ -3581,7 +4376,7 @@ mod tests {
     fn mica_owns_global_chords_and_window_policy() {
         let _guard = MICA_TEST_LOCK.lock().unwrap();
         compio::runtime::Runtime::new().unwrap().block_on(async {
-            let mut session = HostSession::open_with_mica_clock(
+            let mut session = test_mica_client_with_clock(
                 test_editor(),
                 CapabilityGrants::editor_default(),
                 Arc::new(FixedNativeClock(42)),
@@ -3685,10 +4480,7 @@ mod tests {
                 .unwrap();
             assert!(quit.lifecycle.contains(&LifecycleEvent::QuitRequested));
 
-            session
-                .dispatch(session.envelope(InputEvent::Close))
-                .await
-                .unwrap();
+            session.terminate_workspace().await.unwrap();
         });
     }
 
@@ -3696,7 +4488,7 @@ mod tests {
     fn mica_discovery_drives_command_palette_and_invocation() {
         let _guard = MICA_TEST_LOCK.lock().unwrap();
         compio::runtime::Runtime::new().unwrap().block_on(async {
-            let mut session = HostSession::open_with_mica_clock(
+            let mut session = test_mica_client_with_clock(
                 test_editor(),
                 CapabilityGrants::editor_default(),
                 Arc::new(FixedNativeClock(42)),
@@ -3783,18 +4575,20 @@ mod tests {
             assert_eq!(snapshot(&selected).views.len(), 2);
 
             let original = session
+                .workspace
                 .editor
                 .windows
                 .keys()
-                .find(|window| *window != session.editor.active_window)
+                .find(|window| *window != session.workspace.editor.active_window)
                 .unwrap();
-            let other = session.editor.active_window;
+            let other = session.workspace.editor.active_window;
             let other_buffer = session
+                .workspace
                 .editor
                 .create_buffer("*argument-target*".to_owned(), "target".to_owned());
-            session.editor.windows[other].active_buffer = other_buffer;
-            session.editor.active_window = original;
-            let _ = session.synchronize_identities();
+            session.workspace.editor.windows[other].active_buffer = other_buffer;
+            session.workspace.editor.active_window = original;
+            let _ = session.workspace.synchronize_identities();
 
             session
                 .dispatch(
@@ -3830,7 +4624,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 snapshot(&selected_argument).active_view,
-                session.view_ids[&other]
+                session.workspace.view_ids[&other]
             );
 
             let mismatched_provider = include_str!("../../mica/roe-first-wave.mica").replace(
@@ -3838,6 +4632,7 @@ mod tests {
                 "assert roe/ArgumentCandidateKind(:visible_views, :logical_buffer)",
             );
             session
+                .workspace
                 .replace_mica_first_wave(mismatched_provider)
                 .await
                 .unwrap();
@@ -3863,10 +4658,7 @@ mod tests {
                 "mismatched candidate provider kind opened a prompt: {rejected_argument_prompt:#?}"
             );
 
-            session
-                .dispatch(session.envelope(InputEvent::Close))
-                .await
-                .unwrap();
+            session.terminate_workspace().await.unwrap();
         });
     }
 
@@ -3878,7 +4670,7 @@ mod tests {
             let buffer = editor.windows[editor.active_window].active_buffer;
             editor.buffers[buffer].load_str("hello hello");
             editor.windows[editor.active_window].cursor = 5;
-            let mut session = HostSession::open_with_mica_clock(
+            let mut session = test_mica_client_with_clock(
                 editor,
                 CapabilityGrants::editor_default(),
                 Arc::new(FixedNativeClock(42)),
@@ -3945,10 +4737,7 @@ mod tests {
             assert_eq!(snapshot(&cancelled).views[0].cursor, 5);
             assert!(!snapshot(&cancelled).views[0].command_view);
 
-            session
-                .dispatch(session.envelope(InputEvent::Close))
-                .await
-                .unwrap();
+            session.terminate_workspace().await.unwrap();
         });
     }
 
@@ -3965,7 +4754,7 @@ mod tests {
                 vec![meta, LogicalKey::AlphaNumeric('x')],
                 vec![control, LogicalKey::AlphaNumeric('s')],
             ] {
-                let mut session = HostSession::open_with_mica_clock(
+                let mut session = test_mica_client_with_clock(
                     test_editor(),
                     CapabilityGrants::editor_default(),
                     Arc::new(FixedNativeClock(42)),
@@ -3995,10 +4784,7 @@ mod tests {
                     .unwrap();
                 assert!(quit.lifecycle.contains(&LifecycleEvent::QuitRequested));
 
-                session
-                    .dispatch(session.envelope(InputEvent::Close))
-                    .await
-                    .unwrap();
+                session.terminate_workspace().await.unwrap();
             }
         });
     }
@@ -4008,8 +4794,7 @@ mod tests {
         let _guard = MICA_TEST_LOCK.lock().unwrap();
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let mut session =
-                HostSession::open_with_mica(test_editor(), CapabilityGrants::editor_default())
-                    .unwrap();
+                test_mica_client(test_editor(), CapabilityGrants::editor_default()).unwrap();
             let initial = session.initial_output().await;
             let view = snapshot(&initial).active_view;
 
@@ -4047,19 +4832,25 @@ mod tests {
                         .all(|event| !matches!(event, LifecycleEvent::Error(_)))
                 );
                 if index == 0 {
-                    assert_eq!(session.pointer_selection.map(|(_, anchor)| anchor), Some(1));
+                    assert_eq!(
+                        session
+                            .attachment
+                            .pointer_selection
+                            .map(|(_, anchor)| anchor),
+                        Some(1)
+                    );
                 }
                 if index == 1 {
-                    let window = session.editor.active_window;
-                    let buffer = session.editor.windows[window].active_buffer;
-                    assert_eq!(session.editor.buffers[buffer].get_mark(), Some(1));
+                    let window = session.workspace.editor.active_window;
+                    let buffer = session.workspace.editor.windows[window].active_buffer;
+                    assert_eq!(session.workspace.editor.buffers[buffer].get_mark(), Some(1));
                 }
             }
 
-            let window = session.editor.active_window;
-            let buffer = session.editor.windows[window].active_buffer;
-            assert_eq!(session.editor.buffers[buffer].get_mark(), Some(1));
-            assert_eq!(session.editor.windows[window].cursor, 3);
+            let window = session.workspace.editor.active_window;
+            let buffer = session.workspace.editor.windows[window].active_buffer;
+            assert_eq!(session.workspace.editor.buffers[buffer].get_mark(), Some(1));
+            assert_eq!(session.workspace.editor.windows[window].cursor, 3);
 
             let scrolled = session
                 .dispatch(session.envelope(InputEvent::SetViewScroll {
@@ -4088,6 +4879,7 @@ mod tests {
                 .await
                 .unwrap();
             let top = session
+                .workspace
                 .editor
                 .windows
                 .iter()
@@ -4095,7 +4887,7 @@ mod tests {
                 .map(|(_, window)| window.clone())
                 .unwrap();
             let border_row = top.y + top.height_chars - 1;
-            let before = ratio_at_path(&session.editor.window_tree, &[]).unwrap();
+            let before = ratio_at_path(&session.workspace.editor.window_tree, &[]).unwrap();
             for event in [
                 PointerEvent {
                     column: 40,
@@ -4129,12 +4921,9 @@ mod tests {
                     output.lifecycle
                 );
             }
-            assert!(ratio_at_path(&session.editor.window_tree, &[]).unwrap() > before);
+            assert!(ratio_at_path(&session.workspace.editor.window_tree, &[]).unwrap() > before);
 
-            session
-                .dispatch(session.envelope(InputEvent::Close))
-                .await
-                .unwrap();
+            session.terminate_workspace().await.unwrap();
         });
     }
 
@@ -4142,25 +4931,26 @@ mod tests {
     fn mica_background_completion_is_pumped_by_idle_timer() {
         let _guard = MICA_TEST_LOCK.lock().unwrap();
         compio::runtime::Runtime::new().unwrap().block_on(async {
-            let mut session = HostSession::open_with_mica_clock(
+            let mut session = test_mica_client_with_clock(
                 test_editor(),
                 CapabilityGrants::editor_default(),
                 Arc::new(FixedNativeClock(42)),
             )
             .unwrap();
             let task = session
+                .workspace
                 .mica
                 .as_mut()
                 .unwrap()
                 .start_background_test_task()
                 .await
                 .unwrap();
+            let next_input = session.next_sequence();
             compio::time::sleep(std::time::Duration::from_millis(40)).await;
 
-            let idle = session
-                .dispatch(session.envelope(InputEvent::Timer { token: 0 }))
-                .await
-                .unwrap();
+            let idle = session.poll_output().await.unwrap().unwrap();
+            assert_eq!(idle.acknowledged_input, None);
+            assert_eq!(session.next_sequence(), next_input);
             assert!(idle.presentation.is_some());
             assert_eq!(snapshot(&idle).views[0].visible_text, "hello");
             assert!(idle.lifecycle.iter().all(|event| !matches!(
@@ -4168,10 +4958,7 @@ mod tests {
                 LifecycleEvent::Error(message) if message.contains(&task.to_string())
             )));
 
-            session
-                .dispatch(session.envelope(InputEvent::Close))
-                .await
-                .unwrap();
+            session.terminate_workspace().await.unwrap();
         });
     }
 
@@ -4179,7 +4966,7 @@ mod tests {
     fn mica_replacement_failure_and_recovery_remain_live() {
         let _guard = MICA_TEST_LOCK.lock().unwrap();
         compio::runtime::Runtime::new().unwrap().block_on(async {
-            let mut session = HostSession::open_with_mica_clock(
+            let mut session = test_mica_client_with_clock(
                 test_editor(),
                 CapabilityGrants::editor_default(),
                 Arc::new(FixedNativeClock(42)),
@@ -4192,11 +4979,11 @@ mod tests {
             );
             assert_ne!(replacement, original);
             session
-                .replace_mica_first_wave(replacement.clone())
+                .workspace.replace_mica_first_wave(replacement.clone())
                 .await
                 .unwrap();
             assert!(session
-                .export_mica_unit("roe/first-wave")
+                .workspace.export_mica_unit("roe/first-wave")
                 .await
                 .unwrap()
                 .contains("v2:"));
@@ -4209,7 +4996,7 @@ mod tests {
 
             assert!(
                 session
-                    .replace_mica_first_wave("verb this is malformed".to_owned())
+                    .workspace.replace_mica_first_wave("verb this is malformed".to_owned())
                     .await
                     .is_err()
             );
@@ -4223,7 +5010,7 @@ mod tests {
             );
 
             session
-                .set_mica_package_enabled("roe/core_package", false)
+                .workspace.set_mica_package_enabled("roe/core_package", false)
                 .unwrap();
             let disabled = session
                 .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Function(12)])))
@@ -4235,7 +5022,7 @@ mod tests {
             );
             assert_eq!(snapshot(&disabled).echo_area, "F12 is undefined");
             session
-                .set_mica_package_enabled("roe/core_package", true)
+                .workspace.set_mica_package_enabled("roe/core_package", true)
                 .unwrap();
 
             let without_yellow = replacement.replace(
@@ -4243,14 +5030,14 @@ mod tests {
                 "",
             );
             session
-                .replace_mica_first_wave(without_yellow)
+                .workspace.replace_mica_first_wave(without_yellow)
                 .await
                 .unwrap();
             session
                 .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Function(1)])))
                 .await
                 .unwrap();
-            assert!(!session.mica_faces["isearch-current"].contains_key("background"));
+            assert!(!session.workspace.mica_faces["isearch-current"].contains_key("background"));
 
             let start = original.find("verb roe/insert_current_time").unwrap();
             let end = start + original[start..].find("\nend\n").unwrap() + "\nend\n".len();
@@ -4259,7 +5046,7 @@ mod tests {
                 &original[..start],
                 &original[end..]
             );
-            session.replace_mica_first_wave(failing).await.unwrap();
+            session.workspace.replace_mica_first_wave(failing).await.unwrap();
             let failed = session
                 .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Function(12)])))
                 .await
@@ -4277,7 +5064,7 @@ mod tests {
                     if message.contains("selector=roe/dispatch_key")
             )));
 
-            session.restore_mica_first_wave().await.unwrap();
+            session.workspace.restore_mica_first_wave().await.unwrap();
             let recovered = session
                 .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Function(12)])))
                 .await
@@ -4287,7 +5074,7 @@ mod tests {
                 "hellov2:42\nv2:42\n42\n"
             );
             session
-                .dispatch(session.envelope(InputEvent::Close))
+                .terminate_workspace()
                 .await
                 .unwrap();
         });
@@ -4297,7 +5084,7 @@ mod tests {
     fn native_recovery_surface_operates_before_user_policy_load() {
         let _guard = MICA_TEST_LOCK.lock().unwrap();
         compio::runtime::Runtime::new().unwrap().block_on(async {
-            let mut session = HostSession::open_with_mica_clock(
+            let mut session = test_mica_client_with_clock(
                 test_editor(),
                 CapabilityGrants::editor_default(),
                 Arc::new(FixedNativeClock(42)),
@@ -4316,16 +5103,17 @@ mod tests {
                 event,
                 LifecycleEvent::RecoveryResult { result: Err(_), .. }
             )));
-            assert!(!session.closed);
+            assert!(!session.workspace.terminated);
 
             let recovery_dir = std::env::temp_dir().join(format!(
                 "roe-recovery-{}-{}",
                 std::process::id(),
-                session.epoch.0
+                session.epoch().0
             ));
             std::fs::create_dir(&recovery_dir).unwrap();
             let export_path = recovery_dir.join("first-wave.mica");
             let reports = session
+                .workspace
                 .execute_startup_recovery(&[
                     StartupRecoveryOperation::Inspect,
                     StartupRecoveryOperation::ExportUnit {
@@ -4380,6 +5168,7 @@ mod tests {
             )));
 
             let reports = session
+                .workspace
                 .execute_startup_recovery(&[
                     StartupRecoveryOperation::Inspect,
                     StartupRecoveryOperation::ExportUnit {
@@ -4398,10 +5187,7 @@ mod tests {
             std::fs::remove_file(export_path).unwrap();
             std::fs::remove_dir(recovery_dir).unwrap();
 
-            session
-                .dispatch(session.envelope(InputEvent::Close))
-                .await
-                .unwrap();
+            session.terminate_workspace().await.unwrap();
         });
     }
 
@@ -4409,29 +5195,31 @@ mod tests {
     fn mica_close_cancels_pending_request() {
         let _guard = MICA_TEST_LOCK.lock().unwrap();
         compio::runtime::Runtime::new().unwrap().block_on(async {
-            let mut session = HostSession::open_with_mica_clock(
+            let mut session = test_mica_client_with_clock(
                 test_editor(),
                 CapabilityGrants::editor_default(),
                 Arc::new(FixedNativeClock(7)),
             )
             .unwrap();
             let pending = session
+                .workspace
                 .mica
                 .as_mut()
                 .unwrap()
                 .start_pending_test_request()
                 .await
                 .unwrap();
-            let close = session
-                .dispatch(session.envelope(InputEvent::Close))
-                .await
-                .unwrap();
+            let close = session.terminate_workspace().await.unwrap();
             assert!(
                 close
                     .lifecycle
                     .contains(&LifecycleEvent::MicaTaskCancelled { task_id: pending })
             );
-            assert!(close.lifecycle.contains(&LifecycleEvent::EndpointClosed));
+            assert!(
+                close
+                    .lifecycle
+                    .contains(&LifecycleEvent::WorkspaceTerminated)
+            );
         });
     }
 
@@ -4445,6 +5233,158 @@ mod tests {
             let output = session.dispatch(envelope).await.unwrap();
             assert!(snapshot(&output).revision.0 > first_revision.0);
             assert_eq!(snapshot(&output).views[0].visible_text, "hello!");
+        });
+    }
+
+    #[test]
+    fn attachment_lifecycle_preserves_workspace_and_resets_transport_state() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut session = test_session();
+            let first_attachment = session.attachment_id();
+            let first_epoch = session.epoch();
+            session.initial_output().await;
+            let edited = session
+                .dispatch(session.envelope(InputEvent::Text("!".to_owned())))
+                .await
+                .unwrap();
+            assert_eq!(edited.acknowledged_input, Some(0));
+            assert_eq!(snapshot(&edited).views[0].visible_text, "hello!");
+
+            let detached = session.detach().await.unwrap();
+            assert!(
+                detached
+                    .lifecycle
+                    .contains(&LifecycleEvent::AttachmentDetached {
+                        attachment: first_attachment,
+                    })
+            );
+            assert!(matches!(
+                session.poll_output().await,
+                Err(SessionError::AttachmentUnavailable)
+            ));
+
+            let resumed = session
+                .resume(AttachmentConfiguration::headless(100, 40))
+                .await
+                .unwrap();
+            assert_eq!(session.attachment_id(), first_attachment);
+            assert_ne!(session.epoch(), first_epoch);
+            assert_eq!(session.next_sequence(), 0);
+            assert_eq!(resumed.acknowledged_input, None);
+            assert!(matches!(
+                resumed.presentation,
+                Some(PresentationUpdate::Full(_))
+            ));
+            assert_eq!(snapshot(&resumed).views[0].visible_text, "hello!");
+
+            let closed = session.close_attachment().await.unwrap();
+            assert!(
+                closed
+                    .lifecycle
+                    .contains(&LifecycleEvent::AttachmentClosed {
+                        attachment: first_attachment,
+                    })
+            );
+            let workspace = session.into_workspace().unwrap();
+            let mut replacement =
+                DirectSessionClient::new(workspace, AttachmentConfiguration::headless(80, 24));
+            assert_ne!(replacement.attachment_id(), first_attachment);
+            let replacement_initial = replacement.initial_output().await;
+            assert_eq!(
+                snapshot(&replacement_initial).views[0].visible_text,
+                "hello!"
+            );
+            replacement.terminate_workspace().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn workspace_and_attachment_can_be_driven_without_the_direct_client() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut workspace =
+                WorkspaceHost::open(test_editor(), CapabilityGrants::editor_default()).unwrap();
+            let mut attachment = workspace.attach(AttachmentConfiguration::headless(80, 24));
+            let initial = workspace.initial_output(&mut attachment).await;
+            assert_eq!(snapshot(&initial).views[0].visible_text, "hello");
+            let envelope = InputEnvelope {
+                protocol_version: SESSION_PROTOCOL_VERSION,
+                epoch: attachment.epoch(),
+                sequence: 0,
+                event: InputEvent::Text("!".to_owned()),
+            };
+            let edited = workspace.dispatch(&mut attachment, envelope).await.unwrap();
+            assert_eq!(edited.acknowledged_input, Some(0));
+            assert_eq!(snapshot(&edited).views[0].visible_text, "hello!");
+            workspace
+                .terminate_workspace(&mut attachment)
+                .await
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn frontend_clipboard_requests_are_correlated_and_attachment_local() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let workspace =
+                WorkspaceHost::open(test_editor(), CapabilityGrants::editor_default()).unwrap();
+            let mut session = DirectSessionClient::new(
+                workspace,
+                AttachmentConfiguration::local_frontend(80, 24),
+            );
+            session.workspace.editor.kill_ring.kill("copied".to_owned());
+            let mut lifecycle = Vec::new();
+            {
+                let DirectSessionClient {
+                    workspace,
+                    attachment,
+                } = &mut session;
+                workspace.write_kill_ring_to_frontend(attachment, "copy_region", &mut lifecycle);
+            }
+            let write = session.poll_output().await.unwrap().unwrap();
+            let FrontendServiceRequest::WriteClipboard {
+                request_id,
+                contents,
+            } = &write.frontend_requests[0]
+            else {
+                panic!("expected a clipboard write request");
+            };
+            assert_eq!(contents, "copied");
+            let write_complete = session
+                .complete_frontend_request(FrontendServiceResult {
+                    request_id: *request_id,
+                    result: Ok(FrontendServiceResponse::Completed),
+                })
+                .await
+                .unwrap();
+            assert_eq!(write_complete.acknowledged_input, None);
+
+            let read_id;
+            {
+                let attachment = &mut session.attachment;
+                attachment
+                    .enqueue_frontend_request(
+                        PendingFrontendRequest::ReadClipboardForYank,
+                        |request_id| FrontendServiceRequest::ReadClipboard { request_id },
+                    )
+                    .unwrap();
+                read_id = attachment.frontend_requests.front().unwrap().request_id();
+            }
+            let read = session.poll_output().await.unwrap().unwrap();
+            assert!(matches!(
+                read.frontend_requests.as_slice(),
+                [FrontendServiceRequest::ReadClipboard { request_id }] if *request_id == read_id
+            ));
+            let yank = session
+                .complete_frontend_request(FrontendServiceResult {
+                    request_id: read_id,
+                    result: Ok(FrontendServiceResponse::ClipboardContents(Some(
+                        " pasted".to_owned(),
+                    ))),
+                })
+                .await
+                .unwrap();
+            assert_eq!(snapshot(&yank).views[0].visible_text, "hello pasted");
+            session.terminate_workspace().await.unwrap();
         });
     }
 
@@ -4506,15 +5446,16 @@ mod tests {
     }
 
     #[test]
-    fn close_is_idempotently_terminal() {
+    fn workspace_termination_is_idempotently_terminal() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let mut session = test_session();
-            let close = session
-                .dispatch(session.envelope(InputEvent::Close))
-                .await
-                .unwrap();
+            let close = session.terminate_workspace().await.unwrap();
             assert!(close.presentation.is_none());
-            assert!(close.lifecycle.contains(&LifecycleEvent::EndpointClosed));
+            assert!(
+                close
+                    .lifecycle
+                    .contains(&LifecycleEvent::WorkspaceTerminated)
+            );
             assert!(
                 close
                     .lifecycle
@@ -4525,13 +5466,14 @@ mod tests {
                 session
                     .dispatch(session.envelope(InputEvent::Heartbeat))
                     .await,
-                Err(SessionError::Closed)
+                Err(SessionError::WorkspaceTerminated)
             ));
-            let repeated = session
-                .dispatch(session.envelope(InputEvent::Close))
-                .await
-                .unwrap();
-            assert!(repeated.lifecycle.contains(&LifecycleEvent::EndpointClosed));
+            let repeated = session.terminate_workspace().await.unwrap();
+            assert!(
+                repeated
+                    .lifecycle
+                    .contains(&LifecycleEvent::WorkspaceTerminated)
+            );
         });
     }
 
@@ -4635,10 +5577,10 @@ mod tests {
             std::fs::write(&path, "after").unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
             loop {
-                let output = session
-                    .dispatch(session.envelope(InputEvent::Timer { token: 0 }))
-                    .await
-                    .unwrap();
+                let output = session.poll_output().await.unwrap();
+                let Some(output) = output else {
+                    continue;
+                };
                 if output.lifecycle.iter().any(|event| {
                     matches!(
                         event,
@@ -4657,10 +5599,7 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
 
-            session
-                .dispatch(session.envelope(InputEvent::Close))
-                .await
-                .unwrap();
+            session.terminate_workspace().await.unwrap();
             std::fs::remove_file(path).unwrap();
             std::fs::remove_dir(directory).unwrap();
         });
@@ -4682,12 +5621,14 @@ mod tests {
 
         let mut session = test_session();
         let (buffer, resource) = session
+            .workspace
             .buffer_resources
             .iter()
             .next()
             .map(|(buffer, resource)| (*buffer, *resource))
             .unwrap();
         session
+            .workspace
             .kernel
             .lock()
             .unwrap()
@@ -4697,14 +5638,15 @@ mod tests {
             })
             .unwrap();
         session
+            .workspace
             .kernel
             .lock()
             .unwrap()
             .force_backend_unwatch_for_test(&path)
             .unwrap();
-        session.editor.buffers.remove(buffer);
+        session.workspace.editor.buffers.remove(buffer);
 
-        let (invalidated, warnings) = session.synchronize_identities();
+        let (invalidated, warnings) = session.workspace.synchronize_identities();
         assert_eq!(invalidated, vec![resource]);
         assert!(
             warnings
@@ -4712,7 +5654,7 @@ mod tests {
                 .any(|warning| warning.contains("cleanup failed"))
         );
         assert!(matches!(
-            session.kernel.lock().unwrap().snapshot(resource),
+            session.workspace.kernel.lock().unwrap().snapshot(resource),
             Err(KernelError::StaleResource(id)) if id == resource
         ));
 

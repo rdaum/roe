@@ -4,7 +4,10 @@ use roe_core::keys::LogicalKey;
 use roe_core::kill_ring::KillRing;
 use roe_core::native_kernel::CapabilityGrants;
 use roe_core::native_services::SystemClock;
-use roe_core::session::{HostSession, InputEvent, PresentationUpdate};
+use roe_core::session::{
+    AttachmentConfiguration, DirectSessionClient, InputEvent, PresentationUpdate, SessionClient,
+    WorkspaceHost,
+};
 use roe_core::{Buffer, BufferId, Editor, Frame, Window, WindowId};
 use roe_terminal::TerminalRenderer;
 use roe_vello::VelloRenderer;
@@ -24,8 +27,6 @@ fn editor_fixture() -> Editor {
         width_chars: 80,
         height_chars: 23,
         active_buffer: buffer_id,
-        start_line: 0,
-        start_column: 0,
         cursor: 5,
         window_type: WindowType::Normal,
     });
@@ -35,7 +36,7 @@ fn editor_fixture() -> Editor {
         windows,
         active_window: window_id,
         window_tree: WindowNode::new_leaf(window_id),
-        kill_ring: KillRing::without_clipboard(60),
+        kill_ring: KillRing::with_capacity(60),
         previous_active_window: None,
         buffer_history: vec![buffer_id],
         echo_message: String::new(),
@@ -50,9 +51,11 @@ fn editor_fixture() -> Editor {
 #[test]
 fn terminal_and_vello_consume_the_same_production_mica_session_stream() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mut session =
-            HostSession::open_with_mica(editor_fixture(), CapabilityGrants::editor_default())
+        let workspace =
+            WorkspaceHost::open_with_mica(editor_fixture(), CapabilityGrants::editor_default())
                 .unwrap();
+        let mut session =
+            DirectSessionClient::new(workspace, AttachmentConfiguration::headless(80, 23));
         let mut outputs = vec![session.initial_output().await];
         outputs.push(
             session
@@ -99,9 +102,6 @@ fn terminal_and_vello_consume_the_same_production_mica_session_stream() {
         let current = terminal.session_presentation().current().unwrap();
         assert!(current.views[0].visible_text.starts_with("one λ"));
         assert!(current.views[0].visible_text.len() > "one λ".len());
-        session
-            .dispatch(session.envelope(InputEvent::Close))
-            .await
-            .unwrap();
+        session.terminate_workspace().await.unwrap();
     });
 }

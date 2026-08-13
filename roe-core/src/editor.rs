@@ -13,7 +13,7 @@
 
 use crate::buffer::Buffer;
 use crate::keys::{CursorDirection, KeyAction};
-use crate::kill_ring::{ClipboardError, KillRing};
+use crate::kill_ring::KillRing;
 use crate::native_services::Clock;
 use crate::renderer::{DirtyRegion, ModelineComponent};
 use crate::{BufferId, WindowId};
@@ -83,10 +83,6 @@ pub struct Window {
     /// Height in characters
     pub height_chars: u16,
     pub active_buffer: BufferId,
-    /// What line is the top left corner of the window in the buffer at?
-    pub start_line: u16,
-    /// What column is the left edge of the window at? (for horizontal scrolling)
-    pub start_column: u16,
     /// Cursor offset
     /// The position of the cursor inside the buffer for this window.
     /// The actual physical cursor position on the screen is calculated from this and the window's
@@ -243,7 +239,6 @@ impl ActionPosition {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum ChromeAction {
     Save,
-    CursorMove((u16, u16)),
     Echo(String),
     MarkDirty(DirtyRegion),
     BufferChanged {
@@ -255,8 +250,8 @@ pub enum ChromeAction {
 }
 
 impl Editor {
-    /// Realize an action selected by Mica's keymap. The temporary binding is a
-    /// mechanism adapter only; it does not assign any platform key meaning.
+    /// Realize a native action selected by Mica's keymap. This vocabulary does
+    /// not assign platform keys or editor policy.
     pub async fn perform_native_action(
         &mut self,
         action: KeyAction,
@@ -303,16 +298,13 @@ impl Editor {
         let window = &mut self.windows[self.active_window];
         let buffer = &self.buffers[window.active_buffer];
         buffer.undo_boundary();
-        let mark_changed = if selecting {
+        if selecting {
             if !buffer.has_mark() {
                 buffer.set_transient_mark(window.cursor);
-                true
-            } else {
-                false
             }
         } else {
-            buffer.clear_transient_mark()
-        };
+            buffer.clear_transient_mark();
+        }
         let new_pos = match direction {
             CursorDirection::Left => buffer.move_left(window.cursor),
             CursorDirection::Right => buffer.move_right(window.cursor),
@@ -339,27 +331,15 @@ impl Editor {
             CursorDirection::ParagraphBackward => buffer.move_paragraph_backward(window.cursor),
         };
         window.cursor = new_pos;
-        let (column, line) = buffer.to_column_line(new_pos);
-        let scrolled = Self::ensure_cursor_visible_static(
-            window,
-            column,
-            line,
-            window.width_chars.saturating_sub(4),
-            window.height_chars.saturating_sub(3),
-        );
-        let mut actions = vec![
-            ChromeAction::CursorMove(window.absolute_cursor_position(column, line)),
+        vec![
             ChromeAction::MarkDirty(DirtyRegion::Modeline {
                 window_id: self.active_window,
                 component: ModelineComponent::CursorPosition,
             }),
-        ];
-        if scrolled || selecting || mark_changed || buffer.has_mark() {
-            actions.push(ChromeAction::MarkDirty(DirtyRegion::Buffer {
+            ChromeAction::MarkDirty(DirtyRegion::Buffer {
                 buffer_id: window.active_buffer,
-            }));
-        }
-        actions
+            }),
+        ]
     }
 
     /// Realize an exact character cursor chosen by external editor policy.
@@ -369,20 +349,9 @@ impl Editor {
         buffer.undo_boundary();
         buffer.clear_transient_mark();
         window.cursor = position.min(buffer.buffer_len_chars());
-        let (column, line) = buffer.to_column_line(window.cursor);
-        Self::ensure_cursor_visible_static(
-            window,
-            column,
-            line,
-            window.width_chars.saturating_sub(4),
-            window.height_chars.saturating_sub(3),
-        );
-        vec![
-            ChromeAction::CursorMove(window.absolute_cursor_position(column, line)),
-            ChromeAction::MarkDirty(DirtyRegion::Buffer {
-                buffer_id: window.active_buffer,
-            }),
-        ]
+        vec![ChromeAction::MarkDirty(DirtyRegion::Buffer {
+            buffer_id: window.active_buffer,
+        })]
     }
 
     fn undo_or_redo(&mut self, redo: bool) -> Vec<ChromeAction> {
@@ -397,16 +366,7 @@ impl Editor {
             })];
         };
         window.cursor = cursor;
-        let (column, line) = buffer.to_column_line(cursor);
-        Self::ensure_cursor_visible_static(
-            window,
-            column,
-            line,
-            window.width_chars.saturating_sub(4),
-            window.height_chars.saturating_sub(3),
-        );
         vec![
-            ChromeAction::CursorMove(window.absolute_cursor_position(column, line)),
             ChromeAction::MarkDirty(DirtyRegion::Buffer {
                 buffer_id: window.active_buffer,
             }),
@@ -434,8 +394,6 @@ impl Editor {
             width_chars: self.frame.available_columns,
             height_chars: height,
             active_buffer: command_buffer_id,
-            start_line: 0,
-            start_column: 0,
             cursor: cursor.min(content.chars().count()),
             window_type: WindowType::Command {
                 position,
@@ -452,8 +410,6 @@ impl Editor {
         let window_id = self.find_command_window()?;
         let buffer_id = self.windows[window_id].active_buffer;
         self.buffers[buffer_id].load_str(content);
-        self.windows[window_id].start_line = 0;
-        self.windows[window_id].start_column = 0;
         self.windows[window_id].cursor = cursor.min(content.chars().count());
         Some(window_id)
     }
@@ -580,16 +536,6 @@ impl Editor {
         self.windows[window].active_buffer = buffer_id;
         self.windows[window].cursor = 0;
         Ok(format!("Opened: {}", path.display()))
-    }
-
-    fn with_clipboard_error(
-        mut actions: Vec<ChromeAction>,
-        error: Option<ClipboardError>,
-    ) -> Vec<ChromeAction> {
-        if let Some(error) = error {
-            actions.push(ChromeAction::Echo(error.to_string()));
-        }
-        actions
     }
 
     /// Create a command window and associated buffer
@@ -1222,9 +1168,6 @@ impl Editor {
                 // Advance the cursor
                 window.cursor += length;
 
-                let new_cursor = buffer.to_column_line(window.cursor);
-                let window_cursor = window.absolute_cursor_position(new_cursor.0, new_cursor.1);
-
                 // Mark dirty regions based on what was inserted
                 let cursor_line = buffer.to_column_line(window.cursor).1 as usize;
                 let dirty_action = if has_newline {
@@ -1241,7 +1184,6 @@ impl Editor {
                 vec![
                     ChromeAction::Echo("Inserted text".to_string()),
                     dirty_action,
-                    ChromeAction::CursorMove(window_cursor),
                     // Notify major mode of buffer change for syntax highlighting
                     ChromeAction::BufferChanged {
                         buffer_id,
@@ -1257,9 +1199,6 @@ impl Editor {
                 let length = text.chars().count();
                 buffer.insert_col_line(text.clone(), (*l, *c));
 
-                let new_cursor = buffer.to_column_line(window.cursor);
-                let window_cursor = window.absolute_cursor_position(new_cursor.0, new_cursor.1);
-
                 let dirty_action = if text.contains('\n') {
                     // Newlines affect multiple lines, mark entire buffer dirty
                     ChromeAction::MarkDirty(DirtyRegion::Buffer { buffer_id })
@@ -1274,7 +1213,6 @@ impl Editor {
                 vec![
                     ChromeAction::Echo("Inserted text".to_string()),
                     dirty_action,
-                    ChromeAction::CursorMove(window_cursor),
                     ChromeAction::BufferChanged {
                         buffer_id,
                         start,
@@ -1329,9 +1267,7 @@ impl Editor {
                 if count < 0 {
                     window.cursor = window.cursor.saturating_sub(deleted_len);
                 }
-                let new_cursor = buffer.to_column_line(window.cursor);
-                let window_cursor = window.absolute_cursor_position(new_cursor.0, new_cursor.1);
-                let cursor_line = new_cursor.1 as usize;
+                let cursor_line = buffer.to_column_line(window.cursor).1 as usize;
 
                 // If we deleted a newline, mark entire buffer dirty to handle line merging
                 let dirty_action = if deleted.contains('\n') {
@@ -1346,7 +1282,6 @@ impl Editor {
                 vec![
                     ChromeAction::Echo("Deleted text".to_string()),
                     dirty_action,
-                    ChromeAction::CursorMove(window_cursor),
                     ChromeAction::BufferChanged {
                         buffer_id,
                         start,
@@ -1371,9 +1306,6 @@ impl Editor {
                     (start, start + deleted_len)
                 };
 
-                let new_cursor = buffer.to_column_line(window.cursor);
-                let window_cursor = window.absolute_cursor_position(new_cursor.0, new_cursor.1);
-
                 // If we deleted a newline, mark entire buffer dirty to handle line merging
                 let dirty_action = if deleted.contains('\n') {
                     ChromeAction::MarkDirty(DirtyRegion::Buffer { buffer_id })
@@ -1387,7 +1319,6 @@ impl Editor {
                 vec![
                     ChromeAction::Echo("Deleted text".to_string()),
                     dirty_action,
-                    ChromeAction::CursorMove(window_cursor),
                     ChromeAction::BufferChanged {
                         buffer_id,
                         start: change_start,
@@ -1423,28 +1354,21 @@ impl Editor {
                 }
 
                 // Add to kill-ring
-                let clipboard_error = if count < 0 {
-                    let error = self.kill_ring.kill_prepend(deleted.clone());
+                if count < 0 {
+                    self.kill_ring.kill_prepend(deleted.clone());
                     // Adjust cursor for backward kill
                     let length = deleted.chars().count();
                     window.cursor = window.cursor.saturating_sub(length);
-                    error
                 } else {
-                    self.kill_ring.kill(deleted.clone())
-                };
+                    self.kill_ring.kill(deleted.clone());
+                }
 
-                let new_cursor = buffer.to_column_line(window.cursor);
-                let window_cursor = window.absolute_cursor_position(new_cursor.0, new_cursor.1);
-                Self::with_clipboard_error(
-                    vec![
-                        ChromeAction::Echo(format!("Killed: {deleted}")),
-                        ChromeAction::MarkDirty(DirtyRegion::Buffer {
-                            buffer_id: window.active_buffer,
-                        }),
-                        ChromeAction::CursorMove(window_cursor),
-                    ],
-                    clipboard_error,
-                )
+                vec![
+                    ChromeAction::Echo(format!("Killed: {deleted}")),
+                    ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                        buffer_id: window.active_buffer,
+                    }),
+                ]
             }
             ActionPosition::Absolute(l, c) => {
                 let Some(deleted) = buffer.delete_col_line((*l, *c), count) else {
@@ -1455,24 +1379,18 @@ impl Editor {
                 }
 
                 // Add to kill-ring
-                let clipboard_error = if count < 0 {
-                    self.kill_ring.kill_prepend(deleted.clone())
+                if count < 0 {
+                    self.kill_ring.kill_prepend(deleted.clone());
                 } else {
-                    self.kill_ring.kill(deleted.clone())
-                };
+                    self.kill_ring.kill(deleted.clone());
+                }
 
-                let new_cursor = buffer.to_column_line(window.cursor);
-                let window_cursor = window.absolute_cursor_position(new_cursor.0, new_cursor.1);
-                Self::with_clipboard_error(
-                    vec![
-                        ChromeAction::Echo(format!("Killed: {deleted}")),
-                        ChromeAction::MarkDirty(DirtyRegion::Buffer {
-                            buffer_id: window.active_buffer,
-                        }),
-                        ChromeAction::CursorMove(window_cursor),
-                    ],
-                    clipboard_error,
-                )
+                vec![
+                    ChromeAction::Echo(format!("Killed: {deleted}")),
+                    ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                        buffer_id: window.active_buffer,
+                    }),
+                ]
             }
             ActionPosition::End => {
                 vec![ChromeAction::Echo("End kill not implemented".to_string())]
@@ -1503,19 +1421,13 @@ impl Editor {
 
         match text_to_kill {
             Some(killed) if !killed.is_empty() => {
-                let clipboard_error = self.kill_ring.kill(killed.clone());
-                let new_cursor = buffer.to_column_line(window.cursor);
-                let window_cursor = window.absolute_cursor_position(new_cursor.0, new_cursor.1);
-                Self::with_clipboard_error(
-                    vec![
-                        ChromeAction::Echo(format!("Killed line: {}", killed.replace('\n', "\\n"))),
-                        ChromeAction::MarkDirty(DirtyRegion::Buffer {
-                            buffer_id: window.active_buffer,
-                        }),
-                        ChromeAction::CursorMove(window_cursor),
-                    ],
-                    clipboard_error,
-                )
+                self.kill_ring.kill(killed.clone());
+                vec![
+                    ChromeAction::Echo(format!("Killed line: {}", killed.replace('\n', "\\n"))),
+                    ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                        buffer_id: window.active_buffer,
+                    }),
+                ]
             }
             _ => {
                 vec![ChromeAction::Echo("Nothing to kill".to_string())]
@@ -1547,19 +1459,11 @@ impl Editor {
 
         match text_to_kill {
             Some(killed) if !killed.is_empty() => {
-                let clipboard_error = self.kill_ring.kill(killed.clone());
+                self.kill_ring.kill(killed.clone());
                 window.cursor = word_start;
-                let new_cursor = buffer.to_column_line(window.cursor);
-                let window_cursor = window.absolute_cursor_position(new_cursor.0, new_cursor.1);
-                Self::with_clipboard_error(
-                    vec![
-                        ChromeAction::MarkDirty(DirtyRegion::Buffer {
-                            buffer_id: window.active_buffer,
-                        }),
-                        ChromeAction::CursorMove(window_cursor),
-                    ],
-                    clipboard_error,
-                )
+                vec![ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                    buffer_id: window.active_buffer,
+                })]
             }
             _ => {
                 vec![ChromeAction::Echo("Nothing to kill".to_string())]
@@ -1591,19 +1495,11 @@ impl Editor {
 
         match text_to_kill {
             Some(killed) if !killed.is_empty() => {
-                let clipboard_error = self.kill_ring.kill(killed.clone());
+                self.kill_ring.kill(killed.clone());
                 // Cursor stays at current_pos
-                let new_cursor = buffer.to_column_line(window.cursor);
-                let window_cursor = window.absolute_cursor_position(new_cursor.0, new_cursor.1);
-                Self::with_clipboard_error(
-                    vec![
-                        ChromeAction::MarkDirty(DirtyRegion::Buffer {
-                            buffer_id: window.active_buffer,
-                        }),
-                        ChromeAction::CursorMove(window_cursor),
-                    ],
-                    clipboard_error,
-                )
+                vec![ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                    buffer_id: window.active_buffer,
+                })]
             }
             _ => {
                 vec![ChromeAction::Echo("Nothing to kill".to_string())]
@@ -1631,23 +1527,17 @@ impl Editor {
         }
 
         // Add to kill-ring
-        let clipboard_error = self.kill_ring.kill(deleted.clone());
+        self.kill_ring.kill(deleted.clone());
 
         // Update cursor to the start of the deleted region
         window.cursor = new_cursor_pos;
-        let new_cursor = buffer.to_column_line(window.cursor);
-        let window_cursor = window.absolute_cursor_position(new_cursor.0, new_cursor.1);
 
-        Self::with_clipboard_error(
-            vec![
-                ChromeAction::Echo(format!("Killed region: {}", deleted.replace('\n', "\\n"))),
-                ChromeAction::MarkDirty(DirtyRegion::Buffer {
-                    buffer_id: window.active_buffer,
-                }),
-                ChromeAction::CursorMove(window_cursor),
-            ],
-            clipboard_error,
-        )
+        vec![
+            ChromeAction::Echo(format!("Killed region: {}", deleted.replace('\n', "\\n"))),
+            ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                buffer_id: window.active_buffer,
+            }),
+        ]
     }
 
     /// Copy region to kill-ring without deleting
@@ -1666,23 +1556,20 @@ impl Editor {
         }
 
         // Add to kill-ring without deleting
-        let clipboard_error = self.kill_ring.kill(region_text.clone());
+        self.kill_ring.kill(region_text.clone());
 
         // Clear the mark after copying to stop region highlighting
         buffer.clear_mark();
 
-        Self::with_clipboard_error(
-            vec![
-                ChromeAction::Echo(format!(
-                    "Copied region: {}",
-                    region_text.replace('\n', "\\n")
-                )),
-                ChromeAction::MarkDirty(DirtyRegion::Buffer {
-                    buffer_id: window.active_buffer,
-                }),
-            ],
-            clipboard_error,
-        )
+        vec![
+            ChromeAction::Echo(format!(
+                "Copied region: {}",
+                region_text.replace('\n', "\\n")
+            )),
+            ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                buffer_id: window.active_buffer,
+            }),
+        ]
     }
 
     /// Set mark at cursor position
@@ -1719,66 +1606,17 @@ impl Editor {
         }
     }
 
-    /// Ensure the cursor is visible in the window, scrolling if necessary.
-    /// Returns true if scrolling occurred (requiring a redraw).
-    fn ensure_cursor_visible_static(
-        window: &mut Window,
-        cursor_col: u16,
-        cursor_line: u16,
-        content_width: u16,
-        content_height: u16,
-    ) -> bool {
-        let old_start_line = window.start_line;
-        let old_start_column = window.start_column;
-
-        // Vertical scrolling
-        // Check if cursor is below the visible area
-        if cursor_line >= window.start_line + content_height {
-            // Cursor is below visible area - scroll down
-            window.start_line = cursor_line.saturating_sub(content_height.saturating_sub(1));
-        }
-        // Check if cursor is above the visible area
-        else if cursor_line < window.start_line {
-            // Cursor is above visible area - scroll up
-            window.start_line = cursor_line;
-        }
-
-        // Horizontal scrolling
-        // Check if cursor is past the right edge of visible area
-        if cursor_col >= window.start_column + content_width {
-            // Cursor is past right edge - scroll right
-            window.start_column = cursor_col.saturating_sub(content_width.saturating_sub(1));
-        }
-        // Check if cursor is before the left edge of visible area
-        else if cursor_col < window.start_column {
-            // Cursor is before left edge - scroll left
-            window.start_column = cursor_col;
-        }
-
-        // Return true if we scrolled (either axis changed)
-        old_start_line != window.start_line || old_start_column != window.start_column
-    }
-
     /// Yank (paste) from kill-ring
     pub fn yank(&mut self, position: &ActionPosition) -> Vec<ChromeAction> {
-        let text = self.kill_ring.yank().map(str::to_string);
-        let clipboard_error = self.kill_ring.take_clipboard_error();
-        let Some(text) = text else {
-            return vec![ChromeAction::Echo(clipboard_error.map_or_else(
-                || "Kill ring is empty".to_string(),
-                |error| error.to_string(),
-            ))];
+        let Some(text) = self.kill_ring.yank().map(str::to_string) else {
+            return vec![ChromeAction::Echo("Kill ring is empty".to_string())];
         };
 
         // Break the kill sequence since we're doing a yank
         self.kill_ring.break_kill_sequence();
 
         // Insert the yanked text
-        let mut actions = self.insert_text(text, position);
-        if let Some(error) = clipboard_error {
-            actions.push(ChromeAction::Echo(error.to_string()));
-        }
-        actions
+        self.insert_text(text, position)
     }
 
     /// Yank from specific kill-ring index
@@ -2100,8 +1938,6 @@ mod tests {
             width_chars: 80,
             height_chars: 22,
             active_buffer: scratch_buffer_id,
-            start_line: 0,
-            start_column: 0,
             cursor: 0,
             window_type: WindowType::Normal,
         };
@@ -2115,7 +1951,7 @@ mod tests {
             active_window: window_id,
             previous_active_window: None,
             window_tree: WindowNode::new_leaf(window_id),
-            kill_ring: KillRing::without_clipboard(60),
+            kill_ring: KillRing::with_capacity(60),
             buffer_history: vec![],
             echo_message: "".to_string(),
             echo_message_time: None,
@@ -2135,17 +1971,10 @@ mod tests {
             let initial_cursor = window.cursor;
 
             // Move cursor right
-            let actions = editor
+            editor
                 .perform_native_action(KeyAction::Cursor(CursorDirection::Right))
                 .await
                 .unwrap();
-
-            // Should get a CursorMove action
-            assert!(
-                actions
-                    .iter()
-                    .any(|action| matches!(action, ChromeAction::CursorMove(_)))
-            );
 
             // Cursor should have moved
             let window = &editor.windows[editor.active_window];
@@ -2302,17 +2131,10 @@ mod tests {
             let mut editor = test_editor();
 
             // Move cursor down
-            let actions = editor
+            editor
                 .perform_native_action(KeyAction::Cursor(CursorDirection::Down))
                 .await
                 .unwrap();
-
-            // Should get a CursorMove action
-            assert!(
-                actions
-                    .iter()
-                    .any(|action| matches!(action, ChromeAction::CursorMove(_)))
-            );
 
             // Cursor should have moved to next line
             let window = &editor.windows[editor.active_window];
@@ -2346,35 +2168,6 @@ mod tests {
             // Cursor should stay at end
             let window = &editor.windows[editor.active_window];
             assert_eq!(window.cursor, buffer_len);
-        });
-    }
-
-    #[test]
-    fn test_cursor_position_calculation() {
-        let _runtime_guard = COMPIO_RUNTIME_LOCK.lock().unwrap();
-        compio::runtime::Runtime::new().unwrap().block_on(async {
-            let mut editor = test_editor();
-
-            // Move to a specific position
-            let window = &mut editor.windows[editor.active_window];
-            window.cursor = 7; // Should be at "World" line, column 1
-
-            let actions = editor
-                .perform_native_action(KeyAction::Cursor(CursorDirection::Right))
-                .await
-                .unwrap();
-
-            // Check the CursorMove action has correct coordinates
-            if let Some(ChromeAction::CursorMove((x, y))) = actions
-                .iter()
-                .find(|a| matches!(a, ChromeAction::CursorMove(_)))
-            {
-                // Should be at column 2 of line 1, plus border offset (+1, +1)
-                assert_eq!(*x, 3);
-                assert_eq!(*y, 2);
-            } else {
-                panic!("Expected CursorMove action");
-            }
         });
     }
 

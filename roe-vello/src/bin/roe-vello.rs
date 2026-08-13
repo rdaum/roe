@@ -192,8 +192,6 @@ async fn create_editor(config: EditorConfig) -> std::io::Result<Editor> {
         width_chars: DEFAULT_COLS,
         height_chars: DEFAULT_LINES,
         active_buffer,
-        start_line: 0,
-        start_column: 0,
         cursor: 0,
         window_type: editor::WindowType::Normal,
     };
@@ -213,7 +211,7 @@ async fn create_editor(config: EditorConfig) -> std::io::Result<Editor> {
         active_window: active_window_id,
         previous_active_window: None,
         window_tree,
-        kill_ring: kill_ring::KillRing::without_clipboard(60),
+        kill_ring: kill_ring::KillRing::with_capacity(60),
         buffer_history: Vec::new(),
         echo_message: String::new(),
         echo_message_time: None,

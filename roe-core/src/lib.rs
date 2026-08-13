@@ -25,7 +25,6 @@ pub mod native_services;
 pub mod renderer;
 pub mod session;
 pub mod undo;
-pub mod window;
 
 new_key_type! {
     pub struct WindowId;

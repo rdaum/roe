@@ -2633,7 +2633,6 @@ dependencies = [
 name = "roe-core"
 version = "0.1.0"
 dependencies = [
- "arboard",
  "compio",
  "mica-driver",
  "notify",
@@ -2649,6 +2648,7 @@ dependencies = [
 name = "roe-terminal"
 version = "0.1.0"
 dependencies = [
+ "arboard",
  "compio",
  "crossterm",
  "roe-core",
@@ -2660,6 +2660,7 @@ dependencies = [
 name = "roe-vello"
 version = "0.1.0"
 dependencies = [
+ "arboard",
  "compio",
  "parley",
  "pollster",

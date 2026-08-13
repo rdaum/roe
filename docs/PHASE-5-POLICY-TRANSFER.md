@@ -4,18 +4,20 @@ Phase 5 completes the policy transfer described in
 [ROE-MICA-ROADMAP.md](../ROE-MICA-ROADMAP.md). Mica is now the sole production owner of editor
 meaning: commands, bindings, prompts, completion, search state, modes, hooks, faces, syntax,
 configuration, packages, and logical view decisions. Rust realizes bounded native mechanisms and
-renderer-neutral presentation. Both the terminal and Vello frontends open the same Mica-enabled
-`HostSession`.
+renderer-neutral presentation. Both terminal and Vello create a Mica-enabled `WorkspaceHost` and
+attach through the `SessionClient` contract.
 
 This is an ownership boundary, not a claim that all of Roe is implemented in Mica. Rope storage,
-filesystem and watcher operations, clipboard access, validated window-tree mutation, terminal
-cells, glyph layout, Winit, WGPU, and Vello scenes remain native by design.
+filesystem and watcher operations, validated window-tree mutation, terminal cells, glyph layout,
+Winit, WGPU, and Vello scenes remain native by design. Platform clipboard access is native but
+attachment-local; it is not a workspace or native-kernel service.
 
 ## Production path
 
 ```text
 terminal or Vello input
   -> renderer-neutral InputEvent
+  -> ordered Attachment
   -> Mica prompt state or key dispatch
   -> Mica command/policy transaction
   -> bounded native action or host effect
@@ -24,11 +26,24 @@ terminal or Vello input
   -> terminal cells or Vello scene
 ```
 
-`HostSession::open_with_mica` is the production constructor. `HostSession::open` remains only as a
-policy-free protocol/native-mechanism test harness; it has no Rust command or binding fallback.
-`HostSession::initial_output` publishes the initial Mica policy before the first presentation, and
-subsequent key transactions republish an atomic policy snapshot so replacement can remove facts
-without leaving stale Rust projections.
+`WorkspaceHost::open_with_mica` is the production constructor. `WorkspaceHost::open` remains only
+as a policy-free workspace/native-mechanism test harness; it has no Rust command or binding
+fallback. `DirectSessionClient::initial_output` publishes the initial Mica policy before the first
+presentation. Subsequent key transactions republish an atomic policy snapshot so replacement can
+remove facts without leaving stale Rust projections.
+
+`WorkspaceHost` owns the long-running editor, buffers, Mica driver, native kernel, watchers, and
+processes. An `Attachment` owns viewport and focus, exact input sequence, presentation revision,
+pointer/scroll state, and frontend-service capabilities. Attach, detach, resume, close-attachment,
+and terminate-workspace are separate lifecycle operations. A detached or closed frontend does not
+terminate the workspace. Background work emits server-originated `SessionOutput` with no client
+input acknowledgement and therefore consumes no input sequence number.
+
+`SessionClient` is the transport-independent frontend interface. `DirectSessionClient` implements
+it in process without serialization. A future remote implementation can encode the same owned,
+Serde-compatible protocol over CBOR and ZeroMQ without retaining a second session API. Bounded,
+correlated frontend-service requests cover attachment-local clipboard and notification work;
+files, processes, and watches remain backend-local.
 
 ## Transferred slices
 
@@ -105,7 +120,7 @@ Neither renderer interprets a window command.
 
 `PackageEnabled`, `PackageDisabled`, and `Package*` membership determine which commands, keymaps,
 and modes participate. Package disable is a volatile endpoint overlay, so it cannot persist native
-authority. `HostSession` exposes check-before-replace, named-unit replacement, fileout/export,
+authority. `WorkspaceHost` exposes check-before-replace, named-unit replacement, fileout/export,
 first-wave restore, and package enable/disable operations. Malformed replacement leaves the last
 working unit live; a valid replacement atomically resets projected policy and removes stale
 settings.
