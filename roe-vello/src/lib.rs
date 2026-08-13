@@ -38,6 +38,7 @@ use roe_core::syntax::face_registry;
 use roe_core::{Editor, WindowId};
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use text::TextRenderer;
 use vello::kurbo::{Affine, Rect};
@@ -61,14 +62,50 @@ enum HostEvent {
     Wake,
 }
 
-struct WinitWake(EventLoopProxy<HostEvent>);
+#[derive(Default)]
+struct WakeState {
+    pending: AtomicBool,
+}
+
+impl WakeState {
+    fn request(&self, send: impl FnOnce() -> bool) {
+        if self
+            .pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            && !send()
+        {
+            self.pending.store(false, Ordering::Release);
+        }
+    }
+
+    fn acknowledge(&self) {
+        self.pending.store(false, Ordering::Release);
+    }
+}
+
+struct WinitWake {
+    proxy: EventLoopProxy<HostEvent>,
+    state: Arc<WakeState>,
+}
 
 impl FrontendWake for WinitWake {
     fn wake(&self) {
-        if self.0.send_event(HostEvent::Wake).is_err() {
-            tracing::debug!("Vello event loop already closed");
-        }
+        self.state.request(|| {
+            let sent = self.proxy.send_event(HostEvent::Wake).is_ok();
+            if !sent {
+                tracing::debug!("Vello event loop already closed");
+            }
+            sent
+        });
     }
+}
+
+fn pump_runtime(runtime: &compio::runtime::Runtime) {
+    runtime.enter(|| {
+        runtime.poll_with(Some(Duration::ZERO));
+        runtime.run();
+    });
 }
 
 /// Convert a syntax color to Vello Color
@@ -114,6 +151,8 @@ pub struct RoeVelloApp<'a> {
     redraw_state: VelloRenderer,
     /// Current render state (window + surface)
     state: Option<RenderState<'a>>,
+    /// Coalesces host wakeups to at most one queued Winit user event.
+    wake_state: Arc<WakeState>,
     /// The scene to render
     scene: Scene,
     /// The theme
@@ -142,10 +181,11 @@ struct RenderState<'s> {
 }
 
 impl<'a> RoeVelloApp<'a> {
-    pub fn new(
+    fn new(
         editor: &'a mut Editor,
         theme: VelloTheme,
         runtime: compio::runtime::Runtime,
+        wake_state: Arc<WakeState>,
     ) -> Self {
         let font_size = theme.font_size;
         let font_family = if theme.font_family.is_empty() {
@@ -161,6 +201,7 @@ impl<'a> RoeVelloApp<'a> {
             renderers: vec![],
             redraw_state: VelloRenderer::with_theme(theme.clone()),
             state: None,
+            wake_state,
             scene: Scene::new(),
             text_renderer: TextRenderer::new(font_size, font_family),
             theme,
@@ -183,10 +224,7 @@ impl<'a> RoeVelloApp<'a> {
     }
 
     fn drive_background(&mut self) {
-        self.runtime.enter(|| {
-            self.runtime.poll_with(Some(Duration::ZERO));
-            self.runtime.run();
-        });
+        pump_runtime(&self.runtime);
 
         let file_change_actions = self.editor.poll_file_changes();
         for action in file_change_actions {
@@ -1799,6 +1837,7 @@ impl<'a> ApplicationHandler<HostEvent> for RoeVelloApp<'a> {
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: HostEvent) {
+        self.wake_state.acknowledge();
         self.drive_background();
     }
 
@@ -1882,15 +1921,81 @@ pub fn run_vello(
 
     let event_loop = EventLoop::<HostEvent>::with_user_event().build()?;
     let wake_proxy = event_loop.create_proxy();
-    editor
-        .file_watcher
-        .set_wake_handler(Arc::new(WinitWake(wake_proxy)));
+    let wake_state = Arc::new(WakeState::default());
+    editor.file_watcher.set_wake_handler(Arc::new(WinitWake {
+        proxy: wake_proxy,
+        state: wake_state.clone(),
+    }));
     event_loop.set_control_flow(ControlFlow::WaitUntil(
         Instant::now() + Duration::from_millis(20),
     ));
 
-    let mut app = RoeVelloApp::new(editor, theme, runtime);
+    let mut app = RoeVelloApp::new(editor, theme, runtime, wake_state);
     event_loop.run_app(&mut app)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn wake_requests_are_coalesced_until_the_ui_acknowledges() {
+        let state = WakeState::default();
+        let sends = AtomicUsize::new(0);
+
+        for _ in 0..10_000 {
+            state.request(|| {
+                sends.fetch_add(1, Ordering::Relaxed);
+                true
+            });
+        }
+        assert_eq!(sends.load(Ordering::Relaxed), 1);
+
+        state.acknowledge();
+        state.request(|| {
+            sends.fetch_add(1, Ordering::Relaxed);
+            true
+        });
+        assert_eq!(sends.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn failed_wake_send_can_be_retried() {
+        let state = WakeState::default();
+        state.request(|| false);
+
+        let sent = AtomicBool::new(false);
+        state.request(|| {
+            sent.store(true, Ordering::Relaxed);
+            true
+        });
+        assert!(sent.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn runtime_pump_completes_ready_work_without_window_input() {
+        let runtime = compio::runtime::Runtime::new().unwrap();
+        let completed = Rc::new(Cell::new(false));
+        let task_completed = completed.clone();
+        let task = runtime.enter(|| {
+            runtime.spawn(async move {
+                compio::time::sleep(Duration::from_millis(1)).await;
+                task_completed.set(true);
+            })
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !completed.get() && Instant::now() < deadline {
+            pump_runtime(&runtime);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(completed.get(), "periodic runtime pump stranded ready work");
+        drop(task);
+    }
 }

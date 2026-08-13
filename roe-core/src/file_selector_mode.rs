@@ -42,6 +42,8 @@ pub struct FileSelectorMode {
     all_items: Vec<String>,
     /// All paths in current directory (unfiltered)
     all_paths: Vec<PathBuf>,
+    /// Most recent filesystem failure, rendered in the selector buffer.
+    directory_error: Option<String>,
     /// How to open the selected file
     open_type: OpenType,
     file_system: Arc<dyn FileSystem>,
@@ -54,9 +56,13 @@ impl FileSelectorMode {
     }
 
     pub fn with_file_system(open_type: OpenType, file_system: Arc<dyn FileSystem>) -> Self {
-        let current_dir = file_system
-            .current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."));
+        let (current_dir, directory_error) = match file_system.current_dir() {
+            Ok(current_dir) => (current_dir, None),
+            Err(error) => (
+                PathBuf::from("."),
+                Some(format!("Failed to determine current directory: {error}")),
+            ),
+        };
         Self {
             input: String::new(),
             matches: Vec::new(),
@@ -68,6 +74,7 @@ impl FileSelectorMode {
             current_dir,
             all_items: Vec::new(),
             all_paths: Vec::new(),
+            directory_error,
             open_type,
             file_system,
         }
@@ -91,6 +98,9 @@ impl FileSelectorMode {
     fn load_directory(&mut self) {
         self.all_items.clear();
         self.all_paths.clear();
+        // Preserve a constructor error until the fallback directory has also
+        // been attempted. A successful listing clears it.
+        let prior_error = self.directory_error.take();
 
         // Always add ".." to go up a directory (unless we're at root)
         if let Some(parent) = self.current_dir.parent() {
@@ -101,6 +111,7 @@ impl FileSelectorMode {
         // Read directory contents
         match self.file_system.read_directory(&self.current_dir) {
             Ok(entries) => {
+                self.directory_error = prior_error;
                 let mut dirs = Vec::new();
                 let mut files = Vec::new();
 
@@ -127,6 +138,16 @@ impl FileSelectorMode {
                 }
             }
             Err(error) => {
+                self.directory_error = Some(match prior_error {
+                    Some(prior) => format!(
+                        "{prior}; failed to read {}: {error}",
+                        self.current_dir.display()
+                    ),
+                    None => format!(
+                        "Failed to read directory {}: {error}",
+                        self.current_dir.display()
+                    ),
+                });
                 tracing::warn!(
                     %error,
                     path = %self.current_dir.display(),
@@ -172,6 +193,10 @@ impl FileSelectorMode {
 
         // Show current directory path
         content.push_str(&format!("Directory: {}\n", self.current_dir.display()));
+
+        if let Some(error) = &self.directory_error {
+            content.push_str(&format!("Error: {error}\n"));
+        }
 
         // Show user input on next line if any
         if !self.input.is_empty() {
@@ -377,6 +402,8 @@ mod tests {
 
     struct TestFileSystem;
 
+    struct FailingFileSystem;
+
     impl FileSystem for TestFileSystem {
         fn current_dir(&self) -> io::Result<PathBuf> {
             Ok(PathBuf::from("/workspace"))
@@ -403,6 +430,26 @@ mod tests {
         }
     }
 
+    impl FileSystem for FailingFileSystem {
+        fn current_dir(&self) -> io::Result<PathBuf> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "cwd denied",
+            ))
+        }
+
+        fn read_directory(&self, _path: &Path) -> io::Result<Vec<DirectoryEntry>> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "listing denied",
+            ))
+        }
+
+        fn is_directory(&self, _path: &Path) -> bool {
+            false
+        }
+    }
+
     #[test]
     fn directory_listing_uses_injected_file_system() {
         let mut mode = FileSelectorMode::with_file_system(OpenType::New, Arc::new(TestFileSystem));
@@ -412,5 +459,17 @@ mod tests {
         assert_eq!(mode.current_dir, PathBuf::from("/workspace"));
         assert_eq!(mode.matches, vec!["../", "src/", "README.md"]);
         assert_eq!(mode.paths[1], PathBuf::from("/workspace/src"));
+    }
+
+    #[test]
+    fn directory_failures_are_rendered_for_the_user() {
+        let mut mode =
+            FileSelectorMode::with_file_system(OpenType::New, Arc::new(FailingFileSystem));
+        let mut buffers: SlotMap<BufferId, ()> = SlotMap::with_key();
+        mode.init_with_buffer(buffers.insert(()));
+
+        let content = mode.generate_buffer_content();
+        assert!(content.contains("Error: Failed to determine current directory"));
+        assert!(content.contains("failed to read .: listing denied"));
     }
 }

@@ -384,24 +384,43 @@ async fn terminal_main<W: Write>(
 }
 
 fn exit_state(device: &mut impl Write) -> Result<(), std::io::Error> {
-    // Restore terminal to original state
-    execute!(device, DisableMouseCapture)?;
-    execute!(device, crossterm::cursor::Show)?;
-    execute!(device, crossterm::cursor::SetCursorStyle::DefaultUserShape)?;
-    execute!(device, PopKeyboardEnhancementFlags)?;
-    device.flush()?;
+    exit_state_with(device, disable_raw_mode)
+}
 
-    disable_raw_mode()?;
+fn exit_state_with(
+    device: &mut impl Write,
+    restore_raw_mode: impl FnOnce() -> Result<(), std::io::Error>,
+) -> Result<(), std::io::Error> {
+    let mut first_error = None;
+    let mut retain_error = |result: Result<(), std::io::Error>| {
+        if let Err(error) = result
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    };
 
-    execute!(
+    // Every presentation reset is best effort. Raw-mode restoration must run
+    // even if the output device has already failed.
+    retain_error(execute!(device, DisableMouseCapture));
+    retain_error(execute!(device, crossterm::cursor::Show));
+    retain_error(execute!(
+        device,
+        crossterm::cursor::SetCursorStyle::DefaultUserShape
+    ));
+    retain_error(execute!(device, PopKeyboardEnhancementFlags));
+    retain_error(device.flush());
+    retain_error(restore_raw_mode());
+
+    retain_error(execute!(
         device,
         crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
-    )?;
+    ));
     let (_, height) = crossterm::terminal::size().unwrap_or((80, 24));
-    execute!(device, crossterm::cursor::MoveTo(0, height))?;
-    device.flush()?;
+    retain_error(execute!(device, crossterm::cursor::MoveTo(0, height)));
+    retain_error(device.flush());
 
-    Ok(())
+    first_error.map_or(Ok(()), Err)
 }
 
 fn main() -> Result<(), std::io::Error> {
@@ -443,4 +462,36 @@ fn main() -> Result<(), std::io::Error> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::exit_state_with;
+    use std::cell::Cell;
+    use std::io::{self, Write};
+
+    struct FailedTerminal;
+
+    impl Write for FailedTerminal {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "terminal gone"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "terminal gone"))
+        }
+    }
+
+    #[test]
+    fn raw_mode_restoration_runs_after_terminal_output_failure() {
+        let restored = Cell::new(false);
+        let error = exit_state_with(&mut FailedTerminal, || {
+            restored.set(true);
+            Ok(())
+        })
+        .expect_err("the original terminal output error must be retained");
+
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert!(restored.get());
+    }
 }

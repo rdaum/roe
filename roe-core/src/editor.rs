@@ -3304,6 +3304,11 @@ impl Editor {
         use crate::file_watcher::{MergeResult, merge_changes};
 
         let mut actions = Vec::new();
+        if let Some(error) = self.file_watcher.take_backend_error() {
+            actions.push(ChromeAction::Echo(format!(
+                "File watcher backend failed: {error}"
+            )));
+        }
         let events = self.file_watcher.poll_events();
 
         for event in events {

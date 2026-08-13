@@ -24,7 +24,7 @@ use similar::{ChangeTag, TextDiff};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::BufferId;
@@ -122,6 +122,8 @@ pub struct FileWatcher {
     /// Map of file paths to buffer IDs (Arc for sharing with callback)
     path_to_buffer: Arc<RwLock<HashMap<PathBuf, BufferId>>>,
     wake_handler: Arc<RwLock<Option<Arc<dyn FrontendWake>>>>,
+    /// Latest backend error; a single replaceable slot bounds failure delivery.
+    backend_error: Arc<Mutex<Option<String>>>,
     clock: Arc<dyn Clock>,
     /// Sync state per buffer
     sync_states: HashMap<BufferId, BufferSyncState>,
@@ -140,6 +142,7 @@ impl FileWatcher {
             event_rx,
             path_to_buffer: Arc::new(RwLock::new(HashMap::new())),
             wake_handler: Arc::new(RwLock::new(None)),
+            backend_error: Arc::new(Mutex::new(None)),
             clock,
             sync_states: HashMap::new(),
         }
@@ -150,9 +153,24 @@ impl FileWatcher {
         let tx = self.event_tx.clone();
         let path_to_buffer = self.path_to_buffer.clone();
         let wake_handler = self.wake_handler.clone();
+        let backend_error = self.backend_error.clone();
 
         let watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
-            let Ok(event) = res else { return };
+            let event = match res {
+                Ok(event) => event,
+                Err(error) => {
+                    tracing::warn!(%error, "file watcher backend error");
+                    if let Ok(mut current) = backend_error.lock() {
+                        *current = Some(error.to_string());
+                    }
+                    if let Ok(handler) = wake_handler.read()
+                        && let Some(handler) = handler.as_ref()
+                    {
+                        handler.wake();
+                    }
+                    return;
+                }
+            };
 
             // Only care about modify/create/remove events
             if !matches!(
@@ -204,6 +222,14 @@ impl FileWatcher {
         if let Ok(mut current) = self.wake_handler.write() {
             *current = Some(handler);
         }
+    }
+
+    /// Take the latest backend failure for one-time presentation by the host.
+    pub fn take_backend_error(&self) -> Option<String> {
+        self.backend_error
+            .lock()
+            .ok()
+            .and_then(|mut error| error.take())
     }
 
     /// Start watching a file for a buffer
@@ -726,6 +752,16 @@ mod tests {
             Err(TrySendError::Full(_))
         ));
         assert_eq!(watcher.poll_events().len(), EVENT_QUEUE_CAPACITY);
+    }
+
+    #[test]
+    fn backend_errors_use_a_bounded_latest_value_slot() {
+        let watcher = FileWatcher::new();
+        *watcher.backend_error.lock().unwrap() = Some("first".to_string());
+        *watcher.backend_error.lock().unwrap() = Some("latest".to_string());
+
+        assert_eq!(watcher.take_backend_error().as_deref(), Some("latest"));
+        assert_eq!(watcher.take_backend_error(), None);
     }
 
     #[test]
