@@ -18,7 +18,7 @@
 //! the entire scene each frame (which is efficient with GPU rendering).
 //! The dirty tracking is still useful to know when to request redraws.
 
-use roe_core::renderer::{DirtyRegion, DirtyTracker, Renderer};
+use roe_core::renderer::{DirtyRegion, DirtyTracker, PresentationSnapshot, Renderer};
 use roe_core::Editor;
 
 use crate::theme::VelloTheme;
@@ -35,6 +35,7 @@ pub struct VelloRenderer {
     pub theme: VelloTheme,
     /// Whether a redraw is needed
     needs_redraw: bool,
+    presentation_snapshot: Option<PresentationSnapshot>,
 }
 
 impl Default for VelloRenderer {
@@ -49,6 +50,7 @@ impl VelloRenderer {
             dirty_tracker: DirtyTracker::new(),
             theme: VelloTheme::default(),
             needs_redraw: true,
+            presentation_snapshot: None,
         }
     }
 
@@ -57,6 +59,7 @@ impl VelloRenderer {
             dirty_tracker: DirtyTracker::new(),
             theme,
             needs_redraw: true,
+            presentation_snapshot: None,
         }
     }
 
@@ -85,17 +88,19 @@ impl Renderer for VelloRenderer {
         self.invalidate(region);
     }
 
-    fn render_incremental(&mut self, _editor: &Editor) -> Result<(), Self::Error> {
+    fn render_incremental(&mut self, editor: &Editor) -> Result<(), Self::Error> {
         // For Vello, we don't do incremental rendering in the traditional sense.
         // The scene is rebuilt each frame by the application.
         // This method just marks that we've processed the dirty state.
         self.needs_redraw = true;
+        self.presentation_snapshot = Some(PresentationSnapshot::capture(editor));
         Ok(())
     }
 
-    fn render_full(&mut self, _editor: &Editor) -> Result<(), Self::Error> {
+    fn render_full(&mut self, editor: &Editor) -> Result<(), Self::Error> {
         // Same as incremental - the actual rendering happens in the app event loop
         self.needs_redraw = true;
+        self.presentation_snapshot = Some(PresentationSnapshot::capture(editor));
         Ok(())
     }
 
@@ -106,5 +111,9 @@ impl Renderer for VelloRenderer {
 
     fn needs_redraw(&self) -> bool {
         VelloRenderer::needs_redraw(self)
+    }
+
+    fn presentation_snapshot(&self) -> Option<&PresentationSnapshot> {
+        self.presentation_snapshot.as_ref()
     }
 }

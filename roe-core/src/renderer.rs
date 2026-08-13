@@ -11,8 +11,74 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
-use crate::{BufferId, WindowId};
+use crate::{BufferId, Editor, WindowId};
 use std::collections::{HashMap, HashSet};
+
+/// Renderer-neutral observation of the logical state presented by a frontend.
+///
+/// This is intentionally a Phase 0 conformance surface, not the final versioned
+/// presentation protocol designed in Phase 2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PresentationSnapshot {
+    pub columns: u16,
+    pub rows: u16,
+    pub active_window: WindowId,
+    pub windows: Vec<PresentedWindow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PresentedWindow {
+    pub window_id: WindowId,
+    pub buffer_id: BufferId,
+    pub buffer_name: String,
+    pub text: String,
+    pub cursor: usize,
+    pub x: u16,
+    pub y: u16,
+    pub width_chars: u16,
+    pub height_chars: u16,
+    pub start_line: u16,
+    pub start_column: u16,
+    pub is_active: bool,
+    pub is_command: bool,
+}
+
+impl PresentationSnapshot {
+    pub fn capture(editor: &Editor) -> Self {
+        let windows = editor
+            .windows
+            .iter()
+            .filter_map(|(window_id, window)| {
+                let buffer = editor.buffers.get(window.active_buffer)?;
+                Some(PresentedWindow {
+                    window_id,
+                    buffer_id: window.active_buffer,
+                    buffer_name: buffer.object(),
+                    text: buffer.content(),
+                    cursor: window.cursor,
+                    x: window.x,
+                    y: window.y,
+                    width_chars: window.width_chars,
+                    height_chars: window.height_chars,
+                    start_line: window.start_line,
+                    start_column: window.start_column,
+                    is_active: window_id == editor.active_window,
+                    is_command: matches!(
+                        window.window_type,
+                        crate::editor::WindowType::Command { .. }
+                    ),
+                })
+            })
+            .collect();
+
+        Self {
+            columns: editor.frame.columns,
+            rows: editor.frame.rows,
+            active_window: editor.active_window,
+            windows,
+        }
+    }
+}
 
 /// Represents a dirty region in logical buffer coordinates
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -321,6 +387,9 @@ pub trait Renderer {
 
     /// Return whether the frontend needs to schedule a redraw.
     fn needs_redraw(&self) -> bool;
+
+    /// Return the last logical state observed by a successful render attempt.
+    fn presentation_snapshot(&self) -> Option<&PresentationSnapshot>;
 }
 
 #[cfg(test)]

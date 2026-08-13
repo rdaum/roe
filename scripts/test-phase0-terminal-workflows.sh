@@ -24,7 +24,8 @@ start_session() {
     shift
 
     local command
-    printf -v command 'cd %q; exec %q ' "$project_root" "$roe_binary"
+    printf -v command 'cd %q; exec env -u DISPLAY -u WAYLAND_DISPLAY %q ' \
+        "$probe_dir" "$roe_binary"
     local argument quoted_argument
     for argument in "$@"; do
         printf -v quoted_argument '%q' "$argument"
@@ -61,6 +62,18 @@ tmux -L "$tmux_socket" send-keys -t one-file C-x C-s
 finish_session one-file
 [[ "$(sed -n '1p' "$one_file")" == 'Zalpha' ]]
 
+# Movement, a multibyte region kill, undo, yank, and insertion must all retain
+# character-index cursor semantics. Display access is removed above so this
+# cannot touch the user's system clipboard.
+unicode_file="$probe_dir/unicode.txt"
+printf 'éx\n' >"$unicode_file"
+start_session unicode-edit "$unicode_file"
+tmux -L "$tmux_socket" send-keys -t unicode-edit C-Space Right C-w C-_ End C-y
+tmux -L "$tmux_socket" send-keys -t unicode-edit -l Z
+tmux -L "$tmux_socket" send-keys -t unicode-edit C-x C-s
+finish_session unicode-edit
+[[ "$(sed -n '1p' "$unicode_file")" == 'éxéZ' ]]
+
 # Two-file startup, window selection, edit of the selected buffer, and save.
 first_file="$probe_dir/first.txt"
 second_file="$probe_dir/second.txt"
@@ -73,6 +86,30 @@ tmux -L "$tmux_socket" send-keys -t two-files C-x C-s
 finish_session two-files
 [[ "$(sed -n '1p' "$first_file")" == 'first' ]]
 [[ "$(sed -n '1p' "$second_file")" == 'Qsecond' ]]
+
+# Buffer selection filters the production menu and switches the active buffer.
+printf 'first\n' >"$first_file"
+printf 'second\n' >"$second_file"
+start_session buffer-select "$first_file" "$second_file"
+tmux -L "$tmux_socket" send-keys -t buffer-select C-x b
+tmux -L "$tmux_socket" send-keys -t buffer-select -l second.txt
+tmux -L "$tmux_socket" send-keys -t buffer-select Enter
+tmux -L "$tmux_socket" send-keys -t buffer-select -l B
+tmux -L "$tmux_socket" send-keys -t buffer-select C-x C-s
+finish_session buffer-select
+[[ "$(sed -n '1p' "$second_file")" == 'Bsecond' ]]
+
+# File selection opens a listed file from the controlled working directory.
+selected_file="$probe_dir/selected.txt"
+printf 'selected\n' >"$selected_file"
+start_session file-select
+tmux -L "$tmux_socket" send-keys -t file-select C-x C-f
+tmux -L "$tmux_socket" send-keys -t file-select -l selected.txt
+tmux -L "$tmux_socket" send-keys -t file-select Enter End
+tmux -L "$tmux_socket" send-keys -t file-select -l F
+tmux -L "$tmux_socket" send-keys -t file-select C-x C-s
+finish_session file-select
+[[ "$(sed -n '1p' "$selected_file")" == 'selectedF' ]]
 
 # Incremental search moves to a Unicode-safe character position before editing.
 search_file="$probe_dir/search.txt"
@@ -91,9 +128,35 @@ window_file="$probe_dir/window.txt"
 printf 'window\n' >"$window_file"
 start_session windows "$window_file"
 tmux -L "$tmux_socket" send-keys -t windows C-x 2
+sleep 0.2
+before_resize_row="$(
+    tmux -L "$tmux_socket" capture-pane -p -t windows \
+        | awk '/window.txt/ { print NR; exit }'
+)"
+tmux -L "$tmux_socket" send-keys -t windows -l \
+    $'\e[<0;40;11M\e[<32;40;19M\e[<0;40;19m'
+sleep 0.2
+after_resize_row="$(
+    tmux -L "$tmux_socket" capture-pane -p -t windows \
+        | awk '/window.txt/ { print NR; exit }'
+)"
+[[ -n "$before_resize_row" && -n "$after_resize_row" ]]
+((after_resize_row > before_resize_row))
 tmux -L "$tmux_socket" send-keys -t windows C-x o
 tmux -L "$tmux_socket" send-keys -t windows C-x 0
 finish_session windows
+
+# Command selection executes a named command through M-x.
+command_file="$probe_dir/command.txt"
+printf 'command\n' >"$command_file"
+start_session command-select "$command_file"
+tmux -L "$tmux_socket" send-keys -t command-select M-x
+tmux -L "$tmux_socket" send-keys -t command-select -l split-window-horizontally
+tmux -L "$tmux_socket" send-keys -t command-select Enter C-x o End
+tmux -L "$tmux_socket" send-keys -t command-select -l M
+tmux -L "$tmux_socket" send-keys -t command-select C-x C-s
+finish_session command-select
+[[ "$(sed -n '1p' "$command_file")" == 'commandM' ]]
 
 # A notify event must wake the terminal loop and update the buffer without input.
 watch_file="$probe_dir/watch.txt"
@@ -106,4 +169,21 @@ tmux -L "$tmux_socket" send-keys -t watcher C-x C-s
 finish_session watcher
 [[ "$(sed -n '1p' "$watch_file")" == 'Xafter' ]]
 
+# Record the current forced-shutdown behavior without risking the user's
+# terminal. Roe has no signal-aware cleanup path yet; SIGTERM ends the owned
+# tmux pane directly. Phase 1 must make this path restore the terminal itself.
+start_session forced-shutdown
+forced_pid="$(tmux -L "$tmux_socket" display-message -p -t forced-shutdown '#{pane_pid}')"
+kill -TERM "$forced_pid"
+for _ in $(seq 1 30); do
+    if ! tmux -L "$tmux_socket" has-session -t forced-shutdown 2>/dev/null; then
+        break
+    fi
+    sleep 0.1
+done
+if tmux -L "$tmux_socket" has-session -t forced-shutdown 2>/dev/null; then
+    exit 1
+fi
+
 printf '%s\n' 'phase0_terminal_workflows=pass'
+printf '%s\n' 'phase0_forced_shutdown=no_signal_cleanup_handler'

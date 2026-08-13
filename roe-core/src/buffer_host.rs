@@ -708,8 +708,11 @@ impl BufferHost {
                     // Get line start and make sure column is within line bounds
                     let line_start = self.buffer.buffer_line_to_char(target_line);
                     let line_len = if target_line < buffer_lines {
-                        self.buffer.buffer_line(target_line).len().saturating_sub(1)
-                    // -1 for newline
+                        self.buffer
+                            .buffer_line(target_line)
+                            .trim_end_matches('\n')
+                            .chars()
+                            .count()
                     } else {
                         0
                     };

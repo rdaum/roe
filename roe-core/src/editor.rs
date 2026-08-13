@@ -2373,7 +2373,7 @@ impl Editor {
         match position {
             ActionPosition::Cursor => {
                 let start = window.cursor;
-                let length = text.len();
+                let length = text.chars().count();
                 let has_newline = text.contains('\n');
                 let buffer_id = window.active_buffer;
                 buffer.insert_pos(text, window.cursor);
@@ -2413,7 +2413,7 @@ impl Editor {
             ActionPosition::Absolute(l, c) => {
                 let buffer_id = window.active_buffer;
                 let start = buffer.to_char_index(*c, *l);
-                let length = text.len();
+                let length = text.chars().count();
                 buffer.insert_col_line(text.clone(), (*l, *c));
 
                 let new_cursor = buffer.to_column_line(window.cursor);
@@ -2471,12 +2471,12 @@ impl Editor {
                 if deleted.is_empty() {
                     return vec![];
                 }
-                let deleted_len = deleted.len();
+                let deleted_len = deleted.chars().count();
 
                 // Calculate change region for after-change hook
                 let (start, old_end) = if count < 0 {
                     // Deleted backward: text was before cursor
-                    let start = cursor_before - deleted_len;
+                    let start = cursor_before.saturating_sub(deleted_len);
                     (start, cursor_before)
                 } else {
                     // Deleted forward: text was after cursor
@@ -2486,7 +2486,7 @@ impl Editor {
                 // If the count was negative, then we need to adjust the cursor back by the size
                 // of the deleted fragment.
                 if count < 0 {
-                    window.cursor -= deleted_len;
+                    window.cursor = window.cursor.saturating_sub(deleted_len);
                 }
                 let new_cursor = buffer.to_column_line(window.cursor);
                 let window_cursor = window.absolute_cursor_position(new_cursor.0, new_cursor.1);
@@ -2523,11 +2523,11 @@ impl Editor {
                 if deleted.is_empty() {
                     return vec![];
                 }
-                let deleted_len = deleted.len();
-                let old_end = if count < 0 {
-                    start // For backward delete, we'd need more complex calculation
+                let deleted_len = deleted.chars().count();
+                let (change_start, old_end) = if count < 0 {
+                    (start.saturating_sub(deleted_len), start)
                 } else {
-                    start + deleted_len
+                    (start, start + deleted_len)
                 };
 
                 let new_cursor = buffer.to_column_line(window.cursor);
@@ -2549,9 +2549,9 @@ impl Editor {
                     ChromeAction::CursorMove(window_cursor),
                     ChromeAction::BufferChanged {
                         buffer_id,
-                        start,
+                        start: change_start,
                         old_end,
-                        new_end: start,
+                        new_end: change_start,
                     },
                 ]
             }
@@ -2585,8 +2585,8 @@ impl Editor {
                 if count < 0 {
                     self.kill_ring.kill_prepend(deleted.clone());
                     // Adjust cursor for backward kill
-                    let length = deleted.len();
-                    window.cursor -= length;
+                    let length = deleted.chars().count();
+                    window.cursor = window.cursor.saturating_sub(length);
                 } else {
                     self.kill_ring.kill(deleted.clone());
                 }
@@ -3580,6 +3580,50 @@ mod tests {
         *clock.now.lock().unwrap() = start + Duration::from_secs(ECHO_TIMEOUT_SECS);
         assert!(editor.check_and_clear_expired_echo());
         assert!(editor.echo_message.is_empty());
+    }
+
+    #[test]
+    fn public_edit_paths_use_character_offsets_for_unicode() {
+        let mut editor = test_editor();
+        let window_id = editor.active_window;
+        let buffer_id = editor.windows[window_id].active_buffer;
+        editor.buffers[buffer_id].load_str("éx");
+        editor.windows[window_id].cursor = 2;
+        editor.kill_ring.kill("é".to_string());
+
+        let yank_actions = editor.yank(&ActionPosition::Cursor);
+        assert_eq!(editor.buffers[buffer_id].content(), "éxé");
+        assert_eq!(editor.windows[window_id].cursor, 3);
+        assert!(yank_actions.iter().any(|action| matches!(
+            action,
+            ChromeAction::BufferChanged {
+                start: 2,
+                old_end: 2,
+                new_end: 3,
+                ..
+            }
+        )));
+
+        editor.insert_text("Z".to_string(), &ActionPosition::Cursor);
+        assert_eq!(editor.buffers[buffer_id].content(), "éxéZ");
+        assert_eq!(editor.windows[window_id].cursor, 4);
+
+        let delete_actions = editor.delete_text(&ActionPosition::Cursor, -2);
+        assert_eq!(editor.buffers[buffer_id].content(), "éx");
+        assert_eq!(editor.windows[window_id].cursor, 2);
+        assert!(delete_actions.iter().any(|action| matches!(
+            action,
+            ChromeAction::BufferChanged {
+                start: 2,
+                old_end: 4,
+                new_end: 2,
+                ..
+            }
+        )));
+
+        editor.kill_text(&ActionPosition::Cursor, -1);
+        assert_eq!(editor.buffers[buffer_id].content(), "é");
+        assert_eq!(editor.windows[window_id].cursor, 1);
     }
 
     #[test]

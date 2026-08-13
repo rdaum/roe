@@ -25,10 +25,13 @@ use roe_core::gutter::{
     calculate_gutter_width, format_line_number, get_line_status, GutterConfig, LineStatus,
 };
 use roe_core::keys::{KeyModifier, LogicalKey, Side};
-use roe_core::renderer::{DirtyRegion, DirtyTracker, ModelineComponent, Renderer};
+use roe_core::renderer::{
+    DirtyRegion, DirtyTracker, ModelineComponent, PresentationSnapshot, Renderer,
+};
 use roe_core::syntax::face_registry;
 use roe_core::syntax::Color as SyntaxColor;
 use roe_core::{Editor, HighlightSpan, WindowId};
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::io::Write;
 use std::time::Duration;
@@ -53,6 +56,20 @@ pub const _BORDER_T_DOWN: &str = "┬";
 pub const _BORDER_T_UP: &str = "┴";
 pub const BORDER_T_RIGHT: &str = "├";
 pub const BORDER_T_LEFT: &str = "┤";
+
+fn truncate_echo(message: &str, available_width: usize) -> Cow<'_, str> {
+    if message.chars().count() <= available_width {
+        return Cow::Borrowed(message);
+    }
+
+    if available_width <= 3 {
+        return Cow::Owned(".".repeat(available_width));
+    }
+
+    let mut truncated: String = message.chars().take(available_width - 3).collect();
+    truncated.push_str("...");
+    Cow::Owned(truncated)
+}
 
 // Gutter colors
 pub const GUTTER_BG_COLOR: Color = Color::Rgb {
@@ -127,6 +144,7 @@ pub struct TerminalRenderer<W: Write> {
     device: W,
     dirty_tracker: DirtyTracker,
     theme: CachedTheme,
+    presentation_snapshot: Option<PresentationSnapshot>,
 }
 
 impl<W: Write> TerminalRenderer<W> {
@@ -135,6 +153,7 @@ impl<W: Write> TerminalRenderer<W> {
             device,
             dirty_tracker: DirtyTracker::new(),
             theme: CachedTheme::default(),
+            presentation_snapshot: None,
         }
     }
 
@@ -143,6 +162,7 @@ impl<W: Write> TerminalRenderer<W> {
             device,
             dirty_tracker: DirtyTracker::new(),
             theme,
+            presentation_snapshot: None,
         }
     }
 
@@ -451,6 +471,7 @@ impl<W: Write> Renderer for TerminalRenderer<W> {
     }
 
     fn render_incremental(&mut self, editor: &Editor) -> Result<(), std::io::Error> {
+        self.presentation_snapshot = Some(PresentationSnapshot::capture(editor));
         // If full screen is dirty, fall back to full render
         if self.dirty_tracker.is_full_screen_dirty() {
             return self.render_full(editor);
@@ -583,6 +604,7 @@ impl<W: Write> Renderer for TerminalRenderer<W> {
     }
 
     fn render_full(&mut self, editor: &Editor) -> Result<(), std::io::Error> {
+        self.presentation_snapshot = Some(PresentationSnapshot::capture(editor));
         // Hide cursor during redraw
         queue!(&mut self.device, cursor::Hide)?;
 
@@ -613,11 +635,7 @@ impl<W: Write> Renderer for TerminalRenderer<W> {
         if !editor.echo_message.is_empty() {
             let (x, y) = echo_area_position(&editor.frame);
             let available_width = editor.frame.columns.saturating_sub(x); // Use full terminal width
-            let truncated_message = if editor.echo_message.len() > available_width as usize {
-                &editor.echo_message[..available_width.saturating_sub(3) as usize]
-            } else {
-                &editor.echo_message
-            };
+            let truncated_message = truncate_echo(&editor.echo_message, available_width as usize);
             queue!(
                 &mut self.device,
                 cursor::MoveTo(x, y),
@@ -628,6 +646,7 @@ impl<W: Write> Renderer for TerminalRenderer<W> {
                 cursor::MoveTo(x, y),
                 Print(
                     truncated_message
+                        .as_ref()
                         .with(self.theme.fg_color)
                         .on(self.theme.bg_color)
                 )
@@ -675,6 +694,10 @@ impl<W: Write> Renderer for TerminalRenderer<W> {
 
     fn needs_redraw(&self) -> bool {
         self.dirty_tracker.is_dirty()
+    }
+
+    fn presentation_snapshot(&self) -> Option<&PresentationSnapshot> {
+        self.presentation_snapshot.as_ref()
     }
 }
 
@@ -1261,16 +1284,17 @@ pub fn echo(
     let cursor_pos = crossterm::cursor::position()?;
 
     let available_width = editor.frame.columns.saturating_sub(x); // Use full terminal width
-    let truncated_message = if message.len() > available_width as usize {
-        &message[..available_width.saturating_sub(3) as usize]
-    } else {
-        message
-    };
+    let truncated_message = truncate_echo(message, available_width as usize);
     queue!(device, cursor::MoveTo(x, y), Clear(ClearType::CurrentLine))?;
     queue!(
         device,
         cursor::MoveTo(x, y),
-        Print(truncated_message.with(theme.fg_color).on(theme.bg_color))
+        Print(
+            truncated_message
+                .as_ref()
+                .with(theme.fg_color)
+                .on(theme.bg_color)
+        )
     )?;
     // Restore the cursor position
     queue!(device, cursor::MoveTo(cursor_pos.0, cursor_pos.1))?;
@@ -1679,7 +1703,7 @@ fn detect_border_click(editor: &Editor, x: u16, y: u16) -> Option<(BorderInfo, W
         // Check vertical borders (left and right sides)
         if (x == left_border || x == right_border) && y >= top_border && y <= bottom_border {
             // This is a vertical border
-            if let Some(split_info) = find_split_for_border(editor, window_id, true) {
+            if let Some(split_info) = find_split_for_border(editor, window_id, x, true) {
                 return Some((
                     BorderInfo {
                         is_vertical: true,
@@ -1694,7 +1718,7 @@ fn detect_border_click(editor: &Editor, x: u16, y: u16) -> Option<(BorderInfo, W
         // Check horizontal borders (top and bottom sides)
         if (y == top_border || y == bottom_border) && x >= left_border && x <= right_border {
             // This is a horizontal border
-            if let Some(split_info) = find_split_for_border(editor, window_id, false) {
+            if let Some(split_info) = find_split_for_border(editor, window_id, y, false) {
                 return Some((
                     BorderInfo {
                         is_vertical: false,
@@ -1714,42 +1738,83 @@ fn detect_border_click(editor: &Editor, x: u16, y: u16) -> Option<(BorderInfo, W
 fn find_split_for_border(
     editor: &Editor,
     window_id: WindowId,
+    border_coordinate: u16,
     is_vertical_border: bool,
 ) -> Option<(Vec<usize>, f32)> {
-    // This is a simplified implementation
-    // In a real implementation, we would traverse the window tree to find the exact split node
-    // For now, we'll return a placeholder that works with simple two-window splits
+    let window = editor.windows.get(window_id)?;
+    let (leading_edge, trailing_edge) = if is_vertical_border {
+        (window.x, window.x + window.width_chars.saturating_sub(1))
+    } else {
+        (window.y, window.y + window.height_chars.saturating_sub(1))
+    };
+    let required_branch = if border_coordinate == leading_edge {
+        1
+    } else if border_coordinate == trailing_edge {
+        0
+    } else {
+        return None;
+    };
+    let direction = if is_vertical_border {
+        roe_core::editor::SplitDirection::Vertical
+    } else {
+        roe_core::editor::SplitDirection::Horizontal
+    };
 
-    // Find if this window has a sibling that shares the border
-    for (other_window_id, other_window) in &editor.windows {
-        if other_window_id == window_id {
-            continue;
-        }
+    find_split_path(&editor.window_tree, window_id, direction, required_branch)
+}
 
-        let window = &editor.windows[window_id];
+fn find_split_path(
+    tree: &roe_core::editor::WindowNode,
+    window_id: WindowId,
+    direction: roe_core::editor::SplitDirection,
+    required_branch: usize,
+) -> Option<(Vec<usize>, f32)> {
+    use roe_core::editor::WindowNode;
 
-        if is_vertical_border {
-            // Check if windows are horizontally adjacent
-            if (window.x + window.width_chars == other_window.x
-                || other_window.x + other_window.width_chars == window.x)
-                && window.y < other_window.y + other_window.height_chars
-                && other_window.y < window.y + window.height_chars
-            {
-                return Some((vec![0], 0.5)); // Simplified path and ratio
-            }
-        } else {
-            // Check if windows are vertically adjacent
-            if (window.y + window.height_chars == other_window.y
-                || other_window.y + other_window.height_chars == window.y)
-                && window.x < other_window.x + other_window.width_chars
-                && other_window.x < window.x + window.width_chars
-            {
-                return Some((vec![0], 0.5)); // Simplified path and ratio
+    fn leaf_path(node: &WindowNode, target: WindowId, path: &mut Vec<usize>) -> bool {
+        match node {
+            WindowNode::Leaf { window_id } => *window_id == target,
+            WindowNode::Split { first, second, .. } => {
+                path.push(0);
+                if leaf_path(first, target, path) {
+                    return true;
+                }
+                path.pop();
+                path.push(1);
+                if leaf_path(second, target, path) {
+                    return true;
+                }
+                path.pop();
+                false
             }
         }
     }
 
-    None
+    let mut leaf = Vec::new();
+    if !leaf_path(tree, window_id, &mut leaf) {
+        return None;
+    }
+
+    let mut node = tree;
+    let mut node_path = Vec::new();
+    let mut candidate = None;
+    for branch in leaf {
+        let WindowNode::Split {
+            direction: node_direction,
+            ratio,
+            first,
+            second,
+        } = node
+        else {
+            return None;
+        };
+        if *node_direction == direction && branch == required_branch {
+            candidate = Some((node_path.clone(), *ratio));
+        }
+        node = if branch == 0 { first } else { second };
+        node_path.push(branch);
+    }
+    candidate
 }
 
 /// Update window layout based on incremental mouse drag
@@ -1761,7 +1826,7 @@ fn update_window_resize_incremental(
     dy: i32,
 ) {
     // Use incremental changes with much finer granularity
-    if let Some(_target_window_id) = target_window_id {
+    if target_window_id.is_some() {
         // Use a sensitivity factor to make resizing smoother
         // Each pixel of mouse movement = 0.5% ratio change (adjustable)
         const SENSITIVITY: f32 = 0.005;
@@ -1770,11 +1835,19 @@ fn update_window_resize_incremental(
         if border_info.is_vertical && dx != 0 {
             // For vertical borders, adjust the split ratio based on horizontal movement
             let ratio_change = dx as f32 * SENSITIVITY;
-            adjust_window_tree_ratio_incremental(&mut editor.window_tree, ratio_change, true);
+            adjust_window_tree_ratio_at_path(
+                &mut editor.window_tree,
+                &border_info.split_node_path,
+                ratio_change,
+            );
         } else if !border_info.is_vertical && dy != 0 {
             // For horizontal borders, adjust the split ratio based on vertical movement
             let ratio_change = dy as f32 * SENSITIVITY;
-            adjust_window_tree_ratio_incremental(&mut editor.window_tree, ratio_change, false);
+            adjust_window_tree_ratio_at_path(
+                &mut editor.window_tree,
+                &border_info.split_node_path,
+                ratio_change,
+            );
         }
 
         // Recalculate layout to apply the new ratios
@@ -1782,40 +1855,28 @@ fn update_window_resize_incremental(
     }
 }
 
-/// Recursively adjust window tree ratios for incremental resizing
-fn adjust_window_tree_ratio_incremental(
+/// Adjust exactly the split identified when the drag began.
+fn adjust_window_tree_ratio_at_path(
     node: &mut roe_core::editor::WindowNode,
+    path: &[usize],
     ratio_change: f32,
-    is_vertical: bool,
 ) {
-    use roe_core::editor::{SplitDirection, WindowNode};
+    use roe_core::editor::WindowNode;
+
+    if path.is_empty() {
+        if let WindowNode::Split { ratio, .. } = node {
+            *ratio = (*ratio + ratio_change).clamp(0.15, 0.85);
+        }
+        return;
+    }
 
     match node {
-        WindowNode::Leaf { .. } => {
-            // Nothing to adjust for leaf nodes
-        }
-        WindowNode::Split {
-            direction,
-            ratio,
-            first,
-            second,
-        } => {
-            // Only adjust if the split direction matches the resize direction
-            let should_adjust = match direction {
-                SplitDirection::Vertical => is_vertical,
-                SplitDirection::Horizontal => !is_vertical,
-            };
-
-            if should_adjust {
-                // Adjust the ratio incrementally, keeping it within bounds
-                // Use tighter bounds to prevent extreme layouts
-                *ratio = (*ratio + ratio_change).clamp(0.15, 0.85);
-            } else {
-                // Recurse into child nodes
-                adjust_window_tree_ratio_incremental(first, ratio_change, is_vertical);
-                adjust_window_tree_ratio_incremental(second, ratio_change, is_vertical);
-            }
-        }
+        WindowNode::Leaf { .. } => {}
+        WindowNode::Split { first, second, .. } => match path[0] {
+            0 => adjust_window_tree_ratio_at_path(first, &path[1..], ratio_change),
+            1 => adjust_window_tree_ratio_at_path(second, &path[1..], ratio_change),
+            _ => {}
+        },
     }
 }
 
@@ -1842,5 +1903,61 @@ mod tests {
 
         renderer.clear_dirty();
         assert!(!renderer.dirty_tracker.is_line_dirty(buffer_id, 5));
+    }
+
+    #[test]
+    fn unicode_echo_truncation_preserves_character_boundaries() {
+        assert_eq!(truncate_echo("λé猫abc", 5), "λé...");
+        assert_eq!(truncate_echo("λé", 5), "λé");
+        assert_eq!(truncate_echo("λé", 1), ".");
+    }
+
+    #[test]
+    fn nested_border_resize_targets_only_the_controlling_split() {
+        use roe_core::editor::{SplitDirection, WindowNode};
+
+        let mut ids: slotmap::SlotMap<WindowId, ()> = slotmap::SlotMap::with_key();
+        let left = ids.insert(());
+        let middle = ids.insert(());
+        let bottom = ids.insert(());
+        let mut tree = WindowNode::new_split(
+            SplitDirection::Horizontal,
+            0.5,
+            WindowNode::new_split(
+                SplitDirection::Vertical,
+                0.4,
+                WindowNode::new_leaf(left),
+                WindowNode::new_leaf(middle),
+            ),
+            WindowNode::new_leaf(bottom),
+        );
+
+        assert_eq!(
+            find_split_path(&tree, middle, SplitDirection::Vertical, 1),
+            Some((vec![0], 0.4))
+        );
+        assert_eq!(
+            find_split_path(&tree, left, SplitDirection::Horizontal, 0),
+            Some((vec![], 0.5))
+        );
+
+        adjust_window_tree_ratio_at_path(&mut tree, &[0], 0.1);
+        let WindowNode::Split {
+            ratio: root_ratio,
+            first,
+            ..
+        } = tree
+        else {
+            unreachable!();
+        };
+        let WindowNode::Split {
+            ratio: nested_ratio,
+            ..
+        } = *first
+        else {
+            unreachable!();
+        };
+        assert_eq!(root_ratio, 0.5);
+        assert!((nested_ratio - 0.5).abs() < f32::EPSILON);
     }
 }

@@ -83,7 +83,7 @@ impl BufferInner {
 
     /// Insert a fragment of text into the buffer at the given line/col position.
     pub fn insert_col_line(&mut self, fragment: String, position: (u16, u16)) {
-        let buffer_location = self.buffer.line_to_char(position.1 as usize) + position.0 as usize;
+        let buffer_location = self.to_char_index(position.0, position.1);
         self.insert_pos(fragment, buffer_location);
     }
 
@@ -99,7 +99,7 @@ impl BufferInner {
     /// Delete a fragment of text from the buffer at the given line/col position.
     /// Returns the deleted text.
     pub fn delete_col_line(&mut self, position: (u16, u16), count: isize) -> Option<String> {
-        let buffer_location = self.buffer.line_to_char(position.1 as usize) + position.0 as usize;
+        let buffer_location = self.to_char_index(position.0, position.1);
         self.delete_pos(buffer_location, count)
     }
 
@@ -1039,6 +1039,10 @@ mod tests {
         assert_eq!(buffer.to_char_index(99, 1), 6);
         assert_eq!(buffer.to_char_index(99, 99), buffer.buffer.len_chars());
         assert_eq!(buffer.to_column_line(usize::MAX), (4, 2));
+
+        buffer.insert_col_line("!".to_string(), (99, 99));
+        assert_eq!(buffer.content(), "abc\nλμ\nlast!");
+        assert_eq!(buffer.delete_col_line((99, 99), -1), Some("!".to_string()));
     }
 
     #[test]

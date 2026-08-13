@@ -31,7 +31,7 @@ use roe_core::editor::{
 use roe_core::gutter::{
     calculate_gutter_width, format_line_number, get_line_status, GutterConfig, LineStatus,
 };
-use roe_core::renderer::DirtyRegion;
+use roe_core::renderer::{DirtyRegion, Renderer};
 use roe_core::syntax::face_registry;
 use roe_core::syntax::Color as SyntaxColor;
 use roe_core::{Editor, WindowId};
@@ -177,6 +177,9 @@ impl<'a> RoeVelloApp<'a> {
     }
 
     fn render(&mut self) {
+        self.redraw_state
+            .render_full(self.editor)
+            .expect("Vello logical presentation capture is infallible");
         // Extract surface info first to avoid borrow conflicts
         let (width, height, dev_id, scale_factor) = {
             let Some(ref state) = self.state else {
@@ -1000,7 +1003,7 @@ impl<'a> RoeVelloApp<'a> {
             .into_iter()
             .nth(clamped_line)
             .unwrap_or_default();
-        let line_len = line_text.trim_end_matches('\n').len();
+        let line_len = line_text.trim_end_matches('\n').chars().count();
         let clamped_col = buffer_col.min(line_len);
 
         // Get the new cursor position using clamped values
@@ -1008,11 +1011,7 @@ impl<'a> RoeVelloApp<'a> {
 
         // Final safety clamp to buffer length
         let buffer_len = buffer.buffer_len_chars();
-        let clamped_cursor = if buffer_len == 0 {
-            0
-        } else {
-            new_cursor.min(buffer_len - 1)
-        };
+        let clamped_cursor = new_cursor.min(buffer_len);
 
         // Update cursor in window
         let window = self.editor.windows.get_mut(window_id).unwrap();
@@ -1057,7 +1056,7 @@ impl<'a> RoeVelloApp<'a> {
             .into_iter()
             .nth(clamped_line)
             .unwrap_or_default();
-        let line_len = line_text.trim_end_matches('\n').len();
+        let line_len = line_text.trim_end_matches('\n').chars().count();
         let clamped_col = buffer_col.min(line_len);
 
         // Get the new cursor position using clamped values
@@ -1065,11 +1064,7 @@ impl<'a> RoeVelloApp<'a> {
 
         // Final safety clamp to buffer length
         let buffer_len = buffer.buffer_len_chars();
-        let clamped_cursor = if buffer_len == 0 {
-            0
-        } else {
-            new_cursor.min(buffer_len - 1)
-        };
+        let clamped_cursor = new_cursor.min(buffer_len);
 
         // On first drag movement, set the mark at the starting position
         if let Some(start_cursor) = self.drag_start_cursor.take() {
