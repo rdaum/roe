@@ -24,6 +24,7 @@ use crate::native_kernel::{
     Capability, CapabilityGrants, KernelError, LayoutNode, LogicalLayout, NativeClock,
     NativeKernel, NativeOperation, NativeResult, ResourceId, SplitAxis, TextSelection, ViewId,
 };
+use crate::renderer::DirtyRegion;
 use crate::{BufferId, Editor, WindowId};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1215,7 +1216,15 @@ impl HostSession {
         }
         for update in events.prompt_updates {
             let (content, cursor) = mica_prompt_content(&update);
-            if !self.editor.update_mica_prompt_window(&content, cursor) {
+            if self.editor.update_mica_prompt_window(&content, cursor) {
+                if let Some(window) = self.editor.find_command_window()
+                    && let Some(view) = self.view_ids.get(&window).copied()
+                {
+                    invalidations.push(Invalidation::View(view));
+                } else {
+                    invalidations.push(Invalidation::Full);
+                }
+            } else {
                 let command_type = match update.kind.as_str() {
                     "command" => CommandType::Execute,
                     "command_argument" => CommandType::Argument,
@@ -1239,8 +1248,8 @@ impl HostSession {
                     content,
                     cursor,
                 );
+                invalidations.push(Invalidation::Full);
             }
-            invalidations.push(Invalidation::Full);
         }
         for update in events.search_updates {
             let Some(window) = self.editor.windows.get_mut(update.view) else {
@@ -1287,7 +1296,11 @@ impl HostSession {
             {
                 window.cursor = finish.original_cursor;
             }
-            invalidations.push(Invalidation::Full);
+            if let Some(view) = self.view_ids.get(&finish.view).copied() {
+                invalidations.push(Invalidation::View(view));
+            } else {
+                invalidations.push(Invalidation::Full);
+            }
         }
         for message in events.errors {
             self.editor.set_echo_message(message.clone());
@@ -1445,6 +1458,7 @@ impl HostSession {
                     }
                 }
                 "other_window" => {
+                    let previous = self.editor.active_window;
                     if let Some(view) = action.view {
                         self.editor.active_window = view;
                     } else {
@@ -1452,7 +1466,13 @@ impl HostSession {
                             "Mica window selection lost its logical view".to_owned(),
                         ));
                     }
-                    invalidations.push(Invalidation::Full);
+                    for window in [previous, self.editor.active_window] {
+                        if let Some(view) = self.view_ids.get(&window).copied()
+                            && !invalidations.contains(&Invalidation::View(view))
+                        {
+                            invalidations.push(Invalidation::View(view));
+                        }
+                    }
                 }
                 "delete_window" => {
                     if let Err(error) = self.kernel.lock().unwrap().authorize(Capability::Layout) {
@@ -1515,6 +1535,7 @@ impl HostSession {
                         if let (Some(view), Some(position), Some(anchor)) =
                             (action.view, action.position, action.anchor)
                         {
+                            let previous = self.editor.active_window;
                             if self.editor.active_window != view {
                                 self.editor.previous_active_window =
                                     Some(self.editor.active_window);
@@ -1524,7 +1545,13 @@ impl HostSession {
                             self.editor.buffers[buffer].clear_mark();
                             self.editor.windows[view].cursor = position;
                             self.pointer_selection = Some((view, anchor));
-                            invalidations.push(Invalidation::Full);
+                            for window in [previous, view] {
+                                if let Some(id) = self.view_ids.get(&window).copied()
+                                    && !invalidations.contains(&Invalidation::View(id))
+                                {
+                                    invalidations.push(Invalidation::View(id));
+                                }
+                            }
                         }
                     }
                     Some("move") => {
@@ -1534,7 +1561,9 @@ impl HostSession {
                             let buffer = self.editor.windows[view].active_buffer;
                             self.editor.buffers[buffer].set_mark(anchor);
                             self.editor.windows[view].cursor = position;
-                            invalidations.push(Invalidation::Full);
+                            if let Some(id) = self.view_ids.get(&view).copied() {
+                                invalidations.push(Invalidation::View(id));
+                            }
                         }
                     }
                     Some("up") => {
@@ -1893,11 +1922,48 @@ impl HostSession {
                     self.editor.set_echo_message(message);
                     invalidations.push(Invalidation::EchoArea);
                 }
-                ChromeAction::MarkDirty(_) => invalidations.push(Invalidation::Full),
+                ChromeAction::MarkDirty(region) => {
+                    self.push_dirty_invalidation(region, invalidations);
+                }
                 ChromeAction::Save => {
                     pending.extend(self.save_active_buffer_via_kernel(lifecycle));
                 }
                 ChromeAction::CursorMove(_) | ChromeAction::BufferChanged { .. } => {}
+            }
+        }
+    }
+
+    fn push_dirty_invalidation(&self, region: DirtyRegion, invalidations: &mut Vec<Invalidation>) {
+        let mut push = |invalidation| {
+            if !invalidations.contains(&invalidation) {
+                invalidations.push(invalidation);
+            }
+        };
+        match region {
+            DirtyRegion::FullScreen => push(Invalidation::Full),
+            DirtyRegion::WindowChrome { window_id } | DirtyRegion::Modeline { window_id, .. } => {
+                if let Some(view) = self.view_ids.get(&window_id).copied() {
+                    push(Invalidation::View(view));
+                } else {
+                    push(Invalidation::Full);
+                }
+            }
+            DirtyRegion::Line { buffer_id, .. }
+            | DirtyRegion::LineRange { buffer_id, .. }
+            | DirtyRegion::CharRange { buffer_id, .. }
+            | DirtyRegion::Buffer { buffer_id } => {
+                let mut found = false;
+                for (window_id, window) in &self.editor.windows {
+                    if window.active_buffer == buffer_id
+                        && let Some(view) = self.view_ids.get(&window_id).copied()
+                    {
+                        push(Invalidation::View(view));
+                        found = true;
+                    }
+                }
+                if !found {
+                    push(Invalidation::Full);
+                }
             }
         }
     }
@@ -3033,6 +3099,16 @@ mod tests {
                 "{output:#?}"
             );
             assert_eq!(snapshot(&output).views[0].cursor, 19);
+            let PresentationUpdate::Delta(delta) = output.presentation.as_ref().unwrap() else {
+                panic!("Mica edit should produce a presentation delta");
+            };
+            assert!(
+                delta
+                    .invalidations
+                    .iter()
+                    .any(|invalidation| matches!(invalidation, Invalidation::View(_)))
+            );
+            assert!(!delta.invalidations.contains(&Invalidation::Full));
             assert!(
                 session
                     .mica_modes
@@ -3054,6 +3130,10 @@ mod tests {
                 snapshot(&indented).views[0].visible_text,
                 "hello1700000000123\n    "
             );
+            let PresentationUpdate::Delta(delta) = indented.presentation.as_ref().unwrap() else {
+                panic!("Mica indent should produce a presentation delta");
+            };
+            assert!(!delta.invalidations.contains(&Invalidation::Full));
             assert!(
                 output
                     .lifecycle
@@ -3577,6 +3657,16 @@ mod tests {
                     .visible_text
                     .contains("insert-current-time")
             );
+            let PresentationUpdate::Delta(delta) = filtered.presentation.as_ref().unwrap() else {
+                panic!("Mica prompt update should produce a presentation delta");
+            };
+            assert!(
+                delta
+                    .invalidations
+                    .iter()
+                    .any(|invalidation| matches!(invalidation, Invalidation::View(_)))
+            );
+            assert!(!delta.invalidations.contains(&Invalidation::Full));
             let inserted = session
                 .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Enter])))
                 .await

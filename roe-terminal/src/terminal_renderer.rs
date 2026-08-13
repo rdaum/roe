@@ -23,7 +23,8 @@ use roe_core::keys::{KeyModifier, LogicalKey, Side};
 use roe_core::renderer::PresentationStreamState;
 use roe_core::session::{
     HostSession, InputEvent, LifecycleEvent, PointerButton, PointerEvent, PointerKind,
-    PresentationColor, PresentationUpdate, PresentedView, SessionOutput, StyleDefinition,
+    PresentationColor, PresentationSnapshot, PresentationUpdate, PresentedView, SessionOutput,
+    StyleDefinition,
 };
 use std::borrow::Cow;
 use std::io::Write;
@@ -178,6 +179,9 @@ pub struct TerminalRenderer<W: Write> {
     device: W,
     theme: CachedTheme,
     session_presentation: PresentationStreamState,
+    rendered_presentation: Option<PresentationSnapshot>,
+    force_full_render: bool,
+    force_clear_render: bool,
 }
 
 impl<W: Write> TerminalRenderer<W> {
@@ -186,6 +190,9 @@ impl<W: Write> TerminalRenderer<W> {
             device,
             theme: CachedTheme::default(),
             session_presentation: PresentationStreamState::default(),
+            rendered_presentation: None,
+            force_full_render: false,
+            force_clear_render: false,
         }
     }
 
@@ -194,6 +201,9 @@ impl<W: Write> TerminalRenderer<W> {
             device,
             theme,
             session_presentation: PresentationStreamState::default(),
+            rendered_presentation: None,
+            force_full_render: false,
+            force_clear_render: false,
         }
     }
 
@@ -203,7 +213,16 @@ impl<W: Write> TerminalRenderer<W> {
     ) -> Result<(), std::io::Error> {
         self.session_presentation
             .apply(update)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        match update {
+            PresentationUpdate::Full(_) => self.force_clear_render = true,
+            PresentationUpdate::Delta(delta) => {
+                self.force_full_render |= delta
+                    .invalidations
+                    .contains(&roe_core::session::Invalidation::Full);
+            }
+        }
+        Ok(())
     }
 
     pub fn session_presentation(&self) -> &PresentationStreamState {
@@ -217,51 +236,154 @@ impl<W: Write> TerminalRenderer<W> {
             .current()
             .cloned()
             .ok_or_else(|| std::io::Error::other("session has no presentation snapshot"))?;
-        queue!(&mut self.device, cursor::Hide, Clear(ClearType::All))?;
+        let previous = self.rendered_presentation.take();
+        let layout_changed = previous
+            .as_ref()
+            .is_some_and(|previous| !session_layout_matches(previous, &snapshot));
+        let result = if self.force_clear_render || previous.is_none() || layout_changed {
+            self.render_full_session(&snapshot)
+        } else if self.force_full_render {
+            self.render_complete_session(&snapshot)
+        } else if let Some(previous) = previous.as_ref() {
+            self.render_incremental_session(previous, &snapshot)
+        } else {
+            self.render_full_session(&snapshot)
+        };
+        if result.is_ok() {
+            self.rendered_presentation = Some(snapshot);
+            self.force_full_render = false;
+            self.force_clear_render = false;
+        } else {
+            self.force_full_render = true;
+            self.force_clear_render = true;
+        }
+        result
+    }
 
+    fn render_full_session(
+        &mut self,
+        snapshot: &PresentationSnapshot,
+    ) -> Result<(), std::io::Error> {
+        queue!(&mut self.device, cursor::Hide, Clear(ClearType::All))?;
+        self.render_complete_session(snapshot)
+    }
+
+    fn render_complete_session(
+        &mut self,
+        snapshot: &PresentationSnapshot,
+    ) -> Result<(), std::io::Error> {
+        queue!(&mut self.device, cursor::Hide)?;
         for view in &snapshot.views {
             self.draw_session_view(view, &snapshot.styles)?;
         }
-        if !snapshot.echo_area.is_empty() {
-            let message = truncate_echo(&snapshot.echo_area, snapshot.columns as usize);
-            queue!(
-                &mut self.device,
-                cursor::MoveTo(0, snapshot.rows),
-                Clear(ClearType::CurrentLine),
-                Print(
-                    message
-                        .as_ref()
-                        .with(self.theme.fg_color)
-                        .on(self.theme.bg_color)
-                )
-            )?;
-        }
+        self.draw_echo_area(snapshot)?;
+        self.position_session_cursor(snapshot)?;
+        self.device.flush()
+    }
 
-        if let Some(view) = snapshot.views.iter().find(|view| view.active) {
-            let (column, line) = cursor_in_visible_slice(view);
-            let gutter = if view.show_gutter {
-                calculate_gutter_width(
-                    view.visible_text.lines().count().max(1),
-                    &GutterConfig::default(),
-                ) as u16
-            } else {
-                0
-            };
-            let x = view
-                .geometry
-                .x
-                .saturating_add(1)
-                .saturating_add(gutter)
-                .saturating_add(column.saturating_sub(view.scroll.start_column));
-            let y = view.geometry.y.saturating_add(1).saturating_add(line);
-            queue!(&mut self.device, cursor::MoveTo(x, y))?;
-            if view.command_view {
-                queue!(&mut self.device, cursor::Hide)?;
-            } else {
-                queue!(&mut self.device, cursor::Show)?;
+    fn render_incremental_session(
+        &mut self,
+        previous: &PresentationSnapshot,
+        snapshot: &PresentationSnapshot,
+    ) -> Result<(), std::io::Error> {
+        let styles_changed = previous.styles != snapshot.styles;
+        let mut drew = false;
+        for view in &snapshot.views {
+            let old = previous
+                .views
+                .iter()
+                .find(|candidate| candidate.id == view.id)
+                .expect("matching session layout must contain every view");
+
+            if old.active != view.active {
+                self.hide_cursor_once(&mut drew)?;
+                self.draw_session_view_border(view)?;
+            }
+
+            let redraw_all_content = styles_changed
+                || old.resource != view.resource
+                || old.visible_start_char != view.visible_start_char
+                || old.scroll != view.scroll
+                || old.selection != view.selection
+                || old.styled_ranges != view.styled_ranges
+                || old.show_gutter != view.show_gutter
+                || old.visible_text.lines().count() != view.visible_text.lines().count();
+            if redraw_all_content {
+                self.hide_cursor_once(&mut drew)?;
+                self.draw_session_view_content(view, &snapshot.styles)?;
+            } else if old.visible_text != view.visible_text {
+                for row in 0..usize::from(view.geometry.rows.saturating_sub(2)) {
+                    if session_view_line(old, row) != session_view_line(view, row) {
+                        self.hide_cursor_once(&mut drew)?;
+                        self.draw_session_view_content_row(view, &snapshot.styles, row)?;
+                    }
+                }
+            }
+
+            if old.modeline != view.modeline || old.active != view.active {
+                self.hide_cursor_once(&mut drew)?;
+                self.draw_session_view_modeline(view)?;
             }
         }
+
+        if previous.echo_area != snapshot.echo_area || previous.rows != snapshot.rows {
+            self.hide_cursor_once(&mut drew)?;
+            self.draw_echo_area(snapshot)?;
+        }
+        self.position_session_cursor(snapshot)?;
         self.device.flush()
+    }
+
+    fn hide_cursor_once(&mut self, drew: &mut bool) -> Result<(), std::io::Error> {
+        if !*drew {
+            queue!(&mut self.device, cursor::Hide)?;
+            *drew = true;
+        }
+        Ok(())
+    }
+
+    fn draw_echo_area(&mut self, snapshot: &PresentationSnapshot) -> Result<(), std::io::Error> {
+        let message = truncate_echo(&snapshot.echo_area, snapshot.columns as usize);
+        queue!(
+            &mut self.device,
+            cursor::MoveTo(0, snapshot.rows),
+            Print(
+                format!("{:<width$}", message, width = snapshot.columns as usize)
+                    .with(self.theme.fg_color)
+                    .on(self.theme.bg_color)
+            )
+        )
+    }
+
+    fn position_session_cursor(
+        &mut self,
+        snapshot: &PresentationSnapshot,
+    ) -> Result<(), std::io::Error> {
+        let Some(view) = snapshot.views.iter().find(|view| view.active) else {
+            return Ok(());
+        };
+        let (column, line) = cursor_in_visible_slice(view);
+        let gutter = if view.show_gutter {
+            calculate_gutter_width(
+                view.visible_text.lines().count().max(1),
+                &GutterConfig::default(),
+            ) as u16
+        } else {
+            0
+        };
+        let x = view
+            .geometry
+            .x
+            .saturating_add(1)
+            .saturating_add(gutter)
+            .saturating_add(column.saturating_sub(view.scroll.start_column));
+        let y = view.geometry.y.saturating_add(1).saturating_add(line);
+        queue!(&mut self.device, cursor::MoveTo(x, y))?;
+        if view.command_view {
+            queue!(&mut self.device, cursor::Hide)
+        } else {
+            queue!(&mut self.device, cursor::Show)
+        }
     }
 
     fn draw_session_view(
@@ -269,6 +391,12 @@ impl<W: Write> TerminalRenderer<W> {
         view: &PresentedView,
         styles: &[StyleDefinition],
     ) -> Result<(), std::io::Error> {
+        self.draw_session_view_border(view)?;
+        self.draw_session_view_content(view, styles)?;
+        self.draw_session_view_modeline(view)
+    }
+
+    fn draw_session_view_border(&mut self, view: &PresentedView) -> Result<(), std::io::Error> {
         let geometry = view.geometry;
         if geometry.columns < 2 || geometry.rows < 2 {
             return Ok(());
@@ -311,8 +439,30 @@ impl<W: Write> TerminalRenderer<W> {
                 Print(BORDER_VERTICAL.with(border))
             )?;
         }
+        Ok(())
+    }
 
-        let content_rows = geometry.rows.saturating_sub(2) as usize;
+    fn draw_session_view_content(
+        &mut self,
+        view: &PresentedView,
+        styles: &[StyleDefinition],
+    ) -> Result<(), std::io::Error> {
+        for row in 0..usize::from(view.geometry.rows.saturating_sub(2)) {
+            self.draw_session_view_content_row(view, styles, row)?;
+        }
+        Ok(())
+    }
+
+    fn draw_session_view_content_row(
+        &mut self,
+        view: &PresentedView,
+        styles: &[StyleDefinition],
+        row: usize,
+    ) -> Result<(), std::io::Error> {
+        let geometry = view.geometry;
+        if geometry.columns < 2 || row >= usize::from(geometry.rows.saturating_sub(2)) {
+            return Ok(());
+        }
         let total_width = geometry.columns.saturating_sub(2) as usize;
         let visible_line_count = view.visible_text.lines().count().max(1);
         let gutter_width = if view.show_gutter {
@@ -321,61 +471,68 @@ impl<W: Write> TerminalRenderer<W> {
             0
         };
         let text_width = total_width.saturating_sub(gutter_width);
-        let mut absolute = view.visible_start_char;
         let lines: Vec<&str> = view.visible_text.split_inclusive('\n').collect();
-        for row in 0..content_rows {
-            let y = geometry.y + 1 + row as u16;
+        let absolute = view.visible_start_char
+            + lines.iter().take(row).fold(0usize, |offset, line| {
+                offset.saturating_add(line.chars().count())
+            });
+        let y = geometry.y + 1 + row as u16;
+        queue!(
+            &mut self.device,
+            cursor::MoveTo(geometry.x + 1, y),
+            Print(
+                " ".repeat(total_width)
+                    .with(self.theme.fg_color)
+                    .on(self.theme.bg_color)
+            )
+        )?;
+        let line = lines.get(row).copied().unwrap_or("").trim_end_matches('\n');
+        if view.show_gutter {
+            let number = usize::from(view.scroll.start_line) + row + 1;
+            let digits = gutter_width.saturating_sub(2);
+            let gutter = format!(" {}│", format_line_number(number, digits));
             queue!(
                 &mut self.device,
                 cursor::MoveTo(geometry.x + 1, y),
-                Print(
-                    " ".repeat(total_width)
-                        .with(self.theme.fg_color)
-                        .on(self.theme.bg_color)
-                )
+                Print(gutter.with(GUTTER_FG_COLOR).on(GUTTER_BG_COLOR))
             )?;
-            let line = lines.get(row).copied().unwrap_or("");
-            let line = line.trim_end_matches('\n');
-            if view.show_gutter {
-                let number = usize::from(view.scroll.start_line) + row + 1;
-                let digits = gutter_width.saturating_sub(2);
-                let gutter = format!(" {}│", format_line_number(number, digits));
-                queue!(
-                    &mut self.device,
-                    cursor::MoveTo(geometry.x + 1, y),
-                    Print(gutter.with(GUTTER_FG_COLOR).on(GUTTER_BG_COLOR))
-                )?;
-            }
+        }
+        queue!(
+            &mut self.device,
+            cursor::MoveTo(geometry.x + 1 + gutter_width as u16, y)
+        )?;
+        for (offset, character) in line
+            .chars()
+            .skip(usize::from(view.scroll.start_column))
+            .take(text_width)
+            .enumerate()
+        {
+            let position = absolute + usize::from(view.scroll.start_column) + offset;
+            let selected = view.selection.is_some_and(|selection| {
+                let start = selection.anchor.min(selection.active);
+                let end = selection.anchor.max(selection.active);
+                position >= start && position < end
+            });
+            let (foreground, background) = if selected {
+                (Color::Black, self.theme.selection_color)
+            } else {
+                session_style(position, &view.styled_ranges, styles, &self.theme)
+            };
             queue!(
                 &mut self.device,
-                cursor::MoveTo(geometry.x + 1 + gutter_width as u16, y)
+                Print(character.to_string().with(foreground).on(background))
             )?;
-            for (offset, character) in line
-                .chars()
-                .skip(usize::from(view.scroll.start_column))
-                .take(text_width)
-                .enumerate()
-            {
-                let position = absolute + usize::from(view.scroll.start_column) + offset;
-                let selected = view.selection.is_some_and(|selection| {
-                    let start = selection.anchor.min(selection.active);
-                    let end = selection.anchor.max(selection.active);
-                    position >= start && position < end
-                });
-                let (foreground, background) = if selected {
-                    (Color::Black, self.theme.selection_color)
-                } else {
-                    session_style(position, &view.styled_ranges, styles, &self.theme)
-                };
-                queue!(
-                    &mut self.device,
-                    Print(character.to_string().with(foreground).on(background))
-                )?;
-            }
-            absolute += line.chars().count()
-                + usize::from(lines.get(row).is_some_and(|l| l.ends_with('\n')));
         }
+        Ok(())
+    }
 
+    fn draw_session_view_modeline(&mut self, view: &PresentedView) -> Result<(), std::io::Error> {
+        let geometry = view.geometry;
+        if geometry.columns < 2 || geometry.rows < 2 {
+            return Ok(());
+        }
+        let total_width = geometry.columns.saturating_sub(2) as usize;
+        let bottom = geometry.y + geometry.rows - 1;
         let modeline_bg = if view.active {
             self.theme.mode_line_bg_color
         } else {
@@ -390,6 +547,28 @@ impl<W: Write> TerminalRenderer<W> {
         )?;
         Ok(())
     }
+}
+
+fn session_layout_matches(
+    previous: &PresentationSnapshot,
+    snapshot: &PresentationSnapshot,
+) -> bool {
+    previous.columns == snapshot.columns
+        && previous.rows == snapshot.rows
+        && previous.views.len() == snapshot.views.len()
+        && snapshot.views.iter().all(|view| {
+            previous
+                .views
+                .iter()
+                .any(|old| old.id == view.id && old.geometry == view.geometry)
+        })
+}
+
+fn session_view_line(view: &PresentedView, row: usize) -> &str {
+    view.visible_text
+        .split_inclusive('\n')
+        .nth(row)
+        .unwrap_or("")
 }
 
 fn crossterm_modifier_translate(modifier: &ModifierKeyCode) -> KeyModifier {
@@ -571,6 +750,69 @@ fn session_io_error(error: roe_core::session::SessionError) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use roe_core::native_kernel::{ResourceId, ViewId};
+    use roe_core::session::{
+        Invalidation, PresentationDelta, Revision, SessionEpoch, ViewGeometry, ViewScroll,
+    };
+
+    fn test_snapshot(revision: u64, text: &str) -> PresentationSnapshot {
+        PresentationSnapshot {
+            epoch: SessionEpoch(1),
+            revision: Revision(revision),
+            columns: 20,
+            rows: 5,
+            active_view: ViewId(1),
+            views: vec![PresentedView {
+                id: ViewId(1),
+                resource: ResourceId {
+                    slot: 0,
+                    generation: 1,
+                },
+                name: "*test*".to_owned(),
+                visible_text: text.to_owned(),
+                visible_start_char: 0,
+                visible_end_char: text.chars().count(),
+                total_lines: text.lines().count().max(1),
+                max_line_chars: text
+                    .lines()
+                    .map(|line| line.chars().count())
+                    .max()
+                    .unwrap_or(0),
+                cursor: text.chars().count(),
+                selection: None,
+                geometry: ViewGeometry {
+                    x: 0,
+                    y: 0,
+                    columns: 20,
+                    rows: 5,
+                },
+                scroll: ViewScroll {
+                    start_line: 0,
+                    start_column: 0,
+                },
+                active: true,
+                command_view: false,
+                show_gutter: false,
+                modeline: "*test* 1:1".to_owned(),
+                styled_ranges: Vec::new(),
+            }],
+            styles: Vec::new(),
+            echo_area: String::new(),
+        }
+    }
+
+    fn apply_delta(renderer: &mut TerminalRenderer<Vec<u8>>, snapshot: PresentationSnapshot) {
+        let update = PresentationUpdate::Delta(PresentationDelta {
+            epoch: snapshot.epoch,
+            base_revision: Revision(snapshot.revision.0 - 1),
+            revision: snapshot.revision,
+            invalidations: vec![Invalidation::View(ViewId(1))],
+            snapshot,
+        });
+        renderer.apply_session_presentation(&update).unwrap();
+        renderer.render_session().unwrap();
+    }
+
     #[test]
     fn test_terminal_renderer_creation() {
         let output = Vec::new();
@@ -583,5 +825,72 @@ mod tests {
         assert_eq!(truncate_echo("λé猫abc", 5), "λé...");
         assert_eq!(truncate_echo("λé", 5), "λé");
         assert_eq!(truncate_echo("λé", 1), ".");
+    }
+
+    #[test]
+    fn session_delta_redraws_changed_lines_without_clearing_the_screen() {
+        let mut renderer = TerminalRenderer::new(Vec::new());
+        let first = test_snapshot(1, "alpha\nbeta\n");
+        renderer
+            .apply_session_presentation(&PresentationUpdate::Full(first))
+            .unwrap();
+        renderer.render_session().unwrap();
+        let full_bytes = renderer.device.len();
+        assert!(renderer.device.windows(4).any(|bytes| bytes == b"\x1b[2J"));
+
+        renderer.device.clear();
+        let second = test_snapshot(2, "alpha!\nbeta\n");
+        apply_delta(&mut renderer, second);
+        assert!(!renderer.device.windows(4).any(|bytes| bytes == b"\x1b[2J"));
+        assert!(!String::from_utf8_lossy(&renderer.device).contains(BORDER_TOP_LEFT));
+        assert!(renderer.device.len() < full_bytes / 2);
+
+        renderer.device.clear();
+        let mut cursor_only = test_snapshot(3, "alpha!\nbeta\n");
+        cursor_only.views[0].cursor = 1;
+        apply_delta(&mut renderer, cursor_only);
+        assert!(!String::from_utf8_lossy(&renderer.device).contains("alpha"));
+        assert!(!renderer.device.windows(4).any(|bytes| bytes == b"\x1b[2J"));
+    }
+
+    #[test]
+    fn session_layout_change_still_performs_a_full_clear() {
+        let mut renderer = TerminalRenderer::new(Vec::new());
+        let first = test_snapshot(1, "alpha\n");
+        renderer
+            .apply_session_presentation(&PresentationUpdate::Full(first))
+            .unwrap();
+        renderer.render_session().unwrap();
+        renderer.device.clear();
+
+        let mut resized = test_snapshot(2, "alpha\n");
+        resized.columns = 21;
+        resized.views[0].geometry.columns = 21;
+        apply_delta(&mut renderer, resized);
+        assert!(renderer.device.windows(4).any(|bytes| bytes == b"\x1b[2J"));
+    }
+
+    #[test]
+    fn explicit_full_invalidation_repaints_without_blank_screen_clear() {
+        let mut renderer = TerminalRenderer::new(Vec::new());
+        let first = test_snapshot(1, "alpha\n");
+        renderer
+            .apply_session_presentation(&PresentationUpdate::Full(first))
+            .unwrap();
+        renderer.render_session().unwrap();
+        renderer.device.clear();
+
+        let snapshot = test_snapshot(2, "alpha\n");
+        let update = PresentationUpdate::Delta(PresentationDelta {
+            epoch: snapshot.epoch,
+            base_revision: Revision(1),
+            revision: snapshot.revision,
+            invalidations: vec![Invalidation::Full],
+            snapshot,
+        });
+        renderer.apply_session_presentation(&update).unwrap();
+        renderer.render_session().unwrap();
+        assert!(!renderer.device.windows(4).any(|bytes| bytes == b"\x1b[2J"));
+        assert!(String::from_utf8_lossy(&renderer.device).contains(BORDER_TOP_LEFT));
     }
 }
