@@ -21,6 +21,7 @@ Phase 1 was implemented on 2026-08-13 in these reviewable changes:
 | `02cc6de` | Made interactive visit-file replacement transactional across open failures and shared buffers. |
 | `5e36d1d` | Coalesced graphical wakeups, guaranteed raw-mode restoration attempts, and surfaced filesystem/watcher failures. |
 | `8acd256` | Made interactive watches transactional/owned, returned graphical failures, traced mutation/redraw, and implemented explicit native shutdown. |
+| `0f636e4` | Preserved watcher ownership on backend teardown failure and rejected live rebinding without mutation. |
 
 ## Toolchain and dependencies
 
@@ -57,7 +58,7 @@ in-process `BufferHost` service per buffer.
 | -------- | --------------------- | --------------------- | -------- |
 | Buffer host | Direct serialized call; no queue | An overlapping request returns typed `HostError::Busy`. `HostLease::drop` returns the service even when an awaiting caller is cancelled. | Dropping the last client drops its modes and buffer host; no task exists to join. |
 | Mode chain | Major/minor modes run synchronously in declared order inside the host request; no queue | A mode consumes, annotates, or ignores the current request. | Modes are owned by and dropped with the host. |
-| File notifications | Bounded FIFO of 256 path/buffer hints plus one latest-value backend-error slot | Notify uses nonblocking `try_send`; a full queue drops the newest hint and logs the overload. Events carry no file contents; delivery rereads current disk state. Backend failures replace the one prior undelivered error. Backend parent watches are reference-counted and published only after `watch` succeeds. | Killing/replacing a buffer unregisters it. Session shutdown releases all associations/backend watches, then drops notify and its delivery state. |
+| File notifications | Bounded FIFO of 256 path/buffer hints plus one latest-value backend-error slot | Notify uses nonblocking `try_send`; a full queue drops the newest hint and logs the overload. Events carry no file contents; delivery rereads current disk state. Backend failures replace the one prior undelivered error. Backend parent watches are reference-counted and published only after `watch` succeeds. The fallible final `unwatch` also precedes logical removal; live cross-path rebinding is rejected without mutation. | Killing/replacing a buffer unregisters it. Session shutdown attempts every backend unwatch, then drops the backend and clears its logical associations even when explicit teardown reported errors. |
 | Winit wake | At most one outstanding `HostEvent::Wake` | An atomic pending bit coalesces any number of native wake requests until Winit acknowledges the queued event. A failed send clears the bit for retry. | Dropping the event loop closes its platform transport; later send failure is observed and does not remain pending. |
 | Frontend input | Platform event order; no host mailbox | Terminal polls input after each Compio tick. Winit dispatches platform/user events on its UI thread. | Each frontend stops accepting input by leaving its event loop. |
 
@@ -114,7 +115,8 @@ Ordinary external failures no longer use internal assertions:
 - file-selector current-directory/listing failures are rendered in its command buffer, and notify
   backend failures occupy a bounded latest-value slot that the editor echoes on its next wake;
 - interactive opens register their buffer only after the backend directory watch succeeds; shared
-  parent watches remain live until their last buffer owner leaves;
+  parent watches remain live until their last buffer owner leaves, and a failed final backend
+  unwatch preserves the complete logical association for retry or backend drop;
 - Winit window/event-loop, surface, logical-presentation, and Vello renderer/render failures are
   typed `FrontendError` values returned from `run_vello` rather than log-only exits or panics; and
 - file-selector directory failures and watcher initialization failures retain resource context in
@@ -153,18 +155,19 @@ The Phase 1 acceptance commands and results on the Phase 0 host are:
 | `cargo build --release --bin roe-vello` | Passes the renewed Vello/WGPU stack release build. |
 | `./scripts/measure-phase0-baseline.sh` | Completes, including the one-second production terminal idle probe. |
 
-The workspace suite contains 142 tests: one terminal-binary cleanup test, 132 in `roe-core`, four
+The workspace suite contains 144 tests: one terminal-binary cleanup test, 134 in `roe-core`, four
 terminal renderer tests, three Vello lifecycle tests, and one shared renderer-conformance test for
 each frontend. New focused evidence covers overlapping host requests, host cancellation safety,
 bounded file-notification overload and backend errors, real notify wakeup, coalesced graphical
 wakeups, no-input Compio progress, raw-mode cleanup after device failure, visible file-selector
 errors, clipboard failure preservation/reporting, non-`NotFound` open errors, Unicode invariants,
 external save failure behavior, transactional backend watch failure, and shared-directory watch
-ownership. Visit-file tests cover rollback on open failure, idle external updates, explicit native
+ownership. Failed-unwatch and rejected-rebind tests prove that backend failure cannot partially
+remove or replace logical ownership. Visit-file tests cover rollback on open failure, idle external updates, explicit native
 shutdown, and retention of a replaced buffer still displayed in another window.
 
-The same-host coarse sample measured 1,025 ns per edit round trip, 266 microseconds per terminal
-full redraw, 30.208 ms to the first welcome frame, and 3,596 KiB maximum RSS during the one-second
+The same-host coarse sample measured 1,419 ns per edit round trip, 249 microseconds per terminal
+full redraw, 31.446 ms to the first welcome frame, and 3,596 KiB maximum RSS during the one-second
 terminal idle probe. These are regression sentinels rather than acceptance thresholds. The idle RSS
 sample is higher than Phase 0's 1,948 KiB observation and remains visible for later profiling; no
 performance conclusion is drawn from one process sample.
