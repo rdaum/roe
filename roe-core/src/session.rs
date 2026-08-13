@@ -3073,7 +3073,7 @@ mod tests {
                 LogicalKey::Modifier(crate::keys::KeyModifier::Control(crate::keys::Side::Left));
             let split = session
                 .dispatch(session.envelope(InputEvent::Keys(vec![
-                    control.clone(),
+                    control,
                     LogicalKey::AlphaNumeric('x'),
                     LogicalKey::AlphaNumeric('2'),
                 ])))
