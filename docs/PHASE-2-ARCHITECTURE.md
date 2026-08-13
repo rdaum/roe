@@ -16,6 +16,7 @@ Phase 2 was implemented in these reviewable changes:
 | `a695fd8` | Routed terminal and Vello input, policy execution, pointer/layout operations, presentation, and shutdown through `HostSession`. |
 | `3b2e7be` | Restored Vello selection, active cursor, and scrollbar realization from session presentation state. |
 | `31a2a03` | Closed the fresh-review gaps in watcher delivery, lifecycle/output bounds, resource invalidation, and Vello chrome geometry. |
+| `e7c18d6` | Made host resource revocation generation-safe even when watcher cleanup fails. |
 
 ## Native kernel
 
@@ -37,8 +38,10 @@ bounded 256-hint queue; change hints carry the ephemeral resource identity into 
 lifecycle, and backend failures are surfaced rather than reported as successful bookkeeping.
 Every operation checks an explicit `CapabilityGrants` set before looking up or disclosing a
 resource. Kernel errors distinguish denied authority, stale resources, invalid ranges/layout, I/O,
-clipboard, and watcher failures. A kernel failure is returned as a request completion; it does not
-tear down the session endpoint.
+clipboard, and watcher failures. Host invalidation always clears the native slot and advances its
+generation even when backend watcher cleanup fails; cleanup failure is then a warning, never a
+reason to leave an announced-invalid capability live. A kernel failure is returned as a request
+completion; it does not tear down the session endpoint.
 
 The kernel enforces mechanisms only. It contains no command names, key bindings, modes, completion
 rules, hooks, packages, or renderer policy.
@@ -169,6 +172,7 @@ The Phase 2 acceptance commands are:
 Focused tests cover stale resource generations, Unicode character ranges, atomic invalid-range
 failure, grouped replace undo/redo, capability denial, real bounded native-watch delivery into the
 session lifecycle, bounded input and completion overload, explicit cancellation/invalidation,
+forced watcher-cleanup failure with generation-safe host revocation,
 layout invariants, exact input ordering, bounded idle behavior, revision monotonicity, full resync,
 endpoint close, deterministic headless transcript replay, nested split targeting, Vello scrollbar
 lane/overflow geometry, and cross-frontend presentation conformance.
