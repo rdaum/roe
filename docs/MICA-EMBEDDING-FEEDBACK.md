@@ -10,6 +10,25 @@ at exact revision `a13f479229b761bf45b7ef71802cd4ca6e588dd4`. Some items below m
 been improved elsewhere. Where it was unclear whether a feature was absent or merely difficult to
 discover, this note says so.
 
+## Migration status
+
+Roe now targets Mica revision `bea4fbd786e2601af1a682bd723b527000979f70`. That revision resolves
+several central items in this historical report:
+
+- `DriverOwner`, `DriverClient`, `EndpointSession`, invocation handles, and the sole
+  `DriverEventPump` provide the first-class lifecycle and event-consumer boundaries requested
+  below;
+- query cardinality is expressed through uniform relation values and exact row bindings instead
+  of `one` changing result shape;
+- absence is represented by structural `option<T>` values (`none` and `some(value)`), while `()`
+  is the unit value; and
+- exact bindings require the complete projected heading, making query-variable scope explicit at
+  the binding site.
+
+Roe's production units and embedded test sources have been migrated to those APIs. The remainder
+of this document is retained as evidence from the original integration and may describe surfaces
+that no longer exist.
+
 The most useful Roe-side evidence is:
 
 - [`roe-core/src/mica_host.rs`](../roe-core/src/mica_host.rs), the driver, endpoint, event,
@@ -244,7 +263,7 @@ does not require host-side string bookkeeping.
 
 ## Language, runtime, and documentation pain points
 
-### 1. `one` has a surprising shape discontinuity
+### 1. Resolved: query cardinality had a surprising shape discontinuity
 
 `one Relation(..., ?value)` returns the scalar value when there is one free variable, but a binding
 map when there are multiple free variables. Zero answers return `nothing`; multiple answers raise
@@ -260,7 +279,11 @@ syntax, or at least an error that says “this `one` result is a scalar because 
 variable.” The documentation should cross-link this rule from every introductory `one` example,
 because the happy-path example does not make the discontinuity visible.
 
-### 2. Query variables and lexical variables look more alike than they are
+The current language uses uniform relation values and `let exactly {heading} = query`. Roe's
+migration found the new contract materially clearer: missing and ambiguous rows fail at the
+explicit exact binding, and the binding must name the complete projected heading.
+
+### 2. Resolved: query variables and lexical variables looked more alike than they were
 
 In `one Relation(..., ?value_kind)`, `?value_kind` names a projected column; it does not create a
 lexical local called `value_kind`. Trying to use the latter produces `UnknownValue`. In a `for`
@@ -271,6 +294,9 @@ especially for people coming from Prolog, Datalog, or pattern matching. Destruct
 `let {value_kind} = one ...`, or a distinct projection syntax, would make the binding boundary
 clearer. Compiler suggestions for an unknown local matching a query-variable name would be a cheap
 improvement.
+
+Exact row bindings now provide that distinct lexical boundary. Roe projects only the columns it
+needs and binds the complete heading explicitly.
 
 ### 3. General maps and symbols are doing the work of result and variant types
 
@@ -413,9 +439,9 @@ The most valuable documentation additions would be:
 1. A production-shaped embedder example: named units, endpoint context plus volatile tuples,
    multiple tasks, external requests, a subscription, a foreign-loop wake, replacement, and
    deadlock-safe close/shutdown.
-2. A “sharp edges” page showing `one` scalar versus map results, query variables versus locals,
-   `nothing` versus an empty list/map, durable versus volatile identity lifetime, and dynamic
-   invocation failure modes.
+2. A “sharp edges” page showing exact row cardinality, complete projected headings, structural
+   options versus empty relation/list/map values, durable versus volatile identity lifetime, and
+   dynamic invocation failure modes.
 3. A generated, searchable API reference for every `mica-driver` method with lifecycle state,
    cancellation, event ordering, failure, and backpressure semantics.
 4. A host-protocol guide with versioned tagged values, strict decoding, compatibility rules, and

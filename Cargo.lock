@@ -1631,7 +1631,7 @@ dependencies = [
 [[package]]
 name = "mica-compiler"
 version = "0.1.0"
-source = "git+https://github.com/timbran-project/mica.git?rev=24f9fc3b64d1a08747c29f402b8d024c4795e58c#24f9fc3b64d1a08747c29f402b8d024c4795e58c"
+source = "git+https://github.com/timbran-project/mica.git?rev=bea4fbd786e2601af1a682bd723b527000979f70#bea4fbd786e2601af1a682bd723b527000979f70"
 dependencies = [
  "ariadne",
  "base64",
@@ -1643,7 +1643,7 @@ dependencies = [
 [[package]]
 name = "mica-driver"
 version = "0.1.0"
-source = "git+https://github.com/timbran-project/mica.git?rev=24f9fc3b64d1a08747c29f402b8d024c4795e58c#24f9fc3b64d1a08747c29f402b8d024c4795e58c"
+source = "git+https://github.com/timbran-project/mica.git?rev=bea4fbd786e2601af1a682bd723b527000979f70#bea4fbd786e2601af1a682bd723b527000979f70"
 dependencies = [
  "compio",
  "fast-telemetry",
@@ -1657,7 +1657,7 @@ dependencies = [
 [[package]]
 name = "mica-host-protocol"
 version = "0.1.0"
-source = "git+https://github.com/timbran-project/mica.git?rev=24f9fc3b64d1a08747c29f402b8d024c4795e58c#24f9fc3b64d1a08747c29f402b8d024c4795e58c"
+source = "git+https://github.com/timbran-project/mica.git?rev=bea4fbd786e2601af1a682bd723b527000979f70#bea4fbd786e2601af1a682bd723b527000979f70"
 dependencies = [
  "mica-var",
  "serde_json",
@@ -1666,7 +1666,7 @@ dependencies = [
 [[package]]
 name = "mica-relation-kernel"
 version = "0.1.0"
-source = "git+https://github.com/timbran-project/mica.git?rev=24f9fc3b64d1a08747c29f402b8d024c4795e58c#24f9fc3b64d1a08747c29f402b8d024c4795e58c"
+source = "git+https://github.com/timbran-project/mica.git?rev=bea4fbd786e2601af1a682bd723b527000979f70#bea4fbd786e2601af1a682bd723b527000979f70"
 dependencies = [
  "arc-swap",
  "fast-telemetry",
@@ -1678,7 +1678,7 @@ dependencies = [
 [[package]]
 name = "mica-runtime"
 version = "0.1.0"
-source = "git+https://github.com/timbran-project/mica.git?rev=24f9fc3b64d1a08747c29f402b8d024c4795e58c#24f9fc3b64d1a08747c29f402b8d024c4795e58c"
+source = "git+https://github.com/timbran-project/mica.git?rev=bea4fbd786e2601af1a682bd723b527000979f70#bea4fbd786e2601af1a682bd723b527000979f70"
 dependencies = [
  "base64",
  "fast-telemetry",
@@ -1695,7 +1695,7 @@ dependencies = [
 [[package]]
 name = "mica-var"
 version = "0.1.0"
-source = "git+https://github.com/timbran-project/mica.git?rev=24f9fc3b64d1a08747c29f402b8d024c4795e58c#24f9fc3b64d1a08747c29f402b8d024c4795e58c"
+source = "git+https://github.com/timbran-project/mica.git?rev=bea4fbd786e2601af1a682bd723b527000979f70#bea4fbd786e2601af1a682bd723b527000979f70"
 dependencies = [
  "base64",
 ]
@@ -1703,7 +1703,7 @@ dependencies = [
 [[package]]
 name = "mica-vm"
 version = "0.1.0"
-source = "git+https://github.com/timbran-project/mica.git?rev=24f9fc3b64d1a08747c29f402b8d024c4795e58c#24f9fc3b64d1a08747c29f402b8d024c4795e58c"
+source = "git+https://github.com/timbran-project/mica.git?rev=bea4fbd786e2601af1a682bd723b527000979f70#bea4fbd786e2601af1a682bd723b527000979f70"
 dependencies = [
  "arc-swap",
  "fast-telemetry",

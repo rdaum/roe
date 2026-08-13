@@ -922,7 +922,7 @@ impl MicaHost {
 assert RoleCanInvoke(#roe/editor_role, :roe/test_pending)
 verb roe/test_pending(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor
-  return external_request(:test_pending, nothing, 60)
+  return external_request(:test_pending, (), 60)
 end
 "#;
         self.administrator
@@ -954,9 +954,9 @@ end
 assert RoleCanInvoke(#roe/editor_role, :roe/test_background)
 verb roe/test_background(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor
-  let view = one roe/ActiveView(session, ?view)
-  let buffer = one roe/ViewBuffer(view, ?buffer)
-  let cursor = one roe/ViewCursor(view, ?cursor)
+  let exactly {:view -> view} = roe/ActiveView(session, ?view)
+  let exactly {:buffer -> buffer} = roe/ViewBuffer(view, ?buffer)
+  let exactly {:cursor -> cursor} = roe/ViewCursor(view, ?cursor)
   suspend(0.02)
   emit(session, {:kind -> :presentation_invalidated, :view -> view, :buffer -> buffer, :cursor -> cursor})
   return :done

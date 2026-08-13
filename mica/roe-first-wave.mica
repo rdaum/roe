@@ -535,7 +535,7 @@ verb roe/prompt_candidates(actor, session, prompt_kind, query)
       end
     end
   elseif prompt_kind == :command_argument
-    let state_rows = roe/PromptState(session, ?kind, ?state_query, ?state_selected, ?target, ?aux)
+    let state_rows = roe/PromptState(session, _, _, _, _, ?aux)
     if state_rows
       let exactly {:aux -> aux} = state_rows
       if aux
@@ -569,7 +569,7 @@ verb roe/refresh_prompt(actor, session)
     selected = roe/list_length(candidates) - 1
   end
   if selected != state_selected
-    retract roe/PromptState(session, prompt_kind, query, state_selected, target, aux)
+    retract roe/PromptState(session, _, _, _, _, _)
     assert roe/PromptState(session, prompt_kind, query, selected, target, aux)
   end
   let prompt = ""
@@ -627,7 +627,7 @@ verb roe/prompt_key(actor, session, sequence)
   let selected = state_selected
   let candidates = roe/prompt_candidates(actor, session, prompt_kind, query)
   if sequence == "Esc" || sequence == "C-g"
-    retract roe/PromptState(session, prompt_kind, state_query, state_selected, target, aux)
+    retract roe/PromptState(session, _, _, _, _, _)
     emit(session, {:kind -> :prompt_close})
     return :cancelled
   elseif sequence == "⌫"
@@ -648,7 +648,7 @@ verb roe/prompt_key(actor, session, sequence)
       return roe/refresh_prompt(actor, session)
     end
     let chosen = candidates[selected]
-    retract roe/PromptState(session, prompt_kind, state_query, state_selected, target, aux)
+    retract roe/PromptState(session, _, _, _, _, _)
     emit(session, {:kind -> :prompt_close})
     if target
       let exactly {:value -> target_view} = target
@@ -692,7 +692,7 @@ verb roe/prompt_key(actor, session, sequence)
   else
     return :handled
   end
-  retract roe/PromptState(session, prompt_kind, state_query, state_selected, target, aux)
+  retract roe/PromptState(session, _, _, _, _, _)
   assert roe/PromptState(session, prompt_kind, query, selected, target, aux)
   return roe/refresh_prompt(actor, session)
 end
@@ -742,7 +742,7 @@ verb roe/refresh_search(actor, session)
     selected = count - 1
   end
   if selected != state_selected
-    retract roe/PromptState(session, prompt_kind, query, state_selected, target, aux)
+    retract roe/PromptState(session, _, _, _, _, _)
     assert roe/PromptState(session, prompt_kind, query, selected, target, aux)
   end
   emit(session, {:kind -> :prompt_update, :prompt_kind -> prompt_kind, :query -> query, :selected -> selected, :candidates -> []})
@@ -759,7 +759,7 @@ verb roe/search_prompt_key(actor, session, sequence)
   let query = state_query
   let selected = state_selected
   if sequence == "Esc" || sequence == "C-g"
-    retract roe/PromptState(session, prompt_kind, state_query, state_selected, target, aux)
+    retract roe/PromptState(session, _, _, _, _, _)
     emit(session, {:kind -> :search_finish, :view -> target_view, :original -> original_cursor, :query -> state_query, :accepted -> false})
     emit(session, {:kind -> :prompt_close})
     return :cancelled
@@ -770,7 +770,7 @@ verb roe/search_prompt_key(actor, session, sequence)
       retract roe/PromptLast(session, :search, previous)
     end
     assert roe/PromptLast(session, :search, state_query)
-    retract roe/PromptState(session, prompt_kind, state_query, state_selected, target, aux)
+    retract roe/PromptState(session, _, _, _, _, _)
     emit(session, {:kind -> :search_finish, :view -> target_view, :original -> original_cursor, :query -> state_query, :accepted -> true})
     emit(session, {:kind -> :prompt_close})
     return :accepted
@@ -791,7 +791,7 @@ verb roe/search_prompt_key(actor, session, sequence)
   else
     return :handled
   end
-  retract roe/PromptState(session, prompt_kind, state_query, state_selected, target, aux)
+  retract roe/PromptState(session, _, _, _, _, _)
   assert roe/PromptState(session, prompt_kind, query, selected, target, aux)
   return roe/refresh_search(actor, session)
 end
