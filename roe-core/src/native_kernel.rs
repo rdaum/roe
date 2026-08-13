@@ -191,6 +191,9 @@ pub enum NativeOperation {
     ReadFile {
         path: PathBuf,
     },
+    ListDirectory {
+        path: PathBuf,
+    },
     WriteFile {
         path: PathBuf,
         contents: String,
@@ -226,6 +229,7 @@ pub enum NativeResult {
     },
     LayoutValidated,
     FileContents(String),
+    DirectoryEntries(Vec<PathBuf>),
     FileWritten,
     ClipboardContents(String),
     ClipboardWritten,
@@ -422,6 +426,14 @@ impl NativeKernel {
             NativeOperation::ReadFile { path } => {
                 self.require(Capability::FileRead)?;
                 Ok(NativeResult::FileContents(std::fs::read_to_string(path)?))
+            }
+            NativeOperation::ListDirectory { path } => {
+                self.require(Capability::FileRead)?;
+                let mut entries = std::fs::read_dir(path)?
+                    .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                    .collect::<Vec<_>>();
+                entries.sort();
+                Ok(NativeResult::DirectoryEntries(entries))
             }
             NativeOperation::WriteFile { path, contents } => {
                 self.require(Capability::FileWrite)?;

@@ -17,7 +17,8 @@ use crate::editor::{
 };
 use crate::keys::{CursorDirection, KeyAction, LogicalKey, NoBindings};
 use crate::mica_host::{
-    MicaEventBatch, MicaHost, MicaHostError, MicaKeyResult, normalized_key_sequence,
+    MicaEventBatch, MicaHost, MicaHostError, MicaKeyResult, MicaPromptTarget, MicaPromptUpdate,
+    normalized_key_sequence,
 };
 use crate::native_kernel::{
     Capability, CapabilityGrants, KernelError, NativeClock, NativeKernel, NativeOperation,
@@ -487,10 +488,10 @@ impl HostSession {
                         lifecycle.push(LifecycleEvent::Error(message));
                     }
                     Some(Ok(MicaKeyResult::Unbound)) | None => {
-                        let direct = match keys.as_slice() {
-                            [LogicalKey::AlphaNumeric(character)] => {
+                        let direct = match text_character_from_keys(&keys) {
+                            Some(character) => {
                                 self.editor
-                                    .perform_native_action(KeyAction::AlphaNumeric(*character))
+                                    .perform_native_action(KeyAction::AlphaNumeric(character))
                                     .await
                             }
                             _ => self.editor.key_event(keys).await,
@@ -507,6 +508,36 @@ impl HostSession {
             }
             InputEvent::Text(text) => {
                 for character in text.chars() {
+                    let mica_result = if let Some(mut mica) = self.mica.take() {
+                        let result = mica
+                            .dispatch_key(
+                                &self.editor,
+                                &self.buffer_resources,
+                                character.to_string(),
+                            )
+                            .await;
+                        self.mica = Some(mica);
+                        match result {
+                            Ok(dispatch) => {
+                                self.apply_mica_events(
+                                    dispatch.events,
+                                    &mut lifecycle,
+                                    &mut invalidations,
+                                )
+                                .await;
+                                Some(dispatch.key)
+                            }
+                            Err(error) => {
+                                lifecycle.push(LifecycleEvent::Error(error.to_string()));
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    if matches!(mica_result, Some(MicaKeyResult::Handled)) {
+                        continue;
+                    }
                     match self
                         .editor
                         .perform_native_action(KeyAction::AlphaNumeric(character))
@@ -751,6 +782,52 @@ impl HostSession {
                 }
             }
         }
+        if events.prompt_close
+            && let Some(window) = self.editor.find_command_window()
+        {
+            self.editor.close_command_window(window);
+            invalidations.push(Invalidation::Full);
+        }
+        for update in events.prompt_updates {
+            let (content, cursor) = mica_prompt_content(&update);
+            if !self.editor.update_mica_prompt_window(&content, cursor) {
+                let command_type = match update.kind.as_str() {
+                    "command" => CommandType::Execute,
+                    "switch_buffer" => CommandType::BufferSwitch,
+                    "kill_buffer" => CommandType::KillBuffer,
+                    "find_file" => CommandType::OpenFile(crate::editor::OpenType::New),
+                    "visit_file" => CommandType::OpenFile(crate::editor::OpenType::Visit),
+                    "isearch_forward" => CommandType::ISearch { forward: true },
+                    "isearch_backward" => CommandType::ISearch { forward: false },
+                    _ => {
+                        lifecycle.push(LifecycleEvent::Error(format!(
+                            "unknown Mica prompt kind: {}",
+                            update.kind
+                        )));
+                        continue;
+                    }
+                };
+                self.editor
+                    .create_mica_prompt_window(command_type, 10, content, cursor);
+            }
+            invalidations.push(Invalidation::Full);
+        }
+        for update in events.search_updates {
+            let actions =
+                self.editor
+                    .apply_mica_search(update.view, &update.matches, update.selected);
+            self.resolve_actions(actions, lifecycle, invalidations)
+                .await;
+        }
+        for finish in events.search_finishes {
+            let actions = self.editor.finish_mica_search(
+                finish.view,
+                finish.original_cursor,
+                finish.accepted,
+            );
+            self.resolve_actions(actions, lifecycle, invalidations)
+                .await;
+        }
         for message in events.errors {
             self.editor.set_echo_message(message.clone());
             invalidations.push(Invalidation::EchoArea);
@@ -772,7 +849,7 @@ impl HostSession {
             }
         }
         for action in events.host_actions {
-            match action.as_str() {
+            match action.name.as_str() {
                 "quit" => lifecycle.push(LifecycleEvent::QuitRequested),
                 "redraw" => invalidations.push(Invalidation::Full),
                 "split_horizontal" => {
@@ -864,6 +941,44 @@ impl HostSession {
                     self.editor
                         .set_echo_message("Mica command selection".to_owned());
                     invalidations.push(Invalidation::Full);
+                }
+                "switch_buffer_selected" => {
+                    if let Some(buffer) = action.buffer {
+                        let actions = self.editor.select_mica_buffer(buffer, false);
+                        self.resolve_actions(actions, lifecycle, invalidations)
+                            .await;
+                    } else {
+                        lifecycle.push(LifecycleEvent::Error(
+                            "Mica switch-buffer result lost its buffer identity".to_owned(),
+                        ));
+                    }
+                }
+                "kill_buffer_selected" => {
+                    if let Some(buffer) = action.buffer {
+                        let actions = self.editor.select_mica_buffer(buffer, true);
+                        self.resolve_actions(actions, lifecycle, invalidations)
+                            .await;
+                    } else {
+                        lifecycle.push(LifecycleEvent::Error(
+                            "Mica kill-buffer result lost its buffer identity".to_owned(),
+                        ));
+                    }
+                }
+                "find_file_selected" | "visit_file_selected" => {
+                    if let Some(path) = action.path {
+                        let open_type = if action.name == "find_file_selected" {
+                            crate::editor::OpenType::New
+                        } else {
+                            crate::editor::OpenType::Visit
+                        };
+                        let actions = self.editor.open_mica_file(path.into(), open_type).await;
+                        self.resolve_actions(actions, lifecycle, invalidations)
+                            .await;
+                    } else {
+                        lifecycle.push(LifecycleEvent::Error(
+                            "Mica file prompt result lost its path".to_owned(),
+                        ));
+                    }
                 }
                 "isearch_forward" => {
                     self.resolve_actions(
@@ -1395,6 +1510,44 @@ fn mica_native_action(action: &str) -> Option<KeyAction> {
     }
 }
 
+fn text_character_from_keys(keys: &[LogicalKey]) -> Option<char> {
+    match keys {
+        [LogicalKey::AlphaNumeric(character)] => Some(*character),
+        [
+            LogicalKey::Modifier(crate::keys::KeyModifier::Shift(_)),
+            LogicalKey::AlphaNumeric(character),
+        ] => character.to_uppercase().next(),
+        _ => None,
+    }
+}
+
+fn mica_prompt_content(update: &MicaPromptUpdate) -> (String, usize) {
+    let prefix = match update.kind.as_str() {
+        "command" => "M-x ",
+        "switch_buffer" => "Switch to buffer: ",
+        "kill_buffer" => "Kill buffer: ",
+        "find_file" => "Find file: ",
+        "visit_file" => "Visit file: ",
+        "isearch_forward" => "I-search: ",
+        "isearch_backward" => "I-search backward: ",
+        _ => "Prompt: ",
+    };
+    let mut content = format!("{prefix}{}", update.query);
+    for (index, (name, target)) in update.candidates.iter().take(8).enumerate() {
+        debug_assert!(matches!(
+            target,
+            MicaPromptTarget::Selector(_) | MicaPromptTarget::Buffer(_) | MicaPromptTarget::Path(_)
+        ));
+        content.push('\n');
+        content.push_str(if index == update.selected { "> " } else { "  " });
+        content.push_str(name);
+    }
+    (
+        content,
+        prefix.chars().count() + update.query.chars().count(),
+    )
+}
+
 fn capability_list(grants: &CapabilityGrants) -> Vec<Capability> {
     [
         Capability::TextRead,
@@ -1609,6 +1762,9 @@ fn native_result_size(result: &NativeResult) -> usize {
         NativeResult::FileContents(contents) | NativeResult::ClipboardContents(contents) => {
             contents.len()
         }
+        NativeResult::DirectoryEntries(entries) => entries.iter().fold(0usize, |size, path| {
+            size.saturating_add(path.as_os_str().len())
+        }),
         NativeResult::ProcessOutput { stdout, stderr, .. } => {
             stdout.len().saturating_add(stderr.len())
         }
@@ -2015,31 +2171,35 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert!(
-                snapshot(&palette)
-                    .echo_area
-                    .contains("Mica command selection")
-            );
-            assert!(
-                session
-                    .mica_palette_actions
-                    .contains_key("split-window-horizontally")
-            );
-            assert!(
-                session
-                    .mica_palette_actions
-                    .contains_key("insert-current-time")
-            );
+            let prompt = snapshot(&palette)
+                .views
+                .iter()
+                .find(|view| view.command_view)
+                .unwrap_or_else(|| panic!("Mica command prompt: {palette:#?}"));
+            assert!(prompt.visible_text.starts_with("M-x "));
 
-            session
+            let filtered = session
                 .dispatch(session.envelope(InputEvent::Text("insert-current-time".to_owned())))
                 .await
                 .unwrap();
+            assert!(
+                snapshot(&filtered)
+                    .views
+                    .iter()
+                    .find(|view| view.command_view)
+                    .unwrap()
+                    .visible_text
+                    .contains("insert-current-time")
+            );
             let inserted = session
                 .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Enter])))
                 .await
                 .unwrap();
-            assert_eq!(snapshot(&inserted).views[0].visible_text, "hello42\n");
+            assert_eq!(
+                snapshot(&inserted).views[0].visible_text,
+                "hello42\n",
+                "{inserted:#?}"
+            );
 
             let palette = session
                 .dispatch(
@@ -2049,8 +2209,9 @@ mod tests {
                 .unwrap();
             assert!(
                 snapshot(&palette)
-                    .echo_area
-                    .contains("Mica command selection")
+                    .views
+                    .iter()
+                    .any(|view| view.command_view)
             );
 
             session
@@ -2064,6 +2225,73 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(snapshot(&selected).views.len(), 2);
+
+            session
+                .dispatch(session.envelope(InputEvent::Close))
+                .await
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn mica_owns_incremental_search_state_and_cancellation() {
+        let _guard = MICA_TEST_LOCK.lock().unwrap();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut editor = test_editor();
+            let buffer = editor.windows[editor.active_window].active_buffer;
+            editor.buffers[buffer].load_str("hello hello");
+            editor.windows[editor.active_window].cursor = 5;
+            let mut session = HostSession::open_with_mica_clock(
+                editor,
+                CapabilityGrants::editor_default(),
+                Arc::new(FixedNativeClock(42)),
+            )
+            .unwrap();
+            let control =
+                LogicalKey::Modifier(crate::keys::KeyModifier::Control(crate::keys::Side::Left));
+
+            session
+                .dispatch(session.envelope(InputEvent::Keys(vec![
+                    control,
+                    LogicalKey::AlphaNumeric('s'),
+                ])))
+                .await
+                .unwrap();
+            let searched = session
+                .dispatch(session.envelope(InputEvent::Text("hello".to_owned())))
+                .await
+                .unwrap();
+            assert_eq!(
+                snapshot(&searched)
+                    .views
+                    .iter()
+                    .find(|view| !view.command_view)
+                    .unwrap()
+                    .cursor,
+                0
+            );
+            let next = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![
+                    control,
+                    LogicalKey::AlphaNumeric('s'),
+                ])))
+                .await
+                .unwrap();
+            assert_eq!(
+                snapshot(&next)
+                    .views
+                    .iter()
+                    .find(|view| !view.command_view)
+                    .unwrap()
+                    .cursor,
+                6
+            );
+            let cancelled = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Esc])))
+                .await
+                .unwrap();
+            assert_eq!(snapshot(&cancelled).views[0].cursor, 5);
+            assert!(!snapshot(&cancelled).views[0].command_view);
 
             session
                 .dispatch(session.envelope(InputEvent::Close))

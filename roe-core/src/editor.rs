@@ -353,6 +353,179 @@ impl Editor {
         result
     }
 
+    /// Create a renderer-neutral prompt surface whose state and key handling
+    /// live in Mica. `MessagesMode` is only a passive buffer mechanism.
+    pub fn create_mica_prompt_window(
+        &mut self,
+        command_type: CommandType,
+        height: u16,
+        content: String,
+        cursor: usize,
+    ) -> WindowId {
+        let command_buffer = Buffer::new(&[]);
+        command_buffer.set_object("*Mica Prompt*".to_owned());
+        command_buffer.load_str(&content);
+        let command_buffer_id = self.buffers.insert(command_buffer.clone());
+        let mode_id = self.modes.insert(Box::new(MessagesMode {}));
+        let mode = self
+            .modes
+            .remove(mode_id)
+            .expect("new passive prompt mode exists");
+        let client = buffer_host::create_buffer_host(
+            command_buffer,
+            vec![(mode_id, "mica-prompt".to_owned(), mode)],
+            command_buffer_id,
+        );
+        self.buffer_hosts.insert(command_buffer_id, client);
+        let position = CommandWindowPosition::Bottom;
+        let window = self.windows.insert(Window {
+            x: 0,
+            y: self.frame.available_lines.saturating_sub(height),
+            width_chars: self.frame.available_columns,
+            height_chars: height,
+            active_buffer: command_buffer_id,
+            start_line: 0,
+            start_column: 0,
+            cursor: cursor.min(content.chars().count()),
+            window_type: WindowType::Command {
+                position,
+                command_type,
+            },
+        });
+        self.previous_active_window = Some(self.active_window);
+        self.active_window = window;
+        self.calculate_window_layout();
+        window
+    }
+
+    pub fn update_mica_prompt_window(&mut self, content: &str, cursor: usize) -> bool {
+        let Some(window_id) = self.find_command_window() else {
+            return false;
+        };
+        let buffer_id = self.windows[window_id].active_buffer;
+        self.buffers[buffer_id].load_str(content);
+        self.windows[window_id].cursor = cursor.min(content.chars().count());
+        true
+    }
+
+    pub fn select_mica_buffer(&mut self, buffer_id: BufferId, kill: bool) -> Vec<ChromeAction> {
+        if let Some(prompt) = self.find_command_window() {
+            self.close_command_window(prompt);
+        }
+        if !self.buffers.contains_key(buffer_id) || self.is_command_buffer(buffer_id) {
+            return vec![ChromeAction::Echo("Buffer no longer exists".to_owned())];
+        }
+        if !kill {
+            self.windows[self.active_window].active_buffer = buffer_id;
+            self.windows[self.active_window].cursor = 0;
+            self.record_buffer_access(buffer_id);
+            return vec![
+                ChromeAction::Echo(format!(
+                    "Switched to buffer: {}",
+                    self.buffers[buffer_id].object()
+                )),
+                ChromeAction::MarkDirty(DirtyRegion::FullScreen),
+            ];
+        }
+
+        let name = self.buffers[buffer_id].object();
+        let replacement = self
+            .buffers
+            .iter()
+            .find_map(|(candidate, _)| (candidate != buffer_id).then_some(candidate));
+        let Some(replacement) = replacement else {
+            return vec![ChromeAction::Echo("Cannot kill the only buffer".to_owned())];
+        };
+        for (_, window) in &mut self.windows {
+            if window.active_buffer == buffer_id {
+                window.active_buffer = replacement;
+                window.cursor = 0;
+            }
+        }
+        if let Err(error) = self.file_watcher.unwatch_file(buffer_id) {
+            self.set_echo_message(format!("Killed {name}; watcher cleanup failed: {error}"));
+        }
+        self.buffer_hosts.remove(&buffer_id);
+        self.buffers.remove(buffer_id);
+        self.buffer_history
+            .retain(|candidate| *candidate != buffer_id);
+        self.record_buffer_access(replacement);
+        vec![
+            ChromeAction::Echo(format!("Killed buffer: {name}")),
+            ChromeAction::MarkDirty(DirtyRegion::FullScreen),
+        ]
+    }
+
+    pub async fn open_mica_file(
+        &mut self,
+        path: std::path::PathBuf,
+        open_type: OpenType,
+    ) -> Vec<ChromeAction> {
+        self.handle_open_file_action(path, open_type).await
+    }
+
+    pub fn apply_mica_search(
+        &mut self,
+        view_id: WindowId,
+        matches: &[(usize, usize)],
+        selected: Option<usize>,
+    ) -> Vec<ChromeAction> {
+        let Some(window) = self.windows.get(view_id) else {
+            return vec![ChromeAction::Echo(
+                "Search view no longer exists".to_owned(),
+            )];
+        };
+        let buffer_id = window.active_buffer;
+        let buffer = self.buffers[buffer_id].clone();
+        buffer.with_write(|buffer| buffer.spans.clear());
+        if let Ok(registry) = crate::syntax::face_registry().lock()
+            && let (Some(match_face), Some(current_face)) = (
+                registry.get_id("isearch-match"),
+                registry.get_id("isearch-current"),
+            )
+        {
+            buffer.with_write(|buffer| {
+                buffer
+                    .spans
+                    .add_spans(matches.iter().enumerate().map(|(index, (start, end))| {
+                        crate::syntax::HighlightSpan::new(
+                            *start,
+                            *end,
+                            if selected == Some(index) {
+                                current_face
+                            } else {
+                                match_face
+                            },
+                        )
+                    }));
+            });
+        }
+        if let Some(index) = selected
+            && let Some((start, _)) = matches.get(index)
+            && let Some(window) = self.windows.get_mut(view_id)
+        {
+            window.cursor = *start;
+        }
+        vec![ChromeAction::MarkDirty(DirtyRegion::Buffer { buffer_id })]
+    }
+
+    pub fn finish_mica_search(
+        &mut self,
+        view_id: WindowId,
+        original_cursor: usize,
+        accepted: bool,
+    ) -> Vec<ChromeAction> {
+        let Some(window) = self.windows.get(view_id) else {
+            return vec![ChromeAction::MarkDirty(DirtyRegion::FullScreen)];
+        };
+        let buffer_id = window.active_buffer;
+        self.buffers[buffer_id].with_write(|buffer| buffer.spans.clear());
+        if !accepted && let Some(window) = self.windows.get_mut(view_id) {
+            window.cursor = original_cursor;
+        }
+        vec![ChromeAction::MarkDirty(DirtyRegion::FullScreen)]
+    }
+
     fn with_clipboard_error(
         mut actions: Vec<ChromeAction>,
         error: Option<ClipboardError>,

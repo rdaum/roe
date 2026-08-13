@@ -47,11 +47,52 @@ pub enum MicaKeyResult {
     Failed(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MicaPromptTarget {
+    Selector(String),
+    Buffer(BufferId),
+    Path(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MicaPromptUpdate {
+    pub kind: String,
+    pub query: String,
+    pub selected: usize,
+    pub candidates: Vec<(String, MicaPromptTarget)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MicaHostAction {
+    pub name: String,
+    pub buffer: Option<BufferId>,
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MicaSearchUpdate {
+    pub view: WindowId,
+    pub matches: Vec<(usize, usize)>,
+    pub selected: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MicaSearchFinish {
+    pub view: WindowId,
+    pub original_cursor: usize,
+    pub query: String,
+    pub accepted: bool,
+}
+
 #[derive(Debug, Default)]
 pub struct MicaEventBatch {
     pub effects: Vec<MicaPresentationEffect>,
-    pub host_actions: Vec<String>,
+    pub host_actions: Vec<MicaHostAction>,
     pub native_actions: Vec<String>,
+    pub prompt_updates: Vec<MicaPromptUpdate>,
+    pub prompt_close: bool,
+    pub search_updates: Vec<MicaSearchUpdate>,
+    pub search_finishes: Vec<MicaSearchFinish>,
     pub command_candidates: Vec<(String, String)>,
     pub buffer_candidates: Vec<(BufferId, String)>,
     pub errors: Vec<String>,
@@ -64,6 +105,10 @@ impl MicaEventBatch {
         self.effects.append(&mut other.effects);
         self.host_actions.append(&mut other.host_actions);
         self.native_actions.append(&mut other.native_actions);
+        self.prompt_updates.append(&mut other.prompt_updates);
+        self.prompt_close |= other.prompt_close;
+        self.search_updates.append(&mut other.search_updates);
+        self.search_finishes.append(&mut other.search_finishes);
         self.command_candidates
             .append(&mut other.command_candidates);
         self.buffer_candidates.append(&mut other.buffer_candidates);
@@ -142,6 +187,10 @@ impl NativeBridge {
             sym("clock_read")
         } else if service == sym("text_insert") {
             sym("text_write")
+        } else if service == sym("text_search") {
+            sym("text_read")
+        } else if service == sym("list_directory") {
+            sym("file_read")
         } else {
             return native_error("unknown Roe native service");
         };
@@ -151,6 +200,20 @@ impl NativeBridge {
 
         let operation = if service == sym("clock_millis") {
             NativeOperation::ReadClockMillis
+        } else if service == sym("list_directory") {
+            let path = map_value(&payload, "path")
+                .and_then(|value| value.with_str(str::to_owned))
+                .unwrap_or_else(|| ".".to_owned());
+            NativeOperation::ListDirectory { path: path.into() }
+        } else if service == sym("text_search") {
+            let Some(buffer) = map_value(&payload, "buffer").and_then(|value| value.as_identity())
+            else {
+                return native_error("text_search requires an identity buffer");
+            };
+            let Some(resource) = state.resources.get(&buffer).copied() else {
+                return native_error("text_search buffer is not authorized for this endpoint");
+            };
+            NativeOperation::Snapshot { resource }
         } else {
             let Some(buffer) = map_value(&payload, "buffer").and_then(|value| value.as_identity())
             else {
@@ -182,6 +245,35 @@ impl NativeBridge {
                 Value::int(i64::try_from(value).unwrap_or(i64::MAX))
                     .unwrap_or_else(|_| Value::string(value.to_string())),
             ),
+            Ok(NativeResult::DirectoryEntries(entries)) => native_ok(Value::list(
+                entries
+                    .into_iter()
+                    .take(256)
+                    .map(|path| Value::string(path.to_string_lossy())),
+            )),
+            Ok(NativeResult::Snapshot(snapshot)) if service == sym("text_search") => {
+                let query = map_value(&payload, "query")
+                    .and_then(|value| value.with_str(str::to_owned))
+                    .unwrap_or_default();
+                if query.is_empty() {
+                    native_ok(Value::list([]))
+                } else {
+                    let haystack: Vec<char> = snapshot.text.chars().collect();
+                    let needle: Vec<char> = query.chars().collect();
+                    let matches = haystack
+                        .windows(needle.len())
+                        .enumerate()
+                        .filter(|(_, candidate)| *candidate == needle.as_slice())
+                        .take(1024)
+                        .map(|(start, _)| {
+                            Value::list([
+                                int_value(start),
+                                int_value(start.saturating_add(needle.len())),
+                            ])
+                        });
+                    native_ok(Value::list(matches))
+                }
+            }
             Ok(NativeResult::TextChanged { .. }) => native_ok(Value::symbol(sym("inserted"))),
             Ok(other) => native_error(&format!("unexpected native result: {other:?}")),
             Err(error) => native_error(&error.to_string()),
@@ -207,6 +299,7 @@ pub struct MicaHost {
     view_cursors: HashMap<WindowId, usize>,
     active_view: WindowId,
     pending_key_prefix: Option<String>,
+    prompt_active: bool,
     closed: bool,
 }
 
@@ -369,7 +462,13 @@ impl MicaHost {
         bridge.configure(
             actor,
             bridge_resources,
-            [sym("clock_read"), sym("text_write")].into(),
+            [
+                sym("clock_read"),
+                sym("text_read"),
+                sym("text_write"),
+                sym("file_read"),
+            ]
+            .into(),
         );
 
         Ok(Self {
@@ -390,6 +489,7 @@ impl MicaHost {
             view_cursors,
             active_view,
             pending_key_prefix: None,
+            prompt_active: false,
             closed: false,
         })
     }
@@ -409,11 +509,16 @@ impl MicaHost {
             .pending_key_prefix
             .as_ref()
             .map_or(sequence.clone(), |prefix| format!("{prefix} {sequence}"));
+        let selector = if self.prompt_active {
+            sym("roe/prompt_key")
+        } else {
+            sym("roe/dispatch_key")
+        };
         let submitted = self
             .driver
             .submit_invocation_for_endpoint(
                 self.endpoint,
-                sym("roe/dispatch_key"),
+                selector,
                 vec![
                     (sym("actor"), Value::identity(self.actor)),
                     (sym("session"), Value::identity(self.session)),
@@ -817,6 +922,22 @@ end
                         if let Some(effect) = self.presentation_effect(effect.target, &effect.value)
                         {
                             batch.effects.push(effect);
+                        } else if let Some(update) =
+                            self.prompt_update(effect.target, &effect.value)
+                        {
+                            self.prompt_active = true;
+                            batch.prompt_updates.push(update);
+                        } else if self.prompt_closed(effect.target, &effect.value) {
+                            self.prompt_active = false;
+                            batch.prompt_close = true;
+                        } else if let Some(update) =
+                            self.search_update(effect.target, &effect.value)
+                        {
+                            batch.search_updates.push(update);
+                        } else if let Some(finish) =
+                            self.search_finish(effect.target, &effect.value)
+                        {
+                            batch.search_finishes.push(finish);
                         } else if let Some(action) =
                             self.native_action(effect.target, &effect.value)
                         {
@@ -885,6 +1006,16 @@ end
             DriverEvent::Effect(effect) => {
                 if let Some(effect) = self.presentation_effect(effect.target, &effect.value) {
                     batch.effects.push(effect);
+                } else if let Some(update) = self.prompt_update(effect.target, &effect.value) {
+                    self.prompt_active = true;
+                    batch.prompt_updates.push(update);
+                } else if self.prompt_closed(effect.target, &effect.value) {
+                    self.prompt_active = false;
+                    batch.prompt_close = true;
+                } else if let Some(update) = self.search_update(effect.target, &effect.value) {
+                    batch.search_updates.push(update);
+                } else if let Some(finish) = self.search_finish(effect.target, &effect.value) {
+                    batch.search_finishes.push(finish);
                 } else if let Some(action) = self.native_action(effect.target, &effect.value) {
                     batch.native_actions.push(action);
                 } else if let Some(action) = self.host_action(effect.target, &effect.value) {
@@ -953,14 +1084,114 @@ end
         Some(action.name()?.to_owned())
     }
 
-    fn host_action(&self, target: Identity, value: &Value) -> Option<String> {
+    fn host_action(&self, target: Identity, value: &Value) -> Option<MicaHostAction> {
         if target != self.session || map_value(value, "kind")?.as_symbol()? != sym("host_action") {
             return None;
         }
-        map_value(value, "action")?
+        let name = map_value(value, "action")?
             .as_symbol()?
             .name()
-            .map(str::to_owned)
+            .map(str::to_owned)?;
+        let buffer = map_value(value, "buffer")
+            .and_then(|value| value.as_identity())
+            .and_then(|logical| {
+                self.buffer_ids
+                    .iter()
+                    .find_map(|(buffer, identity)| (*identity == logical).then_some(*buffer))
+            });
+        let path = map_value(value, "path").and_then(|value| value.with_str(str::to_owned));
+        Some(MicaHostAction { name, buffer, path })
+    }
+
+    fn prompt_closed(&self, target: Identity, value: &Value) -> bool {
+        target == self.session
+            && map_value(value, "kind").and_then(|value| value.as_symbol())
+                == Some(sym("prompt_close"))
+    }
+
+    fn prompt_update(&self, target: Identity, value: &Value) -> Option<MicaPromptUpdate> {
+        if target != self.session || map_value(value, "kind")?.as_symbol()? != sym("prompt_update")
+        {
+            return None;
+        }
+        let kind = map_value(value, "prompt_kind")?
+            .as_symbol()?
+            .name()?
+            .to_owned();
+        let query = map_value(value, "query")?.with_str(str::to_owned)?;
+        let selected = usize::try_from(map_value(value, "selected")?.as_int()?).ok()?;
+        let values = map_value(value, "candidates")?;
+        let mut candidates = Vec::new();
+        for index in 0..values.list_len()? {
+            let row = values.list_get(index)?;
+            let name = row.list_get(0)?.with_str(str::to_owned)?;
+            let raw = row.list_get(1)?;
+            let target = if kind == "command" {
+                MicaPromptTarget::Selector(raw.as_symbol()?.name()?.to_owned())
+            } else if kind == "switch_buffer" || kind == "kill_buffer" {
+                let logical = raw.as_identity()?;
+                let buffer = self
+                    .buffer_ids
+                    .iter()
+                    .find_map(|(buffer, identity)| (*identity == logical).then_some(*buffer))?;
+                MicaPromptTarget::Buffer(buffer)
+            } else {
+                MicaPromptTarget::Path(raw.with_str(str::to_owned)?)
+            };
+            candidates.push((name, target));
+        }
+        Some(MicaPromptUpdate {
+            kind,
+            query,
+            selected,
+            candidates,
+        })
+    }
+
+    fn search_update(&self, target: Identity, value: &Value) -> Option<MicaSearchUpdate> {
+        if target != self.session || map_value(value, "kind")?.as_symbol()? != sym("search_update")
+        {
+            return None;
+        }
+        let logical = map_value(value, "view")?.as_identity()?;
+        let view = self
+            .view_ids
+            .iter()
+            .find_map(|(view, identity)| (*identity == logical).then_some(*view))?;
+        let raw = map_value(value, "matches")?;
+        let mut matches = Vec::new();
+        for index in 0..raw.list_len()? {
+            let row = raw.list_get(index)?;
+            let start = usize::try_from(row.list_get(0)?.as_int()?).ok()?;
+            let end = usize::try_from(row.list_get(1)?.as_int()?).ok()?;
+            matches.push((start, end));
+        }
+        let selected = map_value(value, "selected")
+            .and_then(|value| value.as_int())
+            .and_then(|value| usize::try_from(value).ok());
+        Some(MicaSearchUpdate {
+            view,
+            matches,
+            selected,
+        })
+    }
+
+    fn search_finish(&self, target: Identity, value: &Value) -> Option<MicaSearchFinish> {
+        if target != self.session || map_value(value, "kind")?.as_symbol()? != sym("search_finish")
+        {
+            return None;
+        }
+        let logical = map_value(value, "view")?.as_identity()?;
+        let view = self
+            .view_ids
+            .iter()
+            .find_map(|(view, identity)| (*identity == logical).then_some(*view))?;
+        Some(MicaSearchFinish {
+            view,
+            original_cursor: usize::try_from(map_value(value, "original")?.as_int()?).ok()?,
+            query: map_value(value, "query")?.with_str(str::to_owned)?,
+            accepted: map_value(value, "accepted")?.as_bool()?,
+        })
     }
 
     fn command_candidate(&self, target: Identity, value: &Value) -> Option<(String, String)> {
@@ -1159,16 +1390,35 @@ pub fn normalized_key_sequence(keys: &[crate::keys::LogicalKey]) -> String {
     let mut result = Vec::new();
     let mut index = 0;
     while index < keys.len() {
-        if matches!(keys[index], crate::keys::LogicalKey::Modifier(_)) && index + 1 < keys.len() {
-            result.push(format!(
-                "{}-{}",
-                keys[index].as_display_string(),
-                keys[index + 1].as_display_string()
-            ));
-            index += 2;
-        } else {
-            result.push(keys[index].as_display_string());
+        let start = index;
+        let mut modifiers = Vec::new();
+        while index < keys.len() && matches!(keys[index], crate::keys::LogicalKey::Modifier(_)) {
+            modifiers.push(keys[index].as_display_string());
             index += 1;
+        }
+        if index == keys.len() {
+            result.extend(modifiers);
+            break;
+        }
+        let key = keys[index];
+        index += 1;
+        let key_name = match key {
+            crate::keys::LogicalKey::AlphaNumeric(' ') => "Space".to_owned(),
+            _ => key.as_display_string(),
+        };
+        let shift_only_text = index - start == 2
+            && modifiers.as_slice() == ["S"]
+            && matches!(key, crate::keys::LogicalKey::AlphaNumeric(_));
+        if shift_only_text {
+            let crate::keys::LogicalKey::AlphaNumeric(character) = key else {
+                unreachable!()
+            };
+            result.push(character.to_uppercase().collect());
+        } else if modifiers.is_empty() {
+            result.push(key_name);
+        } else {
+            modifiers.push(key_name);
+            result.push(modifiers.join("-"));
         }
     }
     result.join(" ")
@@ -1188,6 +1438,21 @@ mod tests {
                 LogicalKey::AlphaNumeric('x'),
             ]),
             "C-x"
+        );
+        assert_eq!(
+            normalized_key_sequence(&[
+                LogicalKey::Modifier(KeyModifier::Shift(Side::Left)),
+                LogicalKey::AlphaNumeric('Z'),
+            ]),
+            "Z"
+        );
+        assert_eq!(
+            normalized_key_sequence(&[
+                LogicalKey::Modifier(KeyModifier::Control(Side::Left)),
+                LogicalKey::Modifier(KeyModifier::Shift(Side::Right)),
+                LogicalKey::Left,
+            ]),
+            "C-S-←"
         );
     }
 }
