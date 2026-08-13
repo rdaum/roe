@@ -19,6 +19,15 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 
 /// Translate a winit KeyEvent into a sequence of LogicalKeys
 pub fn translate_key_event(event: &KeyEvent, modifiers: ModifiersState) -> Vec<LogicalKey> {
+    translate_key_with_modifiers(&event.logical_key, modifiers)
+}
+
+fn translate_key_with_modifiers(key: &Key, modifiers: ModifiersState) -> Vec<LogicalKey> {
+    let logical_key = translate_key(key);
+    if matches!(logical_key, LogicalKey::Unmapped | LogicalKey::Modifier(_)) {
+        return Vec::new();
+    }
+
     let mut keys = Vec::new();
 
     // Add modifiers first (in consistent order)
@@ -36,20 +45,7 @@ pub fn translate_key_event(event: &KeyEvent, modifiers: ModifiersState) -> Vec<L
         keys.push(LogicalKey::Modifier(KeyModifier::Super(Side::Left)));
     }
 
-    // Translate the main key
-    let logical_key = translate_key(&event.logical_key);
-    if logical_key != LogicalKey::Unmapped {
-        // Don't add modifier keys as the main key if they're already in the modifiers
-        match logical_key {
-            LogicalKey::Modifier(_) => {
-                // Only add if it's the only thing (modifier key press by itself)
-                if keys.is_empty() {
-                    keys.push(logical_key);
-                }
-            }
-            _ => keys.push(logical_key),
-        }
-    }
+    keys.push(logical_key);
 
     keys
 }
@@ -127,5 +123,33 @@ fn translate_named_key(key: &NamedKey) -> LogicalKey {
 
         // Everything else
         _ => LogicalKey::Unmapped,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn standalone_modifier_keys_do_not_become_text() {
+        assert!(
+            translate_key_with_modifiers(&Key::Named(NamedKey::Alt), ModifiersState::empty(),)
+                .is_empty()
+        );
+        assert!(
+            translate_key_with_modifiers(&Key::Named(NamedKey::Alt), ModifiersState::ALT,)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn alt_still_modifies_the_following_key() {
+        assert_eq!(
+            translate_key_with_modifiers(&Key::Character("x".into()), ModifiersState::ALT),
+            vec![
+                LogicalKey::Modifier(KeyModifier::Meta(Side::Left)),
+                LogicalKey::AlphaNumeric('x'),
+            ]
+        );
     }
 }

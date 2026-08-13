@@ -42,6 +42,8 @@ pub const MAX_FRAME_COLUMNS: u16 = 1_000;
 pub const MAX_FRAME_ROWS: u16 = 1_000;
 const MICA_PROMPT_HEIGHT: u16 = 10;
 const MICA_PROMPT_CANDIDATE_ROWS: usize = MICA_PROMPT_HEIGHT as usize - 3;
+const MICA_PROMPT_CONTEXT_BELOW: usize = 2;
+const MICA_PROMPT_SELECTION_FACE: &str = "completion-selection";
 
 static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
 
@@ -272,6 +274,8 @@ pub struct PresentedView {
     pub show_gutter: bool,
     pub modeline: String,
     pub styled_ranges: Vec<StyledRange>,
+    #[serde(default)]
+    pub styled_lines: Vec<StyledLine>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -295,6 +299,13 @@ pub struct StyleRef(pub u32);
 pub struct StyledRange {
     pub start: usize,
     pub end: usize,
+    pub style: StyleRef,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StyledLine {
+    /// Zero-based absolute logical line within the presented buffer.
+    pub line: usize,
     pub style: StyleRef,
 }
 
@@ -470,6 +481,7 @@ pub struct HostSession {
     mica_configuration: HashMap<String, String>,
     mica_syntax: HashMap<BufferId, Vec<MicaSyntaxRule>>,
     mica_search_ranges: HashMap<WindowId, Vec<(usize, usize, String)>>,
+    mica_styled_lines: HashMap<WindowId, Vec<(usize, String)>>,
     closed: bool,
 }
 
@@ -500,6 +512,7 @@ impl HostSession {
             mica_configuration: HashMap::new(),
             mica_syntax: HashMap::new(),
             mica_search_ranges: HashMap::new(),
+            mica_styled_lines: HashMap::new(),
             closed: false,
         };
         for (buffer, value) in &session.editor.buffers {
@@ -1146,6 +1159,13 @@ impl HostSession {
         self.editor.echo_message_time = Some(self.editor.clock.now());
     }
 
+    fn set_prompt_selected_line(&mut self, window: WindowId, selected_line: Option<usize>) {
+        let lines = selected_line
+            .map(|line| vec![(line, MICA_PROMPT_SELECTION_FACE.to_owned())])
+            .unwrap_or_default();
+        self.mica_styled_lines.insert(window, lines);
+    }
+
     async fn apply_mica_events(
         &mut self,
         events: MicaEventBatch,
@@ -1211,15 +1231,18 @@ impl HostSession {
         if events.prompt_close
             && let Some(window) = self.editor.find_command_window()
         {
+            self.mica_styled_lines.remove(&window);
             self.editor.close_command_window(window);
             invalidations.push(Invalidation::Full);
         }
         for update in events.prompt_updates {
-            let (content, cursor) = mica_prompt_content(&update);
-            if self.editor.update_mica_prompt_window(&content, cursor) {
-                if let Some(window) = self.editor.find_command_window()
-                    && let Some(view) = self.view_ids.get(&window).copied()
-                {
+            let prompt = mica_prompt_content(&update);
+            if let Some(window) = self
+                .editor
+                .update_mica_prompt_window(&prompt.content, prompt.cursor)
+            {
+                self.set_prompt_selected_line(window, prompt.selected_line);
+                if let Some(view) = self.view_ids.get(&window).copied() {
                     invalidations.push(Invalidation::View(view));
                 } else {
                     invalidations.push(Invalidation::Full);
@@ -1242,12 +1265,13 @@ impl HostSession {
                         continue;
                     }
                 };
-                self.editor.create_mica_prompt_window(
+                let window = self.editor.create_mica_prompt_window(
                     command_type,
                     MICA_PROMPT_HEIGHT,
-                    content,
-                    cursor,
+                    prompt.content,
+                    prompt.cursor,
                 );
+                self.set_prompt_selected_line(window, prompt.selected_line);
                 invalidations.push(Invalidation::Full);
             }
         }
@@ -2312,6 +2336,8 @@ impl HostSession {
             .retain(|window, _| live_windows.contains(window));
         self.mica_search_ranges
             .retain(|window, _| live_windows.contains(window));
+        self.mica_styled_lines
+            .retain(|window, _| live_windows.contains(window));
         for window_id in self.editor.windows.keys() {
             self.view_ids.entry(window_id).or_insert_with(|| {
                 let id = ViewId(self.next_view_id);
@@ -2385,36 +2411,29 @@ impl HostSession {
                 .flatten()
                 .filter(|(start, end, _)| *end > visible_start_char && *start < visible_end_char)
                 .map(|(start, end, name)| {
-                    let style = *style_by_name.entry(name.clone()).or_insert_with(|| {
-                        let id = StyleRef(styles.len() as u32 + 1);
-                        let attributes = self.mica_faces.get(name);
-                        styles.push(StyleDefinition {
-                            id,
-                            name: name.clone(),
-                            foreground: attributes
-                                .and_then(|values| values.get("foreground"))
-                                .and_then(|value| presentation_color_hex(value)),
-                            background: attributes
-                                .and_then(|values| values.get("background"))
-                                .and_then(|value| presentation_color_hex(value)),
-                            bold: attributes
-                                .and_then(|values| values.get("weight"))
-                                .is_some_and(|value| value == "bold"),
-                            italic: attributes
-                                .and_then(|values| values.get("slant"))
-                                .is_some_and(|value| value == "italic"),
-                            underline: attributes
-                                .and_then(|values| values.get("underline"))
-                                .is_some_and(|value| value == "true"),
-                            strikethrough: false,
-                        });
-                        id
-                    });
+                    let style =
+                        presentation_style(name, &self.mica_faces, &mut styles, &mut style_by_name);
                     StyledRange {
                         start: *start,
                         end: *end,
                         style,
                     }
+                })
+                .collect();
+            let styled_lines = self
+                .mica_styled_lines
+                .get(&window_id)
+                .into_iter()
+                .flatten()
+                .filter(|(line, _)| *line >= start_line && *line < end_line)
+                .map(|(line, name)| StyledLine {
+                    line: *line,
+                    style: presentation_style(
+                        name,
+                        &self.mica_faces,
+                        &mut styles,
+                        &mut style_by_name,
+                    ),
                 })
                 .collect();
 
@@ -2464,6 +2483,7 @@ impl HostSession {
                 show_gutter: buffer.show_gutter(),
                 modeline,
                 styled_ranges,
+                styled_lines,
             });
         }
         views.sort_by_key(|view| view.id.0);
@@ -2562,7 +2582,13 @@ fn text_character_from_keys(keys: &[LogicalKey]) -> Option<char> {
     }
 }
 
-fn mica_prompt_content(update: &MicaPromptUpdate) -> (String, usize) {
+struct MicaPromptContent {
+    content: String,
+    cursor: usize,
+    selected_line: Option<usize>,
+}
+
+fn mica_prompt_content(update: &MicaPromptUpdate) -> MicaPromptContent {
     let default_prefix = match update.kind.as_str() {
         "command" => "M-x ",
         "switch_buffer" => "Switch to buffer: ",
@@ -2579,19 +2605,18 @@ fn mica_prompt_content(update: &MicaPromptUpdate) -> (String, usize) {
         format!("{}: ", update.prompt)
     };
     let mut content = format!("{prefix}{}", update.query);
-    let first_candidate = update
-        .selected
-        .saturating_sub(MICA_PROMPT_CANDIDATE_ROWS.saturating_sub(1))
-        .min(
-            update
-                .candidates
-                .len()
-                .saturating_sub(MICA_PROMPT_CANDIDATE_ROWS),
-        );
-    for (index, (name, target)) in update
+    let selected_row = MICA_PROMPT_CANDIDATE_ROWS
+        .saturating_sub(MICA_PROMPT_CONTEXT_BELOW)
+        .saturating_sub(1);
+    let first_candidate = update.selected.saturating_sub(selected_row).min(
+        update
+            .candidates
+            .len()
+            .saturating_sub(MICA_PROMPT_CANDIDATE_ROWS),
+    );
+    for (name, target) in update
         .candidates
         .iter()
-        .enumerate()
         .skip(first_candidate)
         .take(MICA_PROMPT_CANDIDATE_ROWS)
     {
@@ -2604,13 +2629,15 @@ fn mica_prompt_content(update: &MicaPromptUpdate) -> (String, usize) {
                 | MicaPromptTarget::Opaque(_)
         ));
         content.push('\n');
-        content.push_str(if index == update.selected { "> " } else { "  " });
         content.push_str(name);
     }
-    (
+    let selected_line = (update.selected < update.candidates.len())
+        .then(|| update.selected.saturating_sub(first_candidate) + 1);
+    MicaPromptContent {
         content,
-        prefix.chars().count() + update.query.chars().count(),
-    )
+        cursor: prefix.chars().count() + update.query.chars().count(),
+        selected_line,
+    }
 }
 
 fn word_boundary(
@@ -2973,6 +3000,41 @@ fn presentation_color_hex(value: &str) -> Option<PresentationColor> {
     })
 }
 
+fn presentation_style(
+    name: &str,
+    faces: &HashMap<String, HashMap<String, String>>,
+    styles: &mut Vec<StyleDefinition>,
+    style_by_name: &mut HashMap<String, StyleRef>,
+) -> StyleRef {
+    if let Some(style) = style_by_name.get(name) {
+        return *style;
+    }
+    let id = StyleRef(styles.len() as u32 + 1);
+    let attributes = faces.get(name);
+    styles.push(StyleDefinition {
+        id,
+        name: name.to_owned(),
+        foreground: attributes
+            .and_then(|values| values.get("foreground"))
+            .and_then(|value| presentation_color_hex(value)),
+        background: attributes
+            .and_then(|values| values.get("background"))
+            .and_then(|value| presentation_color_hex(value)),
+        bold: attributes
+            .and_then(|values| values.get("weight"))
+            .is_some_and(|value| value == "bold"),
+        italic: attributes
+            .and_then(|values| values.get("slant"))
+            .is_some_and(|value| value == "italic"),
+        underline: attributes
+            .and_then(|values| values.get("underline"))
+            .is_some_and(|value| value == "true"),
+        strikethrough: false,
+    });
+    style_by_name.insert(name.to_owned(), id);
+    id
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3030,7 +3092,7 @@ mod tests {
     }
 
     #[test]
-    fn mica_prompt_content_keeps_the_selected_candidate_visible() {
+    fn mica_prompt_content_keeps_context_below_the_selected_candidate() {
         let update = MicaPromptUpdate {
             kind: "command".to_owned(),
             value_kind: None,
@@ -3047,20 +3109,23 @@ mod tests {
                 .collect(),
         };
 
-        let (content, cursor) = mica_prompt_content(&update);
-        let lines: Vec<_> = content.lines().collect();
-        assert_eq!(cursor, "M-x ".chars().count());
+        let prompt = mica_prompt_content(&update);
+        let lines: Vec<_> = prompt.content.lines().collect();
+        assert_eq!(prompt.cursor, "M-x ".chars().count());
         assert_eq!(lines.len(), MICA_PROMPT_HEIGHT.saturating_sub(2) as usize);
-        assert_eq!(lines[1], "  command-3");
-        assert_eq!(lines[7], "> command-9");
-        assert!(!content.contains("command-2\n"));
+        assert_eq!(lines[1], "command-5");
+        assert_eq!(lines[5], "command-9");
+        assert_eq!(lines[7], "command-11");
+        assert_eq!(prompt.selected_line, Some(5));
+        assert!(!prompt.content.contains('>'));
 
         let mut at_top = update;
         at_top.selected = 0;
-        let (content, _) = mica_prompt_content(&at_top);
-        assert!(content.contains("\n> command-0\n"));
-        assert!(content.contains("\n  command-6"));
-        assert!(!content.contains("command-7"));
+        let prompt = mica_prompt_content(&at_top);
+        assert_eq!(prompt.selected_line, Some(1));
+        assert!(prompt.content.contains("\ncommand-0\n"));
+        assert!(prompt.content.contains("\ncommand-6"));
+        assert!(!prompt.content.contains("command-7"));
     }
 
     fn test_session_with_grants(grants: CapabilityGrants) -> HostSession {
@@ -3643,6 +3708,12 @@ mod tests {
                 .find(|view| view.command_view)
                 .unwrap_or_else(|| panic!("Mica command prompt: {palette:#?}"));
             assert!(prompt.visible_text.starts_with("M-x "));
+            assert_eq!(prompt.styled_lines.len(), 1);
+            assert!(snapshot(&palette).styles.iter().any(|style| {
+                style.id == prompt.styled_lines[0].style
+                    && style.name == MICA_PROMPT_SELECTION_FACE
+                    && style.background.is_some()
+            }));
 
             let filtered = session
                 .dispatch(session.envelope(InputEvent::Text("insert-current-time".to_owned())))

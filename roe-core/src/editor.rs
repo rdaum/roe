@@ -448,14 +448,14 @@ impl Editor {
         window
     }
 
-    pub fn update_mica_prompt_window(&mut self, content: &str, cursor: usize) -> bool {
-        let Some(window_id) = self.find_command_window() else {
-            return false;
-        };
+    pub fn update_mica_prompt_window(&mut self, content: &str, cursor: usize) -> Option<WindowId> {
+        let window_id = self.find_command_window()?;
         let buffer_id = self.windows[window_id].active_buffer;
         self.buffers[buffer_id].load_str(content);
+        self.windows[window_id].start_line = 0;
+        self.windows[window_id].start_column = 0;
         self.windows[window_id].cursor = cursor.min(content.chars().count());
-        true
+        Some(window_id)
     }
 
     pub fn select_mica_buffer(&mut self, buffer_id: BufferId, kill: bool) -> Vec<ChromeAction> {

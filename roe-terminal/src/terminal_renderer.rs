@@ -88,7 +88,8 @@ fn session_style(
     position: usize,
     ranges: &[roe_core::session::StyledRange],
     styles: &[StyleDefinition],
-    theme: &CachedTheme,
+    default_foreground: Color,
+    default_background: Color,
 ) -> (Color, Color) {
     let style_id = ranges
         .iter()
@@ -96,6 +97,35 @@ fn session_style(
         .find(|range| position >= range.start && position < range.end)
         .map(|range| range.style);
     let Some(style) = style_id.and_then(|id| styles.iter().find(|style| style.id == id)) else {
+        return (default_foreground, default_background);
+    };
+    (
+        style
+            .foreground
+            .as_ref()
+            .map(|color| session_color(color, default_foreground))
+            .unwrap_or(default_foreground),
+        style
+            .background
+            .as_ref()
+            .map(|color| session_color(color, default_background))
+            .unwrap_or(default_background),
+    )
+}
+
+fn session_line_style(
+    line: usize,
+    view: &PresentedView,
+    styles: &[StyleDefinition],
+    theme: &CachedTheme,
+) -> (Color, Color) {
+    let style = view
+        .styled_lines
+        .iter()
+        .rev()
+        .find(|styled| styled.line == line)
+        .and_then(|styled| styles.iter().find(|style| style.id == styled.style));
+    let Some(style) = style else {
         return (theme.fg_color, theme.bg_color);
     };
     (
@@ -306,6 +336,7 @@ impl<W: Write> TerminalRenderer<W> {
                 || old.scroll != view.scroll
                 || old.selection != view.selection
                 || old.styled_ranges != view.styled_ranges
+                || old.styled_lines != view.styled_lines
                 || old.show_gutter != view.show_gutter
                 || old.visible_text.lines().count() != view.visible_text.lines().count();
             if redraw_all_content {
@@ -477,13 +508,16 @@ impl<W: Write> TerminalRenderer<W> {
                 offset.saturating_add(line.chars().count())
             });
         let y = geometry.y + 1 + row as u16;
+        let logical_line = usize::from(view.scroll.start_line) + row;
+        let (line_foreground, line_background) =
+            session_line_style(logical_line, view, styles, &self.theme);
         queue!(
             &mut self.device,
             cursor::MoveTo(geometry.x + 1, y),
             Print(
                 " ".repeat(total_width)
-                    .with(self.theme.fg_color)
-                    .on(self.theme.bg_color)
+                    .with(line_foreground)
+                    .on(line_background)
             )
         )?;
         let line = lines.get(row).copied().unwrap_or("").trim_end_matches('\n');
@@ -516,7 +550,13 @@ impl<W: Write> TerminalRenderer<W> {
             let (foreground, background) = if selected {
                 (Color::Black, self.theme.selection_color)
             } else {
-                session_style(position, &view.styled_ranges, styles, &self.theme)
+                session_style(
+                    position,
+                    &view.styled_ranges,
+                    styles,
+                    line_foreground,
+                    line_background,
+                )
             };
             queue!(
                 &mut self.device,
@@ -656,6 +696,10 @@ pub async fn session_event_loop_with_renderer<W: Write>(
 fn normalize_terminal_event(event: Event) -> Option<InputEvent> {
     match event {
         Event::Key(keystroke) => {
+            let logical_key = crossterm_key_translate(&keystroke.code, keystroke.modifiers);
+            if matches!(logical_key, LogicalKey::Unmapped | LogicalKey::Modifier(_)) {
+                return None;
+            }
             let mut keys = Vec::new();
             if keystroke.modifiers.contains(KeyModifiers::CONTROL) {
                 keys.push(LogicalKey::Modifier(KeyModifier::Control(Side::Left)));
@@ -669,10 +713,7 @@ fn normalize_terminal_event(event: Event) -> Option<InputEvent> {
             if keystroke.modifiers.contains(KeyModifiers::SUPER) {
                 keys.push(LogicalKey::Modifier(KeyModifier::Super(Side::Left)));
             }
-            keys.push(crossterm_key_translate(
-                &keystroke.code,
-                keystroke.modifiers,
-            ));
+            keys.push(logical_key);
             Some(InputEvent::Keys(keys))
         }
         Event::Resize(columns, rows) => Some(InputEvent::Resize {
@@ -752,7 +793,8 @@ mod tests {
     use super::*;
     use roe_core::native_kernel::{ResourceId, ViewId};
     use roe_core::session::{
-        Invalidation, PresentationDelta, Revision, SessionEpoch, ViewGeometry, ViewScroll,
+        Invalidation, PresentationColor, PresentationDelta, Revision, SessionEpoch, StyleRef,
+        StyledLine, ViewGeometry, ViewScroll,
     };
 
     fn test_snapshot(revision: u64, text: &str) -> PresentationSnapshot {
@@ -795,6 +837,7 @@ mod tests {
                 show_gutter: false,
                 modeline: "*test* 1:1".to_owned(),
                 styled_ranges: Vec::new(),
+                styled_lines: Vec::new(),
             }],
             styles: Vec::new(),
             echo_area: String::new(),
@@ -825,6 +868,52 @@ mod tests {
         assert_eq!(truncate_echo("λé猫abc", 5), "λé...");
         assert_eq!(truncate_echo("λé", 5), "λé");
         assert_eq!(truncate_echo("λé", 1), ".");
+    }
+
+    #[test]
+    fn standalone_modifier_keys_do_not_become_text() {
+        let event = crossterm::event::KeyEvent::new(
+            KeyCode::Modifier(ModifierKeyCode::LeftAlt),
+            KeyModifiers::ALT,
+        );
+        assert_eq!(normalize_terminal_event(Event::Key(event)), None);
+    }
+
+    #[test]
+    fn session_line_style_realizes_a_full_row_background() {
+        let mut snapshot = test_snapshot(1, "M-x \ncommand\n");
+        snapshot.styles.push(StyleDefinition {
+            id: StyleRef(1),
+            name: "completion-selection".to_owned(),
+            foreground: None,
+            background: Some(PresentationColor::Rgb {
+                r: 0x3a,
+                g: 0x3a,
+                b: 0x3a,
+            }),
+            bold: false,
+            italic: false,
+            underline: false,
+            strikethrough: false,
+        });
+        snapshot.views[0].styled_lines.push(StyledLine {
+            line: 1,
+            style: StyleRef(1),
+        });
+        let (_, background) = session_line_style(
+            1,
+            &snapshot.views[0],
+            &snapshot.styles,
+            &CachedTheme::default(),
+        );
+        assert_eq!(
+            background,
+            Color::Rgb {
+                r: 0x3a,
+                g: 0x3a,
+                b: 0x3a
+            }
+        );
     }
 
     #[test]

@@ -146,6 +146,36 @@ fn session_vello_color(color: &PresentationColor, default: Color) -> Color {
     }
 }
 
+fn session_vello_line_style(
+    line: usize,
+    view: &PresentedView,
+    styles: &[StyleDefinition],
+    default_foreground: Color,
+    default_background: Color,
+) -> (Color, Color) {
+    let style = view
+        .styled_lines
+        .iter()
+        .rev()
+        .find(|styled| styled.line == line)
+        .and_then(|styled| styles.iter().find(|style| style.id == styled.style));
+    let Some(style) = style else {
+        return (default_foreground, default_background);
+    };
+    (
+        style
+            .foreground
+            .as_ref()
+            .map(|color| session_vello_color(color, default_foreground))
+            .unwrap_or(default_foreground),
+        style
+            .background
+            .as_ref()
+            .map(|color| session_vello_color(color, default_background))
+            .unwrap_or(default_background),
+    )
+}
+
 /// Scrollbar width in logical pixels
 const SCROLLBAR_WIDTH: f64 = 14.0;
 
@@ -164,14 +194,23 @@ fn session_view_metrics(view: &PresentedView, char_width: f64) -> SessionViewMet
     };
     let width = f64::from(view.geometry.columns) * char_width;
     let gutter_width = gutter_chars as f64 * char_width;
+    let renderer_chrome_width = if view.command_view {
+        0.0
+    } else {
+        SCROLLBAR_WIDTH + 4.0
+    };
     let content_width =
-        (width - (2.0 * char_width) - SCROLLBAR_WIDTH - 4.0 - gutter_width).max(0.0);
+        (width - (2.0 * char_width) - renderer_chrome_width - gutter_width).max(0.0);
     let content_width_chars = (content_width / char_width).floor() as usize;
-    let content_rows = view.geometry.rows.saturating_sub(3) as usize;
+    let content_rows = if view.command_view {
+        view.geometry.rows.saturating_sub(2) as usize
+    } else {
+        view.geometry.rows.saturating_sub(3) as usize
+    };
     SessionViewMetrics {
         content_width_chars,
         content_rows,
-        horizontal_overflow: view.max_line_chars > content_width_chars,
+        horizontal_overflow: !view.command_view && view.max_line_chars > content_width_chars,
     }
 }
 
@@ -560,9 +599,9 @@ impl<'a> RoeVelloApp<'a> {
             0
         };
         let content_x = x + char_width * (1 + gutter_chars) as f64;
-        // Vello reserves a right-hand lane for its vertical scrollbar and one
-        // row above the modeline for horizontal scrolling. Text must not be
-        // realized underneath renderer-owned chrome.
+        // Normal views reserve renderer-owned scrollbar lanes. Command views
+        // present an already-windowed candidate list and use the full shared
+        // text area, matching terminal row geometry.
         let metrics = session_view_metrics(view, char_width);
         let content_width_chars = metrics.content_width_chars;
         let content_rows = metrics.content_rows;
@@ -579,6 +618,28 @@ impl<'a> RoeVelloApp<'a> {
                 .take(content_width_chars)
                 .collect();
             let line_y = y + line_height * (row + 1) as f64;
+            let logical_line = usize::from(view.scroll.start_line) + row;
+            let (line_foreground, line_background) = session_vello_line_style(
+                logical_line,
+                view,
+                styles,
+                self.theme.fg_color,
+                self.theme.bg_color,
+            );
+            if line_background != self.theme.bg_color {
+                self.scene.fill(
+                    Fill::NonZero,
+                    Affine::IDENTITY,
+                    line_background,
+                    None,
+                    &Rect::new(
+                        x + char_width,
+                        line_y,
+                        x + width - char_width,
+                        line_y + line_height,
+                    ),
+                );
+            }
             if view.show_gutter {
                 let line_number = usize::from(view.scroll.start_line) + row + 1;
                 let label = format_line_number(line_number, gutter_chars.saturating_sub(2));
@@ -634,8 +695,8 @@ impl<'a> RoeVelloApp<'a> {
                     let color = style
                         .foreground
                         .as_ref()
-                        .map(|color| session_vello_color(color, self.theme.fg_color))
-                        .unwrap_or(self.theme.fg_color);
+                        .map(|color| session_vello_color(color, line_foreground))
+                        .unwrap_or(line_foreground);
                     Some(
                         StyledSpan::new(
                             start - absolute - visible_column,
@@ -652,55 +713,58 @@ impl<'a> RoeVelloApp<'a> {
                 &displayed,
                 content_x as f32,
                 line_y as f32,
-                self.theme.fg_color,
+                line_foreground,
                 &spans,
             );
             absolute += line.chars().count() + usize::from(raw_line.ends_with('\n'));
         }
 
-        let scrollbar_top = y + 2.0;
-        let scrollbar_extent = (height - line_height - 4.0).max(1.0);
-        let scrollbar_x = x + width - SCROLLBAR_WIDTH - 2.0;
-        self.scene.fill(
-            Fill::NonZero,
-            Affine::IDENTITY,
-            Color::from_rgba8(0x40, 0x40, 0x40, 0x80),
-            None,
-            &Rect::new(
-                scrollbar_x,
-                scrollbar_top,
-                scrollbar_x + SCROLLBAR_WIDTH,
-                scrollbar_top + scrollbar_extent,
-            ),
-        );
-        let visible_lines = content_rows.max(1);
-        let vertical_fraction = (visible_lines as f64 / view.total_lines.max(1) as f64).min(1.0);
-        let thumb_height = (scrollbar_extent * vertical_fraction)
-            .max(20.0)
-            .min(scrollbar_extent);
-        let max_line = view.total_lines.saturating_sub(visible_lines);
-        let vertical_position = if max_line == 0 {
-            0.0
-        } else {
-            f64::from(view.scroll.start_line) / max_line as f64
-        };
-        let thumb_y = scrollbar_top + vertical_position * (scrollbar_extent - thumb_height);
-        self.scene.fill(
-            Fill::NonZero,
-            Affine::IDENTITY,
-            if view.active {
-                self.theme.active_border_color
+        if !view.command_view {
+            let scrollbar_top = y + 2.0;
+            let scrollbar_extent = (height - line_height - 4.0).max(1.0);
+            let scrollbar_x = x + width - SCROLLBAR_WIDTH - 2.0;
+            self.scene.fill(
+                Fill::NonZero,
+                Affine::IDENTITY,
+                Color::from_rgba8(0x40, 0x40, 0x40, 0x80),
+                None,
+                &Rect::new(
+                    scrollbar_x,
+                    scrollbar_top,
+                    scrollbar_x + SCROLLBAR_WIDTH,
+                    scrollbar_top + scrollbar_extent,
+                ),
+            );
+            let visible_lines = content_rows.max(1);
+            let vertical_fraction =
+                (visible_lines as f64 / view.total_lines.max(1) as f64).min(1.0);
+            let thumb_height = (scrollbar_extent * vertical_fraction)
+                .max(20.0)
+                .min(scrollbar_extent);
+            let max_line = view.total_lines.saturating_sub(visible_lines);
+            let vertical_position = if max_line == 0 {
+                0.0
             } else {
-                self.theme.border_color
-            },
-            None,
-            &Rect::new(
-                scrollbar_x + 2.0,
-                thumb_y,
-                scrollbar_x + SCROLLBAR_WIDTH - 2.0,
-                thumb_y + thumb_height,
-            ),
-        );
+                f64::from(view.scroll.start_line) / max_line as f64
+            };
+            let thumb_y = scrollbar_top + vertical_position * (scrollbar_extent - thumb_height);
+            self.scene.fill(
+                Fill::NonZero,
+                Affine::IDENTITY,
+                if view.active {
+                    self.theme.active_border_color
+                } else {
+                    self.theme.border_color
+                },
+                None,
+                &Rect::new(
+                    scrollbar_x + 2.0,
+                    thumb_y,
+                    scrollbar_x + SCROLLBAR_WIDTH - 2.0,
+                    thumb_y + thumb_height,
+                ),
+            );
+        }
 
         if metrics.horizontal_overflow {
             let horizontal_x = x + 2.0;
@@ -802,6 +866,9 @@ impl<'a> RoeVelloApp<'a> {
         let char_width = f64::from(self.text_renderer.char_width());
         let line_height = f64::from(self.text_renderer.line_height());
         for view in &self.redraw_state.session_presentation().current()?.views {
+            if view.command_view {
+                continue;
+            }
             let x = f64::from(view.geometry.x) * char_width;
             let y = f64::from(view.geometry.y) * line_height;
             let width = f64::from(view.geometry.columns) * char_width;
@@ -1279,10 +1346,11 @@ mod lifecycle_tests {
     use super::*;
     use roe_core::editor::{WindowNode, WindowType};
     use roe_core::file_watcher::FileWatcher;
+    use roe_core::keys::{KeyModifier, LogicalKey, Side};
     use roe_core::kill_ring::KillRing;
     use roe_core::native_kernel::ResourceId;
     use roe_core::native_services::SystemClock;
-    use roe_core::session::{ViewGeometry, ViewScroll};
+    use roe_core::session::{StyleRef, StyledLine, ViewGeometry, ViewScroll};
     use roe_core::{Buffer, BufferId, Frame, Window as EditorWindow, WindowId};
     use slotmap::SlotMap;
     use std::cell::Cell;
@@ -1420,6 +1488,42 @@ mod lifecycle_tests {
                 .visible_text,
             "headless scene λx"
         );
+
+        let meta = LogicalKey::Modifier(KeyModifier::Meta(Side::Left));
+        let output = app.runtime.block_on(async {
+            let envelope = app
+                .session
+                .envelope(InputEvent::Keys(vec![meta, LogicalKey::AlphaNumeric('x')]));
+            app.session.dispatch(envelope).await
+        });
+        app.apply_session_output(output.unwrap());
+        for _ in 0..5 {
+            let output = app.runtime.block_on(async {
+                let envelope = app
+                    .session
+                    .envelope(InputEvent::Keys(vec![LogicalKey::Down]));
+                app.session.dispatch(envelope).await
+            });
+            app.apply_session_output(output.unwrap());
+        }
+        app.scene.reset();
+        app.build_session_scene(DEFAULT_WIDTH, DEFAULT_HEIGHT)
+            .unwrap();
+        let snapshot = app.redraw_state.session_presentation().current().unwrap();
+        let prompt = snapshot
+            .views
+            .iter()
+            .find(|view| view.command_view)
+            .unwrap();
+        assert_eq!(prompt.geometry.rows, 10);
+        assert_eq!(prompt.styled_lines.len(), 1);
+        assert!(
+            snapshot
+                .styles
+                .iter()
+                .any(|style| style.id == prompt.styled_lines[0].style
+                    && style.name == "completion-selection")
+        );
     }
 
     fn presented_view(columns: u16, rows: u16, max_line_chars: usize) -> PresentedView {
@@ -1452,6 +1556,7 @@ mod lifecycle_tests {
             show_gutter: false,
             modeline: String::new(),
             styled_ranges: Vec::new(),
+            styled_lines: Vec::new(),
         }
     }
 
@@ -1465,5 +1570,38 @@ mod lifecycle_tests {
 
         let overflow = session_view_metrics(&presented_view(80, 24, 76), char_width);
         assert!(overflow.horizontal_overflow);
+
+        let mut command = presented_view(80, 10, 200);
+        command.command_view = true;
+        let command = session_view_metrics(&command, char_width);
+        assert_eq!(command.content_rows, 8);
+        assert_eq!(command.content_width_chars, 78);
+        assert!(!command.horizontal_overflow);
+    }
+
+    #[test]
+    fn session_line_style_realizes_a_full_row_background() {
+        let mut view = presented_view(80, 10, 20);
+        view.styled_lines.push(StyledLine {
+            line: 4,
+            style: StyleRef(1),
+        });
+        let styles = vec![StyleDefinition {
+            id: StyleRef(1),
+            name: "completion-selection".to_owned(),
+            foreground: None,
+            background: Some(PresentationColor::Rgb {
+                r: 0x3a,
+                g: 0x3a,
+                b: 0x3a,
+            }),
+            bold: false,
+            italic: false,
+            underline: false,
+            strikethrough: false,
+        }];
+        let (_, background) =
+            session_vello_line_style(4, &view, &styles, Color::WHITE, Color::BLACK);
+        assert_eq!(background, Color::from_rgb8(0x3a, 0x3a, 0x3a));
     }
 }

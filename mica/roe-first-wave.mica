@@ -5,6 +5,7 @@
 make_identity(:roe/insert_current_time)
 make_identity(:roe/isearch_match_face)
 make_identity(:roe/isearch_current_face)
+make_identity(:roe/completion_selection_face)
 
 assert Delegates(#roe/insert_current_time, #roe/command, 0)
 assert roe/Command(#roe/insert_current_time)
@@ -22,6 +23,9 @@ assert roe/Face(#roe/isearch_current_face)
 assert roe/FaceName(#roe/isearch_current_face, "isearch-current")
 assert roe/FaceAttribute(#roe/isearch_current_face, :foreground, "#000000")
 assert roe/FaceAttribute(#roe/isearch_current_face, :background, "#ffff00")
+assert roe/Face(#roe/completion_selection_face)
+assert roe/FaceName(#roe/completion_selection_face, "completion-selection")
+assert roe/FaceAttribute(#roe/completion_selection_face, :background, "#3a3a3a")
 assert roe/Configuration(#roe/core_configuration, :tab_width, 4)
 assert roe/SyntaxRule(#roe/fundamental_mode, :word, "[[:alnum:]_]", 100)
 
