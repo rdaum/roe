@@ -18,6 +18,8 @@ Phase 1 was implemented on 2026-08-13 in these reviewable changes:
 | `609fc52` | Added tracing at native endpoint, request, mutation, redraw, and close boundaries. |
 | `589dbbc` | Verified that cancellation returns a leased host for the next request. |
 | `94209ec` | Kept the terminal idle regression probe in its pseudo-terminal foreground process group. |
+| `02cc6de` | Made interactive visit-file replacement transactional across open failures and shared buffers. |
+| `5e36d1d` | Coalesced graphical wakeups, guaranteed raw-mode restoration attempts, and surfaced filesystem/watcher failures. |
 
 ## Toolchain and dependencies
 
@@ -54,12 +56,14 @@ in-process `BufferHost` service per buffer.
 | -------- | --------------------- | --------------------- | -------- |
 | Buffer host | Direct serialized call; no queue | An overlapping request returns typed `HostError::Busy`. `HostLease::drop` returns the service even when an awaiting caller is cancelled. | Dropping the last client drops its modes and buffer host; no task exists to join. |
 | Mode chain | Major/minor modes run synchronously in declared order inside the host request; no queue | A mode consumes, annotates, or ignores the current request. | Modes are owned by and dropped with the host. |
-| File notifications | Bounded FIFO of 256 path/buffer hints | Notify uses nonblocking `try_send`; a full queue drops the newest hint, logs the overload, and still wakes the frontend. Events carry no file contents; delivery rereads current disk state. | Dropping `FileWatcher` drops the notify watcher, sender, receiver, and wake handle. |
+| File notifications | Bounded FIFO of 256 path/buffer hints plus one latest-value backend-error slot | Notify uses nonblocking `try_send`; a full queue drops the newest hint and logs the overload. Events carry no file contents; delivery rereads current disk state. Backend failures replace the one prior undelivered error. | Dropping `FileWatcher` drops the notify watcher, sender, receiver, wake handle, and error slot. |
+| Winit wake | At most one outstanding `HostEvent::Wake` | An atomic pending bit coalesces any number of native wake requests until Winit acknowledges the queued event. A failed send clears the bit for retry. | Dropping the event loop closes its platform transport; later send failure is observed and does not remain pending. |
 | Frontend input | Platform event order; no host mailbox | Terminal polls input after each Compio tick. Winit dispatches platform/user events on its UI thread. | Each frontend stops accepting input by leaving its event loop. |
 
-There are no production `compio::runtime::spawn`, detached tasks, Futures MPSC queues, or other
-host-facing unbounded channels in the workspace. The only remaining channel is the bounded native
-file-notification FIFO above.
+There are no production `compio::runtime::spawn`, detached tasks, Futures MPSC queues, or
+Roe-controlled unbounded host queues in the workspace. Winit's platform user-event implementation
+is internal, but Roe permits at most one outstanding wake in it. The only Roe payload channel is the
+bounded native file-notification FIFO above.
 
 Buffer storage remains `Arc<RwLock<BufferInner>>` because renderer snapshots and file-merge logic
 share buffers. Mutations are serialized by the frontend and direct buffer host, snapshots own their
@@ -74,10 +78,12 @@ input. The production workflow proves an external modification changes the visib
 is idle; it no longer injects a keystroke to make the watcher progress.
 
 The Vello loop uses a typed Winit user event and `EventLoopProxy` through the renderer-neutral
-`FrontendWake` boundary. Native file callbacks send that event. `about_to_wait` also schedules a
-20 ms deadline and drives ready Compio work, timers, watcher output, and redraw invalidation, so a
-lost/coalesced platform wake cannot strand runtime work. `RedrawRequested` renders only when the
-shared Vello redraw state is dirty.
+`FrontendWake` boundary. Native file callbacks request that event through one-outstanding-wake
+coalescing. `about_to_wait` also schedules a 20 ms deadline and drives ready Compio work, timers,
+watcher output, and redraw invalidation, so a lost/coalesced platform wake cannot strand runtime
+work. Headless unit tests prove 10,000 requests produce one event until acknowledgement, a failed
+send can be retried, and the periodic Compio pump completes timer work without window input.
+`RedrawRequested` renders only when the shared Vello redraw state is dirty.
 
 Both frontends currently consume the same `ChromeAction`/`DirtyRegion` host outputs and differ only
 in platform wakeup and realization. This is an interim compatibility boundary: Phase 2 replaces
@@ -95,9 +101,12 @@ Ordinary external failures no longer use internal assertions:
 - clipboard reads and writes produce `ClipboardError`, preserve the internal kill ring, log the
   boundary failure, and add a visible echo action;
 - only `NotFound` opens create a new empty buffer; permissions, directories, and other I/O errors
-  retain path context and reach the command or startup caller;
+  retain path context and reach the command or startup caller without removing the window's current
+  buffer;
 - watcher deletion/read failures produce visible messages rather than disappearing after failed
   canonicalization;
+- file-selector current-directory/listing failures are rendered in its command buffer, and notify
+  backend failures occupy a bounded latest-value slot that the editor echoes on its next wake;
 - Winit window/surface and Vello renderer/render failures are logged and exit or return through the
   frontend boundary rather than panicking; and
 - file-selector directory failures and watcher initialization failures retain resource context in
@@ -111,7 +120,9 @@ turning invariant corruption into ordinary user errors.
 Terminal state is owned by `TerminalSession`. Normal exit, I/O error, runtime error, SIGINT,
 SIGTERM, and unwinding all run its idempotent cleanup. The signal path sets an atomic stop flag; the
 next host tick stops input, returns from the runtime future, releases editor/native state, and then
-restores terminal modes. The controlled workflow compares `stty -g` before and after SIGTERM.
+restores terminal modes. Cleanup retains the first device error but attempts every reset, including
+`disable_raw_mode`, even when terminal output has already failed. A failing-writer unit test proves
+that ordering; the controlled workflow compares `stty -g` before and after SIGTERM.
 
 Vello exits through Winit, after which the application, renderer surfaces, file watcher, editor
 hosts, and Compio runtime are dropped by ownership. There are no detached Roe tasks to survive
@@ -132,11 +143,14 @@ The Phase 1 acceptance commands and results on the Phase 0 host are:
 | `cargo build --release --bin roe-vello` | Passes the renewed Vello/WGPU stack release build. |
 | `./scripts/measure-phase0-baseline.sh` | Completes, including the one-second production terminal idle probe. |
 
-The workspace suite contains 133 tests: 127 in `roe-core`, four terminal unit tests, and one shared
-renderer-conformance test for each frontend. New focused evidence covers overlapping host requests,
-host cancellation safety, bounded file-notification overload, real notify wakeup, clipboard
-failure preservation/reporting, non-`NotFound` open errors, Unicode invariants, and external save
-failure behavior.
+The workspace suite contains 140 tests: one terminal-binary cleanup test, 130 in `roe-core`, four
+terminal renderer tests, three Vello lifecycle tests, and one shared renderer-conformance test for
+each frontend. New focused evidence covers overlapping host requests, host cancellation safety,
+bounded file-notification overload and backend errors, real notify wakeup, coalesced graphical
+wakeups, no-input Compio progress, raw-mode cleanup after device failure, visible file-selector
+errors, clipboard failure preservation/reporting, non-`NotFound` open errors, Unicode invariants,
+and external save failure behavior. Visit-file tests cover both rollback on open failure and
+retention of a replaced buffer that is still displayed in another window.
 
 The same-host coarse sample measured 1,025 ns per edit round trip, 266 microseconds per terminal
 full redraw, 30.208 ms to the first welcome frame, and 3,596 KiB maximum RSS during the one-second
@@ -153,7 +167,8 @@ panicking.
 
 The verification environment still has no X11 or Wayland display, so the production Vello event
 loop cannot be observed end to end here. Its release build and renderer-neutral conformance suite
-pass; a display-host smoke remains an explicit platform obligation. The 20 ms bridge and
+pass, and its wake coalescing/runtime-pump semantics are covered headlessly; a display-host smoke
+remains an explicit platform obligation. The 20 ms bridge and
 `runtime.block_on` calls inside Winit input handling are deliberately transitional, not the Phase 2
 architecture. Renderer realization is still frontend-specific, incomplete commands recorded in
 the Phase 0 baseline remain incomplete, and Mica is not yet linked. Those items are routed to the
