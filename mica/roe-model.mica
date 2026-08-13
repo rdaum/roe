@@ -38,6 +38,7 @@ make_relation(:roe/ArgumentCandidate, 5)
 make_relation(:roe/Keymap, 1)
 make_relation(:roe/KeymapParent, 2)
 make_relation(:roe/KeyBinding, 4)
+make_relation(:roe/KeyPrefix, 1)
 make_relation(:roe/MajorMode, 1)
 make_relation(:roe/MinorMode, 1)
 make_relation(:roe/ModeKeymap, 3)
@@ -295,6 +296,7 @@ assert RoleCanRead(#roe/editor_role, :roe/CanUseBuffer)
 assert RoleCanRead(#roe/editor_role, :roe/CanRequestService)
 assert RoleCanRead(#roe/editor_role, :roe/EffectiveSessionKeymap)
 assert RoleCanRead(#roe/editor_role, :roe/EffectiveBinding)
+assert RoleCanRead(#roe/editor_role, :roe/KeyPrefix)
 assert RoleCanRead(#roe/editor_role, :roe/CommandSelector)
 assert RoleCanRead(#roe/editor_role, :roe/CommandArgument)
 assert RoleCanRead(#roe/editor_role, :roe/ArgumentPrompt)
@@ -360,6 +362,9 @@ verb roe/dispatch_key(actor, session, sequence @ #string)
     end
   end
   if selected == nothing
+    if roe/KeyPrefix(sequence)
+      return :prefix
+    end
     return :unbound
   end
   if ambiguous

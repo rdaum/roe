@@ -42,6 +42,7 @@ pub struct MicaPresentationEffect {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MicaKeyResult {
     Unbound,
+    Prefix,
     Handled,
     Failed(String),
 }
@@ -49,6 +50,7 @@ pub enum MicaKeyResult {
 #[derive(Debug, Default)]
 pub struct MicaEventBatch {
     pub effects: Vec<MicaPresentationEffect>,
+    pub host_actions: Vec<String>,
     pub errors: Vec<String>,
     pub cancelled_tasks: Vec<TaskId>,
     pub ready_subscriptions: Vec<u64>,
@@ -57,6 +59,7 @@ pub struct MicaEventBatch {
 impl MicaEventBatch {
     fn extend(&mut self, mut other: Self) {
         self.effects.append(&mut other.effects);
+        self.host_actions.append(&mut other.host_actions);
         self.errors.append(&mut other.errors);
         self.cancelled_tasks.append(&mut other.cancelled_tasks);
         self.ready_subscriptions
@@ -196,6 +199,7 @@ pub struct MicaHost {
     view_buffers: HashMap<WindowId, BufferId>,
     view_cursors: HashMap<WindowId, usize>,
     active_view: WindowId,
+    pending_key_prefix: Option<String>,
     closed: bool,
 }
 
@@ -378,6 +382,7 @@ impl MicaHost {
             view_buffers,
             view_cursors,
             active_view,
+            pending_key_prefix: None,
             closed: false,
         })
     }
@@ -392,6 +397,10 @@ impl MicaHost {
             return Err(MicaHostError::Closed);
         }
         self.synchronize_context(editor, resource_ids)?;
+        let sequence = self
+            .pending_key_prefix
+            .as_ref()
+            .map_or(sequence.clone(), |prefix| format!("{prefix} {sequence}"));
         let submitted = self
             .driver
             .submit_invocation_for_endpoint(
@@ -400,11 +409,17 @@ impl MicaHost {
                 vec![
                     (sym("actor"), Value::identity(self.actor)),
                     (sym("session"), Value::identity(self.session)),
-                    (sym("sequence"), Value::string(sequence)),
+                    (sym("sequence"), Value::string(&sequence)),
                 ],
             )
             .await?;
-        self.wait_for_task(submitted.task_id).await
+        let result = self.wait_for_task(submitted.task_id).await?;
+        if result.key == MicaKeyResult::Prefix {
+            self.pending_key_prefix = Some(sequence);
+        } else {
+            self.pending_key_prefix = None;
+        }
+        Ok(result)
     }
 
     pub fn drain_background_events(&mut self) -> MicaEventBatch {
@@ -767,6 +782,9 @@ end
                         if let Some(effect) = self.presentation_effect(effect.target, &effect.value)
                         {
                             batch.effects.push(effect);
+                        } else if let Some(action) = self.host_action(effect.target, &effect.value)
+                        {
+                            batch.host_actions.push(action);
                         }
                     }
                     DriverEvent::TaskCompleted {
@@ -775,6 +793,8 @@ end
                     } if completed == task_id => {
                         if value.as_symbol() == Some(sym("unbound")) {
                             key = Some(MicaKeyResult::Unbound);
+                        } else if value.as_symbol() == Some(sym("prefix")) {
+                            key = Some(MicaKeyResult::Prefix);
                         } else {
                             key = Some(MicaKeyResult::Handled);
                         }
@@ -818,6 +838,8 @@ end
             DriverEvent::Effect(effect) => {
                 if let Some(effect) = self.presentation_effect(effect.target, &effect.value) {
                     batch.effects.push(effect);
+                } else if let Some(action) = self.host_action(effect.target, &effect.value) {
+                    batch.host_actions.push(action);
                 }
             }
             DriverEvent::TaskAborted { task_id, error } => batch.errors.push(format!(
@@ -865,6 +887,16 @@ end
             view,
             cursor,
         })
+    }
+
+    fn host_action(&self, target: Identity, value: &Value) -> Option<String> {
+        if target != self.session || map_value(value, "kind")?.as_symbol()? != sym("host_action") {
+            return None;
+        }
+        map_value(value, "action")?
+            .as_symbol()?
+            .name()
+            .map(str::to_owned)
     }
 
     pub async fn close(&mut self) -> Result<MicaEventBatch, MicaHostError> {

@@ -67,6 +67,8 @@ pub enum FrontendError {
     Presentation(#[source] std::io::Error),
     #[error("editor session failed: {0}")]
     Session(#[source] roe_core::session::SessionError),
+    #[error("failed to start Mica editor host: {0}")]
+    MicaHost(#[source] roe_core::mica_host::MicaHostError),
     #[error("Vello renderer state is inconsistent: {0}")]
     InvalidState(&'static str),
     #[error("Vello event loop failed: {0}")]
@@ -222,7 +224,7 @@ impl<'a> RoeVelloApp<'a> {
         theme: VelloTheme,
         runtime: compio::runtime::Runtime,
         wake_state: Arc<WakeState>,
-    ) -> Self {
+    ) -> Result<Self, FrontendError> {
         let font_size = theme.font_size;
         let font_family = if theme.font_family.is_empty() {
             None
@@ -230,7 +232,8 @@ impl<'a> RoeVelloApp<'a> {
             Some(theme.font_family.clone())
         };
 
-        let mut session = HostSession::open(editor, CapabilityGrants::editor_default());
+        let mut session = HostSession::open_with_mica(editor, CapabilityGrants::editor_default())
+            .map_err(FrontendError::MicaHost)?;
         let initial = session.initial_output();
         let mut redraw_state = VelloRenderer::with_theme(theme.clone());
         if let Some(update) = initial.presentation.as_ref() {
@@ -239,7 +242,7 @@ impl<'a> RoeVelloApp<'a> {
                 .expect("initial session snapshot must be valid");
         }
 
-        Self {
+        Ok(Self {
             session,
             runtime,
             render_cx: RenderContext::new(),
@@ -258,7 +261,7 @@ impl<'a> RoeVelloApp<'a> {
             scrollbar_dragging: None,
             hscrollbar_dragging: None,
             border_dragging: None,
-        }
+        })
     }
 
     fn request_redraw(&mut self, region: DirtyRegion) {
@@ -1232,7 +1235,7 @@ pub fn run_vello(
         Instant::now() + Duration::from_millis(20),
     ));
 
-    let mut app = RoeVelloApp::new(editor, theme, runtime, wake_state);
+    let mut app = RoeVelloApp::new(editor, theme, runtime, wake_state)?;
     let event_loop_result = event_loop.run_app(&mut app);
     let fatal_error = app.fatal_error.take();
     let close = app.session.envelope(InputEvent::Close);

@@ -270,6 +270,31 @@ impl ConfigurableBindings {
         bindings
     }
 
+    /// Direct editing bindings retained while Mica owns global command and
+    /// keymap policy. No named command or global redraw binding survives.
+    pub fn new_native_fallback() -> Self {
+        let mut bindings = Self::new();
+        bindings.bindings.retain(|_, action| {
+            !matches!(
+                action,
+                KeyAction::Command(_)
+                    | KeyAction::CommandMode
+                    | KeyAction::Save
+                    | KeyAction::Quit
+                    | KeyAction::FindFile
+                    | KeyAction::SplitHorizontal
+                    | KeyAction::SplitVertical
+                    | KeyAction::SwitchWindow
+                    | KeyAction::DeleteWindow
+                    | KeyAction::DeleteOtherWindows
+                    | KeyAction::SwitchBuffer
+                    | KeyAction::KillBuffer
+                    | KeyAction::Redraw
+            )
+        });
+        bindings
+    }
+
     /// Register the default Emacs-style keybindings.
     fn register_default_bindings(&mut self) {
         // Basic cursor movement

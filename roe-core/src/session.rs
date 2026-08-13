@@ -15,7 +15,7 @@ use crate::command_mode::CommandMode;
 use crate::editor::{
     BorderInfo, ChromeAction, DragType, MouseDragState, SplitDirection, WindowNode, WindowType,
 };
-use crate::keys::LogicalKey;
+use crate::keys::{ConfigurableBindings, LogicalKey};
 use crate::mica_host::{
     MicaEventBatch, MicaHost, MicaHostError, MicaKeyResult, normalized_key_sequence,
 };
@@ -349,6 +349,8 @@ impl HostSession {
     /// wave. The ordinary constructor remains available for headless and
     /// frontend-conformance tests that deliberately exercise only Rust policy.
     pub fn open_with_mica(editor: Editor, grants: CapabilityGrants) -> Result<Self, MicaHostError> {
+        let mut editor = editor;
+        editor.bindings = Box::new(ConfigurableBindings::new_native_fallback());
         let mut session = Self::open(editor, grants);
         session.mica = Some(MicaHost::open(
             &session.editor,
@@ -363,6 +365,8 @@ impl HostSession {
         grants: CapabilityGrants,
         clock: Arc<dyn NativeClock>,
     ) -> Result<Self, MicaHostError> {
+        let mut editor = editor;
+        editor.bindings = Box::new(ConfigurableBindings::new_native_fallback());
         let mut session = Self::open_with_kernel(
             editor,
             Arc::new(Mutex::new(NativeKernel::with_clock(grants, clock))),
@@ -433,7 +437,8 @@ impl HostSession {
         if let Some(mut mica) = self.mica.take() {
             let events = mica.drain_background_events();
             self.mica = Some(mica);
-            self.apply_mica_events(events, &mut lifecycle, &mut invalidations);
+            self.apply_mica_events(events, &mut lifecycle, &mut invalidations)
+                .await;
         }
 
         match envelope.event {
@@ -447,15 +452,27 @@ impl HostSession {
                         )
                         .await;
                     self.mica = Some(mica);
-                    Some(result.map(|dispatch| {
-                        self.apply_mica_events(dispatch.events, &mut lifecycle, &mut invalidations);
-                        dispatch.key
-                    }))
+                    match result {
+                        Ok(dispatch) => {
+                            self.apply_mica_events(
+                                dispatch.events,
+                                &mut lifecycle,
+                                &mut invalidations,
+                            )
+                            .await;
+                            Some(Ok(dispatch.key))
+                        }
+                        Err(error) => Some(Err(error)),
+                    }
                 } else {
                     None
                 };
                 match mica_result {
                     Some(Ok(MicaKeyResult::Handled)) => {}
+                    Some(Ok(MicaKeyResult::Prefix)) => {
+                        self.editor.set_echo_message(normalized_key_sequence(&keys));
+                        invalidations.push(Invalidation::EchoArea);
+                    }
                     Some(Ok(MicaKeyResult::Failed(message))) => {
                         self.editor.set_echo_message(message.clone());
                         invalidations.push(Invalidation::EchoArea);
@@ -617,6 +634,7 @@ impl HostSession {
                     match mica.close().await {
                         Ok(events) => {
                             self.apply_mica_events(events, &mut lifecycle, &mut invalidations)
+                                .await
                         }
                         Err(error) => lifecycle.push(LifecycleEvent::Warning(format!(
                             "Mica endpoint shutdown: {error}"
@@ -697,7 +715,7 @@ impl HostSession {
             .await
     }
 
-    fn apply_mica_events(
+    async fn apply_mica_events(
         &mut self,
         events: MicaEventBatch,
         lifecycle: &mut Vec<LifecycleEvent>,
@@ -723,6 +741,89 @@ impl HostSession {
             self.editor.set_echo_message(message.clone());
             invalidations.push(Invalidation::EchoArea);
             lifecycle.push(LifecycleEvent::Error(message));
+        }
+        for action in events.host_actions {
+            match action.as_str() {
+                "quit" => lifecycle.push(LifecycleEvent::QuitRequested),
+                "redraw" => invalidations.push(Invalidation::Full),
+                "split_horizontal" => {
+                    self.editor.split_horizontal();
+                    invalidations.push(Invalidation::Full);
+                }
+                "split_vertical" => {
+                    self.editor.split_vertical();
+                    invalidations.push(Invalidation::Full);
+                }
+                "other_window" => {
+                    self.editor.switch_window();
+                    invalidations.push(Invalidation::Full);
+                }
+                "delete_window" => {
+                    if self.editor.delete_window() {
+                        invalidations.push(Invalidation::Full);
+                    }
+                }
+                "delete_other_windows" => {
+                    if self.editor.delete_other_windows() {
+                        invalidations.push(Invalidation::Full);
+                    }
+                }
+                "save_buffer" => {
+                    self.resolve_actions(vec![ChromeAction::Save], lifecycle, invalidations)
+                        .await;
+                }
+                "find_file" => {
+                    self.resolve_actions(
+                        vec![ChromeAction::OpenFile(crate::editor::OpenType::New)],
+                        lifecycle,
+                        invalidations,
+                    )
+                    .await;
+                }
+                "visit_file" => {
+                    self.resolve_actions(
+                        vec![ChromeAction::OpenFile(crate::editor::OpenType::Visit)],
+                        lifecycle,
+                        invalidations,
+                    )
+                    .await;
+                }
+                "switch_buffer" => {
+                    self.resolve_actions(
+                        vec![ChromeAction::SwitchBuffer],
+                        lifecycle,
+                        invalidations,
+                    )
+                    .await;
+                }
+                "kill_buffer" => {
+                    self.resolve_actions(vec![ChromeAction::KillBuffer], lifecycle, invalidations)
+                        .await;
+                }
+                "execute_command" => {
+                    self.resolve_actions(vec![ChromeAction::CommandMode], lifecycle, invalidations)
+                        .await;
+                }
+                "isearch_forward" => {
+                    self.resolve_actions(
+                        vec![ChromeAction::ISearchForward],
+                        lifecycle,
+                        invalidations,
+                    )
+                    .await;
+                }
+                "isearch_backward" => {
+                    self.resolve_actions(
+                        vec![ChromeAction::ISearchBackward],
+                        lifecycle,
+                        invalidations,
+                    )
+                    .await;
+                }
+                unknown => lifecycle.push(LifecycleEvent::Error(format!(
+                    "unknown Mica host action: {unknown}"
+                ))),
+            }
         }
         lifecycle.extend(
             events
@@ -1656,6 +1757,86 @@ mod tests {
                 LifecycleEvent::Error(message) if message.contains("required native service grant")
             )));
             assert_eq!(snapshot(&denied).views[0].visible_text, "hello");
+
+            session
+                .dispatch(session.envelope(InputEvent::Close))
+                .await
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn mica_owns_global_chords_and_window_policy() {
+        let _guard = MICA_TEST_LOCK.lock().unwrap();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut session = HostSession::open_with_mica_clock(
+                test_editor(),
+                CapabilityGrants::editor_default(),
+                Arc::new(FixedNativeClock(42)),
+            )
+            .unwrap();
+            let control =
+                LogicalKey::Modifier(crate::keys::KeyModifier::Control(crate::keys::Side::Left));
+
+            let prefix = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![
+                    control,
+                    LogicalKey::AlphaNumeric('x'),
+                ])))
+                .await
+                .unwrap();
+            assert!(snapshot(&prefix).echo_area.contains("C-x"));
+            let split = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::AlphaNumeric('2')])))
+                .await
+                .unwrap();
+            assert_eq!(snapshot(&split).views.len(), 2);
+
+            session
+                .dispatch(session.envelope(InputEvent::Keys(vec![
+                    control,
+                    LogicalKey::AlphaNumeric('x'),
+                ])))
+                .await
+                .unwrap();
+            let switched = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::AlphaNumeric('o')])))
+                .await
+                .unwrap();
+            assert_eq!(snapshot(&switched).views.len(), 2);
+            assert_ne!(
+                snapshot(&switched).active_view,
+                snapshot(&split).active_view
+            );
+
+            session
+                .dispatch(session.envelope(InputEvent::Keys(vec![
+                    control,
+                    LogicalKey::AlphaNumeric('x'),
+                ])))
+                .await
+                .unwrap();
+            let deleted = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::AlphaNumeric('0')])))
+                .await
+                .unwrap();
+            assert_eq!(snapshot(&deleted).views.len(), 1);
+
+            session
+                .dispatch(session.envelope(InputEvent::Keys(vec![
+                    control,
+                    LogicalKey::AlphaNumeric('x'),
+                ])))
+                .await
+                .unwrap();
+            let quit = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![
+                    control,
+                    LogicalKey::AlphaNumeric('c'),
+                ])))
+                .await
+                .unwrap();
+            assert!(quit.lifecycle.contains(&LifecycleEvent::QuitRequested));
 
             session
                 .dispatch(session.envelope(InputEvent::Close))

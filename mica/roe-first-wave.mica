@@ -46,3 +46,218 @@ verb roe/insert_current_time(actor, session)
   emit(session, {:kind -> :presentation_invalidated, :view -> view, :buffer -> buffer, :cursor -> next_cursor})
   return :inserted
 end
+
+// Phase 5's global command/keymap slice. Rust realizes these as native editor
+// mechanisms, but their names, discovery, bindings, and dispatch live here.
+make_identity(:roe/save_buffer)
+make_identity(:roe/quit)
+make_identity(:roe/find_file)
+make_identity(:roe/visit_file)
+make_identity(:roe/split_horizontal)
+make_identity(:roe/split_vertical)
+make_identity(:roe/native_other_window)
+make_identity(:roe/delete_window)
+make_identity(:roe/delete_other_windows)
+make_identity(:roe/switch_buffer)
+make_identity(:roe/kill_buffer)
+make_identity(:roe/execute_command)
+make_identity(:roe/isearch_forward)
+make_identity(:roe/isearch_backward)
+make_identity(:roe/redraw)
+
+assert roe/KeyPrefix("C-x")
+
+assert roe/Command(#roe/save_buffer)
+assert roe/CommandSelector(#roe/save_buffer, :roe/save_buffer)
+assert roe/CommandSummary(#roe/save_buffer, "Save the active buffer")
+assert roe/KeyBinding(#roe/global_map, "C-x C-s", #roe/save_buffer, 1000)
+assert roe/PackageCommand(#roe/core_package, #roe/save_buffer)
+assert RoleCanInvoke(#roe/editor_role, :roe/save_buffer)
+
+assert roe/Command(#roe/quit)
+assert roe/CommandSelector(#roe/quit, :roe/quit)
+assert roe/CommandSummary(#roe/quit, "Quit Roe")
+assert roe/KeyBinding(#roe/global_map, "C-x C-c", #roe/quit, 1000)
+assert roe/PackageCommand(#roe/core_package, #roe/quit)
+assert RoleCanInvoke(#roe/editor_role, :roe/quit)
+
+assert roe/Command(#roe/find_file)
+assert roe/CommandSelector(#roe/find_file, :roe/find_file)
+assert roe/CommandSummary(#roe/find_file, "Find a file")
+assert roe/KeyBinding(#roe/global_map, "C-x C-f", #roe/find_file, 1000)
+assert roe/PackageCommand(#roe/core_package, #roe/find_file)
+assert RoleCanInvoke(#roe/editor_role, :roe/find_file)
+
+assert roe/Command(#roe/visit_file)
+assert roe/CommandSelector(#roe/visit_file, :roe/visit_file)
+assert roe/CommandSummary(#roe/visit_file, "Visit a file in the active view")
+assert roe/KeyBinding(#roe/global_map, "C-x C-v", #roe/visit_file, 1000)
+assert roe/PackageCommand(#roe/core_package, #roe/visit_file)
+assert RoleCanInvoke(#roe/editor_role, :roe/visit_file)
+
+assert roe/Command(#roe/split_horizontal)
+assert roe/CommandSelector(#roe/split_horizontal, :roe/split_horizontal)
+assert roe/CommandSummary(#roe/split_horizontal, "Split the active view horizontally")
+assert roe/KeyBinding(#roe/global_map, "C-x 2", #roe/split_horizontal, 1000)
+assert roe/PackageCommand(#roe/core_package, #roe/split_horizontal)
+assert RoleCanInvoke(#roe/editor_role, :roe/split_horizontal)
+
+assert roe/Command(#roe/split_vertical)
+assert roe/CommandSelector(#roe/split_vertical, :roe/split_vertical)
+assert roe/CommandSummary(#roe/split_vertical, "Split the active view vertically")
+assert roe/KeyBinding(#roe/global_map, "C-x 3", #roe/split_vertical, 1000)
+assert roe/PackageCommand(#roe/core_package, #roe/split_vertical)
+assert RoleCanInvoke(#roe/editor_role, :roe/split_vertical)
+
+assert roe/Command(#roe/native_other_window)
+assert roe/CommandSelector(#roe/native_other_window, :roe/native_other_window)
+assert roe/CommandSummary(#roe/native_other_window, "Select the next view")
+assert roe/KeyBinding(#roe/global_map, "C-x o", #roe/native_other_window, 1000)
+assert roe/PackageCommand(#roe/core_package, #roe/native_other_window)
+assert RoleCanInvoke(#roe/editor_role, :roe/native_other_window)
+
+assert roe/Command(#roe/delete_window)
+assert roe/CommandSelector(#roe/delete_window, :roe/delete_window)
+assert roe/CommandSummary(#roe/delete_window, "Delete the active view")
+assert roe/KeyBinding(#roe/global_map, "C-x 0", #roe/delete_window, 1000)
+assert roe/PackageCommand(#roe/core_package, #roe/delete_window)
+assert RoleCanInvoke(#roe/editor_role, :roe/delete_window)
+
+assert roe/Command(#roe/delete_other_windows)
+assert roe/CommandSelector(#roe/delete_other_windows, :roe/delete_other_windows)
+assert roe/CommandSummary(#roe/delete_other_windows, "Delete other views")
+assert roe/KeyBinding(#roe/global_map, "C-x 1", #roe/delete_other_windows, 1000)
+assert roe/PackageCommand(#roe/core_package, #roe/delete_other_windows)
+assert RoleCanInvoke(#roe/editor_role, :roe/delete_other_windows)
+
+assert roe/Command(#roe/switch_buffer)
+assert roe/CommandSelector(#roe/switch_buffer, :roe/switch_buffer)
+assert roe/CommandSummary(#roe/switch_buffer, "Select a buffer")
+assert roe/KeyBinding(#roe/global_map, "C-x b", #roe/switch_buffer, 1000)
+assert roe/PackageCommand(#roe/core_package, #roe/switch_buffer)
+assert RoleCanInvoke(#roe/editor_role, :roe/switch_buffer)
+
+assert roe/Command(#roe/kill_buffer)
+assert roe/CommandSelector(#roe/kill_buffer, :roe/kill_buffer)
+assert roe/CommandSummary(#roe/kill_buffer, "Kill a buffer")
+assert roe/KeyBinding(#roe/global_map, "C-x k", #roe/kill_buffer, 1000)
+assert roe/PackageCommand(#roe/core_package, #roe/kill_buffer)
+assert RoleCanInvoke(#roe/editor_role, :roe/kill_buffer)
+
+assert roe/Command(#roe/execute_command)
+assert roe/CommandSelector(#roe/execute_command, :roe/execute_command)
+assert roe/CommandSummary(#roe/execute_command, "Execute a discoverable command")
+assert roe/KeyBinding(#roe/global_map, "M-x", #roe/execute_command, 1000)
+assert roe/PackageCommand(#roe/core_package, #roe/execute_command)
+assert RoleCanInvoke(#roe/editor_role, :roe/execute_command)
+
+assert roe/Command(#roe/isearch_forward)
+assert roe/CommandSelector(#roe/isearch_forward, :roe/isearch_forward)
+assert roe/CommandSummary(#roe/isearch_forward, "Search forward incrementally")
+assert roe/KeyBinding(#roe/global_map, "C-s", #roe/isearch_forward, 1000)
+assert roe/PackageCommand(#roe/core_package, #roe/isearch_forward)
+assert RoleCanInvoke(#roe/editor_role, :roe/isearch_forward)
+
+assert roe/Command(#roe/isearch_backward)
+assert roe/CommandSelector(#roe/isearch_backward, :roe/isearch_backward)
+assert roe/CommandSummary(#roe/isearch_backward, "Search backward incrementally")
+assert roe/KeyBinding(#roe/global_map, "C-r", #roe/isearch_backward, 1000)
+assert roe/PackageCommand(#roe/core_package, #roe/isearch_backward)
+assert RoleCanInvoke(#roe/editor_role, :roe/isearch_backward)
+
+assert roe/Command(#roe/redraw)
+assert roe/CommandSelector(#roe/redraw, :roe/redraw)
+assert roe/CommandSummary(#roe/redraw, "Redraw the full frame")
+assert roe/KeyBinding(#roe/global_map, "C-l", #roe/redraw, 1000)
+assert roe/PackageCommand(#roe/core_package, #roe/redraw)
+assert RoleCanInvoke(#roe/editor_role, :roe/redraw)
+
+verb roe/save_buffer(actor, session)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  emit(session, {:kind -> :host_action, :action -> :save_buffer})
+  return :ok
+end
+
+verb roe/quit(actor, session)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  emit(session, {:kind -> :host_action, :action -> :quit})
+  return :ok
+end
+
+verb roe/find_file(actor, session)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  emit(session, {:kind -> :host_action, :action -> :find_file})
+  return :ok
+end
+
+verb roe/visit_file(actor, session)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  emit(session, {:kind -> :host_action, :action -> :visit_file})
+  return :ok
+end
+
+verb roe/split_horizontal(actor, session)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  emit(session, {:kind -> :host_action, :action -> :split_horizontal})
+  return :ok
+end
+
+verb roe/split_vertical(actor, session)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  emit(session, {:kind -> :host_action, :action -> :split_vertical})
+  return :ok
+end
+
+verb roe/native_other_window(actor, session)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  emit(session, {:kind -> :host_action, :action -> :other_window})
+  return :ok
+end
+
+verb roe/delete_window(actor, session)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  emit(session, {:kind -> :host_action, :action -> :delete_window})
+  return :ok
+end
+
+verb roe/delete_other_windows(actor, session)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  emit(session, {:kind -> :host_action, :action -> :delete_other_windows})
+  return :ok
+end
+
+verb roe/switch_buffer(actor, session)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  emit(session, {:kind -> :host_action, :action -> :switch_buffer})
+  return :ok
+end
+
+verb roe/kill_buffer(actor, session)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  emit(session, {:kind -> :host_action, :action -> :kill_buffer})
+  return :ok
+end
+
+verb roe/execute_command(actor, session)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  emit(session, {:kind -> :host_action, :action -> :execute_command})
+  return :ok
+end
+
+verb roe/isearch_forward(actor, session)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  emit(session, {:kind -> :host_action, :action -> :isearch_forward})
+  return :ok
+end
+
+verb roe/isearch_backward(actor, session)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  emit(session, {:kind -> :host_action, :action -> :isearch_backward})
+  return :ok
+end
+
+verb roe/redraw(actor, session)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  emit(session, {:kind -> :host_action, :action -> :redraw})
+  return :ok
+end
