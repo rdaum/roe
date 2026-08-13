@@ -2164,20 +2164,24 @@ impl Editor {
                                     self.active_window
                                 };
 
-                            // For visit-file, kill the current buffer first
-                            if open_type == OpenType::Visit {
-                                let current_buffer_id = self.windows[window_to_open].active_buffer;
-                                // Don't kill command buffers
-                                if !self.is_command_buffer(current_buffer_id) {
-                                    // Remove the buffer host and buffer
-                                    self.buffer_hosts.remove(&current_buffer_id);
-                                    self.buffers.remove(current_buffer_id);
-                                }
-                            }
+                            // Visit-file replaces the selected window's buffer only after the
+                            // fallible open succeeds. Retain a buffer still displayed elsewhere.
+                            let replaced_buffer = (open_type == OpenType::Visit)
+                                .then(|| self.windows[window_to_open].active_buffer)
+                                .filter(|buffer_id| !self.is_command_buffer(*buffer_id));
 
                             // Open the file in the determined window
                             match self.open_file_in_window(path, window_to_open).await {
                                 Ok(message) => {
+                                    if let Some(replaced_buffer) = replaced_buffer
+                                        && !self
+                                            .windows
+                                            .values()
+                                            .any(|window| window.active_buffer == replaced_buffer)
+                                    {
+                                        self.buffer_hosts.remove(&replaced_buffer);
+                                        self.buffers.remove(replaced_buffer);
+                                    }
                                     actions.push(ChromeAction::Echo(message));
                                     actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
                                 }
@@ -2963,6 +2967,10 @@ impl Editor {
     ) -> Result<String, String> {
         use crate::mode::FileMode;
 
+        if !self.windows.contains_key(window_id) {
+            return Err("Window no longer exists".to_string());
+        }
+
         // Try to load the file
         let buffer = match Buffer::from_file(&file_path.to_string_lossy(), &[]).await {
             Ok(buffer) => buffer,
@@ -3006,6 +3014,8 @@ impl Editor {
 
             Ok(format!("Opened: {}", file_path.display()))
         } else {
+            self.buffer_hosts.remove(&buffer_id);
+            self.buffers.remove(buffer_id);
             Err("Window no longer exists".to_string())
         }
     }
@@ -3586,6 +3596,66 @@ mod tests {
 
             assert!(error.contains("Failed to open"), "{error}");
             std::fs::remove_dir(directory).unwrap();
+        });
+    }
+
+    #[test]
+    fn visit_file_is_transactional_and_preserves_shared_buffers() {
+        let _runtime_guard = COMPIO_RUNTIME_LOCK.lock().unwrap();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut editor = test_editor();
+            let original_buffer = editor.windows[editor.active_window].active_buffer;
+            let directory =
+                std::env::temp_dir().join(format!("roe-visit-error-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&directory);
+            std::fs::create_dir(&directory).unwrap();
+
+            let failure = crate::buffer_host::BufferResponse::ActionsCompleted {
+                dirty_regions: vec![],
+                new_cursor_pos: None,
+                editor_action: Some(crate::buffer_host::EditorAction::OpenFile {
+                    path: directory.clone(),
+                    open_type: OpenType::Visit,
+                }),
+                buffer_change: None,
+            };
+            let actions = editor.handle_buffer_response(failure).await;
+
+            assert!(actions.iter().any(
+                |action| matches!(action, ChromeAction::Echo(message) if message.contains("Error opening file"))
+            ));
+            assert_eq!(
+                editor.windows[editor.active_window].active_buffer,
+                original_buffer
+            );
+            assert!(editor.buffers.contains_key(original_buffer));
+
+            let other_window = editor.windows[editor.active_window].clone();
+            let other_window_id = editor.windows.insert(other_window);
+            let visited_path = directory.join("visited.txt");
+            std::fs::write(&visited_path, "visited").unwrap();
+            let success = crate::buffer_host::BufferResponse::ActionsCompleted {
+                dirty_regions: vec![],
+                new_cursor_pos: None,
+                editor_action: Some(crate::buffer_host::EditorAction::OpenFile {
+                    path: visited_path,
+                    open_type: OpenType::Visit,
+                }),
+                buffer_change: None,
+            };
+            let actions = editor.handle_buffer_response(success).await;
+
+            assert!(actions.iter().any(
+                |action| matches!(action, ChromeAction::Echo(message) if message.contains("Opened:"))
+            ));
+            assert_ne!(
+                editor.windows[editor.active_window].active_buffer,
+                original_buffer
+            );
+            assert_eq!(editor.windows[other_window_id].active_buffer, original_buffer);
+            assert!(editor.buffers.contains_key(original_buffer));
+
+            std::fs::remove_dir_all(directory).unwrap();
         });
     }
 
