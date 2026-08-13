@@ -28,3 +28,6 @@ pollster = "0.4"
 
 # Utilities
 slotmap = { workspace = true }
+
+[dev-dependencies]
+roe-terminal = { path = "../roe-terminal" }

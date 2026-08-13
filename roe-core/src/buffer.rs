@@ -162,7 +162,10 @@ impl BufferInner {
     }
 
     pub fn to_char_index(&self, col: u16, line: u16) -> usize {
-        let line = (line as usize).min(self.buffer.len_lines().saturating_sub(1));
+        let line = line as usize;
+        if line >= self.buffer.len_lines() {
+            return self.buffer.len_chars();
+        }
         let line_start = self.buffer.line_to_char(line);
         let line_slice = self.buffer.line(line);
         let content_len = line_slice.len_chars().saturating_sub(usize::from(
@@ -1038,11 +1041,30 @@ mod tests {
         assert_eq!(buffer.to_char_index(99, 0), 3);
         assert_eq!(buffer.to_char_index(99, 1), 6);
         assert_eq!(buffer.to_char_index(99, 99), buffer.buffer.len_chars());
+        assert_eq!(buffer.to_char_index(0, 3), buffer.buffer.len_chars());
         assert_eq!(buffer.to_column_line(usize::MAX), (4, 2));
 
         buffer.insert_col_line("!".to_string(), (99, 99));
         assert_eq!(buffer.content(), "abc\nλμ\nlast!");
         assert_eq!(buffer.delete_col_line((99, 99), -1), Some("!".to_string()));
+    }
+
+    #[test]
+    fn position_conversions_round_trip_at_u16_boundaries() {
+        let mut buffer = BufferInner::new(&[]);
+        buffer.load_str(&"λ".repeat(u16::MAX as usize));
+        let last_column = u16::MAX;
+        assert_eq!(
+            buffer.to_column_line(last_column as usize),
+            (last_column, 0)
+        );
+        assert_eq!(buffer.to_char_index(last_column, 0), last_column as usize);
+
+        let mut buffer = BufferInner::new(&[]);
+        buffer.load_str(&("λ\n".repeat(u16::MAX as usize) + "x"));
+        let last_line_start = 2 * u16::MAX as usize;
+        assert_eq!(buffer.to_column_line(last_line_start), (0, u16::MAX));
+        assert_eq!(buffer.to_char_index(0, u16::MAX), last_line_start);
     }
 
     #[test]

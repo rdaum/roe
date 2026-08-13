@@ -2337,6 +2337,7 @@ dependencies = [
  "parley",
  "pollster",
  "roe-core",
+ "roe-terminal",
  "slotmap",
  "vello",
  "winit",

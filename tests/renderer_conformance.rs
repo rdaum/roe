@@ -128,3 +128,47 @@ where
     assert_eq!(updated.windows[0].text, "éλ baseline");
     assert_eq!(updated.windows[0].cursor, 1);
 }
+
+#[allow(dead_code)] // This shared source is also compiled by the terminal-only test target.
+pub fn assert_cross_frontend_presentation<A, B>(first: &mut A, second: &mut B)
+where
+    A: Renderer,
+    B: Renderer,
+    A::Error: Debug,
+    B::Error: Debug,
+{
+    let mut editor = fixture_editor();
+    editor.split_horizontal();
+    editor.handle_resize(80, 23);
+    first.render_full(&editor).unwrap();
+    second.render_full(&editor).unwrap();
+    assert_eq!(
+        first.presentation_snapshot(),
+        second.presentation_snapshot()
+    );
+    let initial = first.presentation_snapshot().unwrap();
+    assert_eq!(initial.windows.len(), 2);
+    assert_eq!(initial.windows[0].width_chars, 80);
+    assert_eq!(initial.windows[0].height_chars, 11);
+    assert_eq!(initial.windows[1].y, 11);
+
+    let window_id = editor.active_window;
+    let buffer_id = editor.windows[window_id].active_buffer;
+    editor.buffers[buffer_id].insert_pos("é".to_string(), 0);
+    editor.windows[window_id].cursor = 1;
+    editor.handle_resize(96, 31);
+
+    first.mark_dirty(DirtyRegion::Buffer { buffer_id });
+    second.mark_dirty(DirtyRegion::Buffer { buffer_id });
+    first.render_incremental(&editor).unwrap();
+    second.render_incremental(&editor).unwrap();
+    assert_eq!(
+        first.presentation_snapshot(),
+        second.presentation_snapshot()
+    );
+    let updated = first.presentation_snapshot().unwrap();
+    assert_eq!((updated.columns, updated.rows), (96, 31));
+    assert_eq!(updated.windows.len(), 2);
+    assert_eq!(updated.windows[0].height_chars, 15);
+    assert_eq!(updated.windows[1].y, 15);
+}

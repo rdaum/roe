@@ -177,9 +177,6 @@ impl<'a> RoeVelloApp<'a> {
     }
 
     fn render(&mut self) {
-        self.redraw_state
-            .render_full(self.editor)
-            .expect("Vello logical presentation capture is infallible");
         // Extract surface info first to avoid borrow conflicts
         let (width, height, dev_id, scale_factor) = {
             let Some(ref state) = self.state else {
@@ -206,6 +203,9 @@ impl<'a> RoeVelloApp<'a> {
         let lines = (logical_height as f32 / line_height).floor() as u16;
         self.editor
             .handle_resize(cols.max(1), lines.saturating_sub(1).max(1)); // -1 for echo area
+        self.redraw_state
+            .render_full(self.editor)
+            .expect("Vello logical presentation capture is infallible");
 
         // Build the scene in logical coordinates, then scale for physical rendering
         self.scene.reset();

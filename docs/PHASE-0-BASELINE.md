@@ -68,12 +68,12 @@ cargo build --release --bin roe-vello
 At capture time:
 
 - `cargo check --workspace` passes;
-- `cargo test --workspace -- --test-threads=8` passes 128 tests;
+- `cargo test --workspace -- --test-threads=8` passes 129 tests;
 - terminal rendering and the logical-observation/redraw component used by production Vello pass the
   shared dirty-lifecycle and presentation-snapshot conformance test;
 - the production terminal adapter passes controlled startup, movement, Unicode region/undo/yank,
-  edit/save, command/buffer/file selection, search, window resize, watcher, and clean-shutdown
-  workflows; and
+  edit/save, command/buffer/file selection, search, window resize, recorded watcher event-loop
+  behavior, and clean-shutdown workflows; and
 - kill-ring and editor tests use an injected clipboard boundary and do not touch the user's system
   clipboard.
 
@@ -103,16 +103,16 @@ tests use injected clocks.
 
 The following platform smoke status was recorded on 2026-08-13:
 
-| Workflow                           | Terminal                                                                                           | Vello                                                                                |
-| ---------------------------------- | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
-| Release build                      | Passed with `cargo build --release --bin roe`                                                      | Passed with `cargo build --release --bin roe-vello`                                  |
-| No-, one-, and two-file start      | Passed in isolated 80x24 tmux terminals                                                            | Not runnable: no X11 or Wayland display is available in the verification environment |
-| Insert and save                    | Passed against a uniquely owned temporary file                                                     | Platform observation unavailable                                                     |
-| Incremental search                 | Passed on a buffer with a multibyte prefix; insertion occurred at the selected match               | Renderer-neutral semantics pass; platform observation unavailable                    |
-| Split/select/resize/delete windows | Passed through production key and SGR mouse input                                                  | Renderer-neutral semantics pass; platform observation unavailable                    |
-| External modification              | Passed: the idle loop polled a delivered notify event, reloaded the buffer, and saved the new text | Renderer-neutral watcher round trip passes; platform observation unavailable         |
-| Clean shutdown                     | Passed via `C-x C-c` for every scripted terminal workflow                                          | Platform observation unavailable                                                     |
-| Forced signal shutdown             | Reproduced in an owned tmux pane; Roe exits without running its terminal cleanup path              | Not run                                                                              |
+| Workflow                           | Terminal                                                                                                      | Vello                                                                                |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| Release build                      | Passed with `cargo build --release --bin roe`                                                                 | Passed with `cargo build --release --bin roe-vello`                                  |
+| No-, one-, and two-file start      | Passed in isolated 80x24 tmux terminals                                                                       | Not runnable: no X11 or Wayland display is available in the verification environment |
+| Insert and save                    | Passed against a uniquely owned temporary file                                                                | Platform observation unavailable                                                     |
+| Incremental search                 | Passed on a buffer with a multibyte prefix; insertion occurred at the selected match                          | Renderer-neutral semantics pass; platform observation unavailable                    |
+| Split/select/resize/delete windows | Passed through production key and SGR mouse input                                                             | Renderer-neutral semantics pass; platform observation unavailable                    |
+| External modification              | Notify was not processed while idle; the next input delivered it, reloaded the buffer, and saved the new text | Renderer-neutral watcher round trip passes; platform observation unavailable         |
+| Clean shutdown                     | Passed via `C-x C-c` for every scripted terminal workflow                                                     | Platform observation unavailable                                                     |
+| Forced signal shutdown             | Reproduced in an owned tmux pane; after SIGTERM Roe left the pseudo-terminal raw and without echo             | Not run                                                                              |
 
 `./scripts/test-phase0-terminal-workflows.sh` reproduces the terminal observations without using the
 user's active terminal. This records both results and what the environment could not exercise; an
@@ -148,8 +148,11 @@ phases must make mechanically true.
 
 - Buffer text is UTF-8 stored in Ropey; public edit and cursor positions are character indices, not
   byte offsets.
-- `(column, line)` conversion clamps out-of-range lines, columns, and character indices and
+- `(column, line)` conversion clamps columns to line content and lines past the buffer to EOF, and
   round-trips for valid positions, including non-ASCII text.
+- Window `(column, line)` coordinates are currently `u16`, so they cannot represent a line or column
+  above 65,535. Direct buffer character offsets are `usize`; replacing the narrow window coordinates
+  is explicit Phase 2 debt rather than an unstated invariant.
 - An edit updates undo state and adjusts syntax spans as one serialized native operation.
 - A region is the ordered range between mark and cursor; clearing or invalidating a mark cannot
   leave a stale range.
@@ -232,8 +235,9 @@ making performance claims.
 | Error handling        | User/environment failures and internal invariants are mixed across `String` errors, ignored results, panics, and exits.                   |
 | End-to-end UI testing | Controlled terminal workflows pass in tmux; no graphical event-loop workflow can run without an X11/Wayland host.                         |
 | Watcher deletion      | Modification delivery is covered, but deletion is currently dropped after canonicalization of the now-missing path.                       |
-| Incomplete operations | `write-file` and `ActionPosition::End` insert/delete/kill remain explicit implementation stubs.                                           |
-| Signal shutdown       | The tmux probe reproduces that SIGTERM bypasses Roe's cleanup path; signal-aware restoration is required in Phase 1.                      |
+| Incomplete operations | `revert-buffer`, `write-file`, and `ActionPosition::End` insert/delete/kill remain explicit implementation stubs.                         |
+| Mode command surface  | `Mode::available_commands` is not registered or consumed, so its mode-local command lists are currently dead code.                        |
+| Signal shutdown       | The tmux probe verifies that SIGTERM leaves its owned terminal raw and without echo; signal-aware restoration is required in Phase 1.     |
 | Performance coverage  | The harness measures core editing and terminal full redraw only, not GPU redraw, input-to-presentation latency, or idle event-loop cost.  |
 
 Nothing in this table is waived. Each item is routed to a later phase of the roadmap.

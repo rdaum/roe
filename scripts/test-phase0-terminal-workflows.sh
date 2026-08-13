@@ -158,32 +158,46 @@ tmux -L "$tmux_socket" send-keys -t command-select C-x C-s
 finish_session command-select
 [[ "$(sed -n '1p' "$command_file")" == 'commandM' ]]
 
-# A notify event must wake the terminal loop and update the buffer without input.
+# Record the current notify/event-loop behavior. The delivered event remains
+# unapplied while idle and is processed when the next terminal event arrives.
 watch_file="$probe_dir/watch.txt"
 printf 'before\n' >"$watch_file"
 start_session watcher "$watch_file"
 printf 'after\n' >"$watch_file"
 sleep 1.2
+watcher_pane="$(tmux -L "$tmux_socket" capture-pane -p -t watcher)"
+[[ "$watcher_pane" == *before* ]]
 tmux -L "$tmux_socket" send-keys -t watcher -l X
 tmux -L "$tmux_socket" send-keys -t watcher C-x C-s
 finish_session watcher
 [[ "$(sed -n '1p' "$watch_file")" == 'Xafter' ]]
 
 # Record the current forced-shutdown behavior without risking the user's
-# terminal. Roe has no signal-aware cleanup path yet; SIGTERM ends the owned
-# tmux pane directly. Phase 1 must make this path restore the terminal itself.
-start_session forced-shutdown
-forced_pid="$(tmux -L "$tmux_socket" display-message -p -t forced-shutdown '#{pane_pid}')"
-kill -TERM "$forced_pid"
+# terminal. A wrapper remains in the owned pane after Roe receives SIGTERM and
+# records the pseudo-terminal state Roe left behind.
+forced_state="$probe_dir/forced-stty.txt"
+forced_marker="$probe_dir/forced-stty-ready"
+printf -v forced_command \
+    'cd %q; env -u DISPLAY -u WAYLAND_DISPLAY %q; stty -a >%q; : >%q; sleep 5' \
+    "$probe_dir" "$roe_binary" "$forced_state" "$forced_marker"
+tmux -L "$tmux_socket" new-session -d -s forced-shutdown -x 80 -y 24 "$forced_command"
+sleep 0.5
+forced_shell_pid="$(
+    tmux -L "$tmux_socket" display-message -p -t forced-shutdown '#{pane_pid}'
+)"
+forced_roe_pid="$(pgrep -P "$forced_shell_pid" -x roe | head -n 1)"
+[[ -n "$forced_roe_pid" ]]
+kill -TERM "$forced_roe_pid"
 for _ in $(seq 1 30); do
-    if ! tmux -L "$tmux_socket" has-session -t forced-shutdown 2>/dev/null; then
+    if [[ -f "$forced_marker" ]]; then
         break
     fi
     sleep 0.1
 done
-if tmux -L "$tmux_socket" has-session -t forced-shutdown 2>/dev/null; then
-    exit 1
-fi
+[[ -f "$forced_marker" ]]
+grep -q -- '-icanon' "$forced_state"
+grep -q -- '-echo' "$forced_state"
+tmux -L "$tmux_socket" kill-session -t forced-shutdown
 
 printf '%s\n' 'phase0_terminal_workflows=pass'
-printf '%s\n' 'phase0_forced_shutdown=no_signal_cleanup_handler'
+printf '%s\n' 'phase0_forced_shutdown=terminal_left_raw_without_echo'
