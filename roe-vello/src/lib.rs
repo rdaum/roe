@@ -234,7 +234,7 @@ impl<'a> RoeVelloApp<'a> {
 
         let mut session = HostSession::open_with_mica(editor, CapabilityGrants::editor_default())
             .map_err(FrontendError::MicaHost)?;
-        let initial = session.initial_output();
+        let initial = runtime.block_on(session.initial_output());
         let mut redraw_state = VelloRenderer::with_theme(theme.clone());
         if let Some(update) = initial.presentation.as_ref() {
             redraw_state

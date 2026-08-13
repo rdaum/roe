@@ -12,10 +12,10 @@
 //! transport.
 
 use crate::editor::{
-    BorderInfo, ChromeAction, CommandType, CommandWindowPosition, DragType, MouseDragState,
-    SplitDirection, WindowNode, WindowType,
+    BorderInfo, ChromeAction, CommandType, DragType, MouseDragState, SplitDirection, WindowNode,
+    WindowType,
 };
-use crate::keys::{CursorDirection, KeyAction, LogicalKey, NoBindings};
+use crate::keys::{CursorDirection, KeyAction, LogicalKey};
 use crate::mica_host::{
     MicaEventBatch, MicaHost, MicaHostError, MicaKeyResult, MicaPromptTarget, MicaPromptUpdate,
     normalized_key_sequence,
@@ -24,7 +24,6 @@ use crate::native_kernel::{
     Capability, CapabilityGrants, KernelError, NativeClock, NativeKernel, NativeOperation,
     NativeResult, ResourceId, TextSelection, ViewId,
 };
-use crate::syntax::{Color, face_registry};
 use crate::{BufferId, Editor, WindowId};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -319,7 +318,6 @@ pub struct HostSession {
     next_view_id: u64,
     pointer_selection: Option<(WindowId, usize)>,
     mica: Option<MicaHost>,
-    mica_palette_actions: HashMap<String, String>,
     mica_modes: HashMap<BufferId, String>,
     mica_faces: HashMap<String, HashMap<String, String>>,
     mica_configuration: HashMap<String, String>,
@@ -346,7 +344,6 @@ impl HostSession {
             next_view_id: 1,
             pointer_selection: None,
             mica: None,
-            mica_palette_actions: HashMap::new(),
             mica_modes: HashMap::new(),
             mica_faces: HashMap::new(),
             mica_configuration: HashMap::new(),
@@ -360,10 +357,8 @@ impl HostSession {
 
     /// Open the public-driver Mica endpoint used by the first integration
     /// wave. The ordinary constructor remains available for headless and
-    /// frontend-conformance tests that deliberately exercise only Rust policy.
+    /// protocol and native-mechanism tests that do not need policy dispatch.
     pub fn open_with_mica(editor: Editor, grants: CapabilityGrants) -> Result<Self, MicaHostError> {
-        let mut editor = editor;
-        editor.bindings = Box::new(NoBindings);
         let mut session = Self::open(editor, grants);
         session.mica = Some(MicaHost::open(
             &session.editor,
@@ -378,8 +373,6 @@ impl HostSession {
         grants: CapabilityGrants,
         clock: Arc<dyn NativeClock>,
     ) -> Result<Self, MicaHostError> {
-        let mut editor = editor;
-        editor.bindings = Box::new(NoBindings);
         let mut session = Self::open_with_kernel(
             editor,
             Arc::new(Mutex::new(NativeKernel::with_clock(grants, clock))),
@@ -409,7 +402,27 @@ impl HostSession {
         }
     }
 
-    pub fn initial_output(&mut self) -> SessionOutput {
+    pub async fn initial_output(&mut self) -> SessionOutput {
+        let mut lifecycle = vec![LifecycleEvent::Ready {
+            protocol_version: SESSION_PROTOCOL_VERSION,
+            capabilities: capability_list(self.kernel.lock().unwrap().grants()),
+        }];
+        if let Some(mut mica) = self.mica.take() {
+            let policy = mica
+                .publish_policy(&self.editor, &self.buffer_resources)
+                .await;
+            self.mica = Some(mica);
+            match policy {
+                Ok(events) => {
+                    let mut initial_invalidations = Vec::new();
+                    self.apply_mica_events(events, &mut lifecycle, &mut initial_invalidations)
+                        .await;
+                }
+                Err(error) => lifecycle.push(LifecycleEvent::Error(format!(
+                    "failed to publish initial Mica policy: {error}"
+                ))),
+            }
+        }
         self.revision.0 += 1;
         SessionOutput {
             protocol_version: SESSION_PROTOCOL_VERSION,
@@ -417,10 +430,7 @@ impl HostSession {
             input_sequence: self.next_sequence,
             presentation: Some(PresentationUpdate::Full(self.capture_snapshot())),
             native_completions: Vec::new(),
-            lifecycle: vec![LifecycleEvent::Ready {
-                protocol_version: SESSION_PROTOCOL_VERSION,
-                capabilities: capability_list(self.kernel.lock().unwrap().grants()),
-            }],
+            lifecycle,
         }
     }
 
@@ -498,20 +508,28 @@ impl HostSession {
                         lifecycle.push(LifecycleEvent::Error(message));
                     }
                     Some(Ok(MicaKeyResult::Unbound)) | None => {
-                        let direct = match text_character_from_keys(&keys) {
-                            Some(character) => {
-                                self.editor
-                                    .perform_native_action(KeyAction::AlphaNumeric(character))
-                                    .await
-                            }
-                            _ => self.editor.key_event(keys).await,
-                        };
-                        match direct {
-                            Ok(actions) => {
-                                self.resolve_actions(actions, &mut lifecycle, &mut invalidations)
+                        if let Some(character) = text_character_from_keys(&keys) {
+                            match self
+                                .editor
+                                .perform_native_action(KeyAction::AlphaNumeric(character))
+                                .await
+                            {
+                                Ok(actions) => {
+                                    self.resolve_actions(
+                                        actions,
+                                        &mut lifecycle,
+                                        &mut invalidations,
+                                    )
                                     .await;
+                                }
+                                Err(error) => self.fail_endpoint(error, &mut lifecycle),
                             }
-                            Err(error) => self.fail_endpoint(error, &mut lifecycle),
+                        } else {
+                            self.editor.set_echo_message(format!(
+                                "{} is undefined",
+                                normalized_key_sequence(&keys)
+                            ));
+                            invalidations.push(Invalidation::EchoArea);
                         }
                     }
                 }
@@ -815,7 +833,6 @@ impl HostSession {
         lifecycle: &mut Vec<LifecycleEvent>,
         invalidations: &mut Vec<Invalidation>,
     ) {
-        let buffer_candidates = events.buffer_candidates;
         if events.policy_reset {
             self.mica_modes.clear();
             self.mica_faces.clear();
@@ -853,9 +870,6 @@ impl HostSession {
                 }
                 _ => {}
             }
-        }
-        if !events.command_candidates.is_empty() {
-            self.mica_palette_actions = events.command_candidates.into_iter().collect();
         }
         for effect in events.effects {
             if let Some(window) = self.editor.windows.get_mut(effect.view) {
@@ -959,7 +973,7 @@ impl HostSession {
             if action.name == "insert_text" {
                 let actions = self.editor.insert_text(
                     action.text.unwrap_or_default(),
-                    &crate::mode::ActionPosition::Cursor,
+                    &crate::editor::ActionPosition::Cursor,
                 );
                 self.resolve_actions(actions, lifecycle, invalidations)
                     .await;
@@ -1043,70 +1057,6 @@ impl HostSession {
                     self.resolve_actions(vec![ChromeAction::Save], lifecycle, invalidations)
                         .await;
                 }
-                "find_file" => {
-                    self.resolve_actions(
-                        vec![ChromeAction::OpenFile(crate::editor::OpenType::New)],
-                        lifecycle,
-                        invalidations,
-                    )
-                    .await;
-                }
-                "visit_file" => {
-                    self.resolve_actions(
-                        vec![ChromeAction::OpenFile(crate::editor::OpenType::Visit)],
-                        lifecycle,
-                        invalidations,
-                    )
-                    .await;
-                }
-                "switch_buffer" => {
-                    if let Some(existing) = self.editor.find_command_window() {
-                        self.editor.close_command_window(existing);
-                    }
-                    self.editor.create_command_window(
-                        CommandType::BufferSwitch,
-                        CommandWindowPosition::Bottom,
-                        10,
-                        None,
-                        Some(buffer_candidates.clone()),
-                    );
-                    self.editor
-                        .set_echo_message("Mica buffer selection".to_owned());
-                    invalidations.push(Invalidation::Full);
-                }
-                "kill_buffer" => {
-                    if let Some(existing) = self.editor.find_command_window() {
-                        self.editor.close_command_window(existing);
-                    }
-                    self.editor.create_command_window(
-                        CommandType::KillBuffer,
-                        CommandWindowPosition::Bottom,
-                        10,
-                        None,
-                        Some(buffer_candidates.clone()),
-                    );
-                    self.editor
-                        .set_echo_message("Mica kill-buffer selection".to_owned());
-                    invalidations.push(Invalidation::Full);
-                }
-                "execute_command" => {
-                    let mut candidates: Vec<_> =
-                        self.mica_palette_actions.keys().cloned().collect();
-                    candidates.sort();
-                    if let Some(existing) = self.editor.find_command_window() {
-                        self.editor.close_command_window(existing);
-                    }
-                    self.editor.create_command_window(
-                        CommandType::Execute,
-                        CommandWindowPosition::Bottom,
-                        10,
-                        Some(candidates),
-                        None,
-                    );
-                    self.editor
-                        .set_echo_message("Mica command selection".to_owned());
-                    invalidations.push(Invalidation::Full);
-                }
                 "switch_buffer_selected" => {
                     if let Some(buffer) = action.buffer {
                         let actions = self.editor.select_mica_buffer(buffer, false);
@@ -1144,22 +1094,6 @@ impl HostSession {
                             "Mica file prompt result lost its path".to_owned(),
                         ));
                     }
-                }
-                "isearch_forward" => {
-                    self.resolve_actions(
-                        vec![ChromeAction::ISearchForward],
-                        lifecycle,
-                        invalidations,
-                    )
-                    .await;
-                }
-                "isearch_backward" => {
-                    self.resolve_actions(
-                        vec![ChromeAction::ISearchBackward],
-                        lifecycle,
-                        invalidations,
-                    )
-                    .await;
                 }
                 unknown => lifecycle.push(LifecycleEvent::Error(format!(
                     "unknown Mica host action: {unknown}"
@@ -1226,7 +1160,7 @@ impl HostSession {
             -isize::try_from(cursor.saturating_sub(boundary)).unwrap_or(isize::MAX)
         };
         self.editor
-            .kill_text(&crate::mode::ActionPosition::Cursor, count)
+            .kill_text(&crate::editor::ActionPosition::Cursor, count)
     }
 
     fn validate_envelope(&self, envelope: &InputEnvelope) -> Result<(), SessionError> {
@@ -1292,100 +1226,21 @@ impl HostSession {
     async fn resolve_actions(
         &mut self,
         actions: Vec<ChromeAction>,
-        lifecycle: &mut Vec<LifecycleEvent>,
+        _lifecycle: &mut Vec<LifecycleEvent>,
         invalidations: &mut Vec<Invalidation>,
     ) {
-        let mut pending: VecDeque<_> = self.editor.process_chrome_actions(actions).await.into();
+        let mut pending: VecDeque<_> = actions.into();
         while let Some(action) = pending.pop_front() {
             match action {
-                ChromeAction::Quit => lifecycle.push(LifecycleEvent::QuitRequested),
                 ChromeAction::Echo(message) => {
                     self.editor.set_echo_message(message);
                     invalidations.push(Invalidation::EchoArea);
                 }
                 ChromeAction::MarkDirty(_) => invalidations.push(Invalidation::Full),
-                ChromeAction::SplitHorizontal => {
-                    self.editor.split_horizontal();
-                    invalidations.push(Invalidation::Full);
-                }
-                ChromeAction::SplitVertical => {
-                    self.editor.split_vertical();
-                    invalidations.push(Invalidation::Full);
-                }
-                ChromeAction::SwitchWindow => {
-                    self.editor.switch_window();
-                    invalidations.push(Invalidation::Full);
-                }
-                ChromeAction::DeleteWindow => {
-                    if self.editor.delete_window() {
-                        invalidations.push(Invalidation::Full);
-                    }
-                }
-                ChromeAction::DeleteOtherWindows => {
-                    if self.editor.delete_other_windows() {
-                        invalidations.push(Invalidation::Full);
-                    }
-                }
-                ChromeAction::ShowMessages => {
-                    let buffer = self.editor.get_messages_buffer();
-                    if let Some(window) = self.editor.windows.get_mut(self.editor.active_window) {
-                        window.active_buffer = buffer;
-                        window.cursor = 0;
-                    }
-                    invalidations.push(Invalidation::Full);
-                }
-                ChromeAction::NewBufferWithMode {
-                    buffer_name,
-                    mode_name,
-                    initial_content,
-                } => {
-                    let cursor = initial_content.chars().count();
-                    if let Some(buffer) =
-                        self.editor
-                            .create_buffer_with_mode(buffer_name, mode_name, initial_content)
-                        && let Some(window) = self.editor.windows.get_mut(self.editor.active_window)
-                    {
-                        window.active_buffer = buffer;
-                        window.cursor = cursor;
-                    }
-                    invalidations.push(Invalidation::Full);
-                }
-                ChromeAction::ExecuteCommand(command_name) => {
-                    let Some(selector) = self.mica_palette_actions.get(&command_name).cloned()
-                    else {
-                        lifecycle.push(LifecycleEvent::Error(format!(
-                            "Mica command is no longer discoverable: {command_name}"
-                        )));
-                        continue;
-                    };
-                    let Some(mut mica) = self.mica.take() else {
-                        lifecycle.push(LifecycleEvent::Error(
-                            "Mica command selected without a live Mica host".to_owned(),
-                        ));
-                        continue;
-                    };
-                    let invoked = mica
-                        .invoke_selector(&self.editor, &self.buffer_resources, &selector)
-                        .await;
-                    self.mica = Some(mica);
-                    match invoked {
-                        Ok(events) => {
-                            Box::pin(self.apply_mica_events(events, lifecycle, invalidations)).await
-                        }
-                        Err(error) => lifecycle.push(LifecycleEvent::Error(error.to_string())),
-                    }
-                }
-                ChromeAction::FileWatcherStatus => {
-                    self.editor
-                        .set_echo_message(self.editor.file_watcher.status());
-                    invalidations.push(Invalidation::EchoArea);
+                ChromeAction::Save => {
+                    pending.extend(self.editor.save_active_buffer().await);
                 }
                 ChromeAction::CursorMove(_) | ChromeAction::BufferChanged { .. } => {}
-                // These are consumed by Editor::process_chrome_actions. If one
-                // survives, report it rather than letting a frontend interpret policy.
-                unexpected => lifecycle.push(LifecycleEvent::Error(format!(
-                    "unresolved editor action: {unexpected:?}"
-                ))),
             }
         }
     }
@@ -1561,7 +1416,6 @@ impl HostSession {
     fn capture_snapshot(&self) -> PresentationSnapshot {
         let mut styles = Vec::new();
         let mut style_by_name = HashMap::new();
-        let face_registry = face_registry().lock().ok();
         let mut views = Vec::new();
 
         for (window_id, window) in &self.editor.windows {
@@ -1589,75 +1443,45 @@ impl HostSession {
                 .take(visible_end_char.saturating_sub(visible_start_char))
                 .collect();
 
-            let styled_ranges = if self.mica.is_some() {
-                self.mica_search_ranges
-                    .get(&window_id)
-                    .into_iter()
-                    .flatten()
-                    .filter(|(start, end, _)| {
-                        *end > visible_start_char && *start < visible_end_char
-                    })
-                    .map(|(start, end, name)| {
-                        let style = *style_by_name.entry(name.clone()).or_insert_with(|| {
-                            let id = StyleRef(styles.len() as u32 + 1);
-                            let attributes = self.mica_faces.get(name);
-                            styles.push(StyleDefinition {
-                                id,
-                                name: name.clone(),
-                                foreground: attributes
-                                    .and_then(|values| values.get("foreground"))
-                                    .and_then(|value| presentation_color_hex(value)),
-                                background: attributes
-                                    .and_then(|values| values.get("background"))
-                                    .and_then(|value| presentation_color_hex(value)),
-                                bold: attributes
-                                    .and_then(|values| values.get("weight"))
-                                    .is_some_and(|value| value == "bold"),
-                                italic: attributes
-                                    .and_then(|values| values.get("slant"))
-                                    .is_some_and(|value| value == "italic"),
-                                underline: attributes
-                                    .and_then(|values| values.get("underline"))
-                                    .is_some_and(|value| value == "true"),
-                                strikethrough: false,
-                            });
-                            id
+            let styled_ranges = self
+                .mica_search_ranges
+                .get(&window_id)
+                .into_iter()
+                .flatten()
+                .filter(|(start, end, _)| *end > visible_start_char && *start < visible_end_char)
+                .map(|(start, end, name)| {
+                    let style = *style_by_name.entry(name.clone()).or_insert_with(|| {
+                        let id = StyleRef(styles.len() as u32 + 1);
+                        let attributes = self.mica_faces.get(name);
+                        styles.push(StyleDefinition {
+                            id,
+                            name: name.clone(),
+                            foreground: attributes
+                                .and_then(|values| values.get("foreground"))
+                                .and_then(|value| presentation_color_hex(value)),
+                            background: attributes
+                                .and_then(|values| values.get("background"))
+                                .and_then(|value| presentation_color_hex(value)),
+                            bold: attributes
+                                .and_then(|values| values.get("weight"))
+                                .is_some_and(|value| value == "bold"),
+                            italic: attributes
+                                .and_then(|values| values.get("slant"))
+                                .is_some_and(|value| value == "italic"),
+                            underline: attributes
+                                .and_then(|values| values.get("underline"))
+                                .is_some_and(|value| value == "true"),
+                            strikethrough: false,
                         });
-                        StyledRange {
-                            start: *start,
-                            end: *end,
-                            style,
-                        }
-                    })
-                    .collect()
-            } else {
-                buffer
-                    .spans_in_range(visible_start_char..visible_end_char)
-                    .into_iter()
-                    .filter_map(|span| {
-                        let face = face_registry.as_ref()?.get(span.face_id)?;
-                        let style = *style_by_name.entry(face.name.clone()).or_insert_with(|| {
-                            let id = StyleRef(styles.len() as u32 + 1);
-                            styles.push(StyleDefinition {
-                                id,
-                                name: face.name.clone(),
-                                foreground: face.foreground.as_ref().map(presentation_color),
-                                background: face.background.as_ref().map(presentation_color),
-                                bold: face.bold,
-                                italic: face.italic,
-                                underline: face.underline,
-                                strikethrough: face.strikethrough,
-                            });
-                            id
-                        });
-                        Some(StyledRange {
-                            start: span.start,
-                            end: span.end,
-                            style,
-                        })
-                    })
-                    .collect()
-            };
+                        id
+                    });
+                    StyledRange {
+                        start: *start,
+                        end: *end,
+                        style,
+                    }
+                })
+                .collect();
 
             let selection = buffer
                 .get_region(window.cursor)
@@ -1667,11 +1491,7 @@ impl HostSession {
                 .mica_modes
                 .get(&window.active_buffer)
                 .cloned()
-                .unwrap_or_else(|| {
-                    buffer
-                        .major_mode()
-                        .unwrap_or_else(|| "fundamental".to_string())
-                });
+                .unwrap_or_else(|| "unpublished".to_string());
             let modeline = format!(
                 "{} ({mode}) {}:{}",
                 buffer.object(),
@@ -2045,18 +1865,6 @@ fn native_result_size(result: &NativeResult) -> usize {
     }
 }
 
-fn presentation_color(color: &Color) -> PresentationColor {
-    match color {
-        Color::Rgb { r, g, b } => PresentationColor::Rgb {
-            r: *r,
-            g: *g,
-            b: *b,
-        },
-        Color::Named(name) => PresentationColor::Named(name.clone()),
-        Color::Inherit => PresentationColor::Inherit,
-    }
-}
-
 fn presentation_color_hex(value: &str) -> Option<PresentationColor> {
     let hex = value.strip_prefix('#')?;
     if hex.len() != 6 {
@@ -2072,15 +1880,11 @@ fn presentation_color_hex(value: &str) -> Option<PresentationColor> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer_host;
-    use crate::command_registry;
     use crate::editor::{Frame, Window, WindowNode};
-    use crate::keys::{ConfigurableBindings, KeyState};
     use crate::kill_ring::KillRing;
     use crate::native_services::SystemClock;
-    use crate::{Buffer, BufferId, Mode, ModeId};
+    use crate::{Buffer, BufferId};
     use slotmap::SlotMap;
-    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
     static MICA_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -2095,24 +1899,10 @@ mod tests {
 
     fn test_editor() -> Editor {
         let mut buffers: SlotMap<BufferId, Buffer> = SlotMap::default();
-        let buffer = Buffer::new(&[]);
+        let buffer = Buffer::new();
         buffer.set_object("*test*".to_string());
         buffer.load_str("hello");
-        let buffer_id = buffers.insert(buffer.clone());
-        let mut modes: SlotMap<ModeId, Box<dyn Mode>> = SlotMap::default();
-        let mode_id = modes.insert(Box::new(crate::mode::FileMode {
-            file_path: "*test*".to_string(),
-        }));
-        let mode = modes.remove(mode_id).unwrap();
-        let mut hosts = HashMap::new();
-        hosts.insert(
-            buffer_id,
-            buffer_host::create_buffer_host(
-                buffer,
-                vec![(mode_id, "file".to_string(), mode)],
-                buffer_id,
-            ),
-        );
+        let buffer_id = buffers.insert(buffer);
         let mut windows = SlotMap::default();
         let window_id = windows.insert(Window {
             x: 0,
@@ -2128,25 +1918,18 @@ mod tests {
         Editor {
             frame: Frame::new(80, 23),
             buffers,
-            buffer_hosts: hosts,
             windows,
-            modes,
             active_window: window_id,
             previous_active_window: None,
-            key_state: KeyState::new(),
-            bindings: Box::new(ConfigurableBindings::new()),
             window_tree: WindowNode::new_leaf(window_id),
             kill_ring: KillRing::without_clipboard(60),
-            command_registry: command_registry::create_default_registry(),
             buffer_history: vec![buffer_id],
             echo_message: String::new(),
             echo_message_time: None,
             clock: Arc::new(SystemClock),
-            current_key_chord: Vec::new(),
             mouse_drag_state: None,
             messages_buffer_id: None,
             file_watcher: crate::file_watcher::FileWatcher::new(),
-            last_search_term: String::new(),
         }
     }
 
@@ -2292,12 +2075,7 @@ mod tests {
             let original_view = session.editor.active_window;
             let buffer = session
                 .editor
-                .create_buffer_with_mode(
-                    "*dynamic*".to_owned(),
-                    "scratch".to_owned(),
-                    "new".to_owned(),
-                )
-                .unwrap();
+                .create_buffer("*dynamic*".to_owned(), "new".to_owned());
             let view = session.editor.split_horizontal();
             session.editor.active_window = view;
             session.editor.windows[view].active_buffer = buffer;
@@ -2324,7 +2102,6 @@ mod tests {
             session.editor.windows.remove(view);
             session.editor.window_tree = WindowNode::new_leaf(original_view);
             session.editor.buffers.remove(buffer);
-            session.editor.buffer_hosts.remove(&buffer);
             let _ = session.synchronize_identities();
             let after_removal = session
                 .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Function(12)])))
@@ -2851,7 +2628,7 @@ mod tests {
     fn ordered_input_produces_monotonic_revisions() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let mut session = test_session();
-            let initial = session.initial_output();
+            let initial = session.initial_output().await;
             let first_revision = snapshot(&initial).revision;
             let envelope = session.envelope(InputEvent::Text("!".to_string()));
             let output = session.dispatch(envelope).await.unwrap();
@@ -3022,7 +2799,7 @@ mod tests {
             std::fs::write(&path, "before").unwrap();
 
             let mut session = test_session();
-            let initial = session.initial_output();
+            let initial = session.initial_output().await;
             let resource = snapshot(&initial).views[0].resource;
             let registered = session
                 .dispatch(session.envelope(InputEvent::NativeRequest {
@@ -3131,7 +2908,7 @@ mod tests {
     fn idle_heartbeat_does_not_advance_presentation_revision() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let mut session = test_session();
-            let initial = session.initial_output();
+            let initial = session.initial_output().await;
             let revision = snapshot(&initial).revision;
             let heartbeat = session
                 .dispatch(session.envelope(InputEvent::Heartbeat))

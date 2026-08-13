@@ -13,12 +13,8 @@
 
 //! Roe editor with Vello/GPU rendering backend.
 
-use roe_core::{
-    Buffer, BufferId, ConfigurableBindings, Editor, Frame, KeyState, Mode, ModeId, Window,
-    WindowId, buffer_host, command_registry, editor, kill_ring, mode,
-};
+use roe_core::{Buffer, BufferId, Editor, Frame, Window, WindowId, editor, kill_ring};
 use slotmap::SlotMap;
-use std::collections::HashMap;
 
 /// Default window size in character cells (will be adjusted by actual window size)
 const DEFAULT_COLS: u16 = 120;
@@ -95,47 +91,25 @@ struct EditorConfig {
 }
 
 async fn create_editor(config: EditorConfig) -> std::io::Result<Editor> {
-    // This construction-time table supplies direct editing mechanics. The
-    // Mica-enabled HostSession replaces global command/keymap policy.
-    let bindings = ConfigurableBindings::new();
-
     let mut buffers: SlotMap<BufferId, Buffer> = SlotMap::default();
-    let mut buffer_hosts: HashMap<BufferId, buffer_host::BufferHostClient> = HashMap::new();
-    let mut modes: SlotMap<ModeId, Box<dyn Mode>> = SlotMap::default();
 
     let mut first_buffer_id = None;
 
     if config.file_paths.is_empty() {
         // No files specified, create welcome screen buffer
-        let welcome_mode = Box::new(mode::MessagesMode {});
-        let welcome_mode_id = modes.insert(welcome_mode);
-
-        let buffer = Buffer::new(&[welcome_mode_id]);
+        let buffer = Buffer::new();
         buffer.set_object("*Welcome*".to_string());
         buffer.load_str(&create_welcome_screen_content());
 
-        let buffer_id = buffers.insert(buffer.clone());
+        let buffer_id = buffers.insert(buffer);
         first_buffer_id = Some(buffer_id);
-
-        let welcome_mode = modes
-            .remove(welcome_mode_id)
-            .expect("MessagesMode should exist");
-        let mode_list = vec![(welcome_mode_id, "welcome".to_string(), welcome_mode)];
-
-        let buffer_client = buffer_host::create_buffer_host(buffer, mode_list, buffer_id);
-        buffer_hosts.insert(buffer_id, buffer_client);
     } else {
         // Create buffers for all specified files
         for file_path in config.file_paths {
-            let file_mode = Box::new(mode::FileMode {
-                file_path: file_path.clone(),
-            });
-            let file_mode_id = modes.insert(file_mode);
-
-            let buffer = match Buffer::from_file(&file_path, &[file_mode_id]).await {
+            let buffer = match Buffer::from_file(&file_path).await {
                 Ok(buffer) => buffer,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    let buffer = Buffer::new(&[file_mode_id]);
+                    let buffer = Buffer::new();
                     buffer.set_object(file_path.clone());
                     buffer
                 }
@@ -147,17 +121,11 @@ async fn create_editor(config: EditorConfig) -> std::io::Result<Editor> {
                 }
             };
 
-            let buffer_id = buffers.insert(buffer.clone());
+            let buffer_id = buffers.insert(buffer);
 
             if first_buffer_id.is_none() {
                 first_buffer_id = Some(buffer_id);
             }
-
-            let file_mode = modes.remove(file_mode_id).expect("FileMode should exist");
-            let mode_list = vec![(file_mode_id, "file".to_string(), file_mode)];
-
-            let buffer_client = buffer_host::create_buffer_host(buffer, mode_list, buffer_id);
-            buffer_hosts.insert(buffer_id, buffer_client);
         }
     }
 
@@ -188,25 +156,18 @@ async fn create_editor(config: EditorConfig) -> std::io::Result<Editor> {
     let mut editor = Editor {
         frame: Frame::new(DEFAULT_COLS, DEFAULT_LINES),
         buffers,
-        buffer_hosts,
         windows,
-        modes,
         active_window: active_window_id,
         previous_active_window: None,
-        key_state: KeyState::new(),
-        bindings: Box::new(bindings),
         window_tree,
         kill_ring: kill_ring::KillRing::new(),
-        command_registry: command_registry::create_default_registry(),
         buffer_history: Vec::new(),
         echo_message: String::new(),
         echo_message_time: None,
         clock: std::sync::Arc::new(roe_core::native_services::SystemClock),
-        current_key_chord: Vec::new(),
         mouse_drag_state: None,
         messages_buffer_id: None,
         file_watcher,
-        last_search_term: String::new(),
     };
 
     // Initialize buffer history

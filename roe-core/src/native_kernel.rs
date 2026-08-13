@@ -336,7 +336,7 @@ impl NativeKernel {
         match operation {
             NativeOperation::CreateText { name, initial } => {
                 self.require(Capability::TextWrite)?;
-                let buffer = Buffer::new(&[]);
+                let buffer = Buffer::new();
                 buffer.set_object(name);
                 buffer.load_str(&initial);
                 Ok(NativeResult::ResourceCreated(self.register_buffer(buffer)))
@@ -1002,7 +1002,7 @@ mod tests {
         std::fs::write(&path, "before").unwrap();
 
         let mut kernel = NativeKernel::new(CapabilityGrants::new([Capability::Watch]));
-        let resource = kernel.register_buffer(Buffer::new(&[]));
+        let resource = kernel.register_buffer(Buffer::new());
         kernel
             .execute(NativeOperation::RegisterWatch {
                 resource,
@@ -1051,7 +1051,7 @@ mod tests {
         std::fs::write(&path, "content").unwrap();
 
         let mut kernel = NativeKernel::new(CapabilityGrants::new([Capability::Watch]));
-        let resource = kernel.register_buffer(Buffer::new(&[]));
+        let resource = kernel.register_buffer(Buffer::new());
         kernel
             .execute(NativeOperation::RegisterWatch {
                 resource,

@@ -19,13 +19,9 @@ use crossterm::execute;
 use crossterm::terminal::disable_raw_mode;
 use roe_core::native_kernel::CapabilityGrants;
 use roe_core::session::{HostSession, InputEvent, LifecycleEvent};
-use roe_core::{
-    Buffer, BufferId, ConfigurableBindings, Editor, Frame, KeyState, Mode, ModeId, Window,
-    WindowId, buffer_host, command_registry, editor, kill_ring, mode,
-};
+use roe_core::{Buffer, BufferId, Editor, Frame, Window, WindowId, editor, kill_ring};
 use roe_terminal::{ECHO_AREA_HEIGHT, TerminalRenderer};
 use slotmap::SlotMap;
-use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -175,50 +171,26 @@ async fn terminal_main<W: Write>(
 
     let tsize = crossterm::terminal::size()?;
 
-    // This construction-time table supplies direct editing mechanics. The
-    // Mica-enabled HostSession replaces global command/keymap policy.
-    let bindings = ConfigurableBindings::new();
-
     let mut buffers: SlotMap<BufferId, Buffer> = SlotMap::default();
-    let mut buffer_hosts: HashMap<BufferId, buffer_host::BufferHostClient> = HashMap::new();
-    let mut modes: SlotMap<ModeId, Box<dyn Mode>> = SlotMap::default();
 
     let mut first_buffer_id = None;
 
     if config.file_paths.is_empty() {
         // No files specified, create welcome screen buffer
-        let welcome_mode = Box::new(mode::MessagesMode {});
-        let welcome_mode_id = modes.insert(welcome_mode);
-
-        let buffer = Buffer::new(&[welcome_mode_id]);
+        let buffer = Buffer::new();
         buffer.set_object("*Welcome*".to_string());
         buffer.load_str(&create_welcome_screen_content());
 
-        let buffer_id = buffers.insert(buffer.clone());
+        let buffer_id = buffers.insert(buffer);
         first_buffer_id = Some(buffer_id);
-
-        // Create BufferHost with MessagesMode for the welcome buffer
-        let welcome_mode = modes
-            .remove(welcome_mode_id)
-            .expect("MessagesMode should exist in modes SlotMap");
-        let mode_list = vec![(welcome_mode_id, "welcome".to_string(), welcome_mode)];
-
-        let buffer_client = buffer_host::create_buffer_host(buffer, mode_list, buffer_id);
-        buffer_hosts.insert(buffer_id, buffer_client);
     } else {
         // Create buffers for all specified files
         for file_path in config.file_paths {
-            // Create FileMode for this file
-            let file_mode = Box::new(mode::FileMode {
-                file_path: file_path.clone(),
-            });
-            let file_mode_id = modes.insert(file_mode);
-
             // Load an existing file, or create a new buffer only when it is absent.
-            let buffer = match Buffer::from_file(&file_path, &[file_mode_id]).await {
+            let buffer = match Buffer::from_file(&file_path).await {
                 Ok(buffer) => buffer,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    let buffer = Buffer::new(&[file_mode_id]);
+                    let buffer = Buffer::new();
                     buffer.set_object(file_path.clone());
                     buffer
                 }
@@ -230,22 +202,12 @@ async fn terminal_main<W: Write>(
                 }
             };
 
-            let buffer_id = buffers.insert(buffer.clone());
+            let buffer_id = buffers.insert(buffer);
 
             // Remember the first buffer for the initial window
             if first_buffer_id.is_none() {
                 first_buffer_id = Some(buffer_id);
             }
-
-            // Create BufferHost with mode for this buffer
-            let file_mode = modes
-                .remove(file_mode_id)
-                .expect("FileMode should exist in modes SlotMap");
-            let mode_list = vec![(file_mode_id, "file".to_string(), file_mode)];
-
-            // Create BufferHost and client
-            let buffer_client = buffer_host::create_buffer_host(buffer, mode_list, buffer_id);
-            buffer_hosts.insert(buffer_id, buffer_client);
         }
     }
 
@@ -325,25 +287,18 @@ async fn terminal_main<W: Write>(
     let mut editor = Editor {
         frame: Frame::new(tsize.0, tsize.1 - ECHO_AREA_HEIGHT),
         buffers,
-        buffer_hosts,
         windows,
-        modes,
         active_window: active_window_id,
         previous_active_window: None,
-        key_state: KeyState::new(),
-        bindings: Box::new(bindings),
         window_tree,
         kill_ring: kill_ring::KillRing::new(),
-        command_registry: command_registry::create_default_registry(),
         buffer_history: Vec::new(),
         echo_message: String::new(),
         echo_message_time: None,
         clock: std::sync::Arc::new(roe_core::native_services::SystemClock),
-        current_key_chord: Vec::new(),
         mouse_drag_state: None,
         messages_buffer_id: None,
         file_watcher,
-        last_search_term: String::new(),
     };
 
     // Initialize buffer history with the current buffer
@@ -373,7 +328,7 @@ async fn terminal_main<W: Write>(
     let mut session = HostSession::open_with_mica(editor, CapabilityGrants::editor_default())
         .map_err(|error| std::io::Error::other(format!("failed to start Mica host: {error}")))?;
 
-    let initial = session.initial_output();
+    let initial = session.initial_output().await;
     if let Some(update) = initial.presentation.as_ref() {
         renderer.apply_session_presentation(update)?;
     }

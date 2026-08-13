@@ -434,6 +434,15 @@ verb roe/dispatch_key(actor, session, sequence @ #string)
     if roe/KeyPrefix(sequence)
       return :prefix
     end
+    if string_len(sequence) == 1
+      emit(session, {:kind -> :native_action, :action -> :insert_text, :text -> sequence})
+      let view = one roe/ActiveView(session, ?view)
+      let buffer = one roe/ViewBuffer(view, ?buffer)
+      for hook in roe/EffectiveModeHook(buffer, ?hook, ?precedence)
+        emit(session, {:kind -> :host_action, :action -> hook[:hook], :view -> view})
+      end
+      return :handled
+    end
     return :unbound
   end
   if ambiguous

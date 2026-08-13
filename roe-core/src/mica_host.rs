@@ -75,6 +75,9 @@ const FIRST_WAVE_SOURCE: &str = include_str!("../../mica/roe-first-wave.mica");
 const EVENT_QUEUE_CAPACITY: usize = 256;
 const EXTERNAL_REQUEST_CAPACITY: usize = 16;
 const SUBSCRIPTION_QUEUE_BUDGET: usize = 64;
+const MAX_PROMPT_CANDIDATES: usize = 256;
+const MAX_SEARCH_MATCHES: usize = 1_024;
+const MAX_POLICY_FACTS: usize = 256;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MicaHostError {
@@ -165,8 +168,6 @@ pub struct MicaEventBatch {
     pub prompt_close: bool,
     pub search_updates: Vec<MicaSearchUpdate>,
     pub search_finishes: Vec<MicaSearchFinish>,
-    pub command_candidates: Vec<(String, String)>,
-    pub buffer_candidates: Vec<(BufferId, String)>,
     pub errors: Vec<String>,
     pub cancelled_tasks: Vec<TaskId>,
     pub ready_subscriptions: Vec<u64>,
@@ -178,18 +179,31 @@ impl MicaEventBatch {
         self.host_actions.append(&mut other.host_actions);
         self.native_actions.append(&mut other.native_actions);
         self.policy_reset |= other.policy_reset;
-        self.policy_facts.append(&mut other.policy_facts);
+        for policy in other.policy_facts.drain(..) {
+            self.push_policy(policy);
+        }
         self.prompt_updates.append(&mut other.prompt_updates);
         self.prompt_close |= other.prompt_close;
         self.search_updates.append(&mut other.search_updates);
         self.search_finishes.append(&mut other.search_finishes);
-        self.command_candidates
-            .append(&mut other.command_candidates);
-        self.buffer_candidates.append(&mut other.buffer_candidates);
         self.errors.append(&mut other.errors);
         self.cancelled_tasks.append(&mut other.cancelled_tasks);
         self.ready_subscriptions
             .append(&mut other.ready_subscriptions);
+    }
+
+    fn push_policy(&mut self, policy: MicaPolicyFact) {
+        if self.policy_facts.len() < MAX_POLICY_FACTS {
+            self.policy_facts.push(policy);
+        } else if !self
+            .errors
+            .iter()
+            .any(|error| error.contains("policy fact limit"))
+        {
+            self.errors.push(format!(
+                "Mica policy fact limit of {MAX_POLICY_FACTS} exceeded"
+            ));
+        }
     }
 }
 
@@ -643,11 +657,10 @@ impl MicaHost {
         batch
     }
 
-    pub async fn invoke_selector(
+    pub async fn publish_policy(
         &mut self,
         editor: &Editor,
         resource_ids: &HashMap<BufferId, ResourceId>,
-        selector: &str,
     ) -> Result<MicaEventBatch, MicaHostError> {
         if self.closed {
             return Err(MicaHostError::Closed);
@@ -657,7 +670,7 @@ impl MicaHost {
             .driver
             .submit_invocation_for_endpoint(
                 self.endpoint,
-                sym(selector),
+                sym("roe/publish_policy"),
                 vec![
                     (sym("actor"), Value::identity(self.actor)),
                     (sym("session"), Value::identity(self.session)),
@@ -1117,7 +1130,7 @@ end
                             batch.policy_reset = true;
                         } else if let Some(policy) = self.policy_fact(effect.target, &effect.value)
                         {
-                            batch.policy_facts.push(policy);
+                            batch.push_policy(policy);
                         } else if let Some(action) =
                             self.native_action(effect.target, &effect.value)
                         {
@@ -1125,14 +1138,6 @@ end
                         } else if let Some(action) = self.host_action(effect.target, &effect.value)
                         {
                             batch.host_actions.push(action);
-                        } else if let Some(candidate) =
-                            self.command_candidate(effect.target, &effect.value)
-                        {
-                            batch.command_candidates.push(candidate);
-                        } else if let Some(candidate) =
-                            self.buffer_candidate(effect.target, &effect.value)
-                        {
-                            batch.buffer_candidates.push(candidate);
                         }
                     }
                     DriverEvent::TaskCompleted {
@@ -1199,17 +1204,11 @@ end
                 } else if self.policy_reset(effect.target, &effect.value) {
                     batch.policy_reset = true;
                 } else if let Some(policy) = self.policy_fact(effect.target, &effect.value) {
-                    batch.policy_facts.push(policy);
+                    batch.push_policy(policy);
                 } else if let Some(action) = self.native_action(effect.target, &effect.value) {
                     batch.native_actions.push(action);
                 } else if let Some(action) = self.host_action(effect.target, &effect.value) {
                     batch.host_actions.push(action);
-                } else if let Some(candidate) = self.command_candidate(effect.target, &effect.value)
-                {
-                    batch.command_candidates.push(candidate);
-                } else if let Some(candidate) = self.buffer_candidate(effect.target, &effect.value)
-                {
-                    batch.buffer_candidates.push(candidate);
                 }
             }
             DriverEvent::TaskAborted { task_id, error } => batch.errors.push(format!(
@@ -1375,7 +1374,7 @@ end
         let selected = usize::try_from(map_value(value, "selected")?.as_int()?).ok()?;
         let values = map_value(value, "candidates")?;
         let mut candidates = Vec::new();
-        for index in 0..values.list_len()? {
+        for index in 0..values.list_len()?.min(MAX_PROMPT_CANDIDATES) {
             let row = values.list_get(index)?;
             let name = row.list_get(0)?.with_str(str::to_owned)?;
             let raw = row.list_get(1)?;
@@ -1413,7 +1412,7 @@ end
             .find_map(|(view, identity)| (*identity == logical).then_some(*view))?;
         let raw = map_value(value, "matches")?;
         let mut matches = Vec::new();
-        for index in 0..raw.list_len()? {
+        for index in 0..raw.list_len()?.min(MAX_SEARCH_MATCHES) {
             let row = raw.list_get(index)?;
             let start = usize::try_from(row.list_get(0)?.as_int()?).ok()?;
             let end = usize::try_from(row.list_get(1)?.as_int()?).ok()?;
@@ -1445,35 +1444,6 @@ end
             query: map_value(value, "query")?.with_str(str::to_owned)?,
             accepted: map_value(value, "accepted")?.as_bool()?,
         })
-    }
-
-    fn command_candidate(&self, target: Identity, value: &Value) -> Option<(String, String)> {
-        if target != self.session
-            || map_value(value, "kind")?.as_symbol()? != sym("command_candidate")
-        {
-            return None;
-        }
-        let name = map_value(value, "name")?.with_str(str::to_owned)?;
-        let action = map_value(value, "selector")?
-            .as_symbol()?
-            .name()
-            .map(str::to_owned)?;
-        Some((name, action))
-    }
-
-    fn buffer_candidate(&self, target: Identity, value: &Value) -> Option<(BufferId, String)> {
-        if target != self.session
-            || map_value(value, "kind")?.as_symbol()? != sym("buffer_candidate")
-        {
-            return None;
-        }
-        let logical = map_value(value, "buffer")?.as_identity()?;
-        let buffer = self
-            .buffer_ids
-            .iter()
-            .find_map(|(buffer, identity)| (*identity == logical).then_some(*buffer))?;
-        let name = map_value(value, "name")?.with_str(str::to_owned)?;
-        Some((buffer, name))
     }
 
     pub async fn close(&mut self) -> Result<MicaEventBatch, MicaHostError> {

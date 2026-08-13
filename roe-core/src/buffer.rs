@@ -11,12 +11,9 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
-use crate::ModeId;
-use crate::syntax::{FaceId, HighlightSpan, SpanStore};
 use crate::undo::{EditOp, UndoManager};
 use compio::buf::BufResult;
 use compio::io::AsyncReadAtExt;
-use std::ops::Range;
 use std::sync::{Arc, RwLock};
 
 /// The internal data structure for a buffer
@@ -24,19 +21,12 @@ use std::sync::{Arc, RwLock};
 pub struct BufferInner {
     // Title / filename
     pub(crate) object: String,
-    /// Modes in order of majority. The first mode is the primary mode, etc.
-    /// Like emacs major/minor mode but with N minor modes.
-    pub(crate) modes: Vec<ModeId>,
     pub(crate) buffer: ropey::Rope,
     /// Mark position for region selection (None = no mark set)
     pub(crate) mark: Option<usize>,
     /// Whether the mark is transient (CUA-style shift-select) vs persistent (Emacs C-Space)
     /// Transient marks are cleared on non-shift cursor movement
     pub(crate) transient_mark: bool,
-    /// Syntax highlighting spans (auto-adjusted on edits)
-    pub(crate) spans: SpanStore,
-    /// Major mode name (e.g., "rust-mode", "fundamental-mode")
-    pub(crate) major_mode: Option<String>,
     /// Whether to show the gutter (line numbers, status) for this buffer
     pub(crate) show_gutter: bool,
     /// Undo/redo history manager
@@ -44,15 +34,12 @@ pub struct BufferInner {
 }
 
 impl BufferInner {
-    pub fn new(modes: &[ModeId]) -> Self {
+    pub fn new() -> Self {
         Self {
             object: String::new(),
-            modes: modes.to_vec(),
             buffer: ropey::Rope::new(),
             mark: None,
             transient_mark: false,
-            spans: SpanStore::new(),
-            major_mode: None,
             show_gutter: false, // Default to no gutter for scratch buffers
             undo_manager: UndoManager::new(),
         }
@@ -63,18 +50,15 @@ impl BufferInner {
     }
 
     /// Create a new buffer inner and load content from a file
-    pub async fn from_file(file_path: &str, modes: &[ModeId]) -> Result<Self, std::io::Error> {
+    pub async fn from_file(file_path: &str) -> Result<Self, std::io::Error> {
         let mut file = compio::fs::File::open(file_path).await?;
         let BufResult(result, content) = file.read_to_string_at(String::new(), 0).await;
         result?;
         let buffer_inner = Self {
             object: file_path.to_string(),
-            modes: modes.to_vec(),
             buffer: ropey::Rope::from_str(&content),
             mark: None,
             transient_mark: false,
-            spans: SpanStore::new(),
-            major_mode: None,
             show_gutter: true, // Default to show gutter for file buffers
             undo_manager: UndoManager::new(),
         };
@@ -93,8 +77,6 @@ impl BufferInner {
         // Record for undo before modifying
         self.undo_manager.record_insert(position, fragment.clone());
         self.buffer.insert(position, &fragment);
-        // Adjust highlight spans for the insertion
-        self.spans.adjust_for_insert(position, len);
     }
 
     /// Delete a fragment of text from the buffer at the given line/col position.
@@ -131,8 +113,6 @@ impl BufferInner {
         self.undo_manager
             .record_delete(start as usize, deleted.clone());
         self.buffer.remove(start as usize..end as usize);
-        // Adjust highlight spans for the deletion
-        self.spans.adjust_for_delete(start as usize, end as usize);
         Some(deleted)
     }
 
@@ -547,8 +527,6 @@ impl BufferInner {
         // Record for undo before modifying
         self.undo_manager.record_delete(start, deleted.clone());
         self.buffer.remove(start..end);
-        // Adjust highlight spans for the deletion
-        self.spans.adjust_for_delete(start, end);
         self.clear_mark();
         // Cursor should be at the start of the deleted region
         Some((deleted, start))
@@ -564,8 +542,6 @@ impl BufferInner {
         // Record for undo before modifying
         self.undo_manager.record_delete(start, deleted.clone());
         self.buffer.remove(start..end);
-        // Adjust highlight spans for the deletion
-        self.spans.adjust_for_delete(start, end);
         Some(deleted)
     }
 
@@ -593,13 +569,11 @@ impl BufferInner {
             EditOp::Insert { pos, text } => {
                 let len = text.chars().count();
                 self.buffer.insert(*pos, text);
-                self.spans.adjust_for_insert(*pos, len);
                 pos + len
             }
             EditOp::Delete { pos, text } => {
                 let end = pos + text.chars().count();
                 self.buffer.remove(*pos..end);
-                self.spans.adjust_for_delete(*pos, end);
                 *pos
             }
             EditOp::Group(ops) => {
@@ -637,47 +611,11 @@ impl BufferInner {
     pub fn undo_boundary(&mut self) {
         self.undo_manager.boundary();
     }
+}
 
-    // === SYNTAX HIGHLIGHTING SPAN OPERATIONS ===
-
-    /// Add a highlight span to the buffer
-    pub fn add_span(&mut self, span: HighlightSpan) {
-        self.spans.add_span(span);
-    }
-
-    /// Add multiple highlight spans at once
-    pub fn add_spans(&mut self, spans: impl IntoIterator<Item = HighlightSpan>) {
-        self.spans.add_spans(spans);
-    }
-
-    /// Clear all highlight spans
-    pub fn clear_spans(&mut self) {
-        self.spans.clear();
-    }
-
-    /// Clear highlight spans in a specific range (for incremental re-highlighting)
-    pub fn clear_spans_in_range(&mut self, range: Range<usize>) {
-        self.spans.clear_range(range);
-    }
-
-    /// Get the face ID at a specific position
-    pub fn face_at(&mut self, pos: usize) -> Option<FaceId> {
-        self.spans.face_at(pos)
-    }
-
-    /// Get all spans that overlap with a range
-    pub fn spans_in_range(&mut self, range: Range<usize>) -> Vec<&HighlightSpan> {
-        self.spans.spans_in_range(range)
-    }
-
-    /// Get all spans (for debugging/inspection)
-    pub fn all_spans(&mut self) -> &[HighlightSpan] {
-        self.spans.all_spans()
-    }
-
-    /// Check if buffer has any highlight spans
-    pub fn has_spans(&self) -> bool {
-        !self.spans.is_empty()
+impl Default for BufferInner {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -695,15 +633,15 @@ impl std::fmt::Debug for Buffer {
 
 impl Buffer {
     /// Create a new buffer
-    pub fn new(modes: &[ModeId]) -> Self {
+    pub fn new() -> Self {
         Self {
-            inner: Arc::new(RwLock::new(BufferInner::new(modes))),
+            inner: Arc::new(RwLock::new(BufferInner::new())),
         }
     }
 
     /// Create a new buffer and load content from a file
-    pub async fn from_file(file_path: &str, modes: &[ModeId]) -> Result<Self, std::io::Error> {
-        let buffer_inner = BufferInner::from_file(file_path, modes).await?;
+    pub async fn from_file(file_path: &str) -> Result<Self, std::io::Error> {
+        let buffer_inner = BufferInner::from_file(file_path).await?;
         Ok(Self {
             inner: Arc::new(RwLock::new(buffer_inner)),
         })
@@ -875,10 +813,6 @@ impl Buffer {
         self.with_read(|b| b.object.clone())
     }
 
-    pub fn modes(&self) -> Vec<ModeId> {
-        self.with_read(|b| b.modes.clone())
-    }
-
     pub fn load_str(&self, text: &str) {
         self.with_write(|b| b.load_str(text))
     }
@@ -903,16 +837,6 @@ impl Buffer {
     // Add mutable field access for main.rs compatibility
     pub fn set_object(&self, object: String) {
         self.with_write(|b| b.object = object)
-    }
-
-    /// Get the major mode name for this buffer
-    pub fn major_mode(&self) -> Option<String> {
-        self.with_read(|b| b.major_mode.clone())
-    }
-
-    /// Set the major mode for this buffer
-    pub fn set_major_mode(&self, mode_name: String) {
-        self.with_write(|b| b.major_mode = Some(mode_name))
     }
 
     /// Get whether the gutter should be shown for this buffer
@@ -940,49 +864,18 @@ impl Buffer {
     pub fn buffer_len_chars(&self) -> usize {
         self.with_read(|b| b.buffer.len_chars())
     }
+}
 
-    // === SYNTAX HIGHLIGHTING SPAN OPERATIONS ===
-
-    /// Add a highlight span to the buffer
-    pub fn add_span(&self, span: HighlightSpan) {
-        self.with_write(|b| b.add_span(span))
-    }
-
-    /// Add multiple highlight spans at once
-    pub fn add_spans(&self, spans: Vec<HighlightSpan>) {
-        self.with_write(|b| b.add_spans(spans))
-    }
-
-    /// Clear all highlight spans
-    pub fn clear_spans(&self) {
-        self.with_write(|b| b.clear_spans())
-    }
-
-    /// Clear highlight spans in a specific range (for incremental re-highlighting)
-    pub fn clear_spans_in_range(&self, range: Range<usize>) {
-        self.with_write(|b| b.clear_spans_in_range(range))
-    }
-
-    /// Get the face ID at a specific position
-    pub fn face_at(&self, pos: usize) -> Option<FaceId> {
-        self.with_write(|b| b.face_at(pos))
-    }
-
-    /// Get all spans that overlap with a range (returns cloned spans for thread safety)
-    pub fn spans_in_range(&self, range: Range<usize>) -> Vec<HighlightSpan> {
-        self.with_write(|b| b.spans_in_range(range).into_iter().cloned().collect())
-    }
-
-    /// Check if buffer has any highlight spans
-    pub fn has_spans(&self) -> bool {
-        self.with_read(|b| b.has_spans())
+impl Default for Buffer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 impl Clone for Buffer {
     fn clone(&self) -> Self {
         Self {
-            inner: self.inner.clone(),
+            inner: Arc::clone(&self.inner),
         }
     }
 }
@@ -992,7 +885,7 @@ mod tests {
     use super::*;
 
     fn test_buffer() -> BufferInner {
-        let mut buffer = BufferInner::new(&[]);
+        let mut buffer = BufferInner::new();
         buffer.load_str("Hello\ncruel\nworld!");
         buffer
     }
@@ -1029,21 +922,8 @@ mod tests {
     }
 
     #[test]
-    fn unicode_edits_adjust_highlight_spans_in_character_units() {
-        let mut buffer = BufferInner::new(&[]);
-        buffer.load_str("é cat");
-        buffer.add_span(HighlightSpan::new(2, 5, FaceId::default()));
-
-        buffer.insert_pos("λ".to_string(), 0);
-
-        let spans = buffer.all_spans();
-        assert_eq!((spans[0].start, spans[0].end), (3, 6));
-        assert_eq!(buffer.content(), "λé cat");
-    }
-
-    #[test]
     fn test_position_conversions_clamp_invalid_line_and_column() {
-        let mut buffer = BufferInner::new(&[]);
+        let mut buffer = BufferInner::new();
         buffer.load_str("abc\n\u{03bb}\u{03bc}\nlast");
 
         assert_eq!(buffer.to_char_index(99, 0), 3);
@@ -1059,7 +939,7 @@ mod tests {
 
     #[test]
     fn position_conversions_round_trip_at_u16_boundaries() {
-        let mut buffer = BufferInner::new(&[]);
+        let mut buffer = BufferInner::new();
         buffer.load_str(&"λ".repeat(u16::MAX as usize));
         let last_column = u16::MAX;
         assert_eq!(
@@ -1068,7 +948,7 @@ mod tests {
         );
         assert_eq!(buffer.to_char_index(last_column, 0), last_column as usize);
 
-        let mut buffer = BufferInner::new(&[]);
+        let mut buffer = BufferInner::new();
         buffer.load_str(&("λ\n".repeat(u16::MAX as usize) + "x"));
         let last_line_start = 2 * u16::MAX as usize;
         assert_eq!(buffer.to_column_line(last_line_start), (0, u16::MAX));
@@ -1077,7 +957,7 @@ mod tests {
 
     #[test]
     fn test_insert() {
-        let mut buffer = BufferInner::new(&[]);
+        let mut buffer = BufferInner::new();
         buffer.load_str("Hello, world!");
         buffer.insert_col_line("cruel ".to_string(), (7, 0));
         assert_eq!(buffer.content(), "Hello, cruel world!");
@@ -1091,7 +971,7 @@ mod tests {
 
     #[test]
     fn test_delete() {
-        let mut buffer = BufferInner::new(&[]);
+        let mut buffer = BufferInner::new();
         buffer.load_str("Hello, cruel world!");
         assert_eq!(
             buffer.delete_col_line((7, 0), 6),
@@ -1116,7 +996,7 @@ mod tests {
 
     #[test]
     fn test_delete_backwards() {
-        let mut buffer = BufferInner::new(&[]);
+        let mut buffer = BufferInner::new();
         buffer.load_str("Hello, cruel world!");
         assert_eq!(
             buffer.delete_col_line((13, 0), -6),
@@ -1240,7 +1120,7 @@ mod tests {
         assert_eq!(buffer.move_down(15), 15);
 
         // Test with empty buffer
-        let empty_buffer = BufferInner::new(&[]);
+        let empty_buffer = BufferInner::new();
         assert_eq!(empty_buffer.move_up(0), 0);
         assert_eq!(empty_buffer.move_down(0), 0);
         assert_eq!(empty_buffer.move_left(0), 0);
@@ -1374,7 +1254,7 @@ mod tests {
 
     #[test]
     fn test_word_movement() {
-        let buffer = BufferInner::new(&[]);
+        let buffer = BufferInner::new();
         // Load some test text with various word patterns
         let mut buffer = buffer;
         buffer.load_str("hello world  test\n  another line");
@@ -1418,7 +1298,7 @@ mod tests {
 
     #[test]
     fn test_paragraph_movement() {
-        let mut buffer = BufferInner::new(&[]);
+        let mut buffer = BufferInner::new();
         // Load text with multiple paragraphs separated by blank lines
         buffer.load_str("First paragraph\nstill first paragraph\n\nSecond paragraph\nstill second\n\n\nThird paragraph\nstill third");
 

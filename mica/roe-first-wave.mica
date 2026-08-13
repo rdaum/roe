@@ -144,6 +144,7 @@ assert roe/NativeBinding("C-S-Home", :cursor_buffer_start_select, 1000)
 assert roe/NativeBinding("C-S-End", :cursor_buffer_end_select, 1000)
 
 assert roe/NativeEditingAction(:backspace)
+assert roe/NativeEditingAction(:insert_text)
 assert roe/NativeEditingAction(:delete)
 assert roe/NativeEditingAction(:enter)
 assert roe/NativeEditingAction(:indent)

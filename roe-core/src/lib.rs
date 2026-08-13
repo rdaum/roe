@@ -14,25 +14,16 @@
 use slotmap::new_key_type;
 
 pub mod buffer;
-pub mod buffer_host;
-pub mod buffer_switch_mode;
-pub mod command_mode;
-pub mod command_registry;
 pub mod editor;
-pub mod file_selector_mode;
 pub mod file_watcher;
 pub mod gutter;
-pub mod isearch_mode;
 pub mod keys;
 pub mod kill_ring;
 pub mod mica_host;
-pub mod mode;
 pub mod native_kernel;
 pub mod native_services;
 pub mod renderer;
-pub mod selection_menu;
 pub mod session;
-pub mod syntax;
 pub mod undo;
 pub mod window;
 
@@ -44,17 +35,9 @@ new_key_type! {
     pub struct BufferId;
 }
 
-new_key_type! {
-    pub struct ModeId;
-}
-
 pub use buffer::Buffer;
 pub use editor::{Editor, Frame, Window};
 pub use gutter::{
     GutterConfig, GutterLine, LineStatus, calculate_gutter_width, format_line_number,
     get_line_status,
 };
-pub use keys::{Bindings, ConfigurableBindings, KeyState};
-pub use mode::{FileMode, Mode};
-pub use renderer::Renderer;
-pub use syntax::{Color, Face, FaceId, FaceRegistry, HighlightSpan, SpanStore};

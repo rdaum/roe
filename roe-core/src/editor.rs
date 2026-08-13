@@ -12,20 +12,12 @@
 //
 
 use crate::buffer::Buffer;
-use crate::buffer_host::{self, BufferHostClient};
-use crate::buffer_switch_mode::{BufferSwitchMode, BufferSwitchPurpose};
-use crate::command_mode::CommandMode;
-use crate::command_registry::CommandRegistry;
-use crate::file_selector_mode::FileSelectorMode;
-use crate::keys::KeyAction::ChordNext;
-use crate::keys::{Bindings, CursorDirection, KeyAction, KeyState, LogicalKey};
+use crate::keys::{CursorDirection, KeyAction};
 use crate::kill_ring::{ClipboardError, KillRing};
-use crate::mode::{ActionPosition, MessagesMode, Mode};
 use crate::native_services::Clock;
 use crate::renderer::{DirtyRegion, ModelineComponent};
-use crate::{BufferId, ModeId, WindowId};
+use crate::{BufferId, WindowId};
 use slotmap::SlotMap;
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -208,18 +200,12 @@ impl Frame {
 pub struct Editor {
     pub frame: Frame,
     pub buffers: SlotMap<BufferId, Buffer>,
-    pub buffer_hosts: HashMap<BufferId, BufferHostClient>,
     pub windows: SlotMap<WindowId, Window>,
-    pub modes: SlotMap<ModeId, Box<dyn Mode>>, // Keep for now for compatibility
     pub active_window: WindowId,
-    pub key_state: KeyState,
-    pub bindings: Box<dyn Bindings>,
     /// Tree structure representing window layout
     pub window_tree: WindowNode,
     /// Global kill-ring for cut/copy/paste operations
     pub kill_ring: KillRing,
-    /// Command registry for M-x commands
-    pub command_registry: CommandRegistry,
     /// Window that was active before opening command/buffer switch window
     pub previous_active_window: Option<WindowId>,
     /// Buffer history (most recently used first) for smart buffer switching
@@ -229,114 +215,40 @@ pub struct Editor {
     /// When the echo message was set (for auto-clearing)
     pub echo_message_time: Option<Instant>,
     pub clock: Arc<dyn Clock>,
-    /// Current key chord being typed (for echo area display)
-    pub current_key_chord: Vec<LogicalKey>,
     /// Mouse drag state for window resizing
     pub mouse_drag_state: Option<MouseDragState>,
     /// Messages buffer for collecting echo messages and logs
     pub messages_buffer_id: Option<BufferId>,
     /// File watcher for detecting external changes
     pub file_watcher: crate::file_watcher::FileWatcher,
-    /// Last search term used in isearch (for prepopulating next search)
-    pub last_search_term: String,
 }
 
-/// The main event loop, which receives keystrokes and dispatches them to the mode in the buffer
-/// in the active window.
-impl Editor {}
-
-struct SingleActionBinding(KeyAction);
-
-impl Bindings for SingleActionBinding {
-    fn keystroke(&self, _keys: Vec<LogicalKey>) -> KeyAction {
-        self.0.clone()
-    }
-}
-
-/// Operations that can be performed on a buffer by scripted commands
+/// Character-oriented location for a native text mutation.
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub enum BufferOperation {
-    /// Insert text at a position
-    Insert { pos: usize, text: String },
-    /// Delete text from start to end (exclusive)
-    Delete { start: usize, end: usize },
-    /// Replace text from start to end with new text
-    Replace {
-        start: usize,
-        end: usize,
-        text: String,
-    },
-    /// Set cursor position
-    SetCursor(usize),
-    /// Set mark at position
-    SetMark(usize),
-    /// Clear the mark
-    ClearMark,
-    /// Set the entire buffer content
-    SetContent(String),
-    /// Indent a line to a specific level (handles cursor positioning)
-    IndentLine { line: usize, indent: usize },
+pub enum ActionPosition {
+    Cursor,
+    Absolute(u16, u16),
+    End,
+}
+
+impl ActionPosition {
+    pub fn cursor() -> Self {
+        Self::Cursor
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum ChromeAction {
-    /// Open file dialog with specified open type
-    OpenFile(OpenType),
-    /// Open the command palette (M-x)
-    CommandMode,
-    /// Open buffer switch dialog
-    SwitchBuffer,
-    /// Open kill buffer dialog  
-    KillBuffer,
-    /// Save current buffer
     Save,
-    /// Move cursor to position
     CursorMove((u16, u16)),
-    /// Unknown/unhandled action
-    Huh,
-    /// Show message in echo area
     Echo(String),
-    /// Mark region as dirty for redraw
     MarkDirty(DirtyRegion),
-    /// Quit the editor
-    Quit,
-    /// Split window horizontally
-    SplitHorizontal,
-    /// Split window vertically  
-    SplitVertical,
-    /// Switch to other window
-    SwitchWindow,
-    /// Delete current window
-    DeleteWindow,
-    /// Delete all other windows
-    DeleteOtherWindows,
-    /// Show messages buffer
-    ShowMessages,
-    /// Create a new buffer with a specific mode
-    NewBufferWithMode {
-        buffer_name: String,
-        mode_name: String,
-        initial_content: String,
-    },
-    /// Execute buffer operations (from scripted commands)
-    BufferOps(Vec<BufferOperation>),
-    /// Dump messages buffer to a file
-    DumpMessages(String),
-    /// Buffer content changed - trigger major mode after-change hook
     BufferChanged {
         buffer_id: BufferId,
         start: usize,
         old_end: usize,
         new_end: usize,
     },
-    /// Execute a command by name
-    ExecuteCommand(String),
-    /// Show file watcher status
-    FileWatcherStatus,
-    /// Start incremental search forward
-    ISearchForward,
-    /// Start incremental search backward
-    ISearchBackward,
 }
 
 impl Editor {
@@ -347,40 +259,137 @@ impl Editor {
         action: KeyAction,
     ) -> Result<Vec<ChromeAction>, std::io::Error> {
         // Editing primitives selected by Mica are realized directly against the
-        // native editor mechanism. They must not pass through BufferHost's Rust
-        // Mode chain, which is retained only for non-Mica compatibility tests.
-        let direct = match action {
+        // native editor mechanism. They do not pass through a second Rust
+        // policy layer.
+        let actions = match action {
             KeyAction::AlphaNumeric(character) => {
-                Some(self.insert_text(character.to_string(), &ActionPosition::Cursor))
+                self.insert_text(character.to_string(), &ActionPosition::Cursor)
             }
-            KeyAction::Backspace => Some(self.delete_text(&ActionPosition::Cursor, -1)),
-            KeyAction::Delete => Some(self.delete_text(&ActionPosition::Cursor, 1)),
-            KeyAction::Enter => Some(self.insert_text("\n".to_owned(), &ActionPosition::Cursor)),
-            KeyAction::Tab => Some(self.insert_text("\t".to_owned(), &ActionPosition::Cursor)),
-            KeyAction::MarkStart => Some(self.set_mark()),
-            KeyAction::KillRegion(true) => Some(self.kill_region()),
-            KeyAction::KillRegion(false) => Some(self.copy_region()),
-            KeyAction::KillLine(_) => Some(self.kill_line()),
-            KeyAction::Yank(Some(index)) => Some(self.yank_index(&ActionPosition::Cursor, index)),
-            KeyAction::Yank(None) => Some(self.yank(&ActionPosition::Cursor)),
-            KeyAction::DeleteWord => Some(self.forward_kill_word()),
-            KeyAction::BackspaceWord => Some(self.backward_kill_word()),
-            _ => None,
+            KeyAction::Backspace => self.delete_text(&ActionPosition::Cursor, -1),
+            KeyAction::Delete => self.delete_text(&ActionPosition::Cursor, 1),
+            KeyAction::Enter => self.insert_text("\n".to_owned(), &ActionPosition::Cursor),
+            KeyAction::Tab => self.insert_text("\t".to_owned(), &ActionPosition::Cursor),
+            KeyAction::MarkStart => self.set_mark(),
+            KeyAction::KillRegion(true) => self.kill_region(),
+            KeyAction::KillRegion(false) => self.copy_region(),
+            KeyAction::KillLine(_) => self.kill_line(),
+            KeyAction::Yank(Some(index)) => self.yank_index(&ActionPosition::Cursor, index),
+            KeyAction::Yank(None) => self.yank(&ActionPosition::Cursor),
+            KeyAction::DeleteWord => self.forward_kill_word(),
+            KeyAction::BackspaceWord => self.backward_kill_word(),
+            KeyAction::Cursor(direction) => self.move_cursor(direction, false),
+            KeyAction::CursorSelect(direction) => self.move_cursor(direction, true),
+            KeyAction::Undo => self.undo_or_redo(false),
+            KeyAction::Redo => self.undo_or_redo(true),
+            KeyAction::Cancel | KeyAction::Escape => {
+                let window = &self.windows[self.active_window];
+                let buffer = &self.buffers[window.active_buffer];
+                buffer.undo_boundary();
+                if buffer.has_mark() {
+                    self.clear_mark()
+                } else {
+                    vec![ChromeAction::Echo("Quit".to_owned())]
+                }
+            }
+            KeyAction::Redraw => vec![ChromeAction::MarkDirty(DirtyRegion::FullScreen)],
         };
-        if let Some(actions) = direct {
-            self.key_state.take();
-            return Ok(actions);
-        }
+        Ok(actions)
+    }
 
-        self.key_state.take();
-        let previous = std::mem::replace(&mut self.bindings, Box::new(SingleActionBinding(action)));
-        let result = self.key_event(vec![LogicalKey::Unmapped]).await;
-        self.bindings = previous;
-        result
+    fn move_cursor(&mut self, direction: CursorDirection, selecting: bool) -> Vec<ChromeAction> {
+        let window = &mut self.windows[self.active_window];
+        let buffer = &self.buffers[window.active_buffer];
+        buffer.undo_boundary();
+        let mark_changed = if selecting {
+            if !buffer.has_mark() {
+                buffer.set_transient_mark(window.cursor);
+                true
+            } else {
+                false
+            }
+        } else {
+            buffer.clear_transient_mark()
+        };
+        let new_pos = match direction {
+            CursorDirection::Left => buffer.move_left(window.cursor),
+            CursorDirection::Right => buffer.move_right(window.cursor),
+            CursorDirection::Up => buffer.move_up(window.cursor),
+            CursorDirection::Down => buffer.move_down(window.cursor),
+            CursorDirection::LineStart => buffer.move_line_start(window.cursor),
+            CursorDirection::LineEnd => buffer.move_line_end(window.cursor),
+            CursorDirection::BufferStart => buffer.move_buffer_start(),
+            CursorDirection::BufferEnd => buffer.move_buffer_end(),
+            CursorDirection::PageUp => {
+                let height = window.height_chars.saturating_sub(3);
+                let (column, line) = buffer.to_column_line(window.cursor);
+                buffer.to_char_index(column, line.saturating_sub(height))
+            }
+            CursorDirection::PageDown => {
+                let height = window.height_chars.saturating_sub(3);
+                let (column, line) = buffer.to_column_line(window.cursor);
+                let last = buffer.buffer_len_lines().saturating_sub(1) as u16;
+                buffer.to_char_index(column, line.saturating_add(height).min(last))
+            }
+            CursorDirection::WordForward => buffer.move_word_forward(window.cursor),
+            CursorDirection::WordBackward => buffer.move_word_backward(window.cursor),
+            CursorDirection::ParagraphForward => buffer.move_paragraph_forward(window.cursor),
+            CursorDirection::ParagraphBackward => buffer.move_paragraph_backward(window.cursor),
+        };
+        window.cursor = new_pos;
+        let (column, line) = buffer.to_column_line(new_pos);
+        let scrolled = Self::ensure_cursor_visible_static(
+            window,
+            column,
+            line,
+            window.width_chars.saturating_sub(4),
+            window.height_chars.saturating_sub(3),
+        );
+        let mut actions = vec![
+            ChromeAction::CursorMove(window.absolute_cursor_position(column, line)),
+            ChromeAction::MarkDirty(DirtyRegion::Modeline {
+                window_id: self.active_window,
+                component: ModelineComponent::CursorPosition,
+            }),
+        ];
+        if scrolled || selecting || mark_changed || buffer.has_mark() {
+            actions.push(ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                buffer_id: window.active_buffer,
+            }));
+        }
+        actions
+    }
+
+    fn undo_or_redo(&mut self, redo: bool) -> Vec<ChromeAction> {
+        let window = &mut self.windows[self.active_window];
+        let buffer = &self.buffers[window.active_buffer];
+        let cursor = if redo { buffer.redo() } else { buffer.undo() };
+        let Some(cursor) = cursor else {
+            return vec![ChromeAction::Echo(if redo {
+                "No further redo information".to_owned()
+            } else {
+                "No further undo information".to_owned()
+            })];
+        };
+        window.cursor = cursor;
+        let (column, line) = buffer.to_column_line(cursor);
+        Self::ensure_cursor_visible_static(
+            window,
+            column,
+            line,
+            window.width_chars.saturating_sub(4),
+            window.height_chars.saturating_sub(3),
+        );
+        vec![
+            ChromeAction::CursorMove(window.absolute_cursor_position(column, line)),
+            ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                buffer_id: window.active_buffer,
+            }),
+            ChromeAction::Echo(if redo { "Redo" } else { "Undo" }.to_owned()),
+        ]
     }
 
     /// Create a renderer-neutral prompt surface whose state and key handling
-    /// live in Mica. `MessagesMode` is only a passive buffer mechanism.
+    /// live in Mica. The Rust side owns only its text buffer and geometry.
     pub fn create_mica_prompt_window(
         &mut self,
         command_type: CommandType,
@@ -388,21 +397,10 @@ impl Editor {
         content: String,
         cursor: usize,
     ) -> WindowId {
-        let command_buffer = Buffer::new(&[]);
+        let command_buffer = Buffer::new();
         command_buffer.set_object("*Mica Prompt*".to_owned());
         command_buffer.load_str(&content);
-        let command_buffer_id = self.buffers.insert(command_buffer.clone());
-        let mode_id = self.modes.insert(Box::new(MessagesMode {}));
-        let mode = self
-            .modes
-            .remove(mode_id)
-            .expect("new passive prompt mode exists");
-        let client = buffer_host::create_buffer_host(
-            command_buffer,
-            vec![(mode_id, "mica-prompt".to_owned(), mode)],
-            command_buffer_id,
-        );
-        self.buffer_hosts.insert(command_buffer_id, client);
+        let command_buffer_id = self.buffers.insert(command_buffer);
         let position = CommandWindowPosition::Bottom;
         let window = self.windows.insert(Window {
             x: 0,
@@ -471,7 +469,6 @@ impl Editor {
         if let Err(error) = self.file_watcher.unwatch_file(buffer_id) {
             self.set_echo_message(format!("Killed {name}; watcher cleanup failed: {error}"));
         }
-        self.buffer_hosts.remove(&buffer_id);
         self.buffers.remove(buffer_id);
         self.buffer_history
             .retain(|candidate| *candidate != buffer_id);
@@ -490,66 +487,36 @@ impl Editor {
         self.handle_open_file_action(path, open_type).await
     }
 
-    pub fn apply_mica_search(
-        &mut self,
-        view_id: WindowId,
-        matches: &[(usize, usize)],
-        selected: Option<usize>,
-    ) -> Vec<ChromeAction> {
-        let Some(window) = self.windows.get(view_id) else {
-            return vec![ChromeAction::Echo(
-                "Search view no longer exists".to_owned(),
-            )];
-        };
-        let buffer_id = window.active_buffer;
-        let buffer = self.buffers[buffer_id].clone();
-        buffer.with_write(|buffer| buffer.spans.clear());
-        if let Ok(registry) = crate::syntax::face_registry().lock()
-            && let (Some(match_face), Some(current_face)) = (
-                registry.get_id("isearch-match"),
-                registry.get_id("isearch-current"),
-            )
-        {
-            buffer.with_write(|buffer| {
-                buffer
-                    .spans
-                    .add_spans(matches.iter().enumerate().map(|(index, (start, end))| {
-                        crate::syntax::HighlightSpan::new(
-                            *start,
-                            *end,
-                            if selected == Some(index) {
-                                current_face
-                            } else {
-                                match_face
-                            },
-                        )
-                    }));
-            });
-        }
-        if let Some(index) = selected
-            && let Some((start, _)) = matches.get(index)
-            && let Some(window) = self.windows.get_mut(view_id)
-        {
-            window.cursor = *start;
-        }
-        vec![ChromeAction::MarkDirty(DirtyRegion::Buffer { buffer_id })]
-    }
+    pub async fn save_active_buffer(&mut self) -> Vec<ChromeAction> {
+        use compio::buf::BufResult;
+        use compio::io::AsyncWriteAtExt;
 
-    pub fn finish_mica_search(
-        &mut self,
-        view_id: WindowId,
-        original_cursor: usize,
-        accepted: bool,
-    ) -> Vec<ChromeAction> {
-        let Some(window) = self.windows.get(view_id) else {
-            return vec![ChromeAction::MarkDirty(DirtyRegion::FullScreen)];
+        let buffer_id = self.windows[self.active_window].active_buffer;
+        let Some(buffer) = self.buffers.get(buffer_id).cloned() else {
+            return vec![ChromeAction::Echo("No active buffer".to_owned())];
         };
-        let buffer_id = window.active_buffer;
-        self.buffers[buffer_id].with_write(|buffer| buffer.spans.clear());
-        if !accepted && let Some(window) = self.windows.get_mut(view_id) {
-            window.cursor = original_cursor;
+        let path = buffer.object();
+        let content = buffer.content();
+        let result: std::io::Result<()> = async {
+            let mut file = compio::fs::File::create(&path).await?;
+            let BufResult(result, _) = file.write_all_at(content.clone().into_bytes(), 0).await;
+            result
         }
-        vec![ChromeAction::MarkDirty(DirtyRegion::FullScreen)]
+        .await;
+        if let Err(error) = result {
+            return vec![ChromeAction::Echo(format!("Error saving {path}: {error}"))];
+        }
+        let watch_error = self
+            .file_watcher
+            .watch_file(buffer_id, std::path::Path::new(&path), content)
+            .err();
+        let mut actions = vec![ChromeAction::Echo(format!("Saved: {path}"))];
+        if let Some(error) = watch_error {
+            actions.push(ChromeAction::Echo(format!(
+                "Saved {path}, but failed to watch it: {error}"
+            )));
+        }
+        actions
     }
 
     fn with_clipboard_error(
@@ -563,351 +530,6 @@ impl Editor {
     }
 
     /// Create a command window and associated buffer
-    pub fn create_command_window(
-        &mut self,
-        command_type: CommandType,
-        position: CommandWindowPosition,
-        height: u16,
-        command_candidates: Option<Vec<String>>,
-        buffer_candidates: Option<Vec<(BufferId, String)>>,
-    ) -> WindowId {
-        // Create a new buffer for command input
-        let command_buffer = Buffer::new(&[]);
-        command_buffer.set_object(format!(
-            "*Command:{}*",
-            match command_type {
-                CommandType::Execute => "Execute",
-                CommandType::BufferSwitch => "Switch Buffer",
-                CommandType::KillBuffer => "Kill Buffer",
-                CommandType::OpenFile(OpenType::New) => "Find File",
-                CommandType::OpenFile(OpenType::Visit) => "Visit File",
-                CommandType::ISearch { .. } => "I-search",
-            }
-        ));
-
-        let command_buffer_id = self.buffers.insert(command_buffer.clone());
-
-        // Create the appropriate mode based on command type
-        let (mode_box, mode_name, initial_content) = match command_type {
-            CommandType::Execute => {
-                // Create CommandMode for M-x
-                let mut command_names: Vec<String> = command_candidates.unwrap_or_else(|| {
-                    self.command_registry
-                        .all_commands()
-                        .iter()
-                        .filter(|cmd| cmd.name != crate::command_registry::CMD_COMMAND_MODE)
-                        .map(|cmd| cmd.name.clone())
-                        .collect()
-                });
-                command_names.sort(); // Sort alphabetically
-                let mut command_mode = CommandMode::new();
-                command_mode.init_with_buffer(command_buffer_id, command_names);
-
-                let content = command_mode.generate_buffer_content();
-                (
-                    Box::new(command_mode) as Box<dyn Mode>,
-                    "command".to_string(),
-                    content,
-                )
-            }
-            CommandType::BufferSwitch => {
-                // Show all buffers except command window buffers (including the current one being created)
-                let mut command_buffer_ids: HashSet<BufferId> = self
-                    .windows
-                    .iter()
-                    .filter(|(_, window)| matches!(window.window_type, WindowType::Command { .. }))
-                    .map(|(_, window)| window.active_buffer)
-                    .collect();
-
-                // Also exclude the command buffer we're about to create
-                command_buffer_ids.insert(command_buffer_id);
-
-                let buffer_list: Vec<(BufferId, String)> = buffer_candidates.unwrap_or_else(|| {
-                    self.buffers
-                        .iter()
-                        .filter(|(id, _)| !command_buffer_ids.contains(id))
-                        .map(|(id, buffer)| (id, buffer.object()))
-                        .collect()
-                });
-
-                // Use the Rust BufferSwitchMode for buffer selection
-                let mut buffer_switch_mode =
-                    BufferSwitchMode::new_with_purpose(BufferSwitchPurpose::Switch);
-
-                let current_buffer_id = self.windows[self.active_window].active_buffer;
-                if let Some(previous_buffer_id) = self.get_previous_buffer(current_buffer_id) {
-                    buffer_switch_mode.init_with_buffer_and_preselect(
-                        command_buffer_id,
-                        buffer_list,
-                        previous_buffer_id,
-                    );
-                } else {
-                    buffer_switch_mode.init_with_buffer(command_buffer_id, buffer_list);
-                }
-
-                let content = buffer_switch_mode.generate_buffer_content();
-                (
-                    Box::new(buffer_switch_mode) as Box<dyn Mode>,
-                    "buffer-switch".to_string(),
-                    content,
-                )
-            }
-            CommandType::KillBuffer => {
-                // Show all buffers except command window buffers (including the current one being created)
-                let mut command_buffer_ids: HashSet<BufferId> = self
-                    .windows
-                    .iter()
-                    .filter(|(_, window)| matches!(window.window_type, WindowType::Command { .. }))
-                    .map(|(_, window)| window.active_buffer)
-                    .collect();
-
-                // Also exclude the command buffer we're about to create
-                command_buffer_ids.insert(command_buffer_id);
-
-                let buffer_list: Vec<(BufferId, String)> = buffer_candidates.unwrap_or_else(|| {
-                    self.buffers
-                        .iter()
-                        .filter(|(id, _)| !command_buffer_ids.contains(id))
-                        .map(|(id, buffer)| (id, buffer.object()))
-                        .collect()
-                });
-
-                // Use the Rust BufferSwitchMode for buffer killing
-                let mut buffer_switch_mode =
-                    BufferSwitchMode::new_with_purpose(BufferSwitchPurpose::Kill);
-                let current_buffer_id = self.windows[self.active_window].active_buffer;
-                buffer_switch_mode.init_with_buffer_and_preselect(
-                    command_buffer_id,
-                    buffer_list,
-                    current_buffer_id,
-                );
-
-                let content = buffer_switch_mode.generate_buffer_content();
-                (
-                    Box::new(buffer_switch_mode) as Box<dyn Mode>,
-                    "buffer-kill".to_string(),
-                    content,
-                )
-            }
-            CommandType::OpenFile(open_type) => {
-                // Use the Rust FileSelectorMode for file selection
-                let mut file_selector_mode = FileSelectorMode::new(open_type);
-                file_selector_mode.init_with_buffer(command_buffer_id);
-
-                let content = file_selector_mode.generate_buffer_content();
-                (
-                    Box::new(file_selector_mode) as Box<dyn Mode>,
-                    "file-selector".to_string(),
-                    content,
-                )
-            }
-            CommandType::ISearch { .. } => {
-                // ISearch has its own create_isearch_window function
-                unreachable!("ISearch should use create_isearch_window, not create_command_window")
-            }
-        };
-
-        // Generate initial buffer content with completions
-        command_buffer.load_str(&initial_content);
-
-        // Create mode ID and add to modes collection
-        let mode_id = self.modes.insert(mode_box);
-
-        // Create BufferHost with the appropriate mode
-        let mode_list = vec![(
-            mode_id,
-            mode_name,
-            self.modes
-                .remove(mode_id)
-                .expect("Mode should exist in SlotMap"),
-        )];
-
-        let buffer_client =
-            crate::buffer_host::create_buffer_host(command_buffer, mode_list, command_buffer_id);
-
-        // Insert the BufferHost using the buffer ID as the key for easy lookup/cleanup
-        self.buffer_hosts.insert(command_buffer_id, buffer_client);
-
-        // Calculate position and size for command window
-        // Frame.available_lines already excludes echo area
-        let (x, y) = match position {
-            CommandWindowPosition::Top => (0, 0),
-            CommandWindowPosition::Bottom => (0, self.frame.available_lines.saturating_sub(height)),
-        };
-
-        // Create command window
-        let command_window = Window {
-            x,
-            y,
-            width_chars: self.frame.available_columns,
-            height_chars: height,
-            active_buffer: command_buffer_id,
-            start_line: 0,
-            start_column: 0,
-            cursor: 0, // Start at beginning
-            window_type: WindowType::Command {
-                position,
-                command_type,
-            },
-        };
-
-        let window_id = self.windows.insert(command_window);
-
-        // Save the current active window before switching
-        self.previous_active_window = Some(self.active_window);
-
-        // Make the command window the active window so keys go to it
-        self.active_window = window_id;
-
-        self.calculate_window_layout();
-        window_id
-    }
-
-    /// Create an isearch command window
-    pub fn create_isearch_window(&mut self, forward: bool) -> WindowId {
-        use crate::isearch_mode::{IsearchMode, SearchDirection};
-
-        // Get target buffer and window info before creating command window
-        let target_window_id = self.active_window;
-        let target_window = &self.windows[target_window_id];
-        let target_buffer_id = target_window.active_buffer;
-        let original_cursor = target_window.cursor;
-        let target_buffer = self.buffers[target_buffer_id].clone();
-
-        // Create command buffer for isearch prompt
-        let command_buffer = Buffer::new(&[]);
-        command_buffer.set_object("*I-search*".to_string());
-        let command_buffer_id = self.buffers.insert(command_buffer.clone());
-
-        // Create the isearch mode
-        let direction = if forward {
-            SearchDirection::Forward
-        } else {
-            SearchDirection::Backward
-        };
-
-        // Get previous search term if available
-        let previous_search = if self.last_search_term.is_empty() {
-            None
-        } else {
-            Some(self.last_search_term.clone())
-        };
-
-        let isearch_mode = IsearchMode::new(
-            direction,
-            target_buffer_id,
-            target_window_id,
-            original_cursor,
-            target_buffer,
-            previous_search,
-        );
-
-        // Set initial content
-        let initial_content = isearch_mode.generate_buffer_content();
-        command_buffer.load_str(&initial_content);
-
-        // If we have a previous search term with matches, apply highlights now
-        let initial_matches = isearch_mode.matches().to_vec();
-        let initial_current = isearch_mode.current_match_index();
-        if !initial_matches.is_empty() {
-            // Apply highlights to target buffer
-            if let Some(buffer) = self.buffers.get(target_buffer_id) {
-                let face_registry = crate::syntax::face_registry();
-                if let Ok(registry) = face_registry.lock() {
-                    let match_face_id = registry.get_id("isearch-match");
-                    let current_face_id = registry.get_id("isearch-current");
-
-                    if let (Some(match_face_id), Some(current_face_id)) =
-                        (match_face_id, current_face_id)
-                    {
-                        let spans: Vec<_> = initial_matches
-                            .iter()
-                            .enumerate()
-                            .map(|(i, (start, end))| {
-                                let face_id = if initial_current == Some(i) {
-                                    current_face_id
-                                } else {
-                                    match_face_id
-                                };
-                                crate::syntax::HighlightSpan::new(*start, *end, face_id)
-                            })
-                            .collect();
-
-                        buffer.with_write(|b| {
-                            b.spans.add_spans(spans);
-                        });
-                    }
-                }
-
-                // Move cursor to current match if any
-                if let Some(current_idx) = initial_current
-                    && let Some((start_char, _)) = initial_matches.get(current_idx)
-                    && let Some(window) = self.windows.get_mut(target_window_id)
-                {
-                    window.cursor = *start_char;
-
-                    // Ensure cursor is visible by scrolling if needed
-                    let (col, line) = buffer.to_column_line(*start_char);
-                    let content_height = window.height_chars.saturating_sub(3);
-                    let content_width = window.width_chars.saturating_sub(4);
-                    Self::ensure_cursor_visible_static(
-                        window,
-                        col,
-                        line,
-                        content_width,
-                        content_height,
-                    );
-                }
-            }
-        }
-
-        // Create buffer host for the isearch mode
-        // Use a dummy FileMode as the base mode (isearch mode will handle all keys)
-        let dummy_mode_id = self.modes.insert(Box::new(crate::mode::FileMode {
-            file_path: String::new(),
-        }));
-        let mode_list = vec![(
-            dummy_mode_id,
-            "isearch".to_string(),
-            Box::new(isearch_mode) as Box<dyn Mode>,
-        )];
-
-        let buffer_client =
-            crate::buffer_host::create_buffer_host(command_buffer, mode_list, command_buffer_id);
-
-        self.buffer_hosts.insert(command_buffer_id, buffer_client);
-
-        // Create command window for isearch prompt
-        // Height 4: Vello needs extra line for scrollbar chrome
-        let height = 4;
-        let y = self.frame.available_lines.saturating_sub(height);
-        let command_window = Window {
-            x: 0,
-            y,
-            width_chars: self.frame.available_columns,
-            height_chars: height,
-            active_buffer: command_buffer_id,
-            start_line: 0,
-            start_column: 0,
-            cursor: initial_content.chars().count(),
-            window_type: WindowType::Command {
-                position: CommandWindowPosition::Bottom,
-                command_type: CommandType::ISearch { forward },
-            },
-        };
-
-        let window_id = self.windows.insert(command_window);
-
-        // Save the current active window before switching
-        self.previous_active_window = Some(self.active_window);
-
-        // Make the command window active
-        self.active_window = window_id;
-
-        self.calculate_window_layout();
-        window_id
-    }
-
     /// Close command window and clean up its buffer
     pub fn close_command_window(&mut self, window_id: WindowId) -> bool {
         if let Some(window) = self.windows.get(window_id)
@@ -916,9 +538,6 @@ impl Editor {
             let buffer_id = window.active_buffer;
             self.windows.remove(window_id);
             self.buffers.remove(buffer_id);
-
-            // Clean up the buffer host - this is critical for proper state cleanup
-            self.buffer_hosts.remove(&buffer_id);
 
             // Restore the previous active window if it still exists
             if let Some(prev_window_id) = self.previous_active_window {
@@ -985,31 +604,12 @@ impl Editor {
             // Messages buffer already exists, return it
             buffer_id
         } else {
-            // Create new Messages buffer
-            let messages_mode = Box::new(MessagesMode {});
-            let messages_mode_id = self.modes.insert(messages_mode);
-
-            let messages_buffer = Buffer::new(&[messages_mode_id]);
+            let messages_buffer = Buffer::new();
             messages_buffer.set_object("*Messages*".to_string());
             messages_buffer
                 .load_str("Messages buffer - echo messages and logs will appear here.\n\n");
 
-            let messages_buffer_id = self.buffers.insert(messages_buffer.clone());
-
-            // Create BufferHost for the messages buffer
-            let mode_list = vec![(
-                messages_mode_id,
-                "messages".to_string(),
-                self.modes
-                    .remove(messages_mode_id)
-                    .expect("Messages mode should exist in SlotMap"),
-            )];
-            let buffer_client = crate::buffer_host::create_buffer_host(
-                messages_buffer,
-                mode_list,
-                messages_buffer_id,
-            );
-            self.buffer_hosts.insert(messages_buffer_id, buffer_client);
+            let messages_buffer_id = self.buffers.insert(messages_buffer);
 
             // Store the Messages buffer ID for future use
             self.messages_buffer_id = Some(messages_buffer_id);
@@ -1035,48 +635,19 @@ impl Editor {
         }
     }
 
-    /// Create a new buffer with the specified mode
-    pub fn create_buffer_with_mode(
-        &mut self,
-        buffer_name: String,
-        mode_name: String,
-        initial_content: String,
-    ) -> Option<BufferId> {
-        // Create the appropriate mode based on mode_name
-        let mode_box: Box<dyn Mode> = match mode_name.as_str() {
-            "scratch" => Box::new(crate::mode::ScratchMode {}),
-            "messages" => Box::new(crate::mode::MessagesMode {}),
-            _ => return None, // Unknown mode
-        };
-
-        let mode_id = self.modes.insert(mode_box);
-
-        let buffer = Buffer::new(&[mode_id]);
+    /// Create an in-memory buffer. Mica assigns its logical mode when the
+    /// session synchronizes the new buffer identity.
+    pub fn create_buffer(&mut self, buffer_name: String, initial_content: String) -> BufferId {
+        let buffer = Buffer::new();
         buffer.set_object(buffer_name);
         buffer.load_str(&initial_content);
-        let buffer_id = self.buffers.insert(buffer.clone());
-
-        // Create BufferHost for the new buffer
-        let mode_list = vec![(
-            mode_id,
-            mode_name,
-            self.modes
-                .remove(mode_id)
-                .expect("Mode should exist in SlotMap"),
-        )];
-        let buffer_client = crate::buffer_host::create_buffer_host(buffer, mode_list, buffer_id);
-        self.buffer_hosts.insert(buffer_id, buffer_client);
-
-        Some(buffer_id)
+        self.buffers.insert(buffer)
     }
 
     /// Set the echo area message (this will override any chord display)
     pub fn set_echo_message(&mut self, message: String) {
         self.echo_message = message.clone();
         self.echo_message_time = Some(self.clock.now());
-        // Clear chord since we're showing a different message
-        self.current_key_chord.clear();
-
         // Also add the message to the Messages buffer
         self.add_message_to_buffer(message);
     }
@@ -1085,19 +656,6 @@ impl Editor {
     pub fn clear_echo_message(&mut self) {
         self.echo_message.clear();
         self.echo_message_time = None;
-    }
-
-    /// Clear the current key chord sequence
-    pub fn clear_key_chord(&mut self) {
-        self.current_key_chord.clear();
-        self.clear_echo_message();
-    }
-
-    /// Update echo area with current key chord
-    pub fn update_echo_with_chord(&mut self) {
-        if !self.current_key_chord.is_empty() {
-            self.echo_message = self.format_key_chord(&self.current_key_chord);
-        }
     }
 
     /// Check if echo message should be auto-cleared and clear it if needed
@@ -1111,47 +669,6 @@ impl Editor {
             return true;
         }
         false
-    }
-
-    /// Format a key chord in Emacs style (e.g., "C-x", "M-x", "C-x C-c")
-    fn format_key_chord(&self, keys: &[LogicalKey]) -> String {
-        let mut result = Vec::new();
-        let mut i = 0;
-
-        while i < keys.len() {
-            match &keys[i] {
-                LogicalKey::Modifier(_modifier) => {
-                    // Check if there's a following non-modifier key
-                    if i + 1 < keys.len() {
-                        match &keys[i + 1] {
-                            LogicalKey::Modifier(_) => {
-                                // Two modifiers in a row, treat separately
-                                result.push(keys[i].as_display_string());
-                                i += 1;
-                            }
-                            _ => {
-                                // Modifier followed by regular key, combine with dash
-                                let modifier_str = keys[i].as_display_string();
-                                let key_str = keys[i + 1].as_display_string();
-                                result.push(format!("{modifier_str}-{key_str}"));
-                                i += 2;
-                            }
-                        }
-                    } else {
-                        // Modifier at end, display as-is
-                        result.push(keys[i].as_display_string());
-                        i += 1;
-                    }
-                }
-                _ => {
-                    // Non-modifier key
-                    result.push(keys[i].as_display_string());
-                    i += 1;
-                }
-            }
-        }
-
-        result.join(" ")
     }
 
     /// Update buffer history when switching to a buffer
@@ -1612,947 +1129,7 @@ impl Editor {
         }
     }
 
-    pub async fn key_event(
-        &mut self,
-        keys: Vec<LogicalKey>,
-    ) -> Result<Vec<ChromeAction>, std::io::Error> {
-        // Check if echo message has expired and clear it
-        let echo_cleared = self.check_and_clear_expired_echo();
-
-        for key in keys {
-            self.key_state.press(key);
-        }
-
-        // Send pressed keys through to the bindings.
-        // If responds with ChordNext, we keep.
-        // Otherwise, we take() and pass that to the mode for execution.
-        // If the mode returns an action, we execute that action.
-        let pressed = self.key_state.pressed();
-        let key_action = self
-            .bindings
-            .keystroke(pressed.iter().map(|k| k.key).collect());
-
-        if key_action == ChordNext {
-            // Update chord display with current pressed keys
-            self.current_key_chord = pressed.iter().map(|k| k.key).collect();
-            self.update_echo_with_chord();
-            // Return an Echo action to trigger redraw of echo area
-            return Ok(vec![ChromeAction::Echo(self.echo_message.clone())]);
-        }
-
-        // For unbound keys, capture the full key sequence before clearing
-        let unbound_key_sequence = if key_action == KeyAction::Unbound {
-            pressed.iter().map(|k| k.key).collect::<Vec<_>>()
-        } else {
-            vec![]
-        };
-
-        let _ = self.key_state.take();
-
-        // Clear the key chord after processing (action completed)
-        self.clear_key_chord();
-
-        // Skip echo in tests to avoid terminal issues
-        let active_buffer_id = {
-            let window = &self.windows[self.active_window];
-            window.active_buffer
-        };
-
-        // Command mode is now handled by the Mode system, not here
-
-        // Some actions like save, quit, etc. are out of the control of the mode.
-        match &key_action {
-            KeyAction::Escape => {
-                // If command window is active, close it
-                if let Some(command_window_id) = self.find_command_window() {
-                    self.close_command_window(command_window_id);
-                    return Ok(vec![
-                        ChromeAction::Echo("Command mode cancelled".to_string()),
-                        ChromeAction::MarkDirty(DirtyRegion::FullScreen),
-                    ]);
-                }
-                // Otherwise, pass to modes
-            }
-
-            KeyAction::Redraw => {
-                // Force a full screen redraw
-                return Ok(vec![ChromeAction::MarkDirty(DirtyRegion::FullScreen)]);
-            }
-
-            KeyAction::Cursor(cd) => {
-                // Check if we're in a command window - if so, delegate to Mode system
-                let current_window = &self.windows[self.active_window];
-                if matches!(current_window.window_type, WindowType::Command { .. }) {
-                    // Let the Mode system handle cursor movement in command windows
-                    // Fall through to the BufferHost dispatch below
-                } else {
-                    // Handle normal cursor movement in regular windows
-                    // Get fresh references for cursor movement
-                    let window = &mut self
-                        .windows
-                        .get_mut(self.active_window)
-                        .expect("Active window should exist");
-                    let buffer = &self.buffers[window.active_buffer];
-
-                    // Insert undo boundary - cursor movement breaks undo groups
-                    buffer.undo_boundary();
-
-                    // Clear transient mark on non-shift cursor movement (CUA-style)
-                    let had_transient_mark = buffer.clear_transient_mark();
-
-                    // Use clean character-position API
-                    let new_pos = match cd {
-                        CursorDirection::Left => buffer.move_left(window.cursor),
-                        CursorDirection::Right => buffer.move_right(window.cursor),
-                        CursorDirection::Up => buffer.move_up(window.cursor),
-                        CursorDirection::Down => buffer.move_down(window.cursor),
-                        CursorDirection::LineStart => buffer.move_line_start(window.cursor),
-                        CursorDirection::LineEnd => buffer.move_line_end(window.cursor),
-                        CursorDirection::BufferStart => buffer.move_buffer_start(),
-                        CursorDirection::BufferEnd => buffer.move_buffer_end(),
-                        CursorDirection::PageUp => {
-                            let content_height = window.height_chars.saturating_sub(3); // Account for border + modeline
-                            let (current_col, current_line) = buffer.to_column_line(window.cursor);
-                            let target_line = current_line.saturating_sub(content_height);
-                            buffer.to_char_index(current_col, target_line)
-                        }
-                        CursorDirection::PageDown => {
-                            let content_height = window.height_chars.saturating_sub(3); // Account for border + modeline
-                            let (current_col, current_line) = buffer.to_column_line(window.cursor);
-                            let target_line = current_line + content_height;
-                            // Bounds check: don't go past the last line
-                            let max_line = buffer.buffer_len_lines().saturating_sub(1) as u16;
-                            let safe_target_line = target_line.min(max_line);
-                            buffer.to_char_index(current_col, safe_target_line)
-                        }
-                        CursorDirection::WordForward => buffer.move_word_forward(window.cursor),
-                        CursorDirection::WordBackward => buffer.move_word_backward(window.cursor),
-                        CursorDirection::ParagraphForward => {
-                            buffer.move_paragraph_forward(window.cursor)
-                        }
-                        CursorDirection::ParagraphBackward => {
-                            buffer.move_paragraph_backward(window.cursor)
-                        }
-                    };
-
-                    window.cursor = new_pos;
-
-                    // Now compute the physical position of the cursor in the window.
-                    let (col, line) = buffer.to_column_line(new_pos);
-
-                    // Auto-scroll to keep cursor visible
-                    let content_height = window.height_chars.saturating_sub(3); // Account for border + modeline
-                    let content_width = window.width_chars.saturating_sub(4); // Account for borders + scrollbar
-                    let needs_redraw = Self::ensure_cursor_visible_static(
-                        window,
-                        col,
-                        line,
-                        content_width,
-                        content_height,
-                    );
-
-                    let mut actions = vec![ChromeAction::CursorMove(
-                        window.absolute_cursor_position(col, line),
-                    )];
-
-                    // If we scrolled, mark the entire buffer dirty to redraw everything
-                    if needs_redraw {
-                        actions.push(ChromeAction::MarkDirty(DirtyRegion::Buffer {
-                            buffer_id: window.active_buffer,
-                        }));
-                    }
-
-                    // If there's a mark set, cursor movement changes the region highlighting
-                    // so we need to mark the buffer dirty to trigger a redraw
-                    // Also redraw if we just cleared a transient mark (to remove highlighting)
-                    if buffer.has_mark() || had_transient_mark {
-                        actions.push(ChromeAction::MarkDirty(DirtyRegion::Buffer {
-                            buffer_id: window.active_buffer,
-                        }));
-                    }
-
-                    // Cursor movement always updates the position in the modeline
-                    actions.push(ChromeAction::MarkDirty(DirtyRegion::Modeline {
-                        window_id: self.active_window,
-                        component: ModelineComponent::CursorPosition,
-                    }));
-
-                    return Ok(actions);
-                }
-            }
-            KeyAction::CursorSelect(cd) => {
-                // CUA-style shift-arrow selection: set transient mark if not set, then move
-                let current_window = &self.windows[self.active_window];
-                if matches!(current_window.window_type, WindowType::Command { .. }) {
-                    // Let the Mode system handle in command windows
-                } else {
-                    let window = &mut self
-                        .windows
-                        .get_mut(self.active_window)
-                        .expect("Active window should exist");
-                    let buffer = &self.buffers[window.active_buffer];
-
-                    // Set transient mark at current position if no mark is set
-                    // (preserves existing persistent marks from C-Space)
-                    if !buffer.has_mark() {
-                        buffer.set_transient_mark(window.cursor);
-                    }
-
-                    // Use clean character-position API for movement
-                    let new_pos = match cd {
-                        CursorDirection::Left => buffer.move_left(window.cursor),
-                        CursorDirection::Right => buffer.move_right(window.cursor),
-                        CursorDirection::Up => buffer.move_up(window.cursor),
-                        CursorDirection::Down => buffer.move_down(window.cursor),
-                        CursorDirection::LineStart => buffer.move_line_start(window.cursor),
-                        CursorDirection::LineEnd => buffer.move_line_end(window.cursor),
-                        CursorDirection::BufferStart => buffer.move_buffer_start(),
-                        CursorDirection::BufferEnd => buffer.move_buffer_end(),
-                        CursorDirection::PageUp => {
-                            let content_height = window.height_chars.saturating_sub(3);
-                            let (current_col, current_line) = buffer.to_column_line(window.cursor);
-                            let target_line = current_line.saturating_sub(content_height);
-                            buffer.to_char_index(current_col, target_line)
-                        }
-                        CursorDirection::PageDown => {
-                            let content_height = window.height_chars.saturating_sub(3);
-                            let (current_col, current_line) = buffer.to_column_line(window.cursor);
-                            let target_line = current_line + content_height;
-                            let max_line = buffer.buffer_len_lines().saturating_sub(1) as u16;
-                            let safe_target_line = target_line.min(max_line);
-                            buffer.to_char_index(current_col, safe_target_line)
-                        }
-                        CursorDirection::WordForward => buffer.move_word_forward(window.cursor),
-                        CursorDirection::WordBackward => buffer.move_word_backward(window.cursor),
-                        CursorDirection::ParagraphForward => {
-                            buffer.move_paragraph_forward(window.cursor)
-                        }
-                        CursorDirection::ParagraphBackward => {
-                            buffer.move_paragraph_backward(window.cursor)
-                        }
-                    };
-
-                    window.cursor = new_pos;
-
-                    let (col, line) = buffer.to_column_line(new_pos);
-
-                    let content_height = window.height_chars.saturating_sub(3);
-                    let content_width = window.width_chars.saturating_sub(4);
-                    let needs_redraw = Self::ensure_cursor_visible_static(
-                        window,
-                        col,
-                        line,
-                        content_width,
-                        content_height,
-                    );
-
-                    let mut actions = vec![ChromeAction::CursorMove(
-                        window.absolute_cursor_position(col, line),
-                    )];
-
-                    if needs_redraw {
-                        actions.push(ChromeAction::MarkDirty(DirtyRegion::Buffer {
-                            buffer_id: window.active_buffer,
-                        }));
-                    }
-
-                    // Selection always needs redraw since mark is set
-                    actions.push(ChromeAction::MarkDirty(DirtyRegion::Buffer {
-                        buffer_id: window.active_buffer,
-                    }));
-
-                    actions.push(ChromeAction::MarkDirty(DirtyRegion::Modeline {
-                        window_id: self.active_window,
-                        component: ModelineComponent::CursorPosition,
-                    }));
-
-                    return Ok(actions);
-                }
-            }
-            KeyAction::Cancel => {
-                // Insert undo boundary - Cancel breaks undo groups
-                {
-                    let window = &self.windows[self.active_window];
-                    let buffer = &self.buffers[window.active_buffer];
-                    buffer.undo_boundary();
-                }
-
-                // Cancel current operation - check command window first, then mark
-                if let Some(command_window_id) = self.find_command_window() {
-                    // For ISearch, let the mode handle cancel (it needs to clear highlights)
-                    let is_isearch = matches!(
-                        self.windows[command_window_id].window_type,
-                        WindowType::Command {
-                            command_type: CommandType::ISearch { .. },
-                            ..
-                        }
-                    );
-                    if !is_isearch {
-                        self.close_command_window(command_window_id);
-                        return Ok(vec![
-                            ChromeAction::Echo("Command mode cancelled".to_string()),
-                            ChromeAction::MarkDirty(DirtyRegion::FullScreen),
-                        ]);
-                    }
-                    // For ISearch, fall through to let the mode handle it
-                } else {
-                    let window = &self.windows[self.active_window];
-                    let buffer = &self.buffers[window.active_buffer];
-
-                    if buffer.has_mark() {
-                        return Ok(self.clear_mark());
-                    } else {
-                        return Ok(vec![ChromeAction::Echo("Quit".to_string())]);
-                    }
-                }
-            }
-            KeyAction::Undo => {
-                let window = &mut self.windows[self.active_window];
-                let buffer = &self.buffers[window.active_buffer];
-
-                if let Some(new_cursor) = buffer.undo() {
-                    window.cursor = new_cursor;
-                    let (col, line) = buffer.to_column_line(new_cursor);
-
-                    let content_height = window.height_chars.saturating_sub(3);
-                    let content_width = window.width_chars.saturating_sub(4);
-                    Self::ensure_cursor_visible_static(
-                        window,
-                        col,
-                        line,
-                        content_width,
-                        content_height,
-                    );
-
-                    return Ok(vec![
-                        ChromeAction::CursorMove(window.absolute_cursor_position(col, line)),
-                        ChromeAction::MarkDirty(DirtyRegion::Buffer {
-                            buffer_id: window.active_buffer,
-                        }),
-                        ChromeAction::Echo("Undo".to_string()),
-                    ]);
-                } else {
-                    return Ok(vec![ChromeAction::Echo(
-                        "No further undo information".to_string(),
-                    )]);
-                }
-            }
-            KeyAction::Redo => {
-                let window = &mut self.windows[self.active_window];
-                let buffer = &self.buffers[window.active_buffer];
-
-                if let Some(new_cursor) = buffer.redo() {
-                    window.cursor = new_cursor;
-                    let (col, line) = buffer.to_column_line(new_cursor);
-
-                    let content_height = window.height_chars.saturating_sub(3);
-                    let content_width = window.width_chars.saturating_sub(4);
-                    Self::ensure_cursor_visible_static(
-                        window,
-                        col,
-                        line,
-                        content_width,
-                        content_height,
-                    );
-
-                    return Ok(vec![
-                        ChromeAction::CursorMove(window.absolute_cursor_position(col, line)),
-                        ChromeAction::MarkDirty(DirtyRegion::Buffer {
-                            buffer_id: window.active_buffer,
-                        }),
-                        ChromeAction::Echo("Redo".to_string()),
-                    ]);
-                } else {
-                    return Ok(vec![ChromeAction::Echo(
-                        "No further redo information".to_string(),
-                    )]);
-                }
-            }
-            KeyAction::Unbound => {
-                // In command windows, pass unbound keys to the mode for handling
-                let current_window = &self.windows[self.active_window];
-                if matches!(current_window.window_type, WindowType::Command { .. }) {
-                    // Convert the unbound key sequence to a KeyAction for the mode
-                    // We only handle single-key unbound sequences (like typing 'a')
-                    if let Some(logical_key) = unbound_key_sequence.first() {
-                        let mode_key_action = match logical_key {
-                            LogicalKey::AlphaNumeric(c) => KeyAction::AlphaNumeric(*c),
-                            LogicalKey::Backspace => KeyAction::Backspace,
-                            LogicalKey::Delete => KeyAction::Delete,
-                            LogicalKey::Enter => KeyAction::Enter,
-                            LogicalKey::Tab => KeyAction::Tab,
-                            LogicalKey::Up => KeyAction::Cursor(CursorDirection::Up),
-                            LogicalKey::Down => KeyAction::Cursor(CursorDirection::Down),
-                            LogicalKey::Left => KeyAction::Cursor(CursorDirection::Left),
-                            LogicalKey::Right => KeyAction::Cursor(CursorDirection::Right),
-                            LogicalKey::Home => KeyAction::Cursor(CursorDirection::LineStart),
-                            LogicalKey::End => KeyAction::Cursor(CursorDirection::LineEnd),
-                            LogicalKey::PageUp => KeyAction::Cursor(CursorDirection::PageUp),
-                            LogicalKey::PageDown => KeyAction::Cursor(CursorDirection::PageDown),
-                            _ => {
-                                // Unknown key type, report as undefined
-                                return Ok(vec![ChromeAction::Echo(format!(
-                                    "{} is undefined",
-                                    self.format_key_chord(&unbound_key_sequence)
-                                ))]);
-                            }
-                        };
-                        // Dispatch this converted key action to the buffer host
-                        let buffer_id = active_buffer_id;
-                        let cursor_pos = {
-                            let window = &self.windows[self.active_window];
-                            window.cursor
-                        };
-                        if let Some(buffer_host) = self.buffer_hosts.get(&buffer_id).cloned() {
-                            let response_result =
-                                buffer_host.handle_key(mode_key_action, cursor_pos).await;
-                            match response_result {
-                                Ok(response) => {
-                                    return Ok(self.handle_buffer_response(response).await);
-                                }
-                                Err(err) => {
-                                    return Ok(vec![ChromeAction::Echo(format!(
-                                        "Buffer error: {err}"
-                                    ))]);
-                                }
-                            }
-                        }
-                    }
-                    // Fall through if we couldn't convert or dispatch
-                } else {
-                    // Include the key sequence in the undefined message, like Emacs
-                    let unbound_message = if !unbound_key_sequence.is_empty() {
-                        format!(
-                            "{} is undefined",
-                            self.format_key_chord(&unbound_key_sequence)
-                        )
-                    } else {
-                        "Key is undefined".to_string()
-                    };
-                    return Ok(vec![ChromeAction::Echo(unbound_message)]);
-                }
-            }
-            KeyAction::Command(command_name) => {
-                // If there's an isearch window and the command is isearch-forward/backward,
-                // switch to the isearch window and dispatch the command to it
-                if let Some(command_window_id) = self.find_command_window() {
-                    let is_isearch = matches!(
-                        self.windows[command_window_id].window_type,
-                        WindowType::Command {
-                            command_type: CommandType::ISearch { .. },
-                            ..
-                        }
-                    );
-                    if is_isearch
-                        && (command_name == "isearch-forward" || command_name == "isearch-backward")
-                    {
-                        // Make the isearch window active and dispatch to its buffer
-                        self.active_window = command_window_id;
-                        let isearch_buffer_id = self.windows[command_window_id].active_buffer;
-                        if let Some(buffer_host) =
-                            self.buffer_hosts.get(&isearch_buffer_id).cloned()
-                        {
-                            let cursor_pos = self.windows[command_window_id].cursor;
-                            let response_result =
-                                buffer_host.handle_key(key_action.clone(), cursor_pos).await;
-                            match response_result {
-                                Ok(response) => {
-                                    return Ok(self.handle_buffer_response(response).await);
-                                }
-                                Err(err) => {
-                                    return Ok(vec![ChromeAction::Echo(format!(
-                                        "Buffer error: {err}"
-                                    ))]);
-                                }
-                            }
-                        }
-                        // Fall through if buffer host not found
-                    } else {
-                        // Execute command through unified command system
-                        let context = self.create_command_context();
-                        if let Some(command) = self.command_registry.get_command(command_name) {
-                            match command.execute(context).await {
-                                Ok(actions) => {
-                                    return Ok(self.process_chrome_actions(actions).await);
-                                }
-                                Err(error_msg) => {
-                                    return Ok(vec![ChromeAction::Echo(format!(
-                                        "Error: {error_msg}"
-                                    ))]);
-                                }
-                            }
-                        } else {
-                            return Ok(vec![ChromeAction::Echo(format!(
-                                "Command not found: '{}'. Available commands: {}",
-                                command_name,
-                                self.command_registry
-                                    .all_commands()
-                                    .iter()
-                                    .map(|c| &c.name)
-                                    .take(5)
-                                    .cloned()
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            ))]);
-                        }
-                    }
-                } else {
-                    // No command window, execute command normally
-                    let context = self.create_command_context();
-                    if let Some(command) = self.command_registry.get_command(command_name) {
-                        match command.execute(context).await {
-                            Ok(actions) => return Ok(self.process_chrome_actions(actions).await),
-                            Err(error_msg) => {
-                                return Ok(vec![ChromeAction::Echo(format!("Error: {error_msg}"))]);
-                            }
-                        }
-                    } else {
-                        return Ok(vec![ChromeAction::Echo(format!(
-                            "Command not found: '{}'. Available commands: {}",
-                            command_name,
-                            self.command_registry
-                                .all_commands()
-                                .iter()
-                                .map(|c| &c.name)
-                                .take(5)
-                                .cloned()
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ))]);
-                    }
-                }
-            }
-            _ => {}
-        }
-
-        // Dispatch the key to the BufferHost for the active buffer
-
-        let buffer_id = active_buffer_id;
-        let cursor_pos = {
-            let window = &self.windows[self.active_window];
-            window.cursor
-        };
-
-        let buffer_host = self.buffer_hosts.get(&buffer_id).cloned();
-        let chrome_actions = match buffer_host {
-            Some(buffer_host) => {
-                let response_result = buffer_host.handle_key(key_action, cursor_pos).await;
-
-                match response_result {
-                    Ok(response) => self.handle_buffer_response(response).await,
-                    Err(err) => vec![ChromeAction::Echo(format!("Buffer error: {err}"))],
-                }
-            }
-            None => vec![ChromeAction::Echo("No buffer host available".to_string())],
-        };
-
-        // If echo was cleared due to timeout, add an echo action to trigger redraw
-        let mut final_actions = chrome_actions;
-        if echo_cleared {
-            final_actions.push(ChromeAction::Echo(self.echo_message.clone()));
-        }
-
-        Ok(final_actions)
-    }
-
     /// Convert BufferResponse to ChromeActions
-    pub async fn handle_buffer_response(
-        &mut self,
-        response: crate::buffer_host::BufferResponse,
-    ) -> Vec<ChromeAction> {
-        use crate::buffer_host::BufferResponse;
-
-        match response {
-            BufferResponse::ActionsCompleted {
-                dirty_regions,
-                new_cursor_pos,
-                editor_action,
-                buffer_change,
-            } => {
-                let mut actions = vec![];
-
-                // Handle dirty regions
-                for dirty_region in dirty_regions {
-                    actions.push(ChromeAction::MarkDirty(dirty_region));
-                }
-
-                // Handle cursor movement
-                if let Some(new_pos) = new_cursor_pos {
-                    // Update the window's cursor position
-                    let window = &mut self
-                        .windows
-                        .get_mut(self.active_window)
-                        .expect("Active window should exist");
-                    window.cursor = new_pos;
-
-                    let buffer = &self.buffers[window.active_buffer];
-                    let (col, line) = buffer.to_column_line(new_pos);
-                    actions.push(ChromeAction::CursorMove(
-                        window.absolute_cursor_position(col, line),
-                    ));
-                }
-
-                // Handle buffer change for after-change hooks
-                if let Some(change) = buffer_change {
-                    let buffer_id = {
-                        let window = &self.windows[self.active_window];
-                        window.active_buffer
-                    };
-                    actions.push(ChromeAction::BufferChanged {
-                        buffer_id,
-                        start: change.start,
-                        old_end: change.old_end,
-                        new_end: change.new_end,
-                    });
-                }
-
-                // Handle editor action
-                if let Some(action) = editor_action {
-                    use crate::buffer_host::EditorAction;
-                    match action {
-                        EditorAction::ExecuteCommand(command_name) => {
-                            // Close the command window after command selection
-                            if let Some(command_window_id) = self.find_command_window() {
-                                self.close_command_window(command_window_id);
-                                actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
-                            }
-                            // The session host resolves this name through the
-                            // Mica-owned discovery result. Editor no longer
-                            // invokes the Rust command registry here.
-                            actions.push(ChromeAction::ExecuteCommand(command_name));
-                        }
-                        EditorAction::SwitchToBuffer(target_buffer_id) => {
-                            // Close the buffer switch window after selection
-                            if let Some(command_window_id) = self.find_command_window() {
-                                self.close_command_window(command_window_id);
-                                actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
-                            }
-
-                            // Determine which window to switch the buffer in
-                            let window_to_switch =
-                                if let Some(prev_window_id) = self.previous_active_window {
-                                    if self.windows.contains_key(prev_window_id) {
-                                        prev_window_id
-                                    } else {
-                                        self.active_window
-                                    }
-                                } else {
-                                    self.active_window
-                                };
-
-                            // Switch the determined window to the selected buffer
-                            if self.buffers.contains_key(target_buffer_id) {
-                                let window = &mut self
-                                    .windows
-                                    .get_mut(window_to_switch)
-                                    .expect("Window to switch should exist");
-                                window.active_buffer = target_buffer_id;
-                                window.cursor = 0;
-
-                                // Record this buffer access for buffer history
-                                self.record_buffer_access(target_buffer_id);
-
-                                let buffer = &self.buffers[target_buffer_id];
-                                let buffer_name = buffer.object();
-                                actions.push(ChromeAction::Echo(format!(
-                                    "Switched to buffer: {buffer_name}"
-                                )));
-                                actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
-                            } else {
-                                actions.push(ChromeAction::Echo(
-                                    "Buffer no longer exists".to_string(),
-                                ));
-                            }
-                        }
-                        EditorAction::KillBuffer(buffer_id) => {
-                            // Close the kill buffer window after selection
-                            if let Some(command_window_id) = self.find_command_window() {
-                                self.close_command_window(command_window_id);
-                                actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
-                            }
-
-                            // Implement buffer killing logic
-                            if self.buffers.contains_key(buffer_id) {
-                                let buffer_name = self.buffers[buffer_id].object().clone();
-
-                                // Find all windows using this buffer and switch them to another buffer
-                                let mut windows_to_switch = Vec::new();
-                                for (window_id, window) in &self.windows {
-                                    if window.active_buffer == buffer_id {
-                                        windows_to_switch.push(window_id);
-                                    }
-                                }
-
-                                // Find an alternative buffer to switch to (avoid command windows)
-                                let alternative_buffer = self
-                                    .buffers
-                                    .iter()
-                                    .find(|(bid, _)| {
-                                        *bid != buffer_id && !self.is_command_buffer(*bid)
-                                    })
-                                    .map(|(bid, _)| bid);
-
-                                if let Some(alt_buffer_id) = alternative_buffer {
-                                    // Switch all windows using the killed buffer to the alternative
-                                    for window_id in windows_to_switch {
-                                        if let Some(window) = self.windows.get_mut(window_id) {
-                                            window.active_buffer = alt_buffer_id;
-                                            window.cursor = 0;
-                                        }
-                                    }
-                                } else {
-                                    // No alternative buffer available - create a new scratch buffer like Emacs
-                                    use crate::mode::ScratchMode;
-                                    let scratch_mode = Box::new(ScratchMode {});
-                                    let scratch_mode_id = self.modes.insert(scratch_mode);
-
-                                    let scratch_buffer = Buffer::new(&[scratch_mode_id]);
-                                    scratch_buffer.set_object("*scratch*".to_string());
-                                    scratch_buffer.load_str("; This buffer is for text that is not saved.\n; To create a file, visit it with C-x C-f and enter text in its buffer.\n\n");
-                                    let scratch_buffer_id =
-                                        self.buffers.insert(scratch_buffer.clone());
-
-                                    // Create BufferHost for the scratch buffer
-                                    let mode_list = vec![(
-                                        scratch_mode_id,
-                                        "scratch".to_string(),
-                                        self.modes
-                                            .remove(scratch_mode_id)
-                                            .expect("Scratch mode should exist"),
-                                    )];
-                                    let buffer_client = buffer_host::create_buffer_host(
-                                        scratch_buffer,
-                                        mode_list,
-                                        scratch_buffer_id,
-                                    );
-                                    self.buffer_hosts.insert(scratch_buffer_id, buffer_client);
-
-                                    // Switch all windows using the killed buffer to the new scratch buffer
-                                    for window_id in windows_to_switch {
-                                        if let Some(window) = self.windows.get_mut(window_id) {
-                                            window.active_buffer = scratch_buffer_id;
-                                            window.cursor = 0;
-                                        }
-                                    }
-                                }
-
-                                // Remove the buffer host
-                                self.buffer_hosts.remove(&buffer_id);
-
-                                let unwatch_error = self
-                                    .file_watcher
-                                    .unwatch_file(buffer_id)
-                                    .err()
-                                    .map(|error| {
-                                        format!(
-                                            "Killed buffer, but failed to stop watching it: {error}"
-                                        )
-                                    });
-
-                                // Remove the buffer itself
-                                self.buffers.remove(buffer_id);
-
-                                actions.push(ChromeAction::Echo(format!(
-                                    "Killed buffer: {buffer_name}"
-                                )));
-                                if let Some(unwatch_error) = unwatch_error {
-                                    actions.push(ChromeAction::Echo(unwatch_error));
-                                }
-                                actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
-                            } else {
-                                actions.push(ChromeAction::Echo(
-                                    "Buffer no longer exists".to_string(),
-                                ));
-                            }
-                        }
-                        EditorAction::OpenFile { path, open_type } => {
-                            actions.extend(self.handle_open_file_action(path, open_type).await);
-                        }
-                        EditorAction::KillLine => {
-                            // Delegate to kill_line method which handles kill-ring
-                            let kill_actions = self.kill_line();
-                            actions.extend(kill_actions);
-                        }
-                        EditorAction::BackwardKillWord => {
-                            // Delegate to backward_kill_word method which handles kill-ring
-                            let kill_actions = self.backward_kill_word();
-                            actions.extend(kill_actions);
-                        }
-                        EditorAction::ForwardKillWord => {
-                            // Delegate to forward_kill_word method which handles kill-ring
-                            let kill_actions = self.forward_kill_word();
-                            actions.extend(kill_actions);
-                        }
-                        EditorAction::KillRegion => {
-                            // Delegate to kill_region method which handles kill-ring
-                            let kill_actions = self.kill_region();
-                            actions.extend(kill_actions);
-                        }
-                        EditorAction::CopyRegion => {
-                            // Delegate to copy_region method which handles kill-ring
-                            let copy_actions = self.copy_region();
-                            actions.extend(copy_actions);
-                        }
-                        EditorAction::Yank { position } => {
-                            // Delegate to yank method
-                            let yank_actions = self.yank(&position);
-                            actions.extend(yank_actions);
-                        }
-                        EditorAction::YankIndex { position, index } => {
-                            // Delegate to yank_index method
-                            let yank_actions = self.yank_index(&position, index);
-                            actions.extend(yank_actions);
-                        }
-                        EditorAction::UpdateIsearch {
-                            target_buffer_id,
-                            target_window_id,
-                            matches,
-                            current_match,
-                        } => {
-                            // Update highlights in the target buffer
-                            if let Some(buffer) = self.buffers.get(target_buffer_id) {
-                                // Clear existing isearch spans
-                                buffer.with_write(|b| {
-                                    b.spans.clear();
-                                });
-
-                                // Add spans for all matches
-                                let face_registry = crate::syntax::face_registry();
-                                if let Ok(registry) = face_registry.lock() {
-                                    let match_face_id = registry.get_id("isearch-match");
-                                    let current_face_id = registry.get_id("isearch-current");
-
-                                    if let (Some(match_face_id), Some(current_face_id)) =
-                                        (match_face_id, current_face_id)
-                                    {
-                                        let spans: Vec<_> = matches
-                                            .iter()
-                                            .enumerate()
-                                            .map(|(i, (start, end))| {
-                                                let face_id = if current_match == Some(i) {
-                                                    current_face_id
-                                                } else {
-                                                    match_face_id
-                                                };
-                                                crate::syntax::HighlightSpan::new(
-                                                    *start, *end, face_id,
-                                                )
-                                            })
-                                            .collect();
-
-                                        buffer.with_write(|b| {
-                                            b.spans.add_spans(spans);
-                                        });
-                                    }
-                                }
-
-                                // Move cursor to current match if any
-                                if let Some(current_idx) = current_match
-                                    && let Some((start_char, _)) = matches.get(current_idx)
-                                    && let Some(window) = self.windows.get_mut(target_window_id)
-                                {
-                                    window.cursor = *start_char;
-
-                                    // Ensure cursor is visible by scrolling if needed
-                                    let (col, line) = buffer.to_column_line(*start_char);
-                                    let content_height = window.height_chars.saturating_sub(3);
-                                    let content_width = window.width_chars.saturating_sub(4);
-                                    Self::ensure_cursor_visible_static(
-                                        window,
-                                        col,
-                                        line,
-                                        content_width,
-                                        content_height,
-                                    );
-
-                                    actions.push(ChromeAction::CursorMove(
-                                        window.absolute_cursor_position(col, line),
-                                    ));
-                                }
-
-                                actions.push(ChromeAction::MarkDirty(DirtyRegion::Buffer {
-                                    buffer_id: target_buffer_id,
-                                }));
-                            }
-                        }
-                        EditorAction::AcceptIsearch {
-                            target_buffer_id,
-                            search_term,
-                        } => {
-                            // Save the search term for next isearch
-                            self.last_search_term = search_term;
-
-                            // Clear isearch highlights
-                            if let Some(buffer) = self.buffers.get(target_buffer_id) {
-                                buffer.with_write(|b| {
-                                    b.spans.clear();
-                                });
-                            }
-
-                            // Close the isearch command window
-                            if let Some(command_window_id) = self.find_command_window() {
-                                self.close_command_window(command_window_id);
-                            }
-
-                            actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
-                        }
-                        EditorAction::CancelIsearch {
-                            target_buffer_id,
-                            target_window_id,
-                            original_cursor,
-                        } => {
-                            // Clear isearch highlights
-                            if let Some(buffer) = self.buffers.get(target_buffer_id) {
-                                buffer.with_write(|b| {
-                                    b.spans.clear();
-                                });
-                            }
-
-                            // Restore original cursor position
-                            if let Some(window) = self.windows.get_mut(target_window_id) {
-                                window.cursor = original_cursor;
-                            }
-
-                            // Close the isearch command window
-                            if let Some(command_window_id) = self.find_command_window() {
-                                self.close_command_window(command_window_id);
-                            }
-
-                            actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
-                        }
-                    }
-                }
-
-                actions
-            }
-            BufferResponse::Saved(file_path) => {
-                let buffer_id = self.windows[self.active_window].active_buffer;
-                let watch_error = self.buffers.get(buffer_id).and_then(|buffer| {
-                    self.file_watcher
-                        .watch_file(
-                            buffer_id,
-                            std::path::Path::new(&file_path),
-                            buffer.content(),
-                        )
-                        .err()
-                });
-                let mut actions = vec![ChromeAction::Echo(format!("Saved: {file_path}"))];
-                if let Some(error) = watch_error {
-                    actions.push(ChromeAction::Echo(format!(
-                        "Saved {file_path}, but failed to watch it: {error}"
-                    )));
-                }
-                actions
-            }
-            BufferResponse::Error(error) => {
-                vec![ChromeAction::Echo(format!("Error: {error}"))]
-            }
-            BufferResponse::NoChange => {
-                vec![]
-            }
-        }
-    }
-
     /// Perform insert action, based on the position passed and taking into account the window's
     /// cursor position.
     pub fn insert_text(&mut self, text: String, position: &ActionPosition) -> Vec<ChromeAction> {
@@ -3193,7 +1770,6 @@ impl Editor {
                         .any(|window| window.active_buffer == replaced_buffer)
                 {
                     let error = self.file_watcher.unwatch_file(replaced_buffer).err();
-                    self.buffer_hosts.remove(&replaced_buffer);
                     self.buffers.remove(replaced_buffer);
                     error.map(|error| {
                         format!("Replaced buffer, but failed to stop watching it: {error}")
@@ -3218,18 +1794,16 @@ impl Editor {
         file_path: std::path::PathBuf,
         window_id: WindowId,
     ) -> Result<String, String> {
-        use crate::mode::FileMode;
-
         if !self.windows.contains_key(window_id) {
             return Err("Window no longer exists".to_string());
         }
 
         // Try to load the file
-        let buffer = match Buffer::from_file(&file_path.to_string_lossy(), &[]).await {
+        let buffer = match Buffer::from_file(&file_path.to_string_lossy()).await {
             Ok(buffer) => buffer,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 // A missing file is the normal create-new-file path.
-                let buffer = Buffer::new(&[]);
+                let buffer = Buffer::new();
                 buffer.set_object(file_path.to_string_lossy().to_string());
                 buffer
             }
@@ -3241,24 +1815,7 @@ impl Editor {
         // Major mode selection based on file extension will be re-added when
         // Mica owns command policy; this remains a native file-open mechanism.
 
-        let buffer_id = self.buffers.insert(buffer.clone());
-
-        // Create FileMode for this file
-        let file_mode = Box::new(FileMode {
-            file_path: file_path.to_string_lossy().to_string(),
-        });
-        let file_mode_id = self.modes.insert(file_mode);
-
-        // Create BufferHost with FileMode for this buffer
-        let file_mode = self
-            .modes
-            .remove(file_mode_id)
-            .expect("File mode should exist in SlotMap");
-        let mode_list = vec![(file_mode_id, "file".to_string(), file_mode)];
-
-        // Create BufferHost and client
-        let buffer_client = crate::buffer_host::create_buffer_host(buffer, mode_list, buffer_id);
-        self.buffer_hosts.insert(buffer_id, buffer_client);
+        let buffer_id = self.buffers.insert(buffer);
 
         // Switch the window to the new buffer
         if let Some(window) = self.windows.get_mut(window_id) {
@@ -3267,7 +1824,6 @@ impl Editor {
 
             Ok(format!("Opened: {}", file_path.display()))
         } else {
-            self.buffer_hosts.remove(&buffer_id);
             self.buffers.remove(buffer_id);
             Err("Window no longer exists".to_string())
         }
@@ -3275,290 +1831,6 @@ impl Editor {
 
     /// Create a CommandContext from the current editor state
     /// Process ChromeActions and handle those that need editor state changes
-    pub async fn process_chrome_actions(
-        &mut self,
-        actions: Vec<ChromeAction>,
-    ) -> Vec<ChromeAction> {
-        let mut result_actions = Vec::new();
-
-        for action in actions {
-            match action {
-                ChromeAction::CommandMode => {
-                    // If command window is already open, close it first
-                    if let Some(existing_command_window_id) = self.find_command_window() {
-                        self.close_command_window(existing_command_window_id);
-                    }
-
-                    // Create command window at bottom with enough height for completions
-                    let window_height = 10; // Total window height
-                    let _command_window_id = self.create_command_window(
-                        CommandType::Execute,
-                        CommandWindowPosition::Bottom,
-                        window_height,
-                        None,
-                        None,
-                    );
-
-                    result_actions.push(ChromeAction::Echo("Command selection".to_string()));
-                    result_actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
-                }
-                ChromeAction::SwitchBuffer => {
-                    // If buffer switch window is already open, close it first
-                    if let Some(existing_command_window_id) = self.find_command_window() {
-                        self.close_command_window(existing_command_window_id);
-                    }
-
-                    // Create buffer switch window at bottom with enough height for buffer list
-                    let window_height = 10; // Dynamic sizing based on available space
-                    let _buffer_switch_window_id = self.create_command_window(
-                        CommandType::BufferSwitch,
-                        CommandWindowPosition::Bottom,
-                        window_height,
-                        None,
-                        None,
-                    );
-
-                    result_actions.push(ChromeAction::Echo("Buffer selection".to_string()));
-                    result_actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
-                }
-                ChromeAction::KillBuffer => {
-                    // If kill buffer window is already open, close it first
-                    if let Some(existing_command_window_id) = self.find_command_window() {
-                        self.close_command_window(existing_command_window_id);
-                    }
-
-                    // Create kill buffer window at bottom with enough height for buffer list
-                    let window_height = 10; // Dynamic sizing based on available space
-                    let _kill_buffer_window_id = self.create_command_window(
-                        CommandType::KillBuffer,
-                        CommandWindowPosition::Bottom,
-                        window_height,
-                        None,
-                        None,
-                    );
-
-                    result_actions.push(ChromeAction::Echo("Kill buffer selection".to_string()));
-                    result_actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
-                }
-                ChromeAction::OpenFile(open_type) => {
-                    // If file selector window is already open, close it first
-                    if let Some(existing_command_window_id) = self.find_command_window() {
-                        self.close_command_window(existing_command_window_id);
-                    }
-
-                    // Create file selector window at bottom with enough height for file list
-                    let window_height = 10; // Dynamic sizing based on available space
-                    let _file_selector_window_id = self.create_command_window(
-                        CommandType::OpenFile(open_type),
-                        CommandWindowPosition::Bottom,
-                        window_height,
-                        None,
-                        None,
-                    );
-
-                    let message = match open_type {
-                        OpenType::New => "Find file: opening file selector".to_string(),
-                        OpenType::Visit => "Visit file: opening file selector".to_string(),
-                    };
-                    result_actions.push(ChromeAction::Echo(message));
-                    result_actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
-                }
-                ChromeAction::Save => {
-                    // Dispatch save action to the active buffer host
-                    let buffer_id = self.windows[self.active_window].active_buffer;
-                    let cursor_pos = self.windows[self.active_window].cursor;
-
-                    let buffer_host = self.buffer_hosts.get(&buffer_id).cloned();
-                    match buffer_host {
-                        Some(buffer_host) => {
-                            let response_result =
-                                buffer_host.handle_key(KeyAction::Save, cursor_pos).await;
-
-                            match response_result {
-                                Ok(response) => {
-                                    let save_actions = self.handle_buffer_response(response).await;
-                                    result_actions.extend(save_actions);
-                                }
-                                Err(error) => result_actions
-                                    .push(ChromeAction::Echo(format!("Save error: {error}"))),
-                            }
-                        }
-                        None => {
-                            result_actions.push(ChromeAction::Echo("No buffer to save".to_string()))
-                        }
-                    }
-                }
-                ChromeAction::BufferOps(ops) => {
-                    // Apply buffer operations from scripted commands
-                    let buffer_id = self.windows[self.active_window].active_buffer;
-                    if let Some(buffer) = self.buffers.get(buffer_id) {
-                        for op in ops {
-                            match op {
-                                BufferOperation::Insert { pos, text } => {
-                                    let char_count = text.chars().count();
-                                    buffer.insert_pos(text, pos);
-                                    // Move cursor to end of inserted text
-                                    let window = &mut self.windows[self.active_window];
-                                    window.cursor = pos + char_count;
-                                    let (col, line) = buffer.to_column_line(window.cursor);
-                                    result_actions.push(ChromeAction::CursorMove(
-                                        window.absolute_cursor_position(col, line),
-                                    ));
-                                    result_actions.push(ChromeAction::MarkDirty(
-                                        DirtyRegion::Buffer { buffer_id },
-                                    ));
-                                }
-                                BufferOperation::Delete { start, end } => {
-                                    if end > start {
-                                        buffer.delete_pos(start, (end - start) as isize);
-                                        result_actions.push(ChromeAction::MarkDirty(
-                                            DirtyRegion::Buffer { buffer_id },
-                                        ));
-                                    }
-                                }
-                                BufferOperation::Replace { start, end, text } => {
-                                    if end > start {
-                                        buffer.delete_pos(start, (end - start) as isize);
-                                    }
-                                    buffer.insert_pos(text, start);
-                                    result_actions.push(ChromeAction::MarkDirty(
-                                        DirtyRegion::Buffer { buffer_id },
-                                    ));
-                                }
-                                BufferOperation::SetCursor(pos) => {
-                                    self.windows[self.active_window].cursor = pos;
-                                    let (col, line) = buffer.to_column_line(pos);
-                                    result_actions.push(ChromeAction::CursorMove((col, line)));
-                                }
-                                BufferOperation::SetMark(pos) => {
-                                    buffer.set_mark(pos);
-                                    result_actions.push(ChromeAction::Echo("Mark set".to_string()));
-                                }
-                                BufferOperation::ClearMark => {
-                                    buffer.clear_mark();
-                                    result_actions
-                                        .push(ChromeAction::Echo("Mark cleared".to_string()));
-                                }
-                                BufferOperation::SetContent(content) => {
-                                    buffer.load_str(&content);
-                                    self.windows[self.active_window].cursor = 0;
-                                    result_actions.push(ChromeAction::MarkDirty(
-                                        DirtyRegion::Buffer { buffer_id },
-                                    ));
-                                    result_actions.push(ChromeAction::CursorMove((0, 0)));
-                                }
-                                BufferOperation::IndentLine { line, indent } => {
-                                    // Find line start position
-                                    let line_start = buffer.to_char_index(0, line as u16);
-
-                                    // Get the line content to find current indentation
-                                    let line_text = buffer.buffer_line(line);
-                                    let current_indent = line_text
-                                        .chars()
-                                        .take_while(|c| *c == ' ' || *c == '\t')
-                                        .count();
-
-                                    // Calculate cursor behavior (Emacs-style)
-                                    let window = &mut self.windows[self.active_window];
-                                    let cursor_in_indent = window.cursor >= line_start
-                                        && window.cursor <= line_start + current_indent;
-
-                                    // Delete old indentation
-                                    if current_indent > 0 {
-                                        buffer.delete_pos(line_start, current_indent as isize);
-                                    }
-
-                                    // Insert new indentation
-                                    if indent > 0 {
-                                        let indent_str = " ".repeat(indent);
-                                        buffer.insert_pos(indent_str, line_start);
-                                    }
-
-                                    // Update cursor position
-                                    if cursor_in_indent {
-                                        // Move to end of new indent
-                                        window.cursor = line_start + indent;
-                                    } else if window.cursor > line_start + current_indent {
-                                        // Adjust cursor by indent difference
-                                        let diff = indent as isize - current_indent as isize;
-                                        window.cursor =
-                                            (window.cursor as isize + diff).max(0) as usize;
-                                    }
-
-                                    let (col, ln) = buffer.to_column_line(window.cursor);
-                                    result_actions.push(ChromeAction::CursorMove((col, ln)));
-                                    result_actions.push(ChromeAction::MarkDirty(
-                                        DirtyRegion::Buffer { buffer_id },
-                                    ));
-                                }
-                            }
-                        }
-                    } else {
-                        result_actions.push(ChromeAction::Echo("No active buffer".to_string()));
-                    }
-                }
-                ChromeAction::DumpMessages(path) => {
-                    let Some(messages_buffer_id) = self.messages_buffer_id else {
-                        result_actions.push(ChromeAction::Echo("No messages to dump".to_string()));
-                        continue;
-                    };
-                    let Some(buffer) = self.buffers.get(messages_buffer_id) else {
-                        result_actions
-                            .push(ChromeAction::Echo("Messages buffer not found".to_string()));
-                        continue;
-                    };
-                    match std::fs::write(&path, buffer.content()) {
-                        Ok(()) => result_actions
-                            .push(ChromeAction::Echo(format!("Messages written to {path}"))),
-                        Err(e) => result_actions
-                            .push(ChromeAction::Echo(format!("Failed to write messages: {e}"))),
-                    }
-                }
-                ChromeAction::ISearchForward => {
-                    // If a command window is already open, close it first
-                    if let Some(existing_command_window_id) = self.find_command_window() {
-                        self.close_command_window(existing_command_window_id);
-                    }
-
-                    // Create isearch window at bottom (single line for prompt)
-                    let _isearch_window_id = self.create_isearch_window(true);
-                    result_actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
-                }
-                ChromeAction::ISearchBackward => {
-                    // If a command window is already open, close it first
-                    if let Some(existing_command_window_id) = self.find_command_window() {
-                        self.close_command_window(existing_command_window_id);
-                    }
-
-                    // Create isearch window at bottom (single line for prompt)
-                    let _isearch_window_id = self.create_isearch_window(false);
-                    result_actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
-                }
-                // All other actions pass through unchanged
-                other => result_actions.push(other),
-            }
-        }
-
-        result_actions
-    }
-
-    pub fn create_command_context(&self) -> crate::command_registry::CommandContext {
-        let window = &self.windows[self.active_window];
-        let buffer = &self.buffers[window.active_buffer];
-        let (current_column, current_line) = buffer.to_column_line(window.cursor);
-
-        crate::command_registry::CommandContext {
-            buffer: buffer.clone(),
-            cursor_pos: window.cursor,
-            buffer_id: window.active_buffer,
-            window_id: self.active_window,
-            buffer_name: buffer.object(),
-            buffer_modified: false, // TODO: Implement buffer modification tracking
-            current_line: current_line + 1, // Convert to 1-based
-            current_column: current_column + 1, // Convert to 1-based
-        }
-    }
-
     /// Poll for external file changes and handle them with CRDT-lite merge
     /// Returns actions to update the UI if any changes were applied
     pub fn poll_file_changes(&mut self) -> Vec<ChromeAction> {
@@ -3724,10 +1996,7 @@ impl Editor {
     /// Stop native delivery before platform and renderer resources are released.
     pub fn shutdown_native_work(&mut self) -> Vec<String> {
         tracing::info!("shutting down editor native work");
-        let errors = self.file_watcher.shutdown();
-        self.buffer_hosts.clear();
-        self.modes.clear();
-        errors
+        self.file_watcher.shutdown()
     }
 
     /// Mark that we're about to save a buffer (prevents false external change detection)
@@ -3748,8 +2017,6 @@ impl Editor {
 mod tests {
     use super::*;
     use crate::buffer::Buffer;
-    use crate::keys::{DefaultBindings, KeyState, LogicalKey};
-    use crate::mode::ScratchMode;
     use slotmap::SlotMap;
     use std::sync::Mutex;
 
@@ -3766,12 +2033,8 @@ mod tests {
     }
 
     fn test_editor() -> Editor {
-        let scratch_mode = Box::new(ScratchMode {});
-        let mut modes: SlotMap<ModeId, Box<dyn Mode>> = SlotMap::default();
-        let scratch_mode_id = modes.insert(scratch_mode);
-
         let mut buffers: SlotMap<BufferId, Buffer> = SlotMap::default();
-        let scratch_buffer = Buffer::new(&[scratch_mode_id]);
+        let scratch_buffer = Buffer::new();
         scratch_buffer.set_object("test".to_string());
         scratch_buffer.load_str("Hello\nWorld\nTest");
         let scratch_buffer_id = buffers.insert(scratch_buffer);
@@ -3793,25 +2056,18 @@ mod tests {
         Editor {
             frame: Frame::new(80, 24),
             buffers,
-            buffer_hosts: HashMap::new(),
             windows,
-            modes,
             active_window: window_id,
             previous_active_window: None,
-            key_state: KeyState::new(),
-            bindings: Box::new(DefaultBindings {}),
             window_tree: WindowNode::new_leaf(window_id),
             kill_ring: KillRing::without_clipboard(60),
-            command_registry: Default::default(),
             buffer_history: vec![],
             echo_message: "".to_string(),
             echo_message_time: None,
             clock: Arc::new(crate::native_services::SystemClock),
-            current_key_chord: vec![],
             mouse_drag_state: None,
             messages_buffer_id: None,
             file_watcher: crate::file_watcher::FileWatcher::new(),
-            last_search_term: String::new(),
         }
     }
 
@@ -3824,7 +2080,10 @@ mod tests {
             let initial_cursor = window.cursor;
 
             // Move cursor right
-            let actions = editor.key_event(vec![LogicalKey::Right]).await.unwrap();
+            let actions = editor
+                .perform_native_action(KeyAction::Cursor(CursorDirection::Right))
+                .await
+                .unwrap();
 
             // Should get a CursorMove action
             assert!(
@@ -3887,16 +2146,9 @@ mod tests {
             let _ = std::fs::remove_dir_all(&directory);
             std::fs::create_dir(&directory).unwrap();
 
-            let failure = crate::buffer_host::BufferResponse::ActionsCompleted {
-                dirty_regions: vec![],
-                new_cursor_pos: None,
-                editor_action: Some(crate::buffer_host::EditorAction::OpenFile {
-                    path: directory.clone(),
-                    open_type: OpenType::Visit,
-                }),
-                buffer_change: None,
-            };
-            let actions = editor.handle_buffer_response(failure).await;
+            let actions = editor
+                .handle_open_file_action(directory.clone(), OpenType::Visit)
+                .await;
 
             assert!(actions.iter().any(
                 |action| matches!(action, ChromeAction::Echo(message) if message.contains("Error opening file"))
@@ -3911,16 +2163,9 @@ mod tests {
             let other_window_id = editor.windows.insert(other_window);
             let visited_path = directory.join("visited.txt");
             std::fs::write(&visited_path, "visited").unwrap();
-            let success = crate::buffer_host::BufferResponse::ActionsCompleted {
-                dirty_regions: vec![],
-                new_cursor_pos: None,
-                editor_action: Some(crate::buffer_host::EditorAction::OpenFile {
-                    path: visited_path,
-                    open_type: OpenType::Visit,
-                }),
-                buffer_change: None,
-            };
-            let actions = editor.handle_buffer_response(success).await;
+            let actions = editor
+                .handle_open_file_action(visited_path, OpenType::Visit)
+                .await;
 
             assert!(actions.iter().any(
                 |action| matches!(action, ChromeAction::Echo(message) if message.contains("Opened:"))
@@ -3946,8 +2191,6 @@ mod tests {
             assert_eq!(editor.buffers[visited_buffer].content(), "external");
 
             assert!(editor.shutdown_native_work().is_empty());
-            assert!(editor.buffer_hosts.is_empty());
-            assert!(editor.modes.is_empty());
             assert!(editor.file_watcher.get_sync_state(visited_buffer).is_none());
             std::fs::remove_dir_all(directory).unwrap();
         });
@@ -4004,7 +2247,10 @@ mod tests {
             let mut editor = test_editor();
 
             // Move cursor down
-            let actions = editor.key_event(vec![LogicalKey::Down]).await.unwrap();
+            let actions = editor
+                .perform_native_action(KeyAction::Cursor(CursorDirection::Down))
+                .await
+                .unwrap();
 
             // Should get a CursorMove action
             assert!(
@@ -4037,7 +2283,10 @@ mod tests {
             window.cursor = buffer_len;
 
             // Try to move right beyond end
-            let _actions = editor.key_event(vec![LogicalKey::Right]).await.unwrap();
+            let _actions = editor
+                .perform_native_action(KeyAction::Cursor(CursorDirection::Right))
+                .await
+                .unwrap();
 
             // Cursor should stay at end
             let window = &editor.windows[editor.active_window];
@@ -4055,7 +2304,10 @@ mod tests {
             let window = &mut editor.windows[editor.active_window];
             window.cursor = 7; // Should be at "World" line, column 1
 
-            let actions = editor.key_event(vec![LogicalKey::Right]).await.unwrap();
+            let actions = editor
+                .perform_native_action(KeyAction::Cursor(CursorDirection::Right))
+                .await
+                .unwrap();
 
             // Check the CursorMove action has correct coordinates
             if let Some(ChromeAction::CursorMove((x, y))) = actions
@@ -4614,7 +2866,7 @@ mod tests {
         // Move cursor and yank
         let window = &mut editor.windows[editor.active_window];
         window.cursor = 0; // Start of buffer (now at "\ncruel...")
-        let actions = editor.yank(&crate::mode::ActionPosition::cursor());
+        let actions = editor.yank(&ActionPosition::cursor());
 
         // Should have inserted text
         assert!(
@@ -4648,7 +2900,7 @@ mod tests {
         // Yank the first kill (index 1, "Hello")
         let window = &mut editor.windows[editor.active_window];
         window.cursor = 0;
-        editor.yank_index(&crate::mode::ActionPosition::cursor(), 1);
+        editor.yank_index(&ActionPosition::cursor(), 1);
 
         // Check that we got the older kill
         let window = &editor.windows[editor.active_window];
@@ -4686,7 +2938,7 @@ mod tests {
         // Do a non-kill operation (insert text)
         let window = &mut editor.windows[editor.active_window];
         window.cursor = 0;
-        editor.insert_text("test".to_string(), &crate::mode::ActionPosition::cursor());
+        editor.insert_text("test".to_string(), &ActionPosition::cursor());
 
         // Kill again - should be separate entry
         editor.kill_ring.kill("second".to_string());
@@ -4701,7 +2953,7 @@ mod tests {
         let mut editor = test_editor();
 
         // Try to yank from empty kill ring
-        let actions = editor.yank(&crate::mode::ActionPosition::cursor());
+        let actions = editor.yank(&ActionPosition::cursor());
 
         // Should get an error message
         assert!(
@@ -4919,7 +3171,7 @@ mod tests {
         window.cursor = editor.buffers[window.active_buffer].buffer_len_chars();
 
         // Yank the killed region
-        let actions = editor.yank(&crate::mode::ActionPosition::cursor());
+        let actions = editor.yank(&ActionPosition::cursor());
 
         // Should have refresh action
         assert!(
