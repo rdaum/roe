@@ -423,17 +423,14 @@ impl HostSession {
         }
 
         self.synchronize_identities();
-        let presentation = if self.closed {
+        let presentation = if self.closed || (!force_full && invalidations.is_empty()) {
             None
         } else {
             self.revision.0 += 1;
             let snapshot = self.capture_snapshot();
-            if force_full || self.revision.0 == 1 {
+            if force_full {
                 Some(PresentationUpdate::Full(snapshot))
             } else {
-                if invalidations.is_empty() {
-                    invalidations.push(Invalidation::Full);
-                }
                 Some(PresentationUpdate::Delta(PresentationDelta {
                     epoch: self.epoch,
                     base_revision: Revision(self.revision.0 - 1),
@@ -1005,6 +1002,27 @@ mod tests {
                     .await,
                 Err(SessionError::Closed)
             ));
+        });
+    }
+
+    #[test]
+    fn idle_heartbeat_does_not_advance_presentation_revision() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut session = test_session();
+            let initial = session.initial_output();
+            let revision = snapshot(&initial).revision;
+            let heartbeat = session
+                .dispatch(session.envelope(InputEvent::Heartbeat))
+                .await
+                .unwrap();
+            assert!(heartbeat.presentation.is_none());
+            let resync = session
+                .dispatch(session.envelope(InputEvent::RequestSnapshot {
+                    after: Some(revision),
+                }))
+                .await
+                .unwrap();
+            assert_eq!(snapshot(&resync).revision.0, revision.0 + 1);
         });
     }
 }
