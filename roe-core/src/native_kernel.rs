@@ -12,10 +12,15 @@
 //! keys, Rust references, or renderer objects.
 
 use crate::Buffer;
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const WATCH_EVENT_CAPACITY: usize = 256;
 
 /// Generation-checked identity for an ephemeral native resource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -89,6 +94,12 @@ pub struct TextSnapshot {
     pub character_len: usize,
     pub line_count: usize,
     pub selection: Option<TextSelection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeWatchNotification {
+    pub resource: ResourceId,
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -188,7 +199,12 @@ pub enum NativeResult {
     ResourceCreated(ResourceId),
     ResourceClosed,
     Snapshot(TextSnapshot),
-    TextChanged(TextSnapshot),
+    TextChanged {
+        resource: ResourceId,
+        character_len: usize,
+        line_count: usize,
+        selection: Option<TextSelection>,
+    },
     LayoutValidated,
     FileContents(String),
     FileWritten,
@@ -222,6 +238,8 @@ pub enum KernelError {
     Io(#[from] std::io::Error),
     #[error("clipboard operation failed: {0}")]
     Clipboard(String),
+    #[error("native file-watch operation failed: {0}")]
+    Watch(#[from] notify::Error),
 }
 
 struct TextResource {
@@ -240,14 +258,33 @@ pub struct NativeKernel {
     grants: CapabilityGrants,
     slots: Vec<ResourceSlot>,
     free: Vec<u32>,
+    watch_service: NativeWatchService,
+}
+
+struct NativeWatchService {
+    watcher: Option<RecommendedWatcher>,
+    registrations: Arc<RwLock<HashMap<PathBuf, HashSet<ResourceId>>>>,
+    watched_parent_counts: HashMap<PathBuf, usize>,
+    event_tx: SyncSender<NativeWatchNotification>,
+    event_rx: Receiver<NativeWatchNotification>,
+    backend_error: Arc<Mutex<Option<String>>>,
 }
 
 impl NativeKernel {
     pub fn new(grants: CapabilityGrants) -> Self {
+        let (event_tx, event_rx) = sync_channel(WATCH_EVENT_CAPACITY);
         Self {
             grants,
             slots: Vec::new(),
             free: Vec::new(),
+            watch_service: NativeWatchService {
+                watcher: None,
+                registrations: Arc::new(RwLock::new(HashMap::new())),
+                watched_parent_counts: HashMap::new(),
+                event_tx,
+                event_rx,
+                backend_error: Arc::new(Mutex::new(None)),
+            },
         }
     }
 
@@ -288,7 +325,7 @@ impl NativeKernel {
                 let len = entry.buffer.buffer_len_chars();
                 validate_range(at, at, len)?;
                 entry.buffer.insert_pos(text, at);
-                Ok(NativeResult::TextChanged(snapshot_entry(resource, entry)))
+                Ok(text_changed(resource, entry))
             }
             NativeOperation::Delete {
                 resource,
@@ -301,7 +338,7 @@ impl NativeKernel {
                 validate_range(start, end, len)?;
                 entry.buffer.delete_pos(start, (end - start) as isize);
                 clamp_selection(entry);
-                Ok(NativeResult::TextChanged(snapshot_entry(resource, entry)))
+                Ok(text_changed(resource, entry))
             }
             NativeOperation::Replace {
                 resource,
@@ -318,7 +355,7 @@ impl NativeKernel {
                 entry.buffer.insert_pos(text, start);
                 entry.buffer.end_undo_group();
                 clamp_selection(entry);
-                Ok(NativeResult::TextChanged(snapshot_entry(resource, entry)))
+                Ok(text_changed(resource, entry))
             }
             NativeOperation::SetSelection {
                 resource,
@@ -332,21 +369,21 @@ impl NativeKernel {
                     validate_range(selection.active, selection.active, len)?;
                 }
                 entry.selection = selection;
-                Ok(NativeResult::TextChanged(snapshot_entry(resource, entry)))
+                Ok(text_changed(resource, entry))
             }
             NativeOperation::Undo { resource } => {
                 self.require(Capability::TextWrite)?;
                 let entry = self.resource_mut(resource)?;
                 entry.buffer.undo();
                 clamp_selection(entry);
-                Ok(NativeResult::TextChanged(snapshot_entry(resource, entry)))
+                Ok(text_changed(resource, entry))
             }
             NativeOperation::Redo { resource } => {
                 self.require(Capability::TextWrite)?;
                 let entry = self.resource_mut(resource)?;
                 entry.buffer.redo();
                 clamp_selection(entry);
-                Ok(NativeResult::TextChanged(snapshot_entry(resource, entry)))
+                Ok(text_changed(resource, entry))
             }
             NativeOperation::ValidateLayout { layout } => {
                 self.require(Capability::Layout)?;
@@ -400,15 +437,37 @@ impl NativeKernel {
             }
             NativeOperation::RegisterWatch { resource, path } => {
                 self.require(Capability::Watch)?;
-                self.resource_mut(resource)?.watched_path = Some(path);
+                self.register_watch(resource, path)?;
                 Ok(NativeResult::WatchRegistered)
             }
             NativeOperation::UnregisterWatch { resource } => {
                 self.require(Capability::Watch)?;
-                self.resource_mut(resource)?.watched_path = None;
+                self.unregister_watch(resource)?;
                 Ok(NativeResult::WatchUnregistered)
             }
         }
+    }
+
+    /// Drain bounded native file-change hints. Notifications contain only an
+    /// ephemeral resource identity and path; the caller rereads authoritative
+    /// state and decides policy.
+    pub fn poll_watch_notifications(&self) -> Vec<NativeWatchNotification> {
+        self.watch_service.event_rx.try_iter().collect()
+    }
+
+    pub fn take_watch_error(&self) -> Option<String> {
+        self.watch_service
+            .backend_error
+            .lock()
+            .ok()
+            .and_then(|mut error| error.take())
+    }
+
+    /// Invalidate a host-owned association independently of client grants.
+    /// Authority controls client operations; host lifecycle cleanup must
+    /// always be able to revoke an ephemeral identity.
+    pub(crate) fn invalidate_resource(&mut self, resource: ResourceId) -> Result<(), KernelError> {
+        self.close(resource)
     }
 
     pub fn snapshot(&self, resource: ResourceId) -> Result<TextSnapshot, KernelError> {
@@ -447,6 +506,7 @@ impl NativeKernel {
     }
 
     fn close(&mut self, id: ResourceId) -> Result<(), KernelError> {
+        self.unregister_watch(id)?;
         let Some(slot) = self.slots.get_mut(id.slot as usize) else {
             return Err(KernelError::StaleResource(id));
         };
@@ -456,6 +516,87 @@ impl NativeKernel {
         slot.resource = None;
         slot.generation = slot.generation.wrapping_add(1).max(1);
         self.free.push(id.slot);
+        Ok(())
+    }
+
+    fn register_watch(&mut self, resource: ResourceId, path: PathBuf) -> Result<(), KernelError> {
+        let current = self.resource(resource)?.watched_path.clone();
+        let canonical = path.canonicalize().unwrap_or(path);
+        if let Some(current) = current {
+            if current == canonical {
+                return Ok(());
+            }
+            return Err(KernelError::Watch(
+                notify::Error::generic("a live native watch cannot be rebound")
+                    .add_path(current)
+                    .add_path(canonical),
+            ));
+        }
+
+        self.watch_service.ensure_watcher()?;
+        let parent = canonical.parent().map(std::path::Path::to_path_buf);
+        if let Some(parent) = parent.as_ref()
+            && !self
+                .watch_service
+                .watched_parent_counts
+                .contains_key(parent)
+            && let Some(watcher) = self.watch_service.watcher.as_mut()
+        {
+            watcher.watch(parent, RecursiveMode::NonRecursive)?;
+        }
+        if let Some(parent) = parent {
+            *self
+                .watch_service
+                .watched_parent_counts
+                .entry(parent)
+                .or_insert(0) += 1;
+        }
+        if let Ok(mut registrations) = self.watch_service.registrations.write() {
+            registrations
+                .entry(canonical.clone())
+                .or_default()
+                .insert(resource);
+        }
+        self.resource_mut(resource)?.watched_path = Some(canonical);
+        Ok(())
+    }
+
+    fn unregister_watch(&mut self, resource: ResourceId) -> Result<(), KernelError> {
+        let Some(path) = self.resource(resource)?.watched_path.clone() else {
+            return Ok(());
+        };
+        let parent = path.parent().map(std::path::Path::to_path_buf);
+        let remove_backend = parent.as_ref().is_some_and(|parent| {
+            self.watch_service
+                .watched_parent_counts
+                .get(parent)
+                .copied()
+                == Some(1)
+        });
+        if remove_backend
+            && let (Some(watcher), Some(parent)) =
+                (self.watch_service.watcher.as_mut(), parent.as_ref())
+        {
+            watcher.unwatch(parent)?;
+        }
+        if let Ok(mut registrations) = self.watch_service.registrations.write()
+            && let Some(resources) = registrations.get_mut(&path)
+        {
+            resources.remove(&resource);
+            if resources.is_empty() {
+                registrations.remove(&path);
+            }
+        }
+        if let Some(parent) = parent {
+            match self.watch_service.watched_parent_counts.get_mut(&parent) {
+                Some(count) if *count > 1 => *count -= 1,
+                Some(_) => {
+                    self.watch_service.watched_parent_counts.remove(&parent);
+                }
+                None => {}
+            }
+        }
+        self.resource_mut(resource)?.watched_path = None;
         Ok(())
     }
 
@@ -476,6 +617,62 @@ impl NativeKernel {
     }
 }
 
+impl NativeWatchService {
+    fn ensure_watcher(&mut self) -> Result<(), notify::Error> {
+        if self.watcher.is_some() {
+            return Ok(());
+        }
+        let registrations = self.registrations.clone();
+        let tx = self.event_tx.clone();
+        let backend_error = self.backend_error.clone();
+        self.watcher = Some(notify::recommended_watcher(
+            move |result: Result<notify::Event, notify::Error>| {
+                let event = match result {
+                    Ok(event) => event,
+                    Err(error) => {
+                        tracing::warn!(%error, "native watcher backend error");
+                        if let Ok(mut current) = backend_error.lock() {
+                            *current = Some(error.to_string());
+                        }
+                        return;
+                    }
+                };
+                if !matches!(
+                    event.kind,
+                    EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
+                ) {
+                    return;
+                }
+                for path in event.paths {
+                    let canonical = path.canonicalize().unwrap_or(path);
+                    let resources = registrations
+                        .read()
+                        .ok()
+                        .and_then(|entries| entries.get(&canonical).cloned())
+                        .unwrap_or_default();
+                    for resource in resources {
+                        let notification = NativeWatchNotification {
+                            resource,
+                            path: canonical.clone(),
+                        };
+                        match tx.try_send(notification) {
+                            Ok(()) => {}
+                            Err(TrySendError::Full(notification)) => tracing::warn!(
+                                resource = ?notification.resource,
+                                path = %notification.path.display(),
+                                capacity = WATCH_EVENT_CAPACITY,
+                                "native watch queue is full; dropping notification hint"
+                            ),
+                            Err(TrySendError::Disconnected(_)) => return,
+                        }
+                    }
+                }
+            },
+        )?);
+        Ok(())
+    }
+}
+
 fn validate_range(start: usize, end: usize, len: usize) -> Result<(), KernelError> {
     if start <= end && end <= len {
         Ok(())
@@ -489,6 +686,15 @@ fn snapshot_entry(resource: ResourceId, entry: &TextResource) -> TextSnapshot {
         resource,
         name: entry.buffer.object(),
         text: entry.buffer.content(),
+        character_len: entry.buffer.buffer_len_chars(),
+        line_count: entry.buffer.buffer_len_lines(),
+        selection: entry.selection,
+    }
+}
+
+fn text_changed(resource: ResourceId, entry: &TextResource) -> NativeResult {
+    NativeResult::TextChanged {
+        resource,
         character_len: entry.buffer.buffer_len_chars(),
         line_count: entry.buffer.buffer_len_lines(),
         selection: entry.selection,
@@ -550,6 +756,7 @@ fn validate_layout_node(node: &LayoutNode, views: &mut HashSet<ViewId>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     fn text_kernel() -> NativeKernel {
         NativeKernel::new(CapabilityGrants::new([
@@ -687,5 +894,54 @@ mod tests {
             Err(KernelError::InvalidRange { .. })
         ));
         assert_eq!(kernel.snapshot(id).unwrap().text, "abc");
+    }
+
+    #[test]
+    fn native_watch_registration_delivers_real_bounded_notifications() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("roe-native-watch-{}-{unique}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("watched.txt");
+        std::fs::write(&path, "before").unwrap();
+
+        let mut kernel = NativeKernel::new(CapabilityGrants::new([Capability::Watch]));
+        let resource = kernel.register_buffer(Buffer::new(&[]));
+        kernel
+            .execute(NativeOperation::RegisterWatch {
+                resource,
+                path: path.clone(),
+            })
+            .unwrap();
+        assert!(kernel.watch_service.watcher.is_some());
+
+        std::fs::write(&path, "after").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let notification = loop {
+            if let Some(notification) = kernel.poll_watch_notifications().into_iter().next() {
+                break notification;
+            }
+            assert!(Instant::now() < deadline, "native watcher did not deliver");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(notification.resource, resource);
+        assert_eq!(notification.path, path.canonicalize().unwrap());
+
+        kernel
+            .execute(NativeOperation::UnregisterWatch { resource })
+            .unwrap();
+        assert!(
+            kernel
+                .watch_service
+                .registrations
+                .read()
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
     }
 }

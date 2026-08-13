@@ -1673,14 +1673,22 @@ fn apply_session_output<W: Write>(
     renderer: &mut TerminalRenderer<W>,
     output: SessionOutput,
 ) -> Result<bool, std::io::Error> {
-    let quit = output
-        .lifecycle
-        .iter()
-        .any(|event| matches!(event, LifecycleEvent::QuitRequested));
+    let quit = output.lifecycle.iter().any(|event| {
+        matches!(
+            event,
+            LifecycleEvent::QuitRequested
+                | LifecycleEvent::EndpointClosed
+                | LifecycleEvent::Fatal(_)
+        )
+    });
     for event in &output.lifecycle {
         match event {
             LifecycleEvent::Warning(message) => tracing::warn!(%message, "session warning"),
             LifecycleEvent::Error(message) => tracing::error!(%message, "session error"),
+            LifecycleEvent::Fatal(message) => tracing::error!(%message, "fatal session error"),
+            LifecycleEvent::Overloaded { detail } => {
+                tracing::warn!(%detail, "session overload")
+            }
             _ => {}
         }
     }

@@ -145,6 +145,32 @@ fn session_vello_color(color: &PresentationColor, default: Color) -> Color {
 /// Scrollbar width in logical pixels
 const SCROLLBAR_WIDTH: f64 = 14.0;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SessionViewMetrics {
+    content_width_chars: usize,
+    content_rows: usize,
+    horizontal_overflow: bool,
+}
+
+fn session_view_metrics(view: &PresentedView, char_width: f64) -> SessionViewMetrics {
+    let gutter_chars = if view.show_gutter {
+        calculate_gutter_width(view.total_lines, &GutterConfig::default())
+    } else {
+        0
+    };
+    let width = f64::from(view.geometry.columns) * char_width;
+    let gutter_width = gutter_chars as f64 * char_width;
+    let content_width =
+        (width - (2.0 * char_width) - SCROLLBAR_WIDTH - 4.0 - gutter_width).max(0.0);
+    let content_width_chars = (content_width / char_width).floor() as usize;
+    let content_rows = view.geometry.rows.saturating_sub(3) as usize;
+    SessionViewMetrics {
+        content_width_chars,
+        content_rows,
+        horizontal_overflow: view.max_line_chars > content_width_chars,
+    }
+}
+
 /// Gutter colors
 const GUTTER_FG_COLOR: Color = Color::from_rgba8(0x60, 0x60, 0x60, 0xFF); // Dimmed line numbers
 
@@ -269,7 +295,18 @@ impl<'a> RoeVelloApp<'a> {
                 }
                 LifecycleEvent::Warning(message) => tracing::warn!(%message, "session warning"),
                 LifecycleEvent::Error(message) => tracing::error!(%message, "session error"),
-                LifecycleEvent::Ready { .. } | LifecycleEvent::Heartbeat => {}
+                LifecycleEvent::Fatal(message) => {
+                    tracing::error!(%message, "fatal session error");
+                    self.quit_requested = true;
+                }
+                LifecycleEvent::Overloaded { detail } => {
+                    tracing::warn!(%detail, "session overload")
+                }
+                LifecycleEvent::Ready { .. }
+                | LifecycleEvent::Heartbeat
+                | LifecycleEvent::RequestCancelled { .. }
+                | LifecycleEvent::ResourceChanged { .. }
+                | LifecycleEvent::ResourceInvalidated { .. } => {}
             }
         }
         if let Some(update) = output.presentation {
@@ -503,11 +540,12 @@ impl<'a> RoeVelloApp<'a> {
             0
         };
         let content_x = x + char_width * (1 + gutter_chars) as f64;
-        let content_width_chars = view
-            .geometry
-            .columns
-            .saturating_sub(2 + gutter_chars as u16) as usize;
-        let content_rows = view.geometry.rows.saturating_sub(2) as usize;
+        // Vello reserves a right-hand lane for its vertical scrollbar and one
+        // row above the modeline for horizontal scrolling. Text must not be
+        // realized underneath renderer-owned chrome.
+        let metrics = session_view_metrics(view, char_width);
+        let content_width_chars = metrics.content_width_chars;
+        let content_rows = metrics.content_rows;
         let mut absolute = view.visible_start_char;
         let mut lines: Vec<&str> = view.visible_text.split_inclusive('\n').collect();
         if lines.is_empty() {
@@ -644,50 +682,52 @@ impl<'a> RoeVelloApp<'a> {
             ),
         );
 
-        let horizontal_x = x + 2.0;
-        let horizontal_y = y + height - line_height - SCROLLBAR_WIDTH - 2.0;
-        let horizontal_extent = (width - SCROLLBAR_WIDTH - 6.0).max(1.0);
-        self.scene.fill(
-            Fill::NonZero,
-            Affine::IDENTITY,
-            Color::from_rgba8(0x40, 0x40, 0x40, 0x80),
-            None,
-            &Rect::new(
-                horizontal_x,
-                horizontal_y,
-                horizontal_x + horizontal_extent,
-                horizontal_y + SCROLLBAR_WIDTH,
-            ),
-        );
-        let visible_columns = content_width_chars.max(1);
-        let horizontal_fraction =
-            (visible_columns as f64 / view.max_line_chars.max(1) as f64).min(1.0);
-        let thumb_width = (horizontal_extent * horizontal_fraction)
-            .max(20.0)
-            .min(horizontal_extent);
-        let max_column = view.max_line_chars.saturating_sub(visible_columns);
-        let horizontal_position = if max_column == 0 {
-            0.0
-        } else {
-            f64::from(view.scroll.start_column) / max_column as f64
-        };
-        let thumb_x = horizontal_x + horizontal_position * (horizontal_extent - thumb_width);
-        self.scene.fill(
-            Fill::NonZero,
-            Affine::IDENTITY,
-            if view.active {
-                self.theme.active_border_color
+        if metrics.horizontal_overflow {
+            let horizontal_x = x + 2.0;
+            let horizontal_y = y + height - line_height - SCROLLBAR_WIDTH - 2.0;
+            let horizontal_extent = (width - SCROLLBAR_WIDTH - 6.0).max(1.0);
+            self.scene.fill(
+                Fill::NonZero,
+                Affine::IDENTITY,
+                Color::from_rgba8(0x40, 0x40, 0x40, 0x80),
+                None,
+                &Rect::new(
+                    horizontal_x,
+                    horizontal_y,
+                    horizontal_x + horizontal_extent,
+                    horizontal_y + SCROLLBAR_WIDTH,
+                ),
+            );
+            let visible_columns = content_width_chars.max(1);
+            let horizontal_fraction =
+                (visible_columns as f64 / view.max_line_chars.max(1) as f64).min(1.0);
+            let thumb_width = (horizontal_extent * horizontal_fraction)
+                .max(20.0)
+                .min(horizontal_extent);
+            let max_column = view.max_line_chars.saturating_sub(visible_columns);
+            let horizontal_position = if max_column == 0 {
+                0.0
             } else {
-                self.theme.border_color
-            },
-            None,
-            &Rect::new(
-                thumb_x,
-                horizontal_y + 2.0,
-                thumb_x + thumb_width,
-                horizontal_y + SCROLLBAR_WIDTH - 2.0,
-            ),
-        );
+                f64::from(view.scroll.start_column) / max_column as f64
+            };
+            let thumb_x = horizontal_x + horizontal_position * (horizontal_extent - thumb_width);
+            self.scene.fill(
+                Fill::NonZero,
+                Affine::IDENTITY,
+                if view.active {
+                    self.theme.active_border_color
+                } else {
+                    self.theme.border_color
+                },
+                None,
+                &Rect::new(
+                    thumb_x,
+                    horizontal_y + 2.0,
+                    thumb_x + thumb_width,
+                    horizontal_y + SCROLLBAR_WIDTH - 2.0,
+                ),
+            );
+        }
     }
 
     async fn handle_key_event(&mut self, event: winit::event::KeyEvent) {
@@ -764,7 +804,8 @@ impl<'a> RoeVelloApp<'a> {
         let Some(view) = self.presented_view(view_id).cloned() else {
             return;
         };
-        let visible = view.geometry.rows.saturating_sub(2) as usize;
+        let visible =
+            session_view_metrics(&view, f64::from(self.text_renderer.char_width())).content_rows;
         if view.total_lines <= visible {
             return;
         }
@@ -792,6 +833,9 @@ impl<'a> RoeVelloApp<'a> {
         let char_width = f64::from(self.text_renderer.char_width());
         let line_height = f64::from(self.text_renderer.line_height());
         for view in &self.redraw_state.session_presentation().current()?.views {
+            if !session_view_metrics(view, char_width).horizontal_overflow {
+                continue;
+            }
             let x = f64::from(view.geometry.x) * char_width;
             let y = f64::from(view.geometry.y) * line_height;
             let width = f64::from(view.geometry.columns) * char_width;
@@ -811,9 +855,7 @@ impl<'a> RoeVelloApp<'a> {
             return;
         };
         let char_width = f64::from(self.text_renderer.char_width());
-        let width = f64::from(view.geometry.columns) * char_width;
-        let visible =
-            ((width - (2.0 * char_width) - SCROLLBAR_WIDTH - 4.0) / char_width).max(0.0) as usize;
+        let visible = session_view_metrics(&view, char_width).content_width_chars;
         if view.max_line_chars <= visible {
             return;
         }
@@ -1210,6 +1252,8 @@ pub fn run_vello(
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+    use roe_core::native_kernel::ResourceId;
+    use roe_core::session::{ViewGeometry, ViewScroll};
     use std::cell::Cell;
     use std::rc::Rc;
     use std::sync::atomic::AtomicUsize;
@@ -1268,5 +1312,50 @@ mod lifecycle_tests {
 
         assert!(completed.get(), "periodic runtime pump stranded ready work");
         drop(task);
+    }
+
+    fn presented_view(columns: u16, rows: u16, max_line_chars: usize) -> PresentedView {
+        PresentedView {
+            id: ViewId(1),
+            resource: ResourceId {
+                slot: 0,
+                generation: 1,
+            },
+            name: "test".to_owned(),
+            visible_text: String::new(),
+            visible_start_char: 0,
+            visible_end_char: 0,
+            total_lines: 20,
+            max_line_chars,
+            cursor: 0,
+            selection: None,
+            geometry: ViewGeometry {
+                x: 0,
+                y: 0,
+                columns,
+                rows,
+            },
+            scroll: ViewScroll {
+                start_line: 0,
+                start_column: 0,
+            },
+            active: true,
+            command_view: false,
+            show_gutter: false,
+            modeline: String::new(),
+            styled_ranges: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn session_scene_reserves_scrollbar_lanes_and_only_shows_overflow() {
+        let char_width = 8.0;
+        let fits = session_view_metrics(&presented_view(80, 24, 70), char_width);
+        assert_eq!(fits.content_rows, 21);
+        assert_eq!(fits.content_width_chars, 75);
+        assert!(!fits.horizontal_overflow);
+
+        let overflow = session_view_metrics(&presented_view(80, 24, 76), char_width);
+        assert!(overflow.horizontal_overflow);
     }
 }

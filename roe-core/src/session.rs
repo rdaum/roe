@@ -30,6 +30,7 @@ pub const SESSION_PROTOCOL_VERSION: u16 = 1;
 pub const MAX_KEYS_PER_INPUT: usize = 64;
 pub const MAX_TEXT_CHARS_PER_INPUT: usize = 65_536;
 pub const MAX_PRESENTATION_CHARS: usize = 1_000_000;
+pub const MAX_NATIVE_RESULT_BYTES: usize = 1_048_576;
 pub const MAX_FRAME_COLUMNS: u16 = 1_000;
 pub const MAX_FRAME_ROWS: u16 = 1_000;
 
@@ -144,6 +145,21 @@ pub enum LifecycleEvent {
     },
     Warning(String),
     Error(String),
+    Fatal(String),
+    Overloaded {
+        detail: String,
+    },
+    RequestCancelled {
+        request_id: RequestId,
+        was_pending: bool,
+    },
+    ResourceChanged {
+        resource: ResourceId,
+        path: std::path::PathBuf,
+    },
+    ResourceInvalidated {
+        resource: ResourceId,
+    },
     QuitRequested,
     EndpointClosed,
     Heartbeat,
@@ -309,7 +325,7 @@ impl HostSession {
             pointer_selection: None,
             closed: false,
         };
-        session.synchronize_identities();
+        let _ = session.synchronize_identities();
         session
     }
 
@@ -350,7 +366,18 @@ impl HostSession {
         envelope: InputEnvelope,
     ) -> Result<SessionOutput, SessionError> {
         self.validate_envelope(&envelope)?;
-        self.validate_event_size(&envelope.event)?;
+        if let Err(SessionError::InputTooLarge(detail)) = self.validate_event_size(&envelope.event)
+        {
+            self.next_sequence += 1;
+            return Ok(SessionOutput {
+                protocol_version: SESSION_PROTOCOL_VERSION,
+                epoch: self.epoch,
+                input_sequence: envelope.sequence,
+                presentation: None,
+                native_completions: Vec::new(),
+                lifecycle: vec![LifecycleEvent::Overloaded { detail }],
+            });
+        }
         self.next_sequence += 1;
 
         let mut lifecycle = Vec::new();
@@ -359,19 +386,29 @@ impl HostSession {
         let force_full = matches!(envelope.event, InputEvent::RequestSnapshot { .. });
 
         match envelope.event {
-            InputEvent::Keys(keys) => {
-                let actions = self.editor.key_event(keys).await?;
-                self.resolve_actions(actions, &mut lifecycle, &mut invalidations)
-                    .await;
-            }
-            InputEvent::Text(text) => {
-                for character in text.chars() {
-                    let actions = self
-                        .editor
-                        .key_event(vec![LogicalKey::AlphaNumeric(character)])
-                        .await?;
+            InputEvent::Keys(keys) => match self.editor.key_event(keys).await {
+                Ok(actions) => {
                     self.resolve_actions(actions, &mut lifecycle, &mut invalidations)
                         .await;
+                }
+                Err(error) => self.fail_endpoint(error, &mut lifecycle),
+            },
+            InputEvent::Text(text) => {
+                for character in text.chars() {
+                    match self
+                        .editor
+                        .key_event(vec![LogicalKey::AlphaNumeric(character)])
+                        .await
+                    {
+                        Ok(actions) => {
+                            self.resolve_actions(actions, &mut lifecycle, &mut invalidations)
+                                .await;
+                        }
+                        Err(error) => {
+                            self.fail_endpoint(error, &mut lifecycle);
+                            break;
+                        }
+                    }
                 }
             }
             InputEvent::Pointer(pointer) => {
@@ -429,6 +466,18 @@ impl HostSession {
                 let actions = self.editor.poll_file_changes();
                 self.resolve_actions(actions, &mut lifecycle, &mut invalidations)
                     .await;
+                for notification in self.kernel.poll_watch_notifications() {
+                    invalidations.push(Invalidation::Resource(notification.resource));
+                    lifecycle.push(LifecycleEvent::ResourceChanged {
+                        resource: notification.resource,
+                        path: notification.path,
+                    });
+                }
+                if let Some(error) = self.kernel.take_watch_error() {
+                    lifecycle.push(LifecycleEvent::Error(format!(
+                        "native watcher backend: {error}"
+                    )));
+                }
             }
             InputEvent::NativeNotification(NativeNotification::PlatformWarning(warning)) => {
                 lifecycle.push(LifecycleEvent::Warning(warning));
@@ -437,7 +486,7 @@ impl HostSession {
                 request_id,
                 operation,
             } => {
-                let result = if matches!(
+                let mut result = if matches!(
                     operation,
                     NativeOperation::CloseResource { resource }
                         if self.buffer_resources.values().any(|current| *current == resource)
@@ -448,15 +497,30 @@ impl HostSession {
                         .execute(operation)
                         .map_err(|error| error.to_string())
                 };
-                if matches!(result, Ok(NativeResult::TextChanged(_))) {
+                if result
+                    .as_ref()
+                    .is_ok_and(|result| native_result_size(result) > MAX_NATIVE_RESULT_BYTES)
+                {
+                    lifecycle.push(LifecycleEvent::Overloaded {
+                        detail: format!(
+                            "native completion exceeds {MAX_NATIVE_RESULT_BYTES} bytes"
+                        ),
+                    });
+                    result = Err(format!(
+                        "native completion exceeds {MAX_NATIVE_RESULT_BYTES} bytes"
+                    ));
+                }
+                if matches!(result, Ok(NativeResult::TextChanged { .. })) {
                     invalidations.push(Invalidation::Full);
                 }
                 completions.push(NativeCompletion { request_id, result });
             }
-            InputEvent::Cancel { request_id } => lifecycle.push(LifecycleEvent::Warning(format!(
-                "request {} was not pending",
-                request_id.0
-            ))),
+            InputEvent::Cancel { request_id } => {
+                lifecycle.push(LifecycleEvent::RequestCancelled {
+                    request_id,
+                    was_pending: false,
+                });
+            }
             InputEvent::Heartbeat => lifecycle.push(LifecycleEvent::Heartbeat),
             InputEvent::RequestSnapshot { .. } => {}
             InputEvent::Focus(_) => {}
@@ -465,11 +529,18 @@ impl HostSession {
                 for warning in self.editor.shutdown_native_work() {
                     lifecycle.push(LifecycleEvent::Warning(warning));
                 }
+                for resource in self.invalidate_all_resources() {
+                    lifecycle.push(LifecycleEvent::ResourceInvalidated { resource });
+                }
                 lifecycle.push(LifecycleEvent::EndpointClosed);
             }
         }
 
-        self.synchronize_identities();
+        if !self.closed {
+            for resource in self.synchronize_identities() {
+                lifecycle.push(LifecycleEvent::ResourceInvalidated { resource });
+            }
+        }
         let presentation = if self.closed || (!force_full && invalidations.is_empty()) {
             None
         } else {
@@ -666,6 +737,20 @@ impl HostSession {
         }
     }
 
+    fn fail_endpoint(&mut self, error: std::io::Error, lifecycle: &mut Vec<LifecycleEvent>) {
+        self.closed = true;
+        lifecycle.push(LifecycleEvent::Fatal(format!(
+            "editor input failed: {error}"
+        )));
+        for warning in self.editor.shutdown_native_work() {
+            lifecycle.push(LifecycleEvent::Warning(warning));
+        }
+        for resource in self.invalidate_all_resources() {
+            lifecycle.push(LifecycleEvent::ResourceInvalidated { resource });
+        }
+        lifecycle.push(LifecycleEvent::EndpointClosed);
+    }
+
     fn apply_pointer(&mut self, pointer: PointerEvent) {
         if pointer.button != PointerButton::Primary && pointer.kind != PointerKind::Move {
             return;
@@ -745,15 +830,15 @@ impl HostSession {
         self.pointer_selection = Some((window_id, cursor));
     }
 
-    fn synchronize_identities(&mut self) {
+    fn synchronize_identities(&mut self) -> Vec<ResourceId> {
+        let mut invalidated = Vec::new();
         let live_buffers: HashSet<_> = self.editor.buffers.keys().collect();
         self.buffer_resources.retain(|buffer, resource| {
             if live_buffers.contains(buffer) {
                 true
             } else {
-                let _ = self.kernel.execute(NativeOperation::CloseResource {
-                    resource: *resource,
-                });
+                let _ = self.kernel.invalidate_resource(*resource);
+                invalidated.push(*resource);
                 false
             }
         });
@@ -773,6 +858,19 @@ impl HostSession {
                 id
             });
         }
+        invalidated
+    }
+
+    fn invalidate_all_resources(&mut self) -> Vec<ResourceId> {
+        let resources: Vec<_> = self
+            .buffer_resources
+            .drain()
+            .map(|(_, resource)| resource)
+            .collect();
+        for resource in &resources {
+            let _ = self.kernel.invalidate_resource(*resource);
+        }
+        resources
     }
 
     fn capture_snapshot(&self) -> PresentationSnapshot {
@@ -1102,6 +1200,27 @@ fn native_operation_text_size(operation: &NativeOperation) -> usize {
     }
 }
 
+fn native_result_size(result: &NativeResult) -> usize {
+    match result {
+        NativeResult::Snapshot(snapshot) => snapshot.name.len().saturating_add(snapshot.text.len()),
+        NativeResult::FileContents(contents) | NativeResult::ClipboardContents(contents) => {
+            contents.len()
+        }
+        NativeResult::ProcessOutput { stdout, stderr, .. } => {
+            stdout.len().saturating_add(stderr.len())
+        }
+        NativeResult::ResourceCreated(_)
+        | NativeResult::ResourceClosed
+        | NativeResult::TextChanged { .. }
+        | NativeResult::LayoutValidated
+        | NativeResult::FileWritten
+        | NativeResult::ClipboardWritten
+        | NativeResult::ClockMillis(_)
+        | NativeResult::WatchRegistered
+        | NativeResult::WatchUnregistered => 0,
+    }
+}
+
 fn presentation_color(color: &Color) -> PresentationColor {
     match color {
         Color::Rgb { r, g, b } => PresentationColor::Rgb {
@@ -1277,12 +1396,149 @@ mod tests {
                 .unwrap();
             assert!(close.presentation.is_none());
             assert!(close.lifecycle.contains(&LifecycleEvent::EndpointClosed));
+            assert!(
+                close
+                    .lifecycle
+                    .iter()
+                    .any(|event| matches!(event, LifecycleEvent::ResourceInvalidated { .. }))
+            );
             assert!(matches!(
                 session
                     .dispatch(session.envelope(InputEvent::Heartbeat))
                     .await,
                 Err(SessionError::Closed)
             ));
+        });
+    }
+
+    #[test]
+    fn overload_and_cancellation_are_explicit_lifecycle_results() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut session = test_session();
+            let oversized = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![
+                    LogicalKey::AlphaNumeric('x');
+                    MAX_KEYS_PER_INPUT + 1
+                ])))
+                .await
+                .unwrap();
+            assert!(matches!(
+                oversized.lifecycle.as_slice(),
+                [LifecycleEvent::Overloaded { .. }]
+            ));
+            assert_eq!(session.next_sequence(), 1);
+
+            let cancel = session
+                .dispatch(session.envelope(InputEvent::Cancel {
+                    request_id: RequestId(19),
+                }))
+                .await
+                .unwrap();
+            assert!(
+                cancel
+                    .lifecycle
+                    .contains(&LifecycleEvent::RequestCancelled {
+                        request_id: RequestId(19),
+                        was_pending: false,
+                    })
+            );
+        });
+    }
+
+    #[test]
+    fn native_completion_payloads_are_bounded() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "roe-session-output-{}-{unique}",
+                std::process::id()
+            ));
+            std::fs::write(&path, vec![b'x'; MAX_NATIVE_RESULT_BYTES + 1]).unwrap();
+            let mut session =
+                test_session_with_grants(CapabilityGrants::new([Capability::FileRead]));
+            let output = session
+                .dispatch(session.envelope(InputEvent::NativeRequest {
+                    request_id: RequestId(23),
+                    operation: NativeOperation::ReadFile { path: path.clone() },
+                }))
+                .await
+                .unwrap();
+            assert!(output.native_completions[0].result.is_err());
+            assert!(
+                output
+                    .lifecycle
+                    .iter()
+                    .any(|event| matches!(event, LifecycleEvent::Overloaded { .. }))
+            );
+            std::fs::remove_file(path).unwrap();
+        });
+    }
+
+    #[test]
+    fn native_watch_changes_surface_through_session_lifecycle() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory = std::env::temp_dir()
+                .join(format!("roe-session-watch-{}-{unique}", std::process::id()));
+            std::fs::create_dir(&directory).unwrap();
+            let path = directory.join("watched.txt");
+            std::fs::write(&path, "before").unwrap();
+
+            let mut session = test_session();
+            let initial = session.initial_output();
+            let resource = snapshot(&initial).views[0].resource;
+            let registered = session
+                .dispatch(session.envelope(InputEvent::NativeRequest {
+                    request_id: RequestId(31),
+                    operation: NativeOperation::RegisterWatch {
+                        resource,
+                        path: path.clone(),
+                    },
+                }))
+                .await
+                .unwrap();
+            assert!(matches!(
+                registered.native_completions[0].result,
+                Ok(NativeResult::WatchRegistered)
+            ));
+
+            std::fs::write(&path, "after").unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                let output = session
+                    .dispatch(session.envelope(InputEvent::Timer { token: 0 }))
+                    .await
+                    .unwrap();
+                if output.lifecycle.iter().any(|event| {
+                    matches!(
+                        event,
+                        LifecycleEvent::ResourceChanged {
+                            resource: changed,
+                            ..
+                        } if *changed == resource
+                    )
+                }) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "session did not surface native watch notification"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+
+            session
+                .dispatch(session.envelope(InputEvent::Close))
+                .await
+                .unwrap();
+            std::fs::remove_file(path).unwrap();
+            std::fs::remove_dir(directory).unwrap();
         });
     }
 
