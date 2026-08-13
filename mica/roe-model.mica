@@ -1,0 +1,204 @@
+// Roe's Phase 3 Mica object-model prototype.
+//
+// This unit deliberately contains editor policy and logical identities only.
+// Native ResourceId values and endpoint capabilities are asserted as volatile
+// tuples by the host and are never part of this filein unit.
+
+make_identity(:roe/editor_actor)
+make_identity(:roe/editor_session)
+make_identity(:roe/frame)
+make_identity(:roe/view)
+make_identity(:roe/buffer)
+make_identity(:roe/command)
+make_identity(:roe/keymap)
+make_identity(:roe/mode)
+make_identity(:roe/hook)
+make_identity(:roe/face)
+make_identity(:roe/syntax_rule)
+make_identity(:roe/package)
+
+make_identity(:roe/demo_actor)
+make_identity(:roe/demo_session)
+make_identity(:roe/demo_frame)
+make_identity(:roe/demo_buffer)
+make_identity(:roe/demo_view_a)
+make_identity(:roe/demo_view_b)
+make_identity(:roe/global_map)
+make_identity(:roe/other_window)
+make_identity(:roe/fundamental_mode)
+make_identity(:roe/default_face)
+make_identity(:roe/core_package)
+
+make_relation(:Delegates, 3)
+
+// Durable programmable description. These facts may be filed out as a named
+// unit; they contain no host capability or process identity.
+make_relation(:roe/Command, 1)
+make_functional_relation(:roe/CommandSelector, 2, [0])
+make_functional_relation(:roe/CommandSummary, 2, [0])
+make_relation(:roe/Keymap, 1)
+make_relation(:roe/KeymapParent, 3)
+make_relation(:roe/KeyBinding, 4)
+make_relation(:roe/MajorMode, 1)
+make_relation(:roe/MinorMode, 1)
+make_relation(:roe/ModeKeymap, 2)
+make_relation(:roe/ModeHook, 3)
+make_relation(:roe/Face, 1)
+make_relation(:roe/FaceAttribute, 3)
+make_relation(:roe/SyntaxRule, 4)
+make_relation(:roe/Configuration, 3)
+make_relation(:roe/Package, 1)
+make_functional_relation(:roe/PackageUnit, 2, [0])
+make_functional_relation(:roe/PackageEnabled, 2, [0])
+
+// Session-volatile logical state. Phase 4 asserts and retracts these tuples at
+// endpoint open/close using the public mica-driver volatile-tuple API.
+make_relation(:roe/EditorSession, 1)
+make_functional_relation(:roe/SessionActor, 2, [0])
+make_functional_relation(:roe/SessionFrame, 2, [0])
+make_functional_relation(:roe/SessionEndpoint, 2, [0])
+make_relation(:roe/LogicalBuffer, 1)
+make_functional_relation(:roe/BufferName, 2, [0])
+make_functional_relation(:roe/BufferMajorMode, 2, [0])
+make_relation(:roe/BufferMinorMode, 2)
+make_relation(:roe/Frame, 1)
+make_functional_relation(:roe/FrameRootView, 2, [0])
+make_relation(:roe/View, 1)
+make_functional_relation(:roe/ViewBuffer, 2, [0])
+make_functional_relation(:roe/ViewParent, 2, [0])
+make_functional_relation(:roe/ViewFirstChild, 2, [0])
+make_functional_relation(:roe/ViewSecondChild, 2, [0])
+make_functional_relation(:roe/ViewSplitAxis, 2, [0])
+make_functional_relation(:roe/ViewSplitRatio, 2, [0])
+make_functional_relation(:roe/ActiveView, 2, [0])
+make_functional_relation(:roe/ViewCursor, 2, [0])
+make_functional_relation(:roe/ViewMark, 2, [0])
+make_relation(:roe/ViewSelection, 3)
+make_relation(:roe/SessionKeymap, 3)
+make_relation(:roe/NextView, 2)
+
+// Ephemeral host associations and native-cached observations. The host owns
+// their invalidation and never persists them in a named unit or durable store.
+make_functional_relation(:roe/NativeTextResource, 2, [0])
+make_functional_relation(:roe/NativeResourceGeneration, 2, [0])
+make_functional_relation(:roe/NativeBufferRevision, 2, [0])
+make_functional_relation(:roe/PresentationRevision, 2, [0])
+
+// Authority policy is durable description. Effective grants are rebuilt for
+// each endpoint; no integer capability token appears in these relations.
+make_relation(:CanRead, 2)
+make_relation(:CanWrite, 2)
+make_relation(:CanInvoke, 2)
+make_relation(:CanEffect, 1)
+make_relation(:roe/CanUseBuffer, 2)
+make_relation(:roe/CanRequestService, 2)
+
+// Derived editor facts.
+make_relation(:roe/EffectiveBinding, 4)
+make_relation(:roe/VisibleBuffer, 2)
+make_relation(:roe/EffectiveMajorMode, 2)
+
+roe/EffectiveBinding(keymap, sequence, command, precedence) :-
+  roe/KeyBinding(keymap, sequence, command, precedence)
+
+roe/EffectiveBinding(keymap, sequence, command, precedence) :-
+  roe/KeymapParent(keymap, parent, offset),
+  roe/EffectiveBinding(parent, sequence, command, precedence)
+
+roe/VisibleBuffer(session, buffer) :-
+  roe/SessionFrame(session, frame),
+  roe/FrameRootView(frame, view),
+  roe/ViewBuffer(view, buffer)
+
+roe/VisibleBuffer(session, buffer) :-
+  roe/SessionFrame(session, frame),
+  roe/FrameRootView(frame, root),
+  roe/ViewParent(view, root),
+  roe/ViewBuffer(view, buffer)
+
+roe/EffectiveMajorMode(buffer, mode) :-
+  roe/BufferMajorMode(buffer, mode)
+
+assert Delegates(#roe/demo_actor, #roe/editor_actor, 0)
+assert Delegates(#roe/demo_session, #roe/editor_session, 0)
+assert Delegates(#roe/demo_frame, #roe/frame, 0)
+assert Delegates(#roe/demo_buffer, #roe/buffer, 0)
+assert Delegates(#roe/demo_view_a, #roe/view, 0)
+assert Delegates(#roe/demo_view_b, #roe/view, 0)
+assert Delegates(#roe/global_map, #roe/keymap, 0)
+assert Delegates(#roe/other_window, #roe/command, 0)
+assert Delegates(#roe/fundamental_mode, #roe/mode, 0)
+assert Delegates(#roe/default_face, #roe/face, 0)
+assert Delegates(#roe/core_package, #roe/package, 0)
+
+assert roe/Command(#roe/other_window)
+assert roe/CommandSelector(#roe/other_window, :roe/other_window)
+assert roe/CommandSummary(#roe/other_window, "Select the next logical view")
+assert roe/Keymap(#roe/global_map)
+assert roe/KeyBinding(#roe/global_map, "C-x o", #roe/other_window, 100)
+assert roe/MajorMode(#roe/fundamental_mode)
+assert roe/ModeKeymap(#roe/fundamental_mode, #roe/global_map)
+assert roe/Face(#roe/default_face)
+assert roe/FaceAttribute(#roe/default_face, :foreground, "inherit")
+assert roe/Package(#roe/core_package)
+assert roe/PackageUnit(#roe/core_package, :roe/core)
+assert roe/PackageEnabled(#roe/core_package, true)
+
+assert CanRead(#roe/demo_actor, :roe/ActiveView)
+assert CanRead(#roe/demo_actor, :roe/NextView)
+assert CanWrite(#roe/demo_actor, :roe/ActiveView)
+assert CanInvoke(#roe/demo_actor, :roe/other_window)
+assert CanEffect(#roe/demo_actor)
+assert roe/CanUseBuffer(#roe/demo_actor, #roe/demo_buffer)
+assert roe/CanRequestService(#roe/demo_actor, :text_read)
+
+// One complete command/keymap/window workflow. The host supplies the volatile
+// session facts shown here for the checked prototype. Runtime endpoint and
+// NativeTextResource tuples are intentionally absent from the filein source.
+assert roe/EditorSession(#roe/demo_session)
+assert roe/SessionActor(#roe/demo_session, #roe/demo_actor)
+assert roe/SessionFrame(#roe/demo_session, #roe/demo_frame)
+assert roe/LogicalBuffer(#roe/demo_buffer)
+assert roe/BufferName(#roe/demo_buffer, "*demo*")
+assert roe/BufferMajorMode(#roe/demo_buffer, #roe/fundamental_mode)
+assert roe/Frame(#roe/demo_frame)
+assert roe/FrameRootView(#roe/demo_frame, #roe/demo_view_a)
+assert roe/View(#roe/demo_view_a)
+assert roe/View(#roe/demo_view_b)
+assert roe/ViewBuffer(#roe/demo_view_a, #roe/demo_buffer)
+assert roe/ViewBuffer(#roe/demo_view_b, #roe/demo_buffer)
+assert roe/ActiveView(#roe/demo_session, #roe/demo_view_a)
+assert roe/ViewCursor(#roe/demo_view_a, 0)
+assert roe/ViewCursor(#roe/demo_view_b, 0)
+assert roe/SessionKeymap(#roe/demo_session, #roe/global_map, 100)
+assert roe/NextView(#roe/demo_view_a, #roe/demo_view_b)
+assert roe/NextView(#roe/demo_view_b, #roe/demo_view_a)
+
+verb roe/other_window(actor @ #roe/editor_actor, session @ #roe/editor_session)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  let current = one roe/ActiveView(session, ?view)
+  if current == nothing
+    return :no_active_view
+  end
+  let next = one roe/NextView(current, ?view)
+  if next == nothing
+    return :no_next_view
+  end
+  retract roe/ActiveView(session, current)
+  assert roe/ActiveView(session, next)
+  emit(session, {:kind -> :presentation_invalidated, :view -> next})
+  return next
+end
+
+verb roe/dispatch_key(actor @ #roe/editor_actor, session @ #roe/editor_session, sequence @ #string)
+  for active in roe/SessionKeymap(session, ?keymap, ?session_precedence)
+    let binding = one roe/EffectiveBinding(active[:keymap], sequence, ?command, ?precedence)
+    if binding != nothing
+      let selector = one roe/CommandSelector(binding[:command], ?selector)
+      if selector != nothing
+        return invoke(selector, {:actor -> actor, :session -> session})
+      end
+    end
+  end
+  return :unbound
+end
