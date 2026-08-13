@@ -95,8 +95,8 @@ struct EditorConfig {
 }
 
 async fn create_editor(config: EditorConfig) -> std::io::Result<Editor> {
-    // Default keybindings ship in Rust; the scripting runtime (mica) will be
-    // able to extend them once integrated.
+    // This construction-time table supplies direct editing mechanics. The
+    // Mica-enabled HostSession replaces global command/keymap policy.
     let bindings = ConfigurableBindings::new();
 
     let mut buffers: SlotMap<BufferId, Buffer> = SlotMap::default();

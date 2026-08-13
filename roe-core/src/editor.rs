@@ -3019,7 +3019,7 @@ impl Editor {
         };
 
         // Major mode selection based on file extension will be re-added when
-        // the scripting runtime (mica) is integrated.
+        // Mica owns command policy; this remains a native file-open mechanism.
 
         let buffer_id = self.buffers.insert(buffer.clone());
 

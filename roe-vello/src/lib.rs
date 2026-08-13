@@ -1218,8 +1218,8 @@ pub fn run_vello(
     mut editor: Editor,
     runtime: compio::runtime::Runtime,
 ) -> Result<(), FrontendError> {
-    // Theme configuration will come from the scripting runtime (mica) once
-    // integrated; use defaults for now.
+    // Mica owns face/configuration description; Vello retains native font,
+    // scene, device, and surface realization.
     let theme = VelloTheme::default();
 
     let event_loop = EventLoop::<HostEvent>::with_user_event()

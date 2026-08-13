@@ -175,8 +175,8 @@ async fn terminal_main<W: Write>(
 
     let tsize = crossterm::terminal::size()?;
 
-    // Default keybindings ship in Rust; the scripting runtime (mica) will be
-    // able to extend them once integrated.
+    // This construction-time table supplies direct editing mechanics. The
+    // Mica-enabled HostSession replaces global command/keymap policy.
     let bindings = ConfigurableBindings::new();
 
     let mut buffers: SlotMap<BufferId, Buffer> = SlotMap::default();
@@ -365,8 +365,8 @@ async fn terminal_main<W: Write>(
         }
     }
 
-    // Theme configuration will come from the scripting runtime (mica) once
-    // integrated; use defaults for now.
+    // Phase 5 keeps theme realization native; Mica face/configuration
+    // relations can describe future theme changes without owning ANSI state.
     let theme = roe_terminal::terminal_renderer::CachedTheme::default();
 
     let mut renderer = TerminalRenderer::new_with_theme(stdout, theme);
