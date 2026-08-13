@@ -175,6 +175,7 @@ impl<'a> RoeVelloApp<'a> {
     }
 
     fn request_redraw(&mut self, region: DirtyRegion) {
+        tracing::trace!(?region, "Vello redraw requested");
         self.redraw_state.invalidate(region);
         if let Some(ref state) = self.state {
             state.window.request_redraw();

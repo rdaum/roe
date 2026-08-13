@@ -187,8 +187,11 @@ impl BufferHostClient {
         key: KeyAction,
         cursor_pos: usize,
     ) -> Result<BufferResponse, HostError> {
+        tracing::trace!(buffer_id = ?self.buffer_id, "starting native key request");
         let mut host = self.take_host()?;
-        Ok(host.handle_key_action(key, cursor_pos).await)
+        let response = host.handle_key_action(key, cursor_pos).await;
+        tracing::trace!(buffer_id = ?self.buffer_id, "completed native key request");
+        Ok(response)
     }
 
     /// Process a mouse event through the buffer's mode chain.
@@ -197,8 +200,19 @@ impl BufferHostClient {
         event: crate::mode::MouseEvent,
         cursor_pos: usize,
     ) -> Result<BufferResponse, HostError> {
+        tracing::trace!(buffer_id = ?self.buffer_id, "starting native mouse request");
         let mut host = self.take_host()?;
-        Ok(host.handle_mouse_action(event, cursor_pos).await)
+        let response = host.handle_mouse_action(event, cursor_pos).await;
+        tracing::trace!(buffer_id = ?self.buffer_id, "completed native mouse request");
+        Ok(response)
+    }
+}
+
+impl Drop for BufferHostClient {
+    fn drop(&mut self) {
+        if Rc::strong_count(&self.host) == 1 {
+            tracing::debug!(buffer_id = ?self.buffer_id, "buffer endpoint closed");
+        }
     }
 }
 
@@ -621,6 +635,11 @@ impl BufferHost {
             let buffer_change = if buffer_changed {
                 // Use full buffer range since we're re-highlighting everything anyway
                 let buffer_len = self.buffer.buffer_len_chars();
+                tracing::trace!(
+                    buffer_id = ?self.buffer_id,
+                    revision_extent = buffer_len,
+                    "buffer mutation completed"
+                );
                 Some(BufferChange {
                     start: 0,
                     old_end: buffer_len,
@@ -672,6 +691,7 @@ pub fn create_buffer_host(
     modes: Vec<(ModeId, String, Box<dyn Mode>)>,
     buffer_id: BufferId,
 ) -> BufferHostClient {
+    tracing::debug!(buffer_id = ?buffer_id, "buffer endpoint created");
     let host = BufferHost::new(buffer, modes, buffer_id);
     BufferHostClient::new(host, buffer_id)
 }
