@@ -240,7 +240,7 @@ impl KeyState {
     /// Return what is currently pressed and in what order.
     pub fn pressed(&self) -> Vec<KeyPress> {
         let mut keys = self.keys.clone();
-        keys.sort_by(|a, b| a.when.cmp(&b.when));
+        keys.sort_by_key(|key| key.when);
         keys
     }
 
@@ -410,39 +410,36 @@ impl ConfigurableBindings {
         let mut chord_modifier: Option<LogicalKey> = None;
 
         for (i, part) in parts.iter().enumerate() {
-            if let Some(parsed_keys) = Self::parse_single_key(part) {
-                if i == 0 {
-                    // First part: include all keys (modifier + base key)
-                    keys.extend(parsed_keys.clone());
-                    // If this part has a modifier, remember it for chord continuation
-                    if parsed_keys.len() > 1 {
-                        if let LogicalKey::Modifier(_) = &parsed_keys[0] {
-                            chord_modifier = Some(parsed_keys[0]);
-                        }
-                    }
-                } else {
-                    // Subsequent parts in a chord
-                    if parsed_keys.len() > 1 {
-                        // This part has a modifier (like C-c in "C-x C-c")
-                        // Check if it's the same modifier as the chord started with
-                        if let LogicalKey::Modifier(_) = &parsed_keys[0] {
-                            if chord_modifier.is_some() {
-                                // Same modifier continuation - only add the base key
-                                keys.extend(parsed_keys.into_iter().skip(1));
-                            } else {
-                                // Different or no chord modifier - add all keys
-                                keys.extend(parsed_keys);
-                            }
-                        } else {
-                            keys.extend(parsed_keys);
-                        }
-                    } else {
-                        // Single key (like 'b' in "C-x b")
-                        keys.extend(parsed_keys);
+            let parsed_keys = Self::parse_single_key(part)?;
+            if i == 0 {
+                // First part: include all keys (modifier + base key)
+                keys.extend(parsed_keys.clone());
+                // If this part has a modifier, remember it for chord continuation
+                if parsed_keys.len() > 1 {
+                    if let LogicalKey::Modifier(_) = &parsed_keys[0] {
+                        chord_modifier = Some(parsed_keys[0]);
                     }
                 }
             } else {
-                return None; // Invalid key in sequence
+                // Subsequent parts in a chord
+                if parsed_keys.len() > 1 {
+                    // This part has a modifier (like C-c in "C-x C-c")
+                    // Check if it's the same modifier as the chord started with
+                    if let LogicalKey::Modifier(_) = &parsed_keys[0] {
+                        if chord_modifier.is_some() {
+                            // Same modifier continuation - only add the base key
+                            keys.extend(parsed_keys.into_iter().skip(1));
+                        } else {
+                            // Different or no chord modifier - add all keys
+                            keys.extend(parsed_keys);
+                        }
+                    } else {
+                        keys.extend(parsed_keys);
+                    }
+                } else {
+                    // Single key (like 'b' in "C-x b")
+                    keys.extend(parsed_keys);
+                }
             }
         }
 

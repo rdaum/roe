@@ -236,7 +236,6 @@ impl TextRenderer {
         y: f32,
         default_color: Color,
         spans: &[StyledSpan],
-        _max_width: Option<f32>, // Reserved for future wrapping support
     ) {
         if text.is_empty() {
             return;
@@ -346,8 +345,7 @@ impl TextRenderer {
                     .map(|angle| Affine::skew(angle.to_radians().tan() as f64, 0.0));
 
                 // Get normalized coordinates for variable fonts
-                let coords: Vec<NormalizedCoord> =
-                    run.normalized_coords().iter().copied().collect();
+                let coords: Vec<NormalizedCoord> = run.normalized_coords().to_vec();
 
                 // Track cumulative x position - glyphs need to be advanced manually
                 let mut cursor_x = 0.0f32;
@@ -359,7 +357,7 @@ impl TextRenderer {
                         let gx = cursor_x + glyph.x;
                         cursor_x += glyph.advance;
                         vello::Glyph {
-                            id: glyph.id as u32,
+                            id: glyph.id,
                             x: gx,
                             y: glyph.y,
                         }

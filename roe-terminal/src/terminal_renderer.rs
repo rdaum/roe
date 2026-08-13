@@ -1638,12 +1638,10 @@ async fn handle_mouse_event<W: Write>(
             );
             renderer.mark_dirty(DirtyRegion::FullScreen);
         }
-        MouseEventKind::Up(MouseButton::Left) => {
+        MouseEventKind::Up(MouseButton::Left) if editor.mouse_drag_state.is_some() => {
             // End dragging
-            if editor.mouse_drag_state.is_some() {
-                editor.mouse_drag_state = None;
-                renderer.mark_dirty(DirtyRegion::FullScreen);
-            }
+            editor.mouse_drag_state = None;
+            renderer.mark_dirty(DirtyRegion::FullScreen);
         }
         _ => {
             // Ignore other mouse events for now

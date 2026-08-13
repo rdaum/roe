@@ -321,7 +321,11 @@ impl UndoManager {
 
     /// Check if undo is available
     pub fn can_undo(&self) -> bool {
-        !self.undo_stack.is_empty() || self.pending_group.as_ref().map_or(false, |g| !g.is_empty())
+        !self.undo_stack.is_empty()
+            || self
+                .pending_group
+                .as_ref()
+                .is_some_and(|group| !group.is_empty())
     }
 
     /// Check if redo is available

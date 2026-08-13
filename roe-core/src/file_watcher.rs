@@ -414,7 +414,7 @@ fn merge_non_overlapping(
         .iter()
         .chain(external_changes.iter())
         .collect();
-    all_changes.sort_by(|a, b| b.start_line.cmp(&a.start_line));
+    all_changes.sort_by_key(|change| std::cmp::Reverse(change.start_line));
 
     let mut lines: Vec<String> = base.lines().map(|s| s.to_string()).collect();
 
@@ -522,9 +522,9 @@ fn merge_with_conflicts(_base: &str, local: &str, external: &str) -> (String, us
                 // Flush any conflict
                 if in_conflict {
                     result.push("<<<<<<< LOCAL".to_string());
-                    result.extend(local_section.drain(..));
+                    result.append(&mut local_section);
                     result.push("=======".to_string());
-                    result.extend(external_section.drain(..));
+                    result.append(&mut external_section);
                     result.push(">>>>>>> EXTERNAL".to_string());
                     conflict_count += 1;
                     in_conflict = false;

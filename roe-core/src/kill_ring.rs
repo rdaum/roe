@@ -45,7 +45,6 @@ impl ClipboardBackend for SystemClipboard {
 /// Kill operations copy to both the kill-ring and the system clipboard.
 /// Yank operations check the system clipboard first - if it contains text
 /// that differs from the kill-ring head, it's treated as external input.
-
 pub struct KillRing {
     /// Ring buffer of killed text entries
     entries: Vec<String>,
@@ -196,10 +195,7 @@ impl KillRing {
         if let Some(clipboard_text) = self.get_from_clipboard() {
             if !clipboard_text.is_empty() {
                 // Check if this differs from our most recent entry
-                let is_new = self
-                    .entries
-                    .last()
-                    .map_or(true, |last| last != &clipboard_text);
+                let is_new = self.entries.last() != Some(&clipboard_text);
 
                 if is_new {
                     // External clipboard content - add to ring

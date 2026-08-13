@@ -741,7 +741,6 @@ impl<'a> RoeVelloApp<'a> {
                     text_y,
                     fg_color,
                     &styled_spans,
-                    Some(content_width),
                 );
             }
         }
@@ -1661,77 +1660,79 @@ impl<'a> ApplicationHandler for RoeVelloApp<'a> {
                         state.window.set_cursor(cursor);
                     }
                 }
-                WindowEvent::MouseInput { state, button, .. } => {
-                    if button == MouseButton::Left {
-                        match state {
-                            ElementState::Pressed => {
-                                if let Some((x, y)) = self.cursor_position {
-                                    // Check if click is on a window border (for resizing splits)
-                                    if let Some((border_info, target_window)) =
-                                        self.check_border_hit(x, y)
-                                    {
-                                        let char_width = self.text_renderer.char_width() as f64;
-                                        let line_height = self.text_renderer.line_height() as f64;
-                                        let grid_x = (x / char_width) as u16;
-                                        let grid_y = (y / line_height) as u16;
+                WindowEvent::MouseInput {
+                    state,
+                    button: MouseButton::Left,
+                    ..
+                } => {
+                    match state {
+                        ElementState::Pressed => {
+                            if let Some((x, y)) = self.cursor_position {
+                                // Check if click is on a window border (for resizing splits)
+                                if let Some((border_info, target_window)) =
+                                    self.check_border_hit(x, y)
+                                {
+                                    let char_width = self.text_renderer.char_width() as f64;
+                                    let line_height = self.text_renderer.line_height() as f64;
+                                    let grid_x = (x / char_width) as u16;
+                                    let grid_y = (y / line_height) as u16;
 
-                                        self.editor.mouse_drag_state = Some(MouseDragState {
-                                            drag_type: DragType::WindowBorder,
-                                            start_pos: (grid_x, grid_y),
-                                            last_pos: (grid_x, grid_y),
-                                            current_pos: (grid_x, grid_y),
-                                            target_window: Some(target_window),
-                                            border_info: Some(border_info.clone()),
-                                        });
-                                        if let Some(ref state) = self.state {
-                                            let cursor = if border_info.is_vertical {
-                                                CursorIcon::ColResize
-                                            } else {
-                                                CursorIcon::RowResize
-                                            };
-                                            state.window.set_cursor(cursor);
-                                        }
+                                    self.editor.mouse_drag_state = Some(MouseDragState {
+                                        drag_type: DragType::WindowBorder,
+                                        start_pos: (grid_x, grid_y),
+                                        last_pos: (grid_x, grid_y),
+                                        current_pos: (grid_x, grid_y),
+                                        target_window: Some(target_window),
+                                        border_info: Some(border_info.clone()),
+                                    });
+                                    if let Some(ref state) = self.state {
+                                        let cursor = if border_info.is_vertical {
+                                            CursorIcon::ColResize
+                                        } else {
+                                            CursorIcon::RowResize
+                                        };
+                                        state.window.set_cursor(cursor);
                                     }
-                                    // Check if click is on vertical scrollbar
-                                    else if let Some((window_id, ratio)) =
-                                        self.check_scrollbar_hit(x, y)
-                                    {
-                                        self.handle_scrollbar_click(window_id, ratio);
-                                        self.scrollbar_dragging = Some(window_id);
-                                        if let Some(ref state) = self.state {
-                                            state.window.set_cursor(CursorIcon::Grabbing);
-                                        }
-                                    }
-                                    // Check horizontal scrollbar
-                                    else if let Some((window_id, ratio)) =
-                                        self.check_hscrollbar_hit(x, y)
-                                    {
-                                        self.handle_hscrollbar_click(window_id, ratio);
-                                        self.hscrollbar_dragging = Some(window_id);
-                                        if let Some(ref state) = self.state {
-                                            state.window.set_cursor(CursorIcon::Grabbing);
-                                        }
-                                    } else {
-                                        // Normal text click
-                                        self.handle_mouse_click(x, y).await;
-                                        // Save cursor position for potential drag selection
-                                        let cursor =
-                                            self.editor.windows[self.editor.active_window].cursor;
-                                        self.drag_start_cursor = Some(cursor);
-                                        self.mouse_dragging = true;
-                                    }
-                                    self.request_redraw(DirtyRegion::FullScreen);
                                 }
+                                // Check if click is on vertical scrollbar
+                                else if let Some((window_id, ratio)) =
+                                    self.check_scrollbar_hit(x, y)
+                                {
+                                    self.handle_scrollbar_click(window_id, ratio);
+                                    self.scrollbar_dragging = Some(window_id);
+                                    if let Some(ref state) = self.state {
+                                        state.window.set_cursor(CursorIcon::Grabbing);
+                                    }
+                                }
+                                // Check horizontal scrollbar
+                                else if let Some((window_id, ratio)) =
+                                    self.check_hscrollbar_hit(x, y)
+                                {
+                                    self.handle_hscrollbar_click(window_id, ratio);
+                                    self.hscrollbar_dragging = Some(window_id);
+                                    if let Some(ref state) = self.state {
+                                        state.window.set_cursor(CursorIcon::Grabbing);
+                                    }
+                                } else {
+                                    // Normal text click
+                                    self.handle_mouse_click(x, y).await;
+                                    // Save cursor position for potential drag selection
+                                    let cursor =
+                                        self.editor.windows[self.editor.active_window].cursor;
+                                    self.drag_start_cursor = Some(cursor);
+                                    self.mouse_dragging = true;
+                                }
+                                self.request_redraw(DirtyRegion::FullScreen);
                             }
-                            ElementState::Released => {
-                                self.mouse_dragging = false;
-                                self.drag_start_cursor = None;
-                                self.scrollbar_dragging = None;
-                                self.hscrollbar_dragging = None;
-                                // Clear border drag state
-                                if self.editor.mouse_drag_state.is_some() {
-                                    self.editor.mouse_drag_state = None;
-                                }
+                        }
+                        ElementState::Released => {
+                            self.mouse_dragging = false;
+                            self.drag_start_cursor = None;
+                            self.scrollbar_dragging = None;
+                            self.hscrollbar_dragging = None;
+                            // Clear border drag state
+                            if self.editor.mouse_drag_state.is_some() {
+                                self.editor.mouse_drag_state = None;
                             }
                         }
                     }
