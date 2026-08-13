@@ -529,7 +529,11 @@ impl HostSession {
                 for warning in self.editor.shutdown_native_work() {
                     lifecycle.push(LifecycleEvent::Warning(warning));
                 }
-                for resource in self.invalidate_all_resources() {
+                let (resources, cleanup_warnings) = self.invalidate_all_resources();
+                for warning in cleanup_warnings {
+                    lifecycle.push(LifecycleEvent::Warning(warning));
+                }
+                for resource in resources {
                     lifecycle.push(LifecycleEvent::ResourceInvalidated { resource });
                 }
                 lifecycle.push(LifecycleEvent::EndpointClosed);
@@ -537,7 +541,11 @@ impl HostSession {
         }
 
         if !self.closed {
-            for resource in self.synchronize_identities() {
+            let (resources, cleanup_warnings) = self.synchronize_identities();
+            for warning in cleanup_warnings {
+                lifecycle.push(LifecycleEvent::Warning(warning));
+            }
+            for resource in resources {
                 lifecycle.push(LifecycleEvent::ResourceInvalidated { resource });
             }
         }
@@ -745,7 +753,11 @@ impl HostSession {
         for warning in self.editor.shutdown_native_work() {
             lifecycle.push(LifecycleEvent::Warning(warning));
         }
-        for resource in self.invalidate_all_resources() {
+        let (resources, cleanup_warnings) = self.invalidate_all_resources();
+        for warning in cleanup_warnings {
+            lifecycle.push(LifecycleEvent::Warning(warning));
+        }
+        for resource in resources {
             lifecycle.push(LifecycleEvent::ResourceInvalidated { resource });
         }
         lifecycle.push(LifecycleEvent::EndpointClosed);
@@ -830,15 +842,27 @@ impl HostSession {
         self.pointer_selection = Some((window_id, cursor));
     }
 
-    fn synchronize_identities(&mut self) -> Vec<ResourceId> {
+    fn synchronize_identities(&mut self) -> (Vec<ResourceId>, Vec<String>) {
         let mut invalidated = Vec::new();
+        let mut cleanup_warnings = Vec::new();
         let live_buffers: HashSet<_> = self.editor.buffers.keys().collect();
         self.buffer_resources.retain(|buffer, resource| {
             if live_buffers.contains(buffer) {
                 true
             } else {
-                let _ = self.kernel.invalidate_resource(*resource);
-                invalidated.push(*resource);
+                match self.kernel.invalidate_resource(*resource) {
+                    Ok(cleanup_error) => {
+                        invalidated.push(*resource);
+                        if let Some(error) = cleanup_error {
+                            cleanup_warnings.push(format!(
+                                "resource {resource:?} was revoked after cleanup failed: {error}"
+                            ));
+                        }
+                    }
+                    Err(error) => cleanup_warnings.push(format!(
+                        "resource {resource:?} invalidation failed: {error}"
+                    )),
+                }
                 false
             }
         });
@@ -858,19 +882,33 @@ impl HostSession {
                 id
             });
         }
-        invalidated
+        (invalidated, cleanup_warnings)
     }
 
-    fn invalidate_all_resources(&mut self) -> Vec<ResourceId> {
+    fn invalidate_all_resources(&mut self) -> (Vec<ResourceId>, Vec<String>) {
         let resources: Vec<_> = self
             .buffer_resources
             .drain()
             .map(|(_, resource)| resource)
             .collect();
+        let mut invalidated = Vec::with_capacity(resources.len());
+        let mut cleanup_warnings = Vec::new();
         for resource in &resources {
-            let _ = self.kernel.invalidate_resource(*resource);
+            match self.kernel.invalidate_resource(*resource) {
+                Ok(cleanup_error) => {
+                    invalidated.push(*resource);
+                    if let Some(error) = cleanup_error {
+                        cleanup_warnings.push(format!(
+                            "resource {resource:?} was revoked after cleanup failed: {error}"
+                        ));
+                    }
+                }
+                Err(error) => cleanup_warnings.push(format!(
+                    "resource {resource:?} invalidation failed: {error}"
+                )),
+            }
         }
-        resources
+        (invalidated, cleanup_warnings)
     }
 
     fn capture_snapshot(&self) -> PresentationSnapshot {
@@ -1540,6 +1578,56 @@ mod tests {
             std::fs::remove_file(path).unwrap();
             std::fs::remove_dir(directory).unwrap();
         });
+    }
+
+    #[test]
+    fn host_reports_cleanup_warning_only_after_resource_is_revoked() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "roe-session-revoke-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("watched.txt");
+        std::fs::write(&path, "content").unwrap();
+
+        let mut session = test_session();
+        let (buffer, resource) = session
+            .buffer_resources
+            .iter()
+            .next()
+            .map(|(buffer, resource)| (*buffer, *resource))
+            .unwrap();
+        session
+            .kernel
+            .execute(NativeOperation::RegisterWatch {
+                resource,
+                path: path.clone(),
+            })
+            .unwrap();
+        session
+            .kernel
+            .force_backend_unwatch_for_test(&path)
+            .unwrap();
+        session.editor.buffers.remove(buffer);
+
+        let (invalidated, warnings) = session.synchronize_identities();
+        assert_eq!(invalidated, vec![resource]);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("cleanup failed"))
+        );
+        assert!(matches!(
+            session.kernel.snapshot(resource),
+            Err(KernelError::StaleResource(id)) if id == resource
+        ));
+
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
     }
 
     #[test]

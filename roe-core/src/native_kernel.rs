@@ -240,6 +240,8 @@ pub enum KernelError {
     Clipboard(String),
     #[error("native file-watch operation failed: {0}")]
     Watch(#[from] notify::Error),
+    #[error("native resource was revoked, but cleanup failed: {0}")]
+    Cleanup(String),
 }
 
 struct TextResource {
@@ -312,7 +314,9 @@ impl NativeKernel {
             }
             NativeOperation::CloseResource { resource } => {
                 self.require(Capability::TextWrite)?;
-                self.close(resource)?;
+                if let Some(error) = self.close(resource)? {
+                    return Err(KernelError::Cleanup(error));
+                }
                 Ok(NativeResult::ResourceClosed)
             }
             NativeOperation::Snapshot { resource } => {
@@ -466,7 +470,10 @@ impl NativeKernel {
     /// Invalidate a host-owned association independently of client grants.
     /// Authority controls client operations; host lifecycle cleanup must
     /// always be able to revoke an ephemeral identity.
-    pub(crate) fn invalidate_resource(&mut self, resource: ResourceId) -> Result<(), KernelError> {
+    pub(crate) fn invalidate_resource(
+        &mut self,
+        resource: ResourceId,
+    ) -> Result<Option<String>, KernelError> {
         self.close(resource)
     }
 
@@ -505,8 +512,19 @@ impl NativeKernel {
         }
     }
 
-    fn close(&mut self, id: ResourceId) -> Result<(), KernelError> {
-        self.unregister_watch(id)?;
+    fn close(&mut self, id: ResourceId) -> Result<Option<String>, KernelError> {
+        // Validate before cleanup, then revoke the generation regardless of a
+        // backend-unwatch failure. Native cleanup is fallible; capability
+        // revocation is not.
+        self.resource(id)?;
+        let cleanup_error = match self.unregister_watch(id) {
+            Ok(()) => None,
+            Err(error) => {
+                let message = error.to_string();
+                self.forget_watch_registration(id);
+                Some(message)
+            }
+        };
         let Some(slot) = self.slots.get_mut(id.slot as usize) else {
             return Err(KernelError::StaleResource(id));
         };
@@ -516,7 +534,7 @@ impl NativeKernel {
         slot.resource = None;
         slot.generation = slot.generation.wrapping_add(1).max(1);
         self.free.push(id.slot);
-        Ok(())
+        Ok(cleanup_error)
     }
 
     fn register_watch(&mut self, resource: ResourceId, path: PathBuf) -> Result<(), KernelError> {
@@ -598,6 +616,49 @@ impl NativeKernel {
         }
         self.resource_mut(resource)?.watched_path = None;
         Ok(())
+    }
+
+    fn forget_watch_registration(&mut self, resource: ResourceId) {
+        let Ok(entry) = self.resource(resource) else {
+            return;
+        };
+        let Some(path) = entry.watched_path.clone() else {
+            return;
+        };
+        if let Ok(mut registrations) = self.watch_service.registrations.write()
+            && let Some(resources) = registrations.get_mut(&path)
+        {
+            resources.remove(&resource);
+            if resources.is_empty() {
+                registrations.remove(&path);
+            }
+        }
+        if let Some(parent) = path.parent() {
+            match self.watch_service.watched_parent_counts.get_mut(parent) {
+                Some(count) if *count > 1 => *count -= 1,
+                Some(_) => {
+                    self.watch_service.watched_parent_counts.remove(parent);
+                }
+                None => {}
+            }
+        }
+        if let Ok(entry) = self.resource_mut(resource) {
+            entry.watched_path = None;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_backend_unwatch_for_test(
+        &mut self,
+        path: &std::path::Path,
+    ) -> Result<(), notify::Error> {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let parent = canonical.parent().unwrap_or(&canonical);
+        self.watch_service
+            .watcher
+            .as_mut()
+            .expect("test watch backend is initialized")
+            .unwatch(parent)
     }
 
     fn resource(&self, id: ResourceId) -> Result<&TextResource, KernelError> {
@@ -941,6 +1002,48 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn host_invalidation_revokes_generation_when_backend_cleanup_fails() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("roe-native-revoke-{}-{unique}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("watched.txt");
+        std::fs::write(&path, "content").unwrap();
+
+        let mut kernel = NativeKernel::new(CapabilityGrants::new([Capability::Watch]));
+        let resource = kernel.register_buffer(Buffer::new(&[]));
+        kernel
+            .execute(NativeOperation::RegisterWatch {
+                resource,
+                path: path.clone(),
+            })
+            .unwrap();
+        kernel.force_backend_unwatch_for_test(&path).unwrap();
+
+        let cleanup_error = kernel.invalidate_resource(resource).unwrap();
+        assert!(cleanup_error.is_some());
+        assert!(matches!(
+            kernel.snapshot(resource),
+            Err(KernelError::StaleResource(id)) if id == resource
+        ));
+        assert!(
+            kernel
+                .watch_service
+                .registrations
+                .read()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(kernel.watch_service.watched_parent_counts.is_empty());
+
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(directory).unwrap();
     }
