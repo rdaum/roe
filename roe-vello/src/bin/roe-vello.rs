@@ -175,7 +175,9 @@ async fn create_editor(config: EditorConfig) -> Editor {
 
     // Initialize file watcher
     let mut file_watcher = roe_core::file_watcher::FileWatcher::new();
-    let _ = file_watcher.init(); // Ignore errors for now
+    if let Err(error) = file_watcher.init() {
+        tracing::warn!(%error, "file watcher is unavailable");
+    }
 
     let mut editor = Editor {
         frame: Frame::new(DEFAULT_COLS, DEFAULT_LINES),
@@ -209,11 +211,13 @@ async fn create_editor(config: EditorConfig) -> Editor {
         let file_path = buffer.object();
         if !file_path.is_empty() && std::path::Path::new(&file_path).exists() {
             let content = buffer.content();
-            let _ = editor.file_watcher.watch_file(
-                buffer_id,
-                std::path::Path::new(&file_path),
-                content,
-            );
+            if let Err(error) =
+                editor
+                    .file_watcher
+                    .watch_file(buffer_id, std::path::Path::new(&file_path), content)
+            {
+                tracing::warn!(%error, %file_path, "failed to watch file");
+            }
         }
     }
 
@@ -221,14 +225,19 @@ async fn create_editor(config: EditorConfig) -> Editor {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
     let config = parse_args();
 
-    let runtime = compio::runtime::Runtime::new().expect("Failed to create compio runtime");
+    tracing::info!("starting Vello frontend");
+    let runtime = compio::runtime::Runtime::new()?;
 
     let mut editor = runtime.block_on(create_editor(config));
 
     // Run with Vello renderer
     roe_vello::run_vello(&mut editor, runtime)?;
+    tracing::info!("Vello frontend stopped");
 
     Ok(())
 }

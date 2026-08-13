@@ -18,145 +18,10 @@ use crate::renderer::DirtyRegion;
 use crate::{BufferId, ModeId};
 use compio::buf::BufResult;
 use compio::io::AsyncWriteAtExt;
-use futures::StreamExt;
-use futures::channel::{mpsc, oneshot};
-
-/// Message sent to a mode actor
-pub enum ModeMessage {
-    /// Key action to process
-    KeyAction {
-        action: KeyAction,
-        reply: oneshot::Sender<ModeResult>,
-    },
-    /// Mouse event to process
-    MouseEvent {
-        event: crate::mode::MouseEvent,
-        reply: oneshot::Sender<ModeResult>,
-    },
-}
-
-/// Persistent mode actor that runs in its own task
-pub struct ModeActor {
-    mode_impl: Box<dyn Mode>,
-    receiver: mpsc::UnboundedReceiver<ModeMessage>,
-    #[allow(dead_code)] // Used for potential future mode operations
-    buffer: Buffer, // Shared buffer access
-    #[allow(dead_code)] // Used for identification in potential future operations
-    mode_id: ModeId,
-}
-
-impl ModeActor {
-    pub fn new(
-        mode_impl: Box<dyn Mode>,
-        receiver: mpsc::UnboundedReceiver<ModeMessage>,
-        buffer: Buffer,
-        mode_id: ModeId,
-    ) -> Self {
-        Self {
-            mode_impl,
-            receiver,
-            buffer,
-            mode_id,
-        }
-    }
-
-    /// Spawn the mode actor as a persistent task
-    pub fn spawn(mut self) -> compio::runtime::JoinHandle<()> {
-        compio::runtime::spawn(async move {
-            loop {
-                let next_message = self.receiver.next().await;
-                let Some(message) = next_message else {
-                    break;
-                };
-                match message {
-                    ModeMessage::KeyAction { action, reply } => {
-                        let result = self.mode_impl.perform(&action);
-                        let _ = reply.send(result);
-                        continue;
-                    }
-                    ModeMessage::MouseEvent { event, reply } => {
-                        let result = self.mode_impl.handle_mouse(&event);
-                        let _ = reply.send(result);
-                        continue;
-                    }
-                };
-            }
-        })
-    }
-}
-
-/// Client handle to communicate with a mode actor
-pub struct ModeClient {
-    sender: mpsc::UnboundedSender<ModeMessage>,
-    #[allow(dead_code)] // Used for identification in potential future operations
-    mode_id: ModeId,
-    name: String,
-}
-
-impl ModeClient {
-    pub fn new(sender: mpsc::UnboundedSender<ModeMessage>, mode_id: ModeId, name: String) -> Self {
-        Self {
-            sender,
-            mode_id,
-            name,
-        }
-    }
-
-    /// Send a key action to the mode and wait for response
-    pub async fn handle_key(&self, action: KeyAction) -> Result<ModeResult, String> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let message = ModeMessage::KeyAction {
-            action,
-            reply: reply_tx,
-        };
-
-        self.sender
-            .unbounded_send(message)
-            .map_err(|_| format!("Mode {} disconnected", self.name))?;
-
-        reply_rx
-            .await
-            .map_err(|_| format!("Mode {} reply failed", self.name))
-    }
-
-    /// Send a mouse event to the mode and wait for response
-    pub async fn handle_mouse(&self, event: crate::mode::MouseEvent) -> Result<ModeResult, String> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let message = ModeMessage::MouseEvent {
-            event,
-            reply: reply_tx,
-        };
-
-        self.sender
-            .unbounded_send(message)
-            .map_err(|_| format!("Mode {} disconnected", self.name))?;
-
-        reply_rx
-            .await
-            .map_err(|_| format!("Mode {} reply failed", self.name))
-    }
-}
-
-/// Request sent to BufferHost
-#[derive(Debug)]
-pub enum BufferRequest {
-    /// Process a keystroke through the mode chain
-    HandleKey {
-        action: KeyAction,
-        cursor_pos: usize,
-    },
-    /// Process a mouse event through the mode chain
-    HandleMouse {
-        event: crate::mode::MouseEvent,
-        cursor_pos: usize,
-    },
-    /// Get current buffer state
-    GetState,
-    /// Save buffer to file
-    Save,
-    /// Load buffer from file
-    Load(String),
-}
+use std::cell::RefCell;
+use std::ops::{Deref, DerefMut};
+use std::rc::Rc;
+use thiserror::Error;
 
 /// Actions that need to be performed at the Editor level
 #[derive(Debug, Clone)]
@@ -239,77 +104,107 @@ pub enum BufferResponse {
     NoChange,
 }
 
-/// Message combining request with reply channel
-pub struct BufferMessage {
-    pub request: BufferRequest,
-    pub reply: oneshot::Sender<BufferResponse>,
+#[derive(Debug, Clone, Error, Eq, PartialEq)]
+pub enum HostError {
+    #[error("buffer host {buffer_id:?} is already processing an operation")]
+    Busy { buffer_id: BufferId },
 }
 
-/// Client-side interface for communicating with BufferHost
+/// Cloneable handle to an in-process, serially borrowed buffer service.
+///
+/// Phase 1 deliberately removed the per-buffer and per-mode actor tasks. The
+/// frontends already dispatch one operation at a time, so those actors added
+/// scheduling, unbounded queues, and detached lifetime without concurrency.
 #[derive(Clone)]
 pub struct BufferHostClient {
-    sender: mpsc::UnboundedSender<BufferMessage>,
-    #[allow(dead_code)] // Used for identification in potential future operations
+    host: Rc<RefCell<Option<BufferHost>>>,
     buffer_id: BufferId,
 }
 
+struct HostLease {
+    slot: Rc<RefCell<Option<BufferHost>>>,
+    host: Option<BufferHost>,
+}
+
+impl Deref for HostLease {
+    type Target = BufferHost;
+
+    fn deref(&self) -> &Self::Target {
+        self.host
+            .as_ref()
+            .expect("a live host lease always owns its service")
+    }
+}
+
+impl DerefMut for HostLease {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.host
+            .as_mut()
+            .expect("a live host lease always owns its service")
+    }
+}
+
+impl Drop for HostLease {
+    fn drop(&mut self) {
+        let host = self
+            .host
+            .take()
+            .expect("a live host lease always owns its service");
+        let previous = self.slot.borrow_mut().replace(host);
+        debug_assert!(previous.is_none(), "host returned to an occupied slot");
+    }
+}
+
 impl BufferHostClient {
-    pub fn new(sender: mpsc::UnboundedSender<BufferMessage>, buffer_id: BufferId) -> Self {
-        Self { sender, buffer_id }
+    fn new(host: BufferHost, buffer_id: BufferId) -> Self {
+        Self {
+            host: Rc::new(RefCell::new(Some(host))),
+            buffer_id,
+        }
     }
 
-    /// Send a key event to the buffer
+    fn take_host(&self) -> Result<HostLease, HostError> {
+        let host = self.host.borrow_mut().take().ok_or(HostError::Busy {
+            buffer_id: self.buffer_id,
+        })?;
+        Ok(HostLease {
+            slot: self.host.clone(),
+            host: Some(host),
+        })
+    }
+
+    /// Process a key event through the buffer's mode chain.
     pub async fn handle_key(
         &self,
         key: KeyAction,
         cursor_pos: usize,
-    ) -> Result<BufferResponse, String> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let message = BufferMessage {
-            request: BufferRequest::HandleKey {
-                action: key,
-                cursor_pos,
-            },
-            reply: reply_tx,
-        };
-
-        self.sender
-            .unbounded_send(message)
-            .map_err(|_| "BufferHost disconnected".to_string())?;
-
-        reply_rx
-            .await
-            .map_err(|_| "BufferHost reply failed".to_string())
+    ) -> Result<BufferResponse, HostError> {
+        let mut host = self.take_host()?;
+        Ok(host.handle_key_action(key, cursor_pos).await)
     }
 
-    /// Send a mouse event to the buffer and wait for response
+    /// Process a mouse event through the buffer's mode chain.
     pub async fn handle_mouse(
         &self,
         event: crate::mode::MouseEvent,
         cursor_pos: usize,
-    ) -> Result<BufferResponse, String> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-
-        let message = BufferMessage {
-            request: BufferRequest::HandleMouse { event, cursor_pos },
-            reply: reply_tx,
-        };
-
-        self.sender
-            .unbounded_send(message)
-            .map_err(|_| "BufferHost disconnected".to_string())?;
-
-        reply_rx
-            .await
-            .map_err(|_| "BufferHost reply failed".to_string())
+    ) -> Result<BufferResponse, HostError> {
+        let mut host = self.take_host()?;
+        Ok(host.handle_mouse_action(event, cursor_pos).await)
     }
 }
 
-/// The BufferHost that processes requests and coordinates with mode actors
+struct ModeEntry {
+    mode_id: ModeId,
+    name: String,
+    implementation: Box<dyn Mode>,
+}
+
+/// Serialized native buffer service. Serialization is enforced by
+/// `BufferHostClient`'s checked mutable borrow rather than a hidden task queue.
 pub struct BufferHost {
     buffer: Buffer,
-    mode_clients: Vec<ModeClient>,
-    receiver: mpsc::UnboundedReceiver<BufferMessage>,
+    modes: Vec<ModeEntry>,
     buffer_id: BufferId,
 }
 
@@ -317,67 +212,19 @@ impl BufferHost {
     pub fn new(
         buffer: Buffer,
         modes: Vec<(ModeId, String, Box<dyn Mode>)>,
-        receiver: mpsc::UnboundedReceiver<BufferMessage>,
         buffer_id: BufferId,
     ) -> Self {
-        let mut mode_clients = Vec::new();
-
-        // Spawn each mode as a persistent actor
-        for (mode_id, name, mode_impl) in modes {
-            let (sender, mode_receiver) = mpsc::unbounded();
-
-            let mode_actor = ModeActor::new(
-                mode_impl,
-                mode_receiver,
-                buffer.clone(), // Share the buffer
-                mode_id,
-            );
-
-            // Spawn the mode actor; it runs until all senders are dropped.
-            mode_actor.spawn().detach();
-
-            mode_clients.push(ModeClient::new(sender, mode_id, name));
-        }
-
         Self {
             buffer,
-            mode_clients,
-            receiver,
+            modes: modes
+                .into_iter()
+                .map(|(mode_id, name, implementation)| ModeEntry {
+                    mode_id,
+                    name,
+                    implementation,
+                })
+                .collect(),
             buffer_id,
-        }
-    }
-
-    /// Spawn the BufferHost as an async task
-    pub fn spawn(mut self) -> compio::runtime::JoinHandle<()> {
-        compio::runtime::spawn(async move {
-            loop {
-                let next_message = self.receiver.next().await;
-                let Some(message) = next_message else {
-                    break;
-                };
-                let response = self.handle_request(message.request).await;
-
-                // Send reply (ignore if receiver dropped)
-                let _ = message.reply.send(response);
-            }
-
-            // Mode actors exit on their own when the clients (and their
-            // channel senders) are dropped along with this host.
-        })
-    }
-
-    /// Handle a single request
-    async fn handle_request(&mut self, request: BufferRequest) -> BufferResponse {
-        match request {
-            BufferRequest::HandleKey { action, cursor_pos } => {
-                self.handle_key_action(action, cursor_pos).await
-            }
-            BufferRequest::HandleMouse { event, cursor_pos } => {
-                self.handle_mouse_action(event, cursor_pos).await
-            }
-            BufferRequest::GetState => self.get_state(),
-            BufferRequest::Save => self.save_buffer().await,
-            BufferRequest::Load(file_path) => self.load_buffer(file_path).await,
         }
     }
 
@@ -390,29 +237,22 @@ impl BufferHost {
         let mut actions_to_execute = vec![];
 
         // Process modes sequentially: major mode first, then minor modes
-        for mode_client in &self.mode_clients {
-            match mode_client.handle_key(key_action.clone()).await {
-                Ok(result) => {
-                    match result {
-                        ModeResult::Consumed(actions) => {
-                            // This mode consumed the event - stop processing
-                            actions_to_execute.extend(actions);
-                            break;
-                        }
-                        ModeResult::Annotated(actions) => {
-                            // This mode handled the event but allows others to see it too
-                            actions_to_execute.extend(actions);
-                            // Continue to next mode
-                        }
-                        ModeResult::Ignored => {
-                            // This mode ignored the event - continue to next mode
-                        }
-                    }
+        for mode in &mut self.modes {
+            tracing::trace!(
+                buffer_id = ?self.buffer_id,
+                mode_id = ?mode.mode_id,
+                mode = %mode.name,
+                "dispatching key to mode"
+            );
+            match mode.implementation.perform(&key_action) {
+                ModeResult::Consumed(actions) => {
+                    actions_to_execute.extend(actions);
+                    break;
                 }
-                Err(_) => {
-                    // Mode communication failed, continue to next mode
-                    continue;
+                ModeResult::Annotated(actions) => {
+                    actions_to_execute.extend(actions);
                 }
+                ModeResult::Ignored => {}
             }
         }
 
@@ -429,28 +269,22 @@ impl BufferHost {
         let mut actions_to_execute = vec![];
 
         // Process through mode chain in order
-        for mode_client in &self.mode_clients {
-            match mode_client.handle_mouse(mouse_event.clone()).await {
-                Ok(result) => {
-                    match result {
-                        ModeResult::Consumed(actions) => {
-                            // This mode consumed the event - add its actions and stop
-                            actions_to_execute.extend(actions);
-                            break;
-                        }
-                        ModeResult::Annotated(actions) => {
-                            // This mode annotated the event - add its actions and continue
-                            actions_to_execute.extend(actions);
-                        }
-                        ModeResult::Ignored => {
-                            // This mode ignored the event - continue to next mode
-                        }
-                    }
+        for mode in &mut self.modes {
+            tracing::trace!(
+                buffer_id = ?self.buffer_id,
+                mode_id = ?mode.mode_id,
+                mode = %mode.name,
+                "dispatching mouse event to mode"
+            );
+            match mode.implementation.handle_mouse(&mouse_event) {
+                ModeResult::Consumed(actions) => {
+                    actions_to_execute.extend(actions);
+                    break;
                 }
-                Err(_) => {
-                    // Mode communication failed, continue to next mode
-                    continue;
+                ModeResult::Annotated(actions) => {
+                    actions_to_execute.extend(actions);
                 }
+                ModeResult::Ignored => {}
             }
         }
 
@@ -800,10 +634,6 @@ impl BufferHost {
     }
 
     /// Get current buffer state
-    fn get_state(&self) -> BufferResponse {
-        BufferResponse::NoChange // State queries don't change anything
-    }
-
     /// Save buffer to file
     async fn save_buffer(&self) -> BufferResponse {
         let file_path = self.buffer.object();
@@ -823,25 +653,6 @@ impl BufferHost {
             Err(e) => BufferResponse::Error(format!("Save failed: {e}")),
         }
     }
-
-    /// Load buffer from file
-    async fn load_buffer(&mut self, file_path: String) -> BufferResponse {
-        match Buffer::from_file(&file_path, &[]).await {
-            Ok(new_buffer) => {
-                // Replace the shared buffer content
-                self.buffer.with_write(|inner| {
-                    new_buffer.with_read(|new_inner| {
-                        inner.object = new_inner.object.clone();
-                        inner.modes = new_inner.modes.clone();
-                        inner.buffer = new_inner.buffer.clone();
-                        inner.mark = new_inner.mark;
-                    });
-                });
-                BufferResponse::Loaded(file_path)
-            }
-            Err(e) => BufferResponse::Error(format!("Load failed: {e}")),
-        }
-    }
 }
 
 /// Create a BufferHost and its client
@@ -850,12 +661,28 @@ pub fn create_buffer_host(
     modes: Vec<(ModeId, String, Box<dyn Mode>)>,
     buffer_id: BufferId,
 ) -> BufferHostClient {
-    let (sender, receiver) = mpsc::unbounded();
+    let host = BufferHost::new(buffer, modes, buffer_id);
+    BufferHostClient::new(host, buffer_id)
+}
 
-    let client = BufferHostClient::new(sender, buffer_id);
-    let host = BufferHost::new(buffer, modes, receiver, buffer_id);
-    // Detach: the host runs until its client senders are dropped.
-    host.spawn().detach();
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use slotmap::SlotMap;
 
-    client
+    #[test]
+    fn overlapping_operations_are_rejected_without_a_queue() {
+        let mut buffers: SlotMap<BufferId, ()> = SlotMap::with_key();
+        let buffer_id = buffers.insert(());
+        let client = create_buffer_host(Buffer::new(&[]), vec![], buffer_id);
+        let _active_operation = client
+            .take_host()
+            .expect("first operation should acquire the host");
+
+        let error = client
+            .take_host()
+            .err()
+            .expect("overlapping borrow must be rejected");
+        assert_eq!(error, HostError::Busy { buffer_id });
+    }
 }

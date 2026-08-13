@@ -176,10 +176,11 @@ finish_session watcher
 # terminal. A wrapper remains in the owned pane after Roe receives SIGTERM and
 # records the pseudo-terminal state Roe left behind.
 forced_state="$probe_dir/forced-stty.txt"
+forced_initial_state="$probe_dir/forced-stty-initial.txt"
 forced_marker="$probe_dir/forced-stty-ready"
 printf -v forced_command \
-    'cd %q; env -u DISPLAY -u WAYLAND_DISPLAY %q; stty -a >%q; : >%q; sleep 5' \
-    "$probe_dir" "$roe_binary" "$forced_state" "$forced_marker"
+    'cd %q; stty -g >%q; env -u DISPLAY -u WAYLAND_DISPLAY %q; stty -g >%q; : >%q; sleep 5' \
+    "$probe_dir" "$forced_initial_state" "$roe_binary" "$forced_state" "$forced_marker"
 tmux -L "$tmux_socket" new-session -d -s forced-shutdown -x 80 -y 24 "$forced_command"
 sleep 0.5
 forced_shell_pid="$(
@@ -195,9 +196,8 @@ for _ in $(seq 1 30); do
     sleep 0.1
 done
 [[ -f "$forced_marker" ]]
-grep -q -- '-icanon' "$forced_state"
-grep -q -- '-echo' "$forced_state"
+cmp "$forced_initial_state" "$forced_state"
 tmux -L "$tmux_socket" kill-session -t forced-shutdown
 
 printf '%s\n' 'phase0_terminal_workflows=pass'
-printf '%s\n' 'phase0_forced_shutdown=terminal_left_raw_without_echo'
+printf '%s\n' 'phase1_forced_shutdown=terminal_restored'

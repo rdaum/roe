@@ -34,6 +34,7 @@ use roe_core::{Editor, HighlightSpan, WindowId};
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 pub const ECHO_AREA_HEIGHT: u16 = 1;
@@ -1306,6 +1307,7 @@ pub fn echo(
 pub async fn event_loop_with_renderer<W: Write>(
     renderer: &mut TerminalRenderer<W>,
     editor: &mut Editor,
+    shutdown_requested: &AtomicBool,
 ) -> Result<(), std::io::Error> {
     let mut event_stream = EventStream::new();
     let mut echo_timer = interval(Duration::from_millis(500)); // Check every 500ms
@@ -1356,6 +1358,10 @@ pub async fn event_loop_with_renderer<W: Write>(
 
         // Handle timer tick - just continue to next iteration
         if event.is_none() {
+            if shutdown_requested.load(Ordering::Acquire) {
+                tracing::info!("terminal shutdown requested");
+                return Ok(());
+            }
             continue;
         }
 

@@ -7,7 +7,7 @@ cd "$project_root"
 grep -q '^compio = { version = "=0\.18\.0",' Cargo.toml
 
 direct_declarations="$(
-    rg -n '^(arboard|compio|crossterm|futures|notify|ropey|similar|slotmap)\s*=' \
+    rg -n '^(arboard|compio|crossterm|futures|notify|ropey|signal-hook|similar|slotmap|thiserror|tracing|tracing-subscriber)\s*=' \
         roe/Cargo.toml roe-core/Cargo.toml roe-terminal/Cargo.toml roe-vello/Cargo.toml \
         | rg -v '\{ workspace = true \}' || true
 )"

@@ -25,6 +25,8 @@ use roe_terminal::{ECHO_AREA_HEIGHT, TerminalRenderer};
 use slotmap::SlotMap;
 use std::collections::HashMap;
 use std::io::Write;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 /// Parse command line arguments
 fn parse_args() -> EditorConfig {
@@ -108,8 +110,61 @@ struct EditorConfig {
     file_paths: Vec<String>,
 }
 
+struct TerminalSession<W: Write> {
+    device: W,
+    active: bool,
+}
+
+impl<W: Write> TerminalSession<W> {
+    fn enter(device: W) -> Result<Self, std::io::Error> {
+        crossterm::terminal::enable_raw_mode()?;
+        let mut session = Self {
+            device,
+            active: true,
+        };
+        execute!(
+            session.device,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+        execute!(session.device, crossterm::cursor::EnableBlinking)?;
+        execute!(session.device, EnableMouseCapture)?;
+        Ok(session)
+    }
+
+    fn device_mut(&mut self) -> &mut W {
+        &mut self.device
+    }
+
+    fn cleanup(&mut self) -> Result<(), std::io::Error> {
+        if !self.active {
+            return Ok(());
+        }
+        exit_state(&mut self.device)?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl<W: Write> Drop for TerminalSession<W> {
+    fn drop(&mut self) {
+        if let Err(error) = self.cleanup() {
+            eprintln!("Warning: Failed to clean up terminal state: {error}");
+        }
+    }
+}
+
+fn install_signal_handlers(shutdown_requested: Arc<AtomicBool>) -> Result<(), std::io::Error> {
+    signal_hook::flag::register(signal_hook::consts::SIGINT, shutdown_requested.clone())?;
+    signal_hook::flag::register(signal_hook::consts::SIGTERM, shutdown_requested)?;
+    Ok(())
+}
+
 // Everything to run in raw_mode
-async fn terminal_main<W: Write>(stdout: W, config: EditorConfig) -> Result<(), std::io::Error> {
+async fn terminal_main<W: Write>(
+    stdout: W,
+    config: EditorConfig,
+    shutdown_requested: &AtomicBool,
+) -> Result<(), std::io::Error> {
     assert!(crossterm::terminal::is_raw_mode_enabled()?);
     let _ws = crossterm::terminal::window_size()?;
 
@@ -313,7 +368,12 @@ async fn terminal_main<W: Write>(stdout: W, config: EditorConfig) -> Result<(), 
     renderer.render_full(&editor)?;
 
     // Event loop with renderer
-    roe_terminal::terminal_renderer::event_loop_with_renderer(&mut renderer, &mut editor).await?;
+    roe_terminal::terminal_renderer::event_loop_with_renderer(
+        &mut renderer,
+        &mut editor,
+        shutdown_requested,
+    )
+    .await?;
 
     Ok(())
 }
@@ -340,9 +400,13 @@ fn exit_state(device: &mut impl Write) -> Result<(), std::io::Error> {
 }
 
 fn main() -> Result<(), std::io::Error> {
-    // Set panic handler to clean up terminal state while preserving panic info
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
+    // Preserve panic diagnostics. TerminalSession performs cleanup while the
+    // stack unwinds, including failures after partial terminal setup.
     std::panic::set_hook(Box::new(|panic_info| {
-        let _ = exit_state(&mut std::io::stdout());
         eprintln!("💥 Roe has crashed! This shouldn't happen - please file a bug report at:");
         eprintln!("   https://github.com/rdaum/roe/issues");
         eprintln!();
@@ -350,28 +414,22 @@ fn main() -> Result<(), std::io::Error> {
         eprintln!("{panic_info}");
     }));
 
-    let mut stdout = std::io::stdout();
-
     // Parse command line arguments
     let config = parse_args();
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    install_signal_handlers(shutdown_requested.clone())?;
 
-    // Set up terminal state
-    crossterm::terminal::enable_raw_mode()?;
-    execute!(
-        stdout,
-        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-    )?;
-    execute!(stdout, crossterm::cursor::EnableBlinking)?;
-    execute!(stdout, EnableMouseCapture)?;
+    tracing::info!("starting terminal frontend");
+    let mut terminal = TerminalSession::enter(std::io::stdout())?;
 
-    let result = compio::runtime::Runtime::new()
-        .expect("Failed to create compio runtime")
-        .block_on(terminal_main(&mut stdout, config));
+    let result = compio::runtime::Runtime::new()?.block_on(terminal_main(
+        terminal.device_mut(),
+        config,
+        shutdown_requested.as_ref(),
+    ));
 
-    // Always clean up terminal state, regardless of success or failure
-    if let Err(cleanup_err) = exit_state(&mut stdout) {
-        eprintln!("Warning: Failed to clean up terminal state: {cleanup_err}");
-    }
+    terminal.cleanup()?;
+    tracing::info!("terminal frontend stopped");
 
     // Handle the main result
     if let Err(e) = result {

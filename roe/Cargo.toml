@@ -17,4 +17,7 @@ compio = { workspace = true }
 crossterm = { workspace = true }
 roe-core = { path = "../roe-core" }
 roe-terminal = { path = "../roe-terminal" }
+signal-hook = { workspace = true }
 slotmap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
