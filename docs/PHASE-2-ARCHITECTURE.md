@@ -14,6 +14,7 @@ Phase 2 was implemented in these reviewable changes:
 | `5a4b537` | Defined the owned, serde-compatible session and revisioned presentation protocol. |
 | `7e29cf3` | Prevented idle inputs from manufacturing unchanged presentation revisions. |
 | `a695fd8` | Routed terminal and Vello input, policy execution, pointer/layout operations, presentation, and shutdown through `HostSession`. |
+| `3b2e7be` | Restored Vello selection, active cursor, and scrollbar realization from session presentation state. |
 
 ## Native kernel
 
@@ -90,9 +91,9 @@ revision.
 
 Terminal owns cell mapping, ANSI/crossterm state, color realization, border glyphs, and cursor
 visibility. Vello owns Parley shaping, GPU scenes, surfaces, scale factors, glyph styling, and
-pixel-level scrollbar hit normalization. Both render chrome in Rust from the same Mica-ready
-modeline, echo, style, geometry, and visible-slice values. Neither renderer infers commands or mode
-policy from presentation data.
+pixel-level scrollbar hit normalization and realization. Both render chrome in Rust from the same
+Mica-ready modeline, echo, style, geometry, selection, cursor, scroll-metric, and visible-slice
+values. Neither renderer infers commands or mode policy from presentation data.
 
 The older `Renderer<Editor>` trait and `renderer::PresentationSnapshot` remain only as the Phase 0
 compatibility/conformance surface. Production frontend loops do not use them. They can be removed
