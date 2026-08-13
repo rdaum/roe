@@ -26,6 +26,7 @@ pub mod isearch_mode;
 pub mod keys;
 pub mod kill_ring;
 pub mod mode;
+pub mod native_kernel;
 pub mod native_services;
 pub mod renderer;
 pub mod selection_menu;

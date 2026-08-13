@@ -21,6 +21,7 @@ compio = { version = "=0.18.0", features = ["fs", "time"] }
 crossterm = "0.29"
 notify = "8.2"
 ropey = "1.6"
+serde = { version = "1.0", features = ["derive"] }
 similar = "3.1"
 signal-hook = "0.4"
 slotmap = "1.1"

@@ -2398,6 +2398,7 @@ dependencies = [
  "compio",
  "notify",
  "ropey",
+ "serde",
  "similar",
  "slotmap",
  "thiserror 2.0.20",
