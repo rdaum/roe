@@ -1,36 +1,43 @@
 # ADR 0005: migrate policy in vertical slices and delete superseded Rust
 
-Status: accepted for Phase 3
+Status: accepted and implemented in Phase 5
 
 ## Context
 
-Roe's current Rust editor path contains overlapping command, keymap, mode, selection-menu, action,
-and buffer-host abstractions. A permanent bridge that keeps them synchronized with Mica would create
-two editors.
+Roe's old Rust path contained overlapping command, keymap, mode, selection-menu, action,
+buffer-host, syntax, and renderer abstractions. Keeping those owners synchronized with Mica would
+have created two editors and made live replacement unreliable.
 
 ## Decision
 
-Phase 4 bypasses Rust command lookup for the selected Mica key binding and owns its complete policy
-in the `roe/core` unit. It retains `HostSession`, `NativeKernel`, presentation types, renderers, and
-the transitional Rust `Editor` only for unmigrated keys.
+Mica is authoritative for editor policy and logical choices. Rust is authoritative for native
+resources, validated mechanisms, session ordering, presentation extraction, and rendering.
 
-Phase 5 transfers and removes policy in this order:
+The migration proceeded as vertical slices: commands/keymaps; prompt/completion and arguments;
+buffer/file/search interactions; modes/hooks; faces/syntax/configuration; logical views; and
+packages/recovery. A slice was complete only after both frontends consumed it through
+`HostSession`, its bounded authority/failure paths were exercised, and the displaced Rust owner was
+deleted or reduced to a mechanism vocabulary.
 
-| Slice                 | Mica becomes authoritative                                  | Rust path to delete or shrink after parity                                                                                                                              |
-| --------------------- | ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| commands and keymaps  | command facts, discovery, invocation, bindings, precedence  | `CommandRegistry`, `Command`, `CommandMode`, `Bindings`, `DefaultBindings`, `ConfigurableBindings`, policy portions of `KeyState`                                       |
-| minibuffer/completion | prompt state, argument acquisition, candidates, history     | `SelectionMenu`, command-window policy and corresponding `ChromeAction` variants                                                                                        |
-| buffer/file/search    | logical buffer selection, file prompt policy, isearch state | `BufferSwitchMode`, `FileSelectorMode`, `IsearchMode`; retain native file/watch/search primitives only where justified                                                  |
-| modes/hooks           | major/minor modes and ordered hook composition              | `Mode` policy trait, `ScratchMode`, `FileMode`, `MessagesMode`, `ModeAction`/`ModeResult`                                                                               |
-| faces/syntax          | face and syntax facts, invalidation policy                  | global `FaceRegistry` policy; retain compact renderer-ready spans/cache                                                                                                 |
-| editing/window policy | kill/yank policy, window commands, view decisions           | policy portions of `KillRing`, `Editor`, `EditorAction`, `ChromeAction`, and `BufferHost`; retain Rope, clipboard adapter, layout validation, session/presentation host |
+The production input path has no Rust command, keymap, prompt, mode, syntax, or face-policy
+fallback. Ordinary character insertion and named native editing actions are selected by Mica and
+realized by Rust. `HostSession::open` is retained solely as a policy-free mechanism/protocol test
+harness; both applications use `HostSession::open_with_mica`.
 
-Each slice must first pass a terminal transcript, native-kernel test, failure/replacement test, and
-renderer-neutral presentation comparison. The old path is then removed in the same slice. A
-temporary fallback is allowed only for keys not yet claimed by the active Mica keymaps.
+Durable user/workspace state remains disabled. It is an optional later decision requiring schema
+versioning and recovery design, and must never persist native capabilities.
 
 ## Consequences
 
-There is one authority for every migrated behavior, and repository size/complexity falls as Mica
-coverage grows. Phase 5 completion is measured by deletion and ownership, not merely by adding Mica
-wrappers.
+- A live behaviour has one production owner.
+- Mica replacement can add, remove, or alter policy without synchronizing a Rust registry.
+- Terminal and Vello receive the same ordered presentation stream and cannot fork editor meaning.
+- The native boundary stays small: text/files/watchers/clipboard/layout/rendering remain Rust
+  mechanisms with capability and generation checks.
+- The old command registry, binding tables, prompt/search modes, mode and buffer-host actors,
+  syntax/face registries, and renderer-over-`Editor` path have been deleted.
+- Coarse editing latency now includes Mica transactions and is materially higher than direct Rope
+  mutation; it is tracked as an honest optimization target rather than hidden by the old benchmark.
+
+The detailed ownership matrix, bounds, commits, and acceptance evidence are recorded in
+[PHASE-5-POLICY-TRANSFER.md](../PHASE-5-POLICY-TRANSFER.md).

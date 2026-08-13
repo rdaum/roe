@@ -1,135 +1,165 @@
 # Phase 5 Mica policy transfer
 
-This document records the Phase 5 transfer implemented after the first vertical slice in
-[ROE-MICA-ROADMAP.md](../ROE-MICA-ROADMAP.md). Both production frontends now run the same
-Mica-enabled `HostSession`. Mica owns global command identity, discovery, binding precedence, chord
-prefixes, invocation, selection candidate policy, and logical window-operation choice. Rust owns
-direct text mechanisms, native selectors, validated layout, presentation extraction, and renderer
-realization.
+Phase 5 completes the policy transfer described in
+[ROE-MICA-ROADMAP.md](../ROE-MICA-ROADMAP.md). Mica is now the sole production owner of editor
+meaning: commands, bindings, prompts, completion, search state, modes, hooks, faces, syntax,
+configuration, packages, and logical view decisions. Rust realizes bounded native mechanisms and
+renderer-neutral presentation. Both the terminal and Vello frontends open the same Mica-enabled
+`HostSession`.
 
-Phase 5 was delivered as these reviewable changes:
+This is an ownership boundary, not a claim that all of Roe is implemented in Mica. Rope storage,
+filesystem and watcher operations, clipboard access, validated window-tree mutation, terminal
+cells, glyph layout, Winit, WGPU, and Vello scenes remain native by design.
 
-| Commit | Change |
-| ------ | ------ |
-| `524b73e` | Moved global commands, Emacs chords, prefix recognition, and window-operation policy to Mica; enabled Mica in Vello. |
-| `cd62ad4` | Made Mica discovery populate the command palette and Mica authority populate buffer selectors; removed production command-registry invocation. |
-| `56060db` | Kept newline and tab as direct native text mechanisms rather than unresolved Rust command policy. |
-| `91f51ee` | Corrected stale integration comments to state the implemented Mica/native ownership. |
-
-## Authoritative path
-
-`mica/roe-first-wave.mica` now defines the production global command package. Each command has a
-Mica identity, user-visible name and summary, selector, package membership, role grant, optional
-host-action relation, and key bindings. `roe/dispatch_key` in `mica/roe-model.mica` selects the
-highest combined session/binding precedence and recognizes the Mica-owned `KeyPrefix("C-x")`.
-Rust only retains the pending prefix bytes needed to join separately delivered platform key events.
-
-The production route is:
+## Production path
 
 ```text
 terminal or Vello input
   -> renderer-neutral InputEvent
-  -> Mica EffectiveSessionKeymap / EffectiveBinding
-  -> Mica command verb
-  -> committed host_action and candidate effects
-  -> HostSession native realization
-  -> renderer-neutral PresentationUpdate / LifecycleEvent
+  -> Mica prompt state or key dispatch
+  -> Mica command/policy transaction
+  -> bounded native action or host effect
+  -> Rust resource/layout mechanism
+  -> renderer-neutral PresentationUpdate and LifecycleEvent
   -> terminal cells or Vello scene
 ```
 
-`HostSession::open_with_mica` replaces the editor's construction-time bindings with
-`ConfigurableBindings::new_native_fallback`. That table contains no named command, global window,
-redraw, save, file, buffer, search, or quit binding. It exists for character insertion, cursor
-motion, region/kill/yank, undo, and other direct editing mechanisms that have not become Mica
-commands. Therefore `C-x C-s`, `C-x C-c`, `C-x C-f`, `C-x C-v`, `C-x 2`, `C-x 3`, `C-x o`,
-`C-x 0`, `C-x 1`, `C-x b`, `C-x k`, `M-x`, `C-s`, `C-r`, `C-l`, and `F12` have one production
-owner: Mica.
+`HostSession::open_with_mica` is the production constructor. `HostSession::open` remains only as a
+policy-free protocol/native-mechanism test harness; it has no Rust command or binding fallback.
+`HostSession::initial_output` publishes the initial Mica policy before the first presentation, and
+subsequent key transactions republish an atomic policy snapshot so replacement can remove facts
+without leaving stale Rust projections.
 
-The old complete `ConfigurableBindings` and `CommandRegistry` remain reachable only from the plain
-`HostSession::open` compatibility constructor and direct legacy unit tests. Neither production
-frontend uses that constructor. This preserves renderer-conformance fixtures while preventing
-dual command ownership in a live Roe session; the compatibility surfaces can be deleted when those
-historical tests are rewritten around Mica session fixtures.
+## Transferred slices
 
-## Command and minibuffer selection
+### Commands, discovery, invocation, and keymaps
 
-The `execute_command` verb enumerates authority-filtered `DiscoverableCommand` facts and emits each
-command's Mica-owned name and `CommandHostAction`. The host presents exactly that settled candidate
-set in the existing command-window renderer. Selecting an entry returns only its name; `HostSession`
-resolves it against the candidate map from the same Mica transaction. `Editor` no longer invokes
-the Rust command registry when command mode confirms a selection.
+Mica owns `Command`, `CommandName`, `CommandSummary`, `CommandSelector`, `PackageCommand`,
+`KeyBinding`, `NativeBinding`, `KeyPrefix`, `SessionKeymap`, `EffectiveSessionKeymap`, and
+`EffectiveBinding`. `roe/dispatch_key` resolves combined keymap/binding precedence, detects equal
+precedence ambiguity, invokes named commands, and selects bounded native editing actions. Printable
+characters are also selected by this verb, so ordinary insertion has no production Rust binding
+fallback.
 
-This division keeps filtering, selection movement, text entry, and drawing in the native generic
-selector mechanism while moving command existence, names, authority, package activation, and
-meaning to Mica. A live replacement can therefore add, remove, rename, rebind, or disable a command
-without changing either renderer or registering a Rust command object.
+`roe/DiscoverableCommand` filters M-x candidates through active packages and endpoint authority.
+M-x invokes the selected Mica selector directly; commands do not require a shadow Rust registry or
+host-action declaration to be discoverable.
 
-Buffer selection follows the same rule. The Mica `switch_buffer` and `kill_buffer` verbs enumerate
-only `LogicalBuffer` identities for which the actor has `CanUseBuffer`, attach `BufferName`, and emit
-the settled candidates. Rust's selector keeps only the ephemeral `BufferId` association required to
-realize the chosen switch or kill. Temporary selector buffers/views are retired from Mica and the
-native bridge by the Phase 4 synchronization rule.
+Rust retains only the normalized platform key vocabulary and the native operation vocabulary used
+to realize Mica's decision.
 
-File selection and incremental search are Mica commands and bindings. Filesystem enumeration,
-character-indexed match computation, temporary selector buffers, and highlighting remain native
-mechanisms. The chosen file operation is still capability-checked at the native boundary. This is
-intentional: Mica decides when and why the interaction starts; Rust performs filesystem and Rope
-work and renders its transient presentation.
+### Minibuffer, completion, files, buffers, and search
 
-## Modes, faces, configuration, packages, and windows
+`PromptState`, `PromptLast`, `FileCandidate`, `ArgumentCandidate`, and the
+`roe/prompt_key`, `roe/refresh_prompt`, and `roe/search_prompt_key` verbs own prompt text,
+selection, cancellation, command argument acquisition, history, and filtering. Command, buffer,
+and file candidates are computed in Mica and capped at 256 entries. Search state and selection live
+in Mica; the native `text_search` request returns at most 1,024 character-indexed matches.
 
-The durable policy relations established in Phase 3 remain authoritative for major/minor mode
-composition, hooks, faces, syntax rules, configuration inheritance, packages, and named units.
-Phase 5 does not introduce parallel Rust policy objects for these relations. The currently installed
-production package uses `fundamental_mode`; native `Mode` implementations are retained as direct
-text/selector mechanism adapters until additional Mica mode packages require distinct hook or
-syntax behavior. Newline and tab now insert native text directly instead of attempting to invoke
-nonexistent Rust `indent-line` or `newline-and-indent` commands.
+Rust retains directory enumeration, Rope searching, fallible file open/save, file watching, and a
+passive prompt view used by both renderers. It receives the selected identity or path only after
+Mica has applied actor, package, and prompt policy.
 
-Logical window-operation choice is Mica-owned. Split, select, delete, and delete-other commands emit
-typed actions; Rust validates and realizes tree geometry, then returns the same presentation to both
-frontends. Renderer windows, Winit handles, terminal state, and Vello/WGPU resources never enter
-Mica.
+The deleted Rust owners are `CommandMode`, `SelectionMenu`, `BufferSwitchMode`,
+`FileSelectorMode`, `IsearchMode`, `CommandRegistry`, and their candidate/action plumbing.
 
-Packages remain named replaceable units. Replacement is check-then-replace, malformed source keeps
-the last working policy, failures are visible and recoverable, and the in-memory world avoids
-persisting endpoint actors or native capabilities. Durable user/workspace state remains optional as
-the roadmap specifies; it is not enabled without revision, backup, export, and migration policy.
+### Modes, hooks, faces, syntax, indentation, and configuration
 
-## Deleted or bypassed policy
+Mica owns `BufferMajorMode`, `BufferMinorMode`, `ModeKeymap`, `ModeHook`, `Face`,
+`FaceAttribute`, `FaceParent`, `SyntaxRule`, `Configuration`, and their `Effective*` rules.
+`roe/publish_policy` emits a reset followed by a bounded projection of effective mode, face,
+syntax, and configuration facts. `roe/dispatch_key` emits ordered effective hooks after editing.
+Tab width comes from `EffectiveConfiguration`; word editing consumes Mica's effective syntax rule;
+search highlighting consumes Mica face attributes. Hook invalidation reaches the common
+presentation stream, not either renderer directly.
 
-- Production frontends no longer use the Rust global binding table.
-- Vello no longer opens a Rust-policy-only session.
-- Mica command-palette confirmation no longer executes `CommandRegistry` handlers.
-- Mica supplies buffer candidates; Rust no longer decides which buffers the actor may see in that
-  interaction.
-- Global window, file, search, buffer, save, redraw, and quit meanings no longer originate in
-  `KeyAction` variants during production input.
-- Tab/newline no longer pretend to be unresolved Rust named commands.
+Rust retains renderer-ready style records, character ranges, native text mutation, and redraw cache
+invalidation. It no longer stores a buffer major mode or owns a mode trait, mode actor, face
+registry, or span policy. The deleted owners are `Mode`, `ScratchMode`, `FileMode`,
+`MessagesMode`, `BufferHost`, and the Rust syntax/face registry.
 
-`ChromeAction`, `ModeAction`, `EditorAction`, `BufferResponse`, native selector modes, and direct
-editing `KeyAction` variants still connect old editing mechanisms internally. They are not exposed
-to either frontend or Mica. Removing them requires migrating the direct editing vocabulary to
-native kernel operations; it is a later deletion optimization, not a second owner for the global
-policy transferred here.
+### Logical frames, windows, and views
+
+The host publishes `SessionFrame`, `FrameRootView`, `ViewFirstChild`, `ViewSecondChild`,
+`ViewSplitAxis`, `ViewSplitRatio`, `ViewBuffer`, `ViewCursor`, `NextView`, and `ActiveView` for the
+complete logical tree. `SessionLeafView` and `VisibleBuffer` derive the usable leaves. Mica window
+verbs choose and identify the exact target view; Rust validates and realizes split/delete geometry.
+Neither renderer interprets a window command.
+
+### Packages, replacement, and recovery
+
+`PackageEnabled`, `PackageDisabled`, and `Package*` membership determine which commands, keymaps,
+and modes participate. Package disable is a volatile endpoint overlay, so it cannot persist native
+authority. `HostSession` exposes check-before-replace, named-unit replacement, fileout/export,
+first-wave restore, and package enable/disable operations. Malformed replacement leaves the last
+working unit live; a valid replacement atomically resets projected policy and removes stale
+settings.
+
+Durable user/workspace state is intentionally not enabled in Phase 5. It was optional in the
+roadmap, and enabling it requires an explicit schema revision, migration, backup, and recovery
+policy. Ephemeral identities, resource generations, endpoints, and capability grants remain
+non-durable.
+
+## Deletion gate
+
+The following superseded paths are absent from the production tree:
+
+- Rust command registry, command mode, global binding tables, and key-state policy;
+- Rust selection, buffer-selection, file-selection, and isearch modes;
+- Rust mode traits/actors, buffer-host actors, face registry, syntax registry, and highlight store;
+- the old renderer-over-`Editor` interface and its duplicate terminal/Vello conformance fixtures;
+- the editor's policy fields and broad command/action fallback path.
+
+The remaining `KeyAction` and reduced `ChromeAction` enums name native mechanisms and session
+effects; they do not bind keys, discover commands, filter candidates, or choose logical targets.
+The only renderer conformance surface is the revisioned `SessionOutput` presentation stream.
+
+## Bounds and failure behaviour
+
+- Mica driver events: 256 queued events with one logical consumer.
+- External native requests: 16 in flight.
+- Subscription delivery: 64 queued events per subscription budget.
+- Prompt candidates: 256.
+- Search matches: 1,024.
+- Effective policy facts per publication: 256; overflow produces a visible lifecycle error.
+- Native resources: fixed-capacity, generation-checked slots with explicit invalidation.
+
+Authority is checked at the endpoint, service, logical-buffer, and native-resource layers. Native
+failures are returned through typed completion/lifecycle results. Cancellation, endpoint close,
+replacement failure, queue pressure, and failed watcher cleanup have focused tests.
+
+## Delivery history
+
+The initial four commits established global-policy ownership, common-frontend routing, and native
+editing separation. A strict end-of-phase review rejected that checkpoint because prompt/mode/view
+policy was still declarative-only and the legacy stack remained reachable. The corrective series
+closed those gaps and passed the deletion gate.
+
+| Commit | Change |
+| ------ | ------ |
+| `524b73e` | Move global editor policy to Mica. |
+| `cd62ad4` | Drive editor selection from Mica. |
+| `56060db` | Keep direct text editing native. |
+| `91f51ee` | Clarify the initial Mica/native boundary. |
+| `7fb8f4d` | Record the initial, subsequently rejected Phase 5 checkpoint. |
+| `edaa0be` | Move complete key dispatch, including native binding choice, into Mica. |
+| `8f0fe35` | Move prompt, completion, file/buffer selection, and isearch state into Mica. |
+| `a085d58` | Publish the complete logical view tree and make Mica choose window targets. |
+| `7aa1f64` | Make mode, hook, face, syntax, indentation, and configuration policy authoritative. |
+| `8e1caf5` | Add check, replacement, export, restore, and package recovery operations. |
+| `ad98565` | Delete the superseded Rust policy stack and old renderer path. |
+| `8ed36b8` | Measure editing and redraw through the production Mica session. |
 
 ## Verification and measurements
 
-| Command or evidence | Result |
-| ------------------- | ------ |
-| `./scripts/check.sh` | Passes formatting, all-target checks, strict Clippy, dependency policy, and 172 workspace tests. |
-| `cargo +1.95.0 check --workspace --all-targets` | Passes at the pinned Mica MSRV. |
-| `cargo test -p roe-core mica_ -- --test-threads=1` | Passes Mica chord/window policy, discovery-driven command invocation, authority, retirement, background progress, replacement, cancellation, and shutdown tests. |
-| `./scripts/test-phase0-terminal-workflows.sh` | Passes real production editing, save, Mica F12, Mica command/buffer/file/search selection, window operations, idle file delivery, and terminal restoration. |
-| `cargo build --release --bin roe-vello` | Passes with Vello constructing the Mica-enabled host; display-host smoke remains unavailable in this environment. |
-| `./scripts/measure-phase0-baseline.sh` | Completes after the transfer: 1.607 us edit round trip, 298 us terminal full redraw, 91.334 ms terminal readiness, and 22,420 KiB idle terminal RSS in this run. |
+| Evidence | Result |
+| -------- | ------ |
+| `./scripts/check.sh` | Formatting, all-target checks, strict Clippy, dependency policy, and 150 tests pass. |
+| `cargo test -p roe-core mica_ -- --test-threads=1` | 11 focused Mica authority, policy, prompt, lifecycle, replacement, and shutdown tests pass. |
+| `./scripts/test-phase0-terminal-workflows.sh` | Release terminal workflows pass through the production Mica session. |
+| `cargo build --release --bin roe-vello` | The production Vello frontend builds with the Mica session path; a display-host smoke remains an open platform obligation. |
+| `./scripts/measure-phase0-baseline.sh` | Completes against the production Mica path. In the recorded run: 85.022 ms Mica-session readiness, 2.224 ms per Mica insert/delete pair, 267 us per snapshot/redraw, and 23,924 KiB idle terminal RSS. |
 
-The Mica runtime increases startup and idle memory relative to the pre-embedding baseline; the
-recorded figures are regression evidence, not an optimization claim. Driver queues, task budgets,
-external requests, subscriptions, selector candidates, presentation slices, and native resources
-retain the explicit bounds and retirement rules from Phases 1 through 4.
-
-Phase 5 has transferred the editor's programmable global policy and selection authority without
-moving Rope, filesystem, layout, or renderer mechanisms out of Rust. Both frontends consume the
-same Mica-owned decisions through `HostSession`, and live replacement can change the command layer
-without a renderer fork or shadow Rust registration.
+The measurements are coarse regression evidence, not optimization claims. Unlike the earlier
+Phase 0 harness, the editing metric includes two complete Mica dispatch transactions and the redraw
+metric requests a revisioned session snapshot before terminal realization.
