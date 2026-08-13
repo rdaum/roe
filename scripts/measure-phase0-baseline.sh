@@ -61,7 +61,7 @@ fi
 if [[ -x /usr/bin/time ]] && command -v script >/dev/null && command -v timeout >/dev/null; then
     idle_metrics="$(mktemp)"
     TERM=xterm-256color script -qec \
-        "stty rows 24 cols 80; exec /usr/bin/time --output=$idle_metrics --format='roe_terminal_idle_seconds=%e\nroe_terminal_idle_max_rss_kib=%M' timeout 1 $roe_binary" \
+        "stty rows 24 cols 80; exec /usr/bin/time --output=$idle_metrics --format='roe_terminal_idle_seconds=%e\nroe_terminal_idle_max_rss_kib=%M' timeout --foreground --kill-after=2 1 $roe_binary" \
         /dev/null >/dev/null 2>&1 || true
     if [[ -s "$idle_metrics" ]]; then
         sed 's/^Command exited with non-zero status 124$//' "$idle_metrics"
