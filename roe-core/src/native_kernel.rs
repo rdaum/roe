@@ -22,6 +22,25 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const WATCH_EVENT_CAPACITY: usize = 256;
 
+/// Wall-clock source for native time requests. Tests inject this boundary so
+/// Mica command policy remains deterministic without gaining a clock builtin.
+pub trait NativeClock: Send + Sync {
+    fn unix_millis(&self) -> u64;
+}
+
+#[derive(Default)]
+pub struct SystemNativeClock;
+
+impl NativeClock for SystemNativeClock {
+    fn unix_millis(&self) -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64
+    }
+}
+
 /// Generation-checked identity for an ephemeral native resource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ResourceId {
@@ -258,6 +277,7 @@ struct ResourceSlot {
 /// In-process implementation of the native kernel contract.
 pub struct NativeKernel {
     grants: CapabilityGrants,
+    clock: Arc<dyn NativeClock>,
     slots: Vec<ResourceSlot>,
     free: Vec<u32>,
     watch_service: NativeWatchService,
@@ -274,9 +294,14 @@ struct NativeWatchService {
 
 impl NativeKernel {
     pub fn new(grants: CapabilityGrants) -> Self {
+        Self::with_clock(grants, Arc::new(SystemNativeClock))
+    }
+
+    pub fn with_clock(grants: CapabilityGrants, clock: Arc<dyn NativeClock>) -> Self {
         let (event_tx, event_rx) = sync_channel(WATCH_EVENT_CAPACITY);
         Self {
             grants,
+            clock,
             slots: Vec::new(),
             free: Vec::new(),
             watch_service: NativeWatchService {
@@ -423,12 +448,7 @@ impl NativeKernel {
             }
             NativeOperation::ReadClockMillis => {
                 self.require(Capability::ClockRead)?;
-                let millis = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis()
-                    .min(u128::from(u64::MAX)) as u64;
-                Ok(NativeResult::ClockMillis(millis))
+                Ok(NativeResult::ClockMillis(self.clock.unix_millis()))
             }
             NativeOperation::SpawnProcess { program, args } => {
                 self.require(Capability::ProcessSpawn)?;

@@ -25,6 +25,7 @@ pub mod gutter;
 pub mod isearch_mode;
 pub mod keys;
 pub mod kill_ring;
+pub mod mica_host;
 pub mod mode;
 pub mod native_kernel;
 pub mod native_services;

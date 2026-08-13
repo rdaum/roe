@@ -16,15 +16,17 @@ use crate::editor::{
     BorderInfo, ChromeAction, DragType, MouseDragState, SplitDirection, WindowNode, WindowType,
 };
 use crate::keys::LogicalKey;
+use crate::mica_host::{MicaHost, MicaHostError, MicaKeyResult, normalized_key_sequence};
 use crate::native_kernel::{
-    Capability, CapabilityGrants, KernelError, NativeKernel, NativeOperation, NativeResult,
-    ResourceId, TextSelection, ViewId,
+    Capability, CapabilityGrants, KernelError, NativeClock, NativeKernel, NativeOperation,
+    NativeResult, ResourceId, TextSelection, ViewId,
 };
 use crate::syntax::{Color, face_registry};
 use crate::{BufferId, Editor, WindowId};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 pub const SESSION_PROTOCOL_VERSION: u16 = 1;
 pub const MAX_KEYS_PER_INPUT: usize = 64;
@@ -159,6 +161,9 @@ pub enum LifecycleEvent {
     },
     ResourceInvalidated {
         resource: ResourceId,
+    },
+    MicaTaskCancelled {
+        task_id: u64,
     },
     QuitRequested,
     EndpointClosed,
@@ -299,7 +304,7 @@ pub enum SessionError {
 /// Direct, ordered in-process session endpoint.
 pub struct HostSession {
     editor: Editor,
-    kernel: NativeKernel,
+    kernel: Arc<Mutex<NativeKernel>>,
     epoch: SessionEpoch,
     next_sequence: u64,
     revision: Revision,
@@ -307,15 +312,20 @@ pub struct HostSession {
     view_ids: HashMap<WindowId, ViewId>,
     next_view_id: u64,
     pointer_selection: Option<(WindowId, usize)>,
+    mica: Option<MicaHost>,
     closed: bool,
 }
 
 impl HostSession {
     pub fn open(editor: Editor, grants: CapabilityGrants) -> Self {
+        Self::open_with_kernel(editor, Arc::new(Mutex::new(NativeKernel::new(grants))))
+    }
+
+    fn open_with_kernel(editor: Editor, kernel: Arc<Mutex<NativeKernel>>) -> Self {
         let epoch = SessionEpoch(NEXT_EPOCH.fetch_add(1, Ordering::Relaxed));
         let mut session = Self {
             editor,
-            kernel: NativeKernel::new(grants),
+            kernel,
             epoch,
             next_sequence: 0,
             revision: Revision(0),
@@ -323,10 +333,41 @@ impl HostSession {
             view_ids: HashMap::new(),
             next_view_id: 1,
             pointer_selection: None,
+            mica: None,
             closed: false,
         };
         let _ = session.synchronize_identities();
         session
+    }
+
+    /// Open the public-driver Mica endpoint used by the first integration
+    /// wave. The ordinary constructor remains available for headless and
+    /// frontend-conformance tests that deliberately exercise only Rust policy.
+    pub fn open_with_mica(editor: Editor, grants: CapabilityGrants) -> Result<Self, MicaHostError> {
+        let mut session = Self::open(editor, grants);
+        session.mica = Some(MicaHost::open(
+            &session.editor,
+            Arc::clone(&session.kernel),
+            &session.buffer_resources,
+        )?);
+        Ok(session)
+    }
+
+    pub fn open_with_mica_clock(
+        editor: Editor,
+        grants: CapabilityGrants,
+        clock: Arc<dyn NativeClock>,
+    ) -> Result<Self, MicaHostError> {
+        let mut session = Self::open_with_kernel(
+            editor,
+            Arc::new(Mutex::new(NativeKernel::with_clock(grants, clock))),
+        );
+        session.mica = Some(MicaHost::open(
+            &session.editor,
+            Arc::clone(&session.kernel),
+            &session.buffer_resources,
+        )?);
+        Ok(session)
     }
 
     pub fn epoch(&self) -> SessionEpoch {
@@ -356,7 +397,7 @@ impl HostSession {
             native_completions: Vec::new(),
             lifecycle: vec![LifecycleEvent::Ready {
                 protocol_version: SESSION_PROTOCOL_VERSION,
-                capabilities: capability_list(self.kernel.grants()),
+                capabilities: capability_list(self.kernel.lock().unwrap().grants()),
             }],
         }
     }
@@ -386,13 +427,62 @@ impl HostSession {
         let force_full = matches!(envelope.event, InputEvent::RequestSnapshot { .. });
 
         match envelope.event {
-            InputEvent::Keys(keys) => match self.editor.key_event(keys).await {
-                Ok(actions) => {
-                    self.resolve_actions(actions, &mut lifecycle, &mut invalidations)
+            InputEvent::Keys(keys) => {
+                let mica_result = if let Some(mut mica) = self.mica.take() {
+                    let result = mica
+                        .dispatch_key(
+                            &self.editor,
+                            &self.buffer_resources,
+                            normalized_key_sequence(&keys),
+                        )
                         .await;
+                    self.mica = Some(mica);
+                    Some(result)
+                } else {
+                    None
+                };
+                match mica_result {
+                    Some(Ok(MicaKeyResult::Handled { effects })) => {
+                        for effect in effects {
+                            if let Some(window) = self.editor.windows.get_mut(effect.view) {
+                                if window.active_buffer == effect.buffer {
+                                    window.cursor = effect.cursor;
+                                    if let Some(view) = self.view_ids.get(&effect.view).copied() {
+                                        invalidations.push(Invalidation::View(view));
+                                    } else {
+                                        invalidations.push(Invalidation::Full);
+                                    }
+                                } else {
+                                    lifecycle.push(LifecycleEvent::Warning(
+                                        "Mica effect referred to a stale view/buffer association"
+                                            .to_owned(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    Some(Ok(MicaKeyResult::Failed(message))) => {
+                        self.editor.set_echo_message(message.clone());
+                        invalidations.push(Invalidation::EchoArea);
+                        lifecycle.push(LifecycleEvent::Error(message));
+                    }
+                    Some(Err(error)) => {
+                        let message = error.to_string();
+                        self.editor.set_echo_message(message.clone());
+                        invalidations.push(Invalidation::EchoArea);
+                        lifecycle.push(LifecycleEvent::Error(message));
+                    }
+                    Some(Ok(MicaKeyResult::Unbound)) | None => {
+                        match self.editor.key_event(keys).await {
+                            Ok(actions) => {
+                                self.resolve_actions(actions, &mut lifecycle, &mut invalidations)
+                                    .await;
+                            }
+                            Err(error) => self.fail_endpoint(error, &mut lifecycle),
+                        }
+                    }
                 }
-                Err(error) => self.fail_endpoint(error, &mut lifecycle),
-            },
+            }
             InputEvent::Text(text) => {
                 for character in text.chars() {
                     match self
@@ -466,14 +556,15 @@ impl HostSession {
                 let actions = self.editor.poll_file_changes();
                 self.resolve_actions(actions, &mut lifecycle, &mut invalidations)
                     .await;
-                for notification in self.kernel.poll_watch_notifications() {
+                let kernel = self.kernel.lock().unwrap();
+                for notification in kernel.poll_watch_notifications() {
                     invalidations.push(Invalidation::Resource(notification.resource));
                     lifecycle.push(LifecycleEvent::ResourceChanged {
                         resource: notification.resource,
                         path: notification.path,
                     });
                 }
-                if let Some(error) = self.kernel.take_watch_error() {
+                if let Some(error) = kernel.take_watch_error() {
                     lifecycle.push(LifecycleEvent::Error(format!(
                         "native watcher backend: {error}"
                     )));
@@ -494,6 +585,8 @@ impl HostSession {
                     Err("cannot close a text resource while a logical buffer owns it".to_string())
                 } else {
                     self.kernel
+                        .lock()
+                        .unwrap()
                         .execute(operation)
                         .map_err(|error| error.to_string())
                 };
@@ -525,6 +618,20 @@ impl HostSession {
             InputEvent::RequestSnapshot { .. } => {}
             InputEvent::Focus(_) => {}
             InputEvent::Close => {
+                if let Some(mut mica) = self.mica.take() {
+                    match mica.close().await {
+                        Ok(cancelled) => {
+                            lifecycle.extend(
+                                cancelled
+                                    .into_iter()
+                                    .map(|task_id| LifecycleEvent::MicaTaskCancelled { task_id }),
+                            );
+                        }
+                        Err(error) => lifecycle.push(LifecycleEvent::Warning(format!(
+                            "Mica endpoint shutdown: {error}"
+                        ))),
+                    }
+                }
                 self.closed = true;
                 for warning in self.editor.shutdown_native_work() {
                     lifecycle.push(LifecycleEvent::Warning(warning));
@@ -589,6 +696,14 @@ impl HostSession {
             outputs.push(self.dispatch(envelope).await?);
         }
         Ok(outputs)
+    }
+
+    pub async fn replace_mica_first_wave(&mut self, source: String) -> Result<(), MicaHostError> {
+        self.mica
+            .as_ref()
+            .ok_or(MicaHostError::Closed)?
+            .replace_first_wave(source)
+            .await
     }
 
     fn validate_envelope(&self, envelope: &InputEnvelope) -> Result<(), SessionError> {
@@ -850,7 +965,7 @@ impl HostSession {
             if live_buffers.contains(buffer) {
                 true
             } else {
-                match self.kernel.invalidate_resource(*resource) {
+                match self.kernel.lock().unwrap().invalidate_resource(*resource) {
                     Ok(cleanup_error) => {
                         invalidated.push(*resource);
                         if let Some(error) = cleanup_error {
@@ -869,7 +984,7 @@ impl HostSession {
         for (buffer_id, buffer) in &self.editor.buffers {
             self.buffer_resources
                 .entry(buffer_id)
-                .or_insert_with(|| self.kernel.register_buffer(buffer.clone()));
+                .or_insert_with(|| self.kernel.lock().unwrap().register_buffer(buffer.clone()));
         }
 
         let live_windows: HashSet<_> = self.editor.windows.keys().collect();
@@ -894,7 +1009,7 @@ impl HostSession {
         let mut invalidated = Vec::with_capacity(resources.len());
         let mut cleanup_warnings = Vec::new();
         for resource in &resources {
-            match self.kernel.invalidate_resource(*resource) {
+            match self.kernel.lock().unwrap().invalidate_resource(*resource) {
                 Ok(cleanup_error) => {
                     invalidated.push(*resource);
                     if let Some(error) = cleanup_error {
@@ -1283,9 +1398,19 @@ mod tests {
     use crate::{Buffer, BufferId, Mode, ModeId};
     use slotmap::SlotMap;
     use std::collections::HashMap;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
-    fn test_session_with_grants(grants: CapabilityGrants) -> HostSession {
+    static MICA_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct FixedNativeClock(u64);
+
+    impl NativeClock for FixedNativeClock {
+        fn unix_millis(&self) -> u64 {
+            self.0
+        }
+    }
+
+    fn test_editor() -> Editor {
         let mut buffers: SlotMap<BufferId, Buffer> = SlotMap::default();
         let buffer = Buffer::new(&[]);
         buffer.set_object("*test*".to_string());
@@ -1317,7 +1442,7 @@ mod tests {
             cursor: 5,
             window_type: WindowType::Normal,
         });
-        let editor = Editor {
+        Editor {
             frame: Frame::new(80, 23),
             buffers,
             buffer_hosts: hosts,
@@ -1339,8 +1464,11 @@ mod tests {
             messages_buffer_id: None,
             file_watcher: crate::file_watcher::FileWatcher::new(),
             last_search_term: String::new(),
-        };
-        HostSession::open(editor, grants)
+        }
+    }
+
+    fn test_session_with_grants(grants: CapabilityGrants) -> HostSession {
+        HostSession::open(test_editor(), grants)
     }
 
     fn test_session() -> HostSession {
@@ -1352,6 +1480,215 @@ mod tests {
             PresentationUpdate::Full(snapshot) => snapshot,
             PresentationUpdate::Delta(delta) => &delta.snapshot,
         }
+    }
+
+    #[test]
+    fn mica_keymap_inserts_injected_native_time_and_redraws() {
+        let _guard = MICA_TEST_LOCK.lock().unwrap();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut session = HostSession::open_with_mica_clock(
+                test_editor(),
+                CapabilityGrants::editor_default(),
+                Arc::new(FixedNativeClock(1_700_000_000_123)),
+            )
+            .unwrap();
+
+            let output = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Function(12)])))
+                .await
+                .unwrap();
+            assert_eq!(
+                snapshot(&output).views[0].visible_text,
+                "hello1700000000123\n"
+            );
+            assert_eq!(snapshot(&output).views[0].cursor, 19);
+            assert!(
+                output
+                    .lifecycle
+                    .iter()
+                    .all(|event| !matches!(event, LifecycleEvent::Error(_)))
+            );
+
+            let close = session
+                .dispatch(session.envelope(InputEvent::Close))
+                .await
+                .unwrap();
+            assert!(close.lifecycle.contains(&LifecycleEvent::EndpointClosed));
+        });
+    }
+
+    #[test]
+    fn mica_context_tracks_rust_cursor_and_new_active_buffer() {
+        let _guard = MICA_TEST_LOCK.lock().unwrap();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut session = HostSession::open_with_mica_clock(
+                test_editor(),
+                CapabilityGrants::editor_default(),
+                Arc::new(FixedNativeClock(42)),
+            )
+            .unwrap();
+
+            let typed = session
+                .dispatch(session.envelope(InputEvent::Text("é".to_owned())))
+                .await
+                .unwrap();
+            assert_eq!(snapshot(&typed).views[0].visible_text, "helloé");
+            let after_rust_edit = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Function(12)])))
+                .await
+                .unwrap();
+            assert_eq!(
+                snapshot(&after_rust_edit).views[0].visible_text,
+                "helloé42\n"
+            );
+
+            let buffer = session
+                .editor
+                .create_buffer_with_mode(
+                    "*dynamic*".to_owned(),
+                    "scratch".to_owned(),
+                    "new".to_owned(),
+                )
+                .unwrap();
+            let view = session.editor.split_horizontal();
+            session.editor.active_window = view;
+            session.editor.windows[view].active_buffer = buffer;
+            session.editor.windows[view].cursor = 3;
+            let _ = session.synchronize_identities();
+
+            let dynamic = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Function(12)])))
+                .await
+                .unwrap();
+            let active = snapshot(&dynamic)
+                .views
+                .iter()
+                .find(|presented| presented.active)
+                .unwrap();
+            assert_eq!(active.visible_text, "new42\n");
+            assert_eq!(active.cursor, 6);
+
+            session
+                .dispatch(session.envelope(InputEvent::Close))
+                .await
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn mica_replacement_failure_and_recovery_remain_live() {
+        let _guard = MICA_TEST_LOCK.lock().unwrap();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut session = HostSession::open_with_mica_clock(
+                test_editor(),
+                CapabilityGrants::editor_default(),
+                Arc::new(FixedNativeClock(42)),
+            )
+            .unwrap();
+            let original = include_str!("../../mica/roe-first-wave.mica");
+            let replacement = original.replace(
+                "let text = string_concat(to_literal(clock[:value]), \"\\n\")",
+                "let text = string_concat(\"v2:\", to_literal(clock[:value]), \"\\n\")",
+            );
+            assert_ne!(replacement, original);
+            session
+                .replace_mica_first_wave(replacement.clone())
+                .await
+                .unwrap();
+
+            let replaced = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Function(12)])))
+                .await
+                .unwrap();
+            assert_eq!(snapshot(&replaced).views[0].visible_text, "hellov2:42\n");
+
+            assert!(
+                session
+                    .replace_mica_first_wave("verb this is malformed".to_owned())
+                    .await
+                    .is_err()
+            );
+            let retained = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Function(12)])))
+                .await
+                .unwrap();
+            assert_eq!(
+                snapshot(&retained).views[0].visible_text,
+                "hellov2:42\nv2:42\n"
+            );
+
+            let prefix = original.split("verb roe/insert_current_time").next().unwrap();
+            let failing = format!(
+                "{prefix}verb roe/insert_current_time(actor, session)\n  raise E_TEST, \"intentional command failure\"\nend\n"
+            );
+            session.replace_mica_first_wave(failing).await.unwrap();
+            let failed = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Function(12)])))
+                .await
+                .unwrap();
+            assert!(failed.lifecycle.iter().any(|event| matches!(
+                event,
+                LifecycleEvent::Error(message) if message.contains("intentional command failure")
+            )));
+            assert!(snapshot(&failed)
+                .echo_area
+                .contains("intentional command failure"));
+
+            session
+                .replace_mica_first_wave(replacement)
+                .await
+                .unwrap();
+            let recovered = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Function(12)])))
+                .await
+                .unwrap();
+            assert_eq!(
+                snapshot(&recovered).views[0].visible_text,
+                "hellov2:42\nv2:42\nv2:42\n"
+            );
+            session
+                .dispatch(session.envelope(InputEvent::Close))
+                .await
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn mica_close_cancels_pending_request_and_drains_full_event_queue() {
+        let _guard = MICA_TEST_LOCK.lock().unwrap();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut session = HostSession::open_with_mica_clock(
+                test_editor(),
+                CapabilityGrants::editor_default(),
+                Arc::new(FixedNativeClock(7)),
+            )
+            .unwrap();
+            let pending = session
+                .mica
+                .as_ref()
+                .unwrap()
+                .start_pending_test_request()
+                .await
+                .unwrap();
+            session
+                .mica
+                .as_ref()
+                .unwrap()
+                .fill_event_queue_for_test()
+                .await
+                .unwrap();
+
+            let close = session
+                .dispatch(session.envelope(InputEvent::Close))
+                .await
+                .unwrap();
+            assert!(
+                close
+                    .lifecycle
+                    .contains(&LifecycleEvent::MicaTaskCancelled { task_id: pending })
+            );
+            assert!(close.lifecycle.contains(&LifecycleEvent::EndpointClosed));
+        });
     }
 
     #[test]
@@ -1603,6 +1940,8 @@ mod tests {
             .unwrap();
         session
             .kernel
+            .lock()
+            .unwrap()
             .execute(NativeOperation::RegisterWatch {
                 resource,
                 path: path.clone(),
@@ -1610,6 +1949,8 @@ mod tests {
             .unwrap();
         session
             .kernel
+            .lock()
+            .unwrap()
             .force_backend_unwatch_for_test(&path)
             .unwrap();
         session.editor.buffers.remove(buffer);
@@ -1622,7 +1963,7 @@ mod tests {
                 .any(|warning| warning.contains("cleanup failed"))
         );
         assert!(matches!(
-            session.kernel.snapshot(resource),
+            session.kernel.lock().unwrap().snapshot(resource),
             Err(KernelError::StaleResource(id)) if id == resource
         ));
 

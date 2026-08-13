@@ -1,0 +1,48 @@
+// Phase 4's first production vertical slice. The keymap, command definition,
+// native-request sequencing, cursor policy, and effect are all Mica-owned.
+// Rust supplies volatile session/resource facts and realizes native requests.
+
+make_identity(:roe/insert_current_time)
+
+assert Delegates(#roe/insert_current_time, #roe/command, 0)
+assert roe/Command(#roe/insert_current_time)
+assert roe/CommandSelector(#roe/insert_current_time, :roe/insert_current_time)
+assert roe/CommandSummary(#roe/insert_current_time, "Insert the current Unix time in milliseconds")
+assert roe/KeyBinding(#roe/global_map, "F12", #roe/insert_current_time, 1000)
+assert roe/PackageCommand(#roe/core_package, #roe/insert_current_time)
+assert RoleCanInvoke(#roe/editor_role, :roe/insert_current_time)
+
+verb roe/insert_current_time(actor, session)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  let view = one roe/ActiveView(session, ?view)
+  if view == nothing
+    return :no_active_view
+  end
+  let buffer = one roe/ViewBuffer(view, ?buffer)
+  if buffer == nothing
+    return :no_active_buffer
+  end
+  roe/CanUseBuffer(actor, buffer) || return :buffer_denied
+  roe/CanRequestService(actor, :clock_read) || return :clock_denied
+  roe/CanRequestService(actor, :text_write) || return :text_write_denied
+  let cursor = one roe/ViewCursor(view, ?cursor)
+  if cursor == nothing
+    return :no_cursor
+  end
+
+  let clock = external_request(:clock_millis, {:buffer -> buffer}, 1)
+  if clock[:status] != :ok
+    raise E_NATIVE, clock[:error]
+  end
+  let text = string_concat(to_literal(clock[:value]), "\n")
+  let mutation = external_request(:text_insert, {:buffer -> buffer, :at -> cursor, :text -> text}, 1)
+  if mutation[:status] != :ok
+    raise E_NATIVE, mutation[:error]
+  end
+
+  let next_cursor = cursor + string_len(text)
+  retract roe/ViewCursor(view, cursor)
+  assert roe/ViewCursor(view, next_cursor)
+  emit(session, {:kind -> :presentation_invalidated, :view -> view, :buffer -> buffer, :cursor -> next_cursor})
+  return :inserted
+end

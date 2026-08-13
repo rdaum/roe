@@ -62,6 +62,17 @@ tmux -L "$tmux_socket" send-keys -t one-file C-x C-s
 finish_session one-file
 [[ "$(sed -n '1p' "$one_file")" == 'Zalpha' ]]
 
+# The first Mica-owned command is bound in Mica, requests the native clock,
+# mutates the Rust text resource, and redraws through the shared session output.
+mica_file="$probe_dir/mica.txt"
+printf 'alpha\n' >"$mica_file"
+start_session mica-command "$mica_file"
+tmux -L "$tmux_socket" send-keys -t mica-command F12
+tmux -L "$tmux_socket" send-keys -t mica-command C-x C-s
+finish_session mica-command
+[[ "$(sed -n '1p' "$mica_file")" =~ ^[0-9]{13}$ ]]
+[[ "$(sed -n '2p' "$mica_file")" == 'alpha' ]]
+
 # An ordinary save failure is reported in the UI and leaves the session usable.
 failed_save_path="/proc/roe-phase1-save-$$"
 start_session failed-save "$failed_save_path"

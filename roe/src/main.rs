@@ -370,7 +370,8 @@ async fn terminal_main<W: Write>(
     let theme = roe_terminal::terminal_renderer::CachedTheme::default();
 
     let mut renderer = TerminalRenderer::new_with_theme(stdout, theme);
-    let mut session = HostSession::open(editor, CapabilityGrants::editor_default());
+    let mut session = HostSession::open_with_mica(editor, CapabilityGrants::editor_default())
+        .map_err(|error| std::io::Error::other(format!("failed to start Mica host: {error}")))?;
 
     let initial = session.initial_output();
     if let Some(update) = initial.presentation.as_ref() {
