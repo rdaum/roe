@@ -7,6 +7,16 @@ make_identity(:roe/isearch_match_face)
 make_identity(:roe/isearch_current_face)
 make_identity(:roe/completion_selection_face)
 make_identity(:roe/mica_mode)
+make_identity(:roe/mica_comment_face)
+make_identity(:roe/mica_string_face)
+make_identity(:roe/mica_number_face)
+make_identity(:roe/mica_keyword_face)
+make_identity(:roe/mica_identifier_face)
+make_identity(:roe/mica_symbol_face)
+make_identity(:roe/mica_identity_face)
+make_identity(:roe/mica_variable_face)
+make_identity(:roe/mica_operator_face)
+make_identity(:roe/mica_error_face)
 make_identity(:roe/eval_buffer)
 make_identity(:roe/eval_region)
 make_identity(:roe/mark_whole_buffer)
@@ -30,6 +40,41 @@ assert roe/FaceAttribute(#roe/isearch_current_face, :background, "#ffff00")
 assert roe/Face(#roe/completion_selection_face)
 assert roe/FaceName(#roe/completion_selection_face, "completion-selection")
 assert roe/FaceAttribute(#roe/completion_selection_face, :background, "#3a3a3a")
+assert roe/Face(#roe/mica_comment_face)
+assert roe/FaceName(#roe/mica_comment_face, "mica-comment")
+assert roe/FaceAttribute(#roe/mica_comment_face, :foreground, "#6a9955")
+assert roe/FaceAttribute(#roe/mica_comment_face, :slant, "italic")
+assert roe/Face(#roe/mica_string_face)
+assert roe/FaceName(#roe/mica_string_face, "mica-string")
+assert roe/FaceAttribute(#roe/mica_string_face, :foreground, "#ce9178")
+assert roe/Face(#roe/mica_number_face)
+assert roe/FaceName(#roe/mica_number_face, "mica-number")
+assert roe/FaceAttribute(#roe/mica_number_face, :foreground, "#b5cea8")
+assert roe/Face(#roe/mica_keyword_face)
+assert roe/FaceName(#roe/mica_keyword_face, "mica-keyword")
+assert roe/FaceAttribute(#roe/mica_keyword_face, :foreground, "#c586c0")
+assert roe/FaceAttribute(#roe/mica_keyword_face, :weight, "bold")
+assert roe/Face(#roe/mica_identifier_face)
+assert roe/FaceName(#roe/mica_identifier_face, "mica-identifier")
+assert roe/FaceAttribute(#roe/mica_identifier_face, :foreground, "#9cdcfe")
+assert roe/Face(#roe/mica_symbol_face)
+assert roe/FaceName(#roe/mica_symbol_face, "mica-symbol")
+assert roe/FaceAttribute(#roe/mica_symbol_face, :foreground, "#dcdcaa")
+assert roe/Face(#roe/mica_identity_face)
+assert roe/FaceName(#roe/mica_identity_face, "mica-identity")
+assert roe/FaceAttribute(#roe/mica_identity_face, :foreground, "#4ec9b0")
+assert roe/FaceAttribute(#roe/mica_identity_face, :weight, "bold")
+assert roe/Face(#roe/mica_variable_face)
+assert roe/FaceName(#roe/mica_variable_face, "mica-variable")
+assert roe/FaceAttribute(#roe/mica_variable_face, :foreground, "#9cdcfe")
+assert roe/FaceAttribute(#roe/mica_variable_face, :slant, "italic")
+assert roe/Face(#roe/mica_operator_face)
+assert roe/FaceName(#roe/mica_operator_face, "mica-operator")
+assert roe/FaceAttribute(#roe/mica_operator_face, :foreground, "#d4d4d4")
+assert roe/Face(#roe/mica_error_face)
+assert roe/FaceName(#roe/mica_error_face, "mica-error")
+assert roe/FaceAttribute(#roe/mica_error_face, :foreground, "#f44747")
+assert roe/FaceAttribute(#roe/mica_error_face, :underline, true)
 assert roe/Configuration(#roe/core_configuration, :tab_width, 4)
 assert roe/SyntaxRule(#roe/fundamental_mode, :word, "[[:alnum:]_]", 100)
 assert Delegates(#roe/mica_mode, #roe/mode, 0)
@@ -38,6 +83,16 @@ assert roe/ModeName(#roe/mica_mode, "mica")
 assert roe/ModeKeymap(#roe/mica_mode, #roe/global_map, 100)
 assert roe/ModeHook(#roe/mica_mode, :roe/invalidate_syntax_hook, 100)
 assert roe/SyntaxRule(#roe/mica_mode, :word, "[[:alnum:]_/-]", 200)
+assert roe/SyntaxHighlightRule(#roe/mica_mode, :comment, #roe/mica_comment_face, 200)
+assert roe/SyntaxHighlightRule(#roe/mica_mode, :string, #roe/mica_string_face, 200)
+assert roe/SyntaxHighlightRule(#roe/mica_mode, :number, #roe/mica_number_face, 200)
+assert roe/SyntaxHighlightRule(#roe/mica_mode, :keyword, #roe/mica_keyword_face, 200)
+assert roe/SyntaxHighlightRule(#roe/mica_mode, :identifier, #roe/mica_identifier_face, 200)
+assert roe/SyntaxHighlightRule(#roe/mica_mode, :symbol, #roe/mica_symbol_face, 200)
+assert roe/SyntaxHighlightRule(#roe/mica_mode, :identity, #roe/mica_identity_face, 200)
+assert roe/SyntaxHighlightRule(#roe/mica_mode, :variable, #roe/mica_variable_face, 200)
+assert roe/SyntaxHighlightRule(#roe/mica_mode, :operator, #roe/mica_operator_face, 200)
+assert roe/SyntaxHighlightRule(#roe/mica_mode, :error, #roe/mica_error_face, 200)
 assert roe/PackageMode(#roe/core_package, #roe/mica_mode)
 
 roe/BufferMajorMode(buffer, #roe/mica_mode) :-
@@ -198,6 +253,19 @@ verb roe/publish_policy(actor, session)
     end
     for syntax in roe/EffectiveSyntaxRule(found[:buffer], ?mode, ?syntax_kind, ?pattern, ?precedence)
       emit(session, {:kind -> :syntax_policy, :buffer -> found[:buffer], :syntax_kind -> syntax[:syntax_kind], :pattern -> syntax[:pattern], :precedence -> syntax[:precedence]})
+    end
+  end
+  for found in roe/EnabledMode(?mode)
+    let mode_name_rows = roe/ModeName(found[:mode], ?mode_name)
+    if mode_name_rows
+      let exactly {:mode_name -> mode_name} = mode_name_rows
+      for highlight in roe/SyntaxHighlightRule(found[:mode], ?capture, ?face, ?precedence)
+        let face_name_rows = roe/FaceName(highlight[:face], ?face_name)
+        if face_name_rows
+          let exactly {:face_name -> face_name} = face_name_rows
+          emit(session, {:kind -> :highlight_policy, :mode -> mode_name, :capture -> highlight[:capture], :face -> face_name, :precedence -> highlight[:precedence]})
+        end
+      end
     end
   end
   for found in roe/Face(?face)
@@ -485,15 +553,19 @@ verb roe/start_file_prompt(actor, session, prompt_kind, aux)
   if prompt_kind == :save_file
     roe/CanRequestService(actor, :file_write) || return :file_write_denied
   end
-  for old in roe/FileCandidate(session, ?path, ?is_dir)
-    retract roe/FileCandidate(session, old[:path], old[:is_dir])
-  end
   let listing = external_request(:list_directory, {:path -> "."}, 1)
   if listing[:status] != :ok
     raise E_NATIVE, listing[:error]
   end
-  for path in listing[:value]
-    assert roe/FileCandidate(session, path, false)
+  for old in roe/FileCandidate(session, ?label, ?path, ?is_dir)
+    retract roe/FileCandidate(session, old[:label], old[:path], old[:is_dir])
+  end
+  retract roe/FilePromptDirectory(session, _)
+  let directory = listing[:value][:directory]
+  assert roe/FilePromptDirectory(session, directory)
+  assert roe/FileCandidate(session, "..", string_concat(directory, "/.."), true)
+  for entry in listing[:value][:entries]
+    assert roe/FileCandidate(session, entry[:name], entry[:path], entry[:is_directory])
   end
   let exactly {:view -> target} = roe/ActiveView(session, ?view)
   assert roe/PromptState(session, prompt_kind, "", 0, some(target), aux)
@@ -611,10 +683,14 @@ verb roe/prompt_candidates(actor, session, prompt_kind, query)
       end
     end
   elseif prompt_kind == :find_file || prompt_kind == :visit_file || prompt_kind == :save_file
-    for found in roe/FileCandidate(session, ?path, ?is_dir)
-      if query == "" || string_contains(lower(found[:path]), lower(query))
+    for found in roe/FileCandidate(session, ?label, ?path, ?is_dir)
+      if query == "" || string_contains(lower(found[:label]), lower(query))
         if roe/list_length(candidates) < 256
-          candidates = [@candidates, [found[:path], found[:path]]]
+          let label = found[:label]
+          if found[:is_dir]
+            label = string_concat(label, "/")
+          end
+          candidates = [@candidates, [label, found[:path]]]
         end
       end
     end
@@ -661,6 +737,19 @@ verb roe/refresh_prompt(actor, session)
     let exactly {:value -> command_state} = aux
     prompt = command_state[3]
     emit(session, {:kind -> :prompt_update, :prompt_kind -> prompt_kind, :value_kind -> command_state[2], :prompt -> prompt, :query -> query, :selected -> selected, :candidates -> candidates})
+  elseif prompt_kind == :find_file || prompt_kind == :visit_file || prompt_kind == :save_file
+    let directory_rows = roe/FilePromptDirectory(session, ?directory)
+    if directory_rows
+      let exactly {:directory -> directory} = directory_rows
+      let action = "Find file"
+      if prompt_kind == :visit_file
+        action = "Visit file"
+      elseif prompt_kind == :save_file
+        action = "Save buffer as"
+      end
+      prompt = string_concat(action, " ", directory)
+    end
+    emit(session, {:kind -> :prompt_update, :prompt_kind -> prompt_kind, :prompt -> prompt, :query -> query, :selected -> selected, :candidates -> candidates})
   else
     emit(session, {:kind -> :prompt_update, :prompt_kind -> prompt_kind, :prompt -> prompt, :query -> query, :selected -> selected, :candidates -> candidates})
   end
@@ -712,6 +801,12 @@ verb roe/prompt_key(actor, session, sequence)
   let candidates = roe/prompt_candidates(actor, session, prompt_kind, query)
   if sequence == "Esc" || sequence == "C-g"
     retract roe/PromptState(session, _, _, _, _, _)
+    if prompt_kind == :find_file || prompt_kind == :visit_file || prompt_kind == :save_file
+      for old in roe/FileCandidate(session, ?label, ?path, ?is_dir)
+        retract roe/FileCandidate(session, old[:label], old[:path], old[:is_dir])
+      end
+      retract roe/FilePromptDirectory(session, _)
+    end
     emit(session, {:kind -> :prompt_close})
     return :cancelled
   elseif sequence == "⌫"
@@ -740,11 +835,58 @@ verb roe/prompt_key(actor, session, sequence)
       emit(session, {:kind -> :host_action, :action -> :create_buffer, :buffer_name -> query, :view -> target_view})
       return :ok
     elseif (prompt_kind == :find_file || prompt_kind == :visit_file || prompt_kind == :save_file) && query != ""
-      chosen_option = some([query, query])
+      let chosen_path = query
+      if not string_starts_with(query, "/")
+        let directory_rows = roe/FilePromptDirectory(session, ?directory)
+        if directory_rows
+          let exactly {:directory -> directory} = directory_rows
+          chosen_path = string_concat(directory, "/", query)
+        end
+      end
+      chosen_option = some([query, chosen_path])
     else
       return roe/refresh_prompt(actor, session)
     end
     let exactly {:value -> chosen} = chosen_option
+    if prompt_kind == :find_file || prompt_kind == :visit_file || prompt_kind == :save_file
+      let directory_listing = none
+      let known_rows = roe/FileCandidate(session, ?label, chosen[1], ?is_dir)
+      if known_rows
+        let exactly {:label -> known_label, :is_dir -> is_directory} = known_rows
+        if is_directory
+          let listing = external_request(:list_directory, {:path -> chosen[1]}, 1)
+          if listing[:status] != :ok
+            raise E_NATIVE, listing[:error]
+          end
+          directory_listing = some(listing[:value])
+        end
+      else
+        let listing = external_request(:list_directory, {:path -> chosen[1]}, 1)
+        if listing[:status] == :ok
+          directory_listing = some(listing[:value])
+        end
+      end
+      if directory_listing
+        let exactly {:value -> listing_value} = directory_listing
+        for old in roe/FileCandidate(session, ?label, ?path, ?is_dir)
+          retract roe/FileCandidate(session, old[:label], old[:path], old[:is_dir])
+        end
+        retract roe/FilePromptDirectory(session, _)
+        let directory = listing_value[:directory]
+        assert roe/FilePromptDirectory(session, directory)
+        assert roe/FileCandidate(session, "..", string_concat(directory, "/.."), true)
+        for entry in listing_value[:entries]
+          assert roe/FileCandidate(session, entry[:name], entry[:path], entry[:is_directory])
+        end
+        retract roe/PromptState(session, _, _, _, _, _)
+        assert roe/PromptState(session, prompt_kind, "", 0, target, aux)
+        return roe/refresh_prompt(actor, session)
+      end
+      for old in roe/FileCandidate(session, ?label, ?path, ?is_dir)
+        retract roe/FileCandidate(session, old[:label], old[:path], old[:is_dir])
+      end
+      retract roe/FilePromptDirectory(session, _)
+    end
     retract roe/PromptState(session, _, _, _, _, _)
     emit(session, {:kind -> :prompt_close})
     if target

@@ -352,12 +352,33 @@ impl NativeBridge {
                 Value::int(i64::try_from(value).unwrap_or(i64::MAX))
                     .unwrap_or_else(|_| Value::string(value.to_string())),
             ),
-            Ok(NativeResult::DirectoryEntries(entries)) => native_ok(Value::list(
-                entries
-                    .into_iter()
-                    .take(256)
-                    .map(|path| Value::string(path.to_string_lossy())),
-            )),
+            Ok(NativeResult::DirectoryEntries { directory, entries }) => native_ok(Value::map([
+                (
+                    Value::symbol(sym("directory")),
+                    Value::string(directory.to_string_lossy()),
+                ),
+                (
+                    Value::symbol(sym("entries")),
+                    Value::list(
+                        entries
+                            .into_iter()
+                            .take(MAX_PROMPT_CANDIDATES.saturating_sub(1))
+                            .map(|entry| {
+                                Value::map([
+                                    (Value::symbol(sym("name")), Value::string(entry.name)),
+                                    (
+                                        Value::symbol(sym("path")),
+                                        Value::string(entry.path.to_string_lossy()),
+                                    ),
+                                    (
+                                        Value::symbol(sym("is_directory")),
+                                        Value::bool(entry.is_directory),
+                                    ),
+                                ])
+                            }),
+                    ),
+                ),
+            ])),
             Ok(NativeResult::Snapshot(snapshot)) if service == sym("text_search") => {
                 let query = map_value(&payload, "query")
                     .and_then(|value| value.with_str(str::to_owned))
@@ -425,6 +446,7 @@ struct MicaBufferMetadata {
     name: String,
     kind: String,
     visited_file: Option<String>,
+    file_extension: Option<String>,
     text_revision: u64,
     last_saved_revision: u64,
     modified: bool,
@@ -439,6 +461,14 @@ impl MicaBufferMetadata {
             visited_file: buffer
                 .visited_file()
                 .map(|path| path.to_string_lossy().into_owned()),
+            file_extension: buffer
+                .visited_file()
+                .and_then(|path| {
+                    path.extension()
+                        .and_then(|value| value.to_str())
+                        .map(str::to_owned)
+                })
+                .map(|value| value.to_ascii_lowercase()),
             text_revision: buffer.text_revision(),
             last_saved_revision: buffer.last_saved_revision(),
             modified: buffer.is_modified(),
@@ -613,6 +643,12 @@ impl MicaHost {
                 tuples.push((
                     sym("roe/BufferVisitedFile"),
                     [Value::identity(logical), Value::string(path)].into(),
+                ));
+            }
+            if let Some(extension) = &metadata.file_extension {
+                tuples.push((
+                    sym("roe/BufferFileExtension"),
+                    [Value::identity(logical), Value::string(extension)].into(),
                 ));
             }
             tuples.extend([
@@ -1393,6 +1429,12 @@ end
                     [Value::identity(*logical), Value::string(path)].into(),
                 ));
             }
+            if let Some(extension) = &metadata.file_extension {
+                facts.push((
+                    sym("roe/BufferFileExtension"),
+                    [Value::identity(*logical), Value::string(extension)].into(),
+                ));
+            }
         }
         for (window_id, view) in &self.view_ids {
             let Some(buffer_id) = self.view_buffers.get(window_id) else {
@@ -1565,7 +1607,11 @@ end
         let kind = map_value(value, "kind")?.as_symbol()?.name()?.to_owned();
         if !matches!(
             kind.as_str(),
-            "mode_policy" | "face_policy" | "syntax_policy" | "configuration_policy"
+            "mode_policy"
+                | "face_policy"
+                | "syntax_policy"
+                | "highlight_policy"
+                | "configuration_policy"
         ) {
             return None;
         }
@@ -1580,24 +1626,37 @@ end
             map_value(value, "face")?.with_str(str::to_owned)?
         } else if kind == "mode_policy" {
             map_value(value, "name")?.with_str(str::to_owned)?
+        } else if kind == "highlight_policy" {
+            map_value(value, "mode")?.with_str(str::to_owned)?
         } else {
             map_value(value, "syntax_kind")
+                .or_else(|| map_value(value, "capture"))
                 .or_else(|| map_value(value, "key"))?
                 .as_symbol()?
                 .name()?
                 .to_owned()
         };
-        let attribute = map_value(value, "attribute")
-            .and_then(|value| value.as_symbol())
-            .and_then(Symbol::name)
-            .map(str::to_owned);
+        let attribute = map_value(
+            value,
+            if kind == "highlight_policy" {
+                "capture"
+            } else {
+                "attribute"
+            },
+        )
+        .and_then(|value| value.as_symbol())
+        .and_then(Symbol::name)
+        .map(str::to_owned);
         let precedence = map_value(value, "precedence").and_then(|value| value.as_int());
-        let raw = map_value(value, "value").or_else(|| map_value(value, "pattern"));
-        let value = raw
-            .clone()
-            .and_then(|value| value.with_str(str::to_owned))
-            .or_else(|| raw.map(|value| self.format_value(&value)))
-            .unwrap_or_default();
+        let value = if kind == "highlight_policy" {
+            map_value(value, "face")?.with_str(str::to_owned)?
+        } else {
+            let raw = map_value(value, "value").or_else(|| map_value(value, "pattern"));
+            raw.clone()
+                .and_then(|value| value.with_str(str::to_owned))
+                .or_else(|| raw.map(|value| self.format_value(&value)))
+                .unwrap_or_default()
+        };
         Some(MicaPolicyFact {
             kind,
             subject,

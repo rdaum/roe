@@ -24,6 +24,7 @@ pub mod native_kernel;
 pub mod native_services;
 pub mod renderer;
 pub mod session;
+mod syntax_highlighting;
 pub mod undo;
 
 new_key_type! {

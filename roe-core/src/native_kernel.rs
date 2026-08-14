@@ -128,6 +128,13 @@ pub struct NativeWatchNotification {
     pub path: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeDirectoryEntry {
+    pub name: String,
+    pub path: PathBuf,
+    pub is_directory: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum LayoutNode {
     View(ViewId),
@@ -232,7 +239,10 @@ pub enum NativeResult {
     },
     LayoutValidated,
     FileContents(String),
-    DirectoryEntries(Vec<PathBuf>),
+    DirectoryEntries {
+        directory: PathBuf,
+        entries: Vec<NativeDirectoryEntry>,
+    },
     FileWritten,
     ClockMillis(u64),
     ProcessOutput {
@@ -462,16 +472,28 @@ impl NativeKernel {
             }
             NativeOperation::ListDirectory { path } => {
                 self.require(Capability::FileRead)?;
+                let directory = std::fs::canonicalize(path)?;
                 let mut entries = BTreeSet::new();
-                for entry in std::fs::read_dir(path)?.flatten() {
+                for entry in std::fs::read_dir(&directory)?.flatten() {
                     entries.insert(entry.path());
                     if entries.len() > MAX_DIRECTORY_ENTRIES {
                         entries.pop_last();
                     }
                 }
-                Ok(NativeResult::DirectoryEntries(
-                    entries.into_iter().collect(),
-                ))
+                Ok(NativeResult::DirectoryEntries {
+                    directory,
+                    entries: entries
+                        .into_iter()
+                        .map(|path| NativeDirectoryEntry {
+                            name: path
+                                .file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_default(),
+                            is_directory: path.is_dir(),
+                            path,
+                        })
+                        .collect(),
+                })
             }
             NativeOperation::WriteFile { path, contents } => {
                 self.require(Capability::FileWrite)?;

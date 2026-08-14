@@ -2634,6 +2634,7 @@ name = "roe-core"
 version = "0.1.0"
 dependencies = [
  "compio",
+ "mica-compiler",
  "mica-driver",
  "notify",
  "ropey",

@@ -59,6 +59,7 @@ make_functional_relation(:roe/FaceName, 2, [0])
 make_relation(:roe/FaceParent, 2)
 make_relation(:roe/FaceAttribute, 3)
 make_relation(:roe/SyntaxRule, 4)
+make_relation(:roe/SyntaxHighlightRule, 4)
 make_relation(:roe/Configuration, 3)
 make_relation(:roe/ConfigurationParent, 2)
 make_relation(:roe/Package, 1)
@@ -81,6 +82,7 @@ make_relation(:roe/LogicalBuffer, 1, :volatile)
 make_functional_relation(:roe/BufferName, 2, [0], :volatile)
 make_functional_relation(:roe/BufferKind, 2, [0], :volatile)
 make_functional_relation(:roe/BufferVisitedFile, 2, [0], :volatile)
+make_functional_relation(:roe/BufferFileExtension, 2, [0], :volatile)
 make_functional_relation(:roe/BufferLastSavedRevision, 2, [0], :volatile)
 make_functional_relation(:roe/BufferModified, 2, [0], :volatile)
 make_functional_relation(:roe/BufferReadOnly, 2, [0], :volatile)
@@ -107,7 +109,8 @@ make_relation(:roe/NextView, 2, :volatile)
 make_relation(:roe/ActorRole, 2, :volatile)
 make_functional_relation(:roe/PromptState, 6, [0], :volatile)
 make_functional_relation(:roe/PromptLast, 3, [0, 1], :volatile)
-make_relation(:roe/FileCandidate, 3, :volatile)
+make_relation(:roe/FileCandidate, 4, :volatile)
+make_functional_relation(:roe/FilePromptDirectory, 2, [0], :volatile)
 
 // Ephemeral host associations and native-cached observations. The host owns
 // their invalidation and never persists them in a named unit or durable store.
@@ -146,6 +149,7 @@ make_relation(:roe/EffectiveModeHook, 3)
 make_relation(:roe/LocalFaceAttribute, 2)
 make_relation(:roe/EffectiveFaceAttribute, 3)
 make_relation(:roe/EffectiveSyntaxRule, 5)
+make_relation(:roe/EffectiveSyntaxHighlightRule, 5)
 make_relation(:roe/LocalConfiguration, 2)
 make_relation(:roe/EffectiveConfiguration, 3)
 make_functional_relation(:roe/BufferSavePolicy, 2, [0])
@@ -246,6 +250,9 @@ roe/VisibleBuffer(session, buffer) :-
 
 roe/BufferSourceLanguage(buffer, :mica) :-
   roe/BufferKind(buffer, :scratch)
+
+roe/BufferSourceLanguage(buffer, :mica) :-
+  roe/BufferFileExtension(buffer, "mica")
 
 roe/BufferSourceUnit(buffer, :roe/user_scratch) :-
   roe/BufferKind(buffer, :scratch)
@@ -355,6 +362,15 @@ roe/EffectiveSyntaxRule(buffer, mode, kind, pattern, precedence) :-
   roe/EnabledMode(mode),
   roe/SyntaxRule(mode, kind, pattern, precedence)
 
+roe/EffectiveSyntaxHighlightRule(buffer, mode, capture, face, precedence) :-
+  roe/EffectiveMajorMode(buffer, mode),
+  roe/SyntaxHighlightRule(mode, capture, face, precedence)
+
+roe/EffectiveSyntaxHighlightRule(buffer, mode, capture, face, precedence) :-
+  roe/BufferMinorMode(buffer, mode),
+  roe/EnabledMode(mode),
+  roe/SyntaxHighlightRule(mode, capture, face, precedence)
+
 roe/LocalConfiguration(scope, key) :-
   roe/Configuration(scope, key, value)
 
@@ -425,6 +441,7 @@ assert RoleCanRead(#roe/editor_role, :roe/LogicalBuffer)
 assert RoleCanRead(#roe/editor_role, :roe/BufferName)
 assert RoleCanRead(#roe/editor_role, :roe/BufferKind)
 assert RoleCanRead(#roe/editor_role, :roe/BufferVisitedFile)
+assert RoleCanRead(#roe/editor_role, :roe/BufferFileExtension)
 assert RoleCanRead(#roe/editor_role, :roe/BufferLastSavedRevision)
 assert RoleCanRead(#roe/editor_role, :roe/BufferModified)
 assert RoleCanRead(#roe/editor_role, :roe/BufferReadOnly)
@@ -447,6 +464,7 @@ assert RoleCanRead(#roe/editor_role, :roe/NativeBufferReadAction)
 assert RoleCanRead(#roe/editor_role, :roe/PromptState)
 assert RoleCanRead(#roe/editor_role, :roe/PromptLast)
 assert RoleCanRead(#roe/editor_role, :roe/FileCandidate)
+assert RoleCanRead(#roe/editor_role, :roe/FilePromptDirectory)
 assert RoleCanRead(#roe/editor_role, :roe/CommandSelector)
 assert RoleCanRead(#roe/editor_role, :roe/CommandName)
 assert RoleCanRead(#roe/editor_role, :roe/CommandHostAction)
@@ -461,11 +479,14 @@ assert RoleCanRead(#roe/editor_role, :roe/NextView)
 assert RoleCanRead(#roe/editor_role, :roe/SessionLeafView)
 assert RoleCanRead(#roe/editor_role, :roe/EffectiveModeHook)
 assert RoleCanRead(#roe/editor_role, :roe/EffectiveMajorMode)
+assert RoleCanRead(#roe/editor_role, :roe/EnabledMode)
 assert RoleCanRead(#roe/editor_role, :roe/ModeName)
 assert RoleCanRead(#roe/editor_role, :roe/FaceName)
 assert RoleCanRead(#roe/editor_role, :roe/Face)
 assert RoleCanRead(#roe/editor_role, :roe/EffectiveFaceAttribute)
 assert RoleCanRead(#roe/editor_role, :roe/EffectiveSyntaxRule)
+assert RoleCanRead(#roe/editor_role, :roe/EffectiveSyntaxHighlightRule)
+assert RoleCanRead(#roe/editor_role, :roe/SyntaxHighlightRule)
 assert RoleCanRead(#roe/editor_role, :roe/EffectiveConfiguration)
 assert RoleCanWrite(#roe/editor_role, :roe/ActiveView)
 assert RoleCanWrite(#roe/editor_role, :roe/PointerSelection)
@@ -473,6 +494,7 @@ assert RoleCanWrite(#roe/editor_role, :roe/ViewSplitRatio)
 assert RoleCanWrite(#roe/editor_role, :roe/PromptState)
 assert RoleCanWrite(#roe/editor_role, :roe/PromptLast)
 assert RoleCanWrite(#roe/editor_role, :roe/FileCandidate)
+assert RoleCanWrite(#roe/editor_role, :roe/FilePromptDirectory)
 assert RoleCanInvoke(#roe/editor_role, :roe/dispatch_key)
 assert RoleCanInvoke(#roe/editor_role, :roe/run_native_action)
 assert RoleCanInvoke(#roe/editor_role, :roe/emit_edit_hooks)

@@ -25,6 +25,7 @@ use crate::native_kernel::{
     NativeKernel, NativeOperation, NativeResult, ResourceId, SplitAxis, TextSelection, ViewId,
 };
 use crate::renderer::DirtyRegion;
+use crate::syntax_highlighting::{HighlightSpan, mica_highlights};
 use crate::{BufferId, Editor, WindowId};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -485,6 +486,20 @@ struct MicaSyntaxRule {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct MicaHighlightRule {
+    capture: String,
+    face: String,
+    precedence: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MicaHighlightCache {
+    text_revision: u64,
+    policy_revision: u64,
+    spans: Vec<HighlightSpan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum SyntaxClassAtom {
     Alnum,
     Alpha,
@@ -604,6 +619,9 @@ pub struct WorkspaceHost {
     mica_faces: HashMap<String, HashMap<String, String>>,
     mica_configuration: HashMap<String, String>,
     mica_syntax: HashMap<BufferId, Vec<MicaSyntaxRule>>,
+    mica_highlight_rules: HashMap<String, Vec<MicaHighlightRule>>,
+    mica_highlight_cache: HashMap<BufferId, MicaHighlightCache>,
+    mica_policy_revision: u64,
     mica_search_ranges: HashMap<WindowId, Vec<(usize, usize, String)>>,
     mica_styled_lines: HashMap<WindowId, Vec<(usize, String)>>,
     terminated: bool,
@@ -745,6 +763,9 @@ impl WorkspaceHost {
             mica_faces: HashMap::new(),
             mica_configuration: HashMap::new(),
             mica_syntax: HashMap::new(),
+            mica_highlight_rules: HashMap::new(),
+            mica_highlight_cache: HashMap::new(),
+            mica_policy_revision: 0,
             mica_search_ranges: HashMap::new(),
             mica_styled_lines: HashMap::new(),
             terminated: false,
@@ -1416,6 +1437,8 @@ impl WorkspaceHost {
             self.mica_faces.clear();
             self.mica_configuration.clear();
             self.mica_syntax.clear();
+            self.mica_highlight_rules.clear();
+            self.mica_policy_revision = self.mica_policy_revision.saturating_add(1);
         }
         for policy in events.policy_facts {
             match policy.kind.as_str() {
@@ -1441,6 +1464,19 @@ impl WorkspaceHost {
                         let rule = MicaSyntaxRule {
                             kind: policy.name,
                             pattern: policy.value,
+                            precedence: policy.precedence.unwrap_or_default(),
+                        };
+                        if !rules.contains(&rule) {
+                            rules.push(rule);
+                        }
+                    }
+                }
+                "highlight_policy" => {
+                    if let Some(capture) = policy.attribute {
+                        let rules = self.mica_highlight_rules.entry(policy.name).or_default();
+                        let rule = MicaHighlightRule {
+                            capture,
+                            face: policy.value,
                             precedence: policy.precedence.unwrap_or_default(),
                         };
                         if !rules.contains(&rule) {
@@ -2915,6 +2951,8 @@ impl WorkspaceHost {
             .retain(|window, _| live_windows.contains(window));
         self.mica_styled_lines
             .retain(|window, _| live_windows.contains(window));
+        self.mica_highlight_cache
+            .retain(|buffer, _| live_buffers.contains(buffer));
         for window_id in self.editor.windows.keys() {
             self.view_ids.entry(window_id).or_insert_with(|| {
                 let id = ViewId(self.next_view_id);
@@ -2951,7 +2989,66 @@ impl WorkspaceHost {
         (invalidated, cleanup_warnings)
     }
 
-    fn capture_snapshot(&self, attachment: &mut Attachment) -> PresentationSnapshot {
+    fn refresh_mica_highlights(&mut self) {
+        let policy_revision = self.mica_policy_revision;
+        let visible_buffers: HashSet<_> = self
+            .editor
+            .windows
+            .values()
+            .map(|window| window.active_buffer)
+            .take(MAX_SESSION_VIEWS)
+            .collect();
+        self.mica_highlight_cache
+            .retain(|buffer, _| visible_buffers.contains(buffer));
+        let candidates: Vec<_> = visible_buffers
+            .into_iter()
+            .filter_map(|buffer| self.editor.buffers.get(buffer).map(|value| (buffer, value)))
+            .filter(|(buffer, _)| {
+                self.mica_modes
+                    .get(buffer)
+                    .is_some_and(|mode| self.mica_highlight_rules.contains_key(mode))
+            })
+            .map(|(buffer, value)| (buffer, value.clone()))
+            .collect();
+
+        for (buffer, value) in candidates {
+            let text_revision = value.text_revision();
+            let current = self.mica_highlight_cache.get(&buffer);
+            if current.is_some_and(|cached| {
+                cached.text_revision == text_revision && cached.policy_revision == policy_revision
+            }) {
+                continue;
+            }
+            self.mica_highlight_cache.insert(
+                buffer,
+                MicaHighlightCache {
+                    text_revision,
+                    policy_revision,
+                    spans: mica_highlights(&value.content()),
+                },
+            );
+        }
+    }
+
+    fn mica_highlight_face(&self, buffer: BufferId, capture: &str) -> Option<&str> {
+        let mode = self.mica_modes.get(&buffer)?;
+        let rules = self
+            .mica_highlight_rules
+            .get(mode)?
+            .iter()
+            .filter(|rule| rule.capture == capture);
+        let selected = rules.clone().max_by_key(|rule| rule.precedence)?;
+        if rules
+            .filter(|rule| rule.precedence == selected.precedence)
+            .any(|rule| rule.face != selected.face)
+        {
+            return None;
+        }
+        Some(selected.face.as_str())
+    }
+
+    fn capture_snapshot(&mut self, attachment: &mut Attachment) -> PresentationSnapshot {
+        self.refresh_mica_highlights();
         let mut styles = Vec::new();
         let mut style_by_name = HashMap::new();
         let mut views = Vec::new();
@@ -3009,22 +3106,50 @@ impl WorkspaceHost {
                 .take(visible_end_char.saturating_sub(visible_start_char))
                 .collect();
 
-            let styled_ranges = self
-                .mica_search_ranges
-                .get(&window_id)
+            let mut styled_ranges: Vec<_> = self
+                .mica_highlight_cache
+                .get(&window.active_buffer)
                 .into_iter()
-                .flatten()
-                .filter(|(start, end, _)| *end > visible_start_char && *start < visible_end_char)
-                .map(|(start, end, name)| {
-                    let style =
-                        presentation_style(name, &self.mica_faces, &mut styles, &mut style_by_name);
-                    StyledRange {
-                        start: *start,
-                        end: *end,
-                        style,
-                    }
+                .flat_map(|cache| &cache.spans)
+                .filter(|span| span.end > visible_start_char && span.start < visible_end_char)
+                .filter_map(|span| {
+                    let face = self
+                        .mica_highlight_face(window.active_buffer, span.capture)?
+                        .to_owned();
+                    Some(StyledRange {
+                        start: span.start,
+                        end: span.end,
+                        style: presentation_style(
+                            &face,
+                            &self.mica_faces,
+                            &mut styles,
+                            &mut style_by_name,
+                        ),
+                    })
                 })
                 .collect();
+            styled_ranges.extend(
+                self.mica_search_ranges
+                    .get(&window_id)
+                    .into_iter()
+                    .flatten()
+                    .filter(|(start, end, _)| {
+                        *end > visible_start_char && *start < visible_end_char
+                    })
+                    .map(|(start, end, name)| {
+                        let style = presentation_style(
+                            name,
+                            &self.mica_faces,
+                            &mut styles,
+                            &mut style_by_name,
+                        );
+                        StyledRange {
+                            start: *start,
+                            end: *end,
+                            style,
+                        }
+                    }),
+            );
             let styled_lines = self
                 .mica_styled_lines
                 .get(&window_id)
@@ -3119,7 +3244,7 @@ impl WorkspaceHost {
     }
 
     fn finish_server_output(
-        &self,
+        &mut self,
         attachment: &mut Attachment,
         invalidations: Vec<Invalidation>,
         lifecycle: Vec<LifecycleEvent>,
@@ -3304,7 +3429,7 @@ impl WorkspaceHost {
         Ok(self.finish_server_output(attachment, invalidations, lifecycle))
     }
 
-    pub fn detach(&self, attachment: &mut Attachment) -> Result<SessionOutput, SessionError> {
+    pub fn detach(&mut self, attachment: &mut Attachment) -> Result<SessionOutput, SessionError> {
         if self.terminated {
             return Err(SessionError::WorkspaceTerminated);
         }
@@ -3361,7 +3486,7 @@ impl WorkspaceHost {
     }
 
     pub fn close_attachment(
-        &self,
+        &mut self,
         attachment: &mut Attachment,
     ) -> Result<SessionOutput, SessionError> {
         if attachment.status == AttachmentStatus::Closed {
@@ -4021,9 +4146,14 @@ fn native_result_size(result: &NativeResult) -> usize {
     match result {
         NativeResult::Snapshot(snapshot) => snapshot.name.len().saturating_add(snapshot.text.len()),
         NativeResult::FileContents(contents) => contents.len(),
-        NativeResult::DirectoryEntries(entries) => entries.iter().fold(0usize, |size, path| {
-            size.saturating_add(path.as_os_str().len())
-        }),
+        NativeResult::DirectoryEntries { directory, entries } => {
+            entries
+                .iter()
+                .fold(directory.as_os_str().len(), |size, entry| {
+                    size.saturating_add(entry.name.len())
+                        .saturating_add(entry.path.as_os_str().len())
+                })
+        }
         NativeResult::ProcessOutput { stdout, stderr, .. } => {
             stdout.len().saturating_add(stderr.len())
         }
@@ -4262,7 +4392,7 @@ mod tests {
             assert!(!ordinary.modified);
             assert!(!ordinary.read_only);
             assert!(snapshot(&save).views.iter().any(|view| {
-                view.command_view && view.visible_text.starts_with("Save buffer as: ")
+                view.command_view && view.visible_text.starts_with("Save buffer as ")
             }));
 
             session.terminate_workspace().await.unwrap();
@@ -4763,6 +4893,235 @@ mod tests {
             )));
 
             session.terminate_workspace().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn mica_policy_highlights_scratch_and_mica_file_buffers() {
+        let _guard = MICA_TEST_LOCK.lock().unwrap();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let source = "// λ\nverb roe/demo(?value)\n  return :ok\nend";
+            let mut scratch_editor = test_editor();
+            let scratch = scratch_editor.windows[scratch_editor.active_window].active_buffer;
+            scratch_editor.buffers[scratch].set_kind(crate::buffer::BufferKind::Scratch);
+            scratch_editor.buffers[scratch].load_str(source);
+            scratch_editor.windows[scratch_editor.active_window].cursor = 0;
+            let mut scratch_session =
+                test_mica_client(scratch_editor, CapabilityGrants::editor_default()).unwrap();
+            let scratch_output = scratch_session.initial_output().await;
+            let scratch_snapshot = snapshot(&scratch_output);
+            let scratch_view = scratch_snapshot
+                .views
+                .iter()
+                .find(|view| view.active)
+                .unwrap();
+            let style_names: HashMap<_, _> = scratch_snapshot
+                .styles
+                .iter()
+                .map(|style| (style.id, style.name.as_str()))
+                .collect();
+            let range_styles: Vec<_> = scratch_view
+                .styled_ranges
+                .iter()
+                .map(|range| style_names[&range.style])
+                .collect();
+            assert!(range_styles.contains(&"mica-comment"));
+            assert!(range_styles.contains(&"mica-keyword"));
+            assert!(range_styles.contains(&"mica-identifier"));
+            assert!(range_styles.contains(&"mica-variable"));
+            assert!(range_styles.contains(&"mica-symbol"));
+            assert_eq!(scratch_session.workspace.mica_modes[&scratch], "mica");
+            assert_eq!(
+                scratch_session.workspace.mica_highlight_cache[&scratch].text_revision,
+                scratch_session.workspace.editor.buffers[scratch].text_revision()
+            );
+            let highlighted_revision =
+                scratch_session.workspace.mica_highlight_cache[&scratch].text_revision;
+            let edited = scratch_session
+                .dispatch(scratch_session.envelope(InputEvent::Text("1".to_owned())))
+                .await
+                .unwrap();
+            assert!(
+                scratch_session.workspace.mica_highlight_cache[&scratch].text_revision
+                    > highlighted_revision
+            );
+            assert!(
+                snapshot(&edited)
+                    .styles
+                    .iter()
+                    .any(|style| style.name == "mica-number")
+            );
+            scratch_session.terminate_workspace().await.unwrap();
+
+            let mut file_editor = test_editor();
+            let file_buffer = file_editor.windows[file_editor.active_window].active_buffer;
+            file_editor.buffers[file_buffer]
+                .set_visited_file(Some(PathBuf::from("/tmp/policy.MICA")));
+            file_editor.buffers[file_buffer].load_str("assert roe/Face(#roe/demo)");
+            file_editor.windows[file_editor.active_window].cursor = 0;
+            let mut file_session =
+                test_mica_client(file_editor, CapabilityGrants::editor_default()).unwrap();
+            let file_output = file_session.initial_output().await;
+            let file_snapshot = snapshot(&file_output);
+            let file_view = file_snapshot.views.iter().find(|view| view.active).unwrap();
+            let file_style_names: HashMap<_, _> = file_snapshot
+                .styles
+                .iter()
+                .map(|style| (style.id, style.name.as_str()))
+                .collect();
+            assert!(
+                file_view
+                    .styled_ranges
+                    .iter()
+                    .any(|range| file_style_names[&range.style] == "mica-keyword")
+            );
+            assert!(
+                file_view
+                    .styled_ranges
+                    .iter()
+                    .any(|range| file_style_names[&range.style] == "mica-identity")
+            );
+            assert_eq!(file_session.workspace.mica_modes[&file_buffer], "mica");
+            file_session.terminate_workspace().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn mica_file_prompt_descends_directories_before_opening_a_file() {
+        let _guard = MICA_TEST_LOCK.lock().unwrap();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory_name = format!("roe-picker-{}-{unique}", std::process::id());
+            let directory = PathBuf::from(&directory_name);
+            let nested = directory.join("nested");
+            let file = nested.join("inside.txt");
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::create_dir(&nested).unwrap();
+            std::fs::write(&file, "nested contents").unwrap();
+
+            let mut session =
+                test_mica_client(test_editor(), CapabilityGrants::editor_default()).unwrap();
+            let opened_prompt = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![
+                    control(),
+                    LogicalKey::AlphaNumeric('x'),
+                    control(),
+                    LogicalKey::AlphaNumeric('f'),
+                ])))
+                .await
+                .unwrap();
+            let prompt_view = snapshot(&opened_prompt)
+                .views
+                .iter()
+                .find(|view| view.command_view)
+                .unwrap_or_else(|| panic!("{opened_prompt:#?}"));
+            assert!(
+                prompt_view
+                    .visible_text
+                    .contains(&format!("{directory_name}/"))
+            );
+            let initial_header = prompt_view.visible_text.lines().next().unwrap().to_owned();
+
+            session
+                .dispatch(session.envelope(InputEvent::Text(directory_name.clone())))
+                .await
+                .unwrap();
+            let descended = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Enter])))
+                .await
+                .unwrap();
+            let descended_prompt = snapshot(&descended)
+                .views
+                .iter()
+                .find(|view| view.command_view)
+                .unwrap();
+            assert!(descended_prompt.visible_text.contains("nested/"));
+            assert!(descended_prompt.visible_text.contains("../"));
+            let descended_header = descended_prompt
+                .visible_text
+                .lines()
+                .next()
+                .unwrap()
+                .to_owned();
+
+            let ascended = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Enter])))
+                .await
+                .unwrap();
+            let ascended_header = snapshot(&ascended)
+                .views
+                .iter()
+                .find(|view| view.command_view)
+                .unwrap()
+                .visible_text
+                .lines()
+                .next()
+                .unwrap();
+            assert_eq!(ascended_header, initial_header);
+
+            session
+                .dispatch(session.envelope(InputEvent::Text(directory_name.clone())))
+                .await
+                .unwrap();
+            let redescended = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Enter])))
+                .await
+                .unwrap();
+            let redescended_header = snapshot(&redescended)
+                .views
+                .iter()
+                .find(|view| view.command_view)
+                .unwrap()
+                .visible_text
+                .lines()
+                .next()
+                .unwrap();
+            assert_eq!(redescended_header, descended_header);
+
+            session
+                .dispatch(session.envelope(InputEvent::Text("nested".to_owned())))
+                .await
+                .unwrap();
+            let nested_descent = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Enter])))
+                .await
+                .unwrap();
+            assert!(
+                snapshot(&nested_descent)
+                    .views
+                    .iter()
+                    .find(|view| view.command_view)
+                    .unwrap()
+                    .visible_text
+                    .contains("inside.txt")
+            );
+
+            session
+                .dispatch(session.envelope(InputEvent::Text("inside".to_owned())))
+                .await
+                .unwrap();
+            let opened_file = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Enter])))
+                .await
+                .unwrap();
+            assert!(
+                snapshot(&opened_file)
+                    .views
+                    .iter()
+                    .any(|view| !view.command_view && view.visible_text == "nested contents")
+            );
+            assert!(opened_file.lifecycle.iter().all(|event| !matches!(
+                event,
+                LifecycleEvent::Error(message) if message.contains("Is a directory")
+            )));
+
+            session.terminate_workspace().await.unwrap();
+            std::fs::remove_file(file).unwrap();
+            std::fs::remove_dir(nested).unwrap();
+            std::fs::remove_dir(directory).unwrap();
         });
     }
 

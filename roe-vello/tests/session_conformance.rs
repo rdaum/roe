@@ -16,8 +16,8 @@ use std::sync::Arc;
 
 fn editor_fixture() -> Editor {
     let mut buffers: SlotMap<BufferId, Buffer> = SlotMap::default();
-    let buffer = Buffer::named("*conformance*", roe_core::buffer::BufferKind::Ordinary);
-    buffer.load_str("one λ");
+    let buffer = Buffer::named("*conformance*", roe_core::buffer::BufferKind::Scratch);
+    buffer.load_str("let one = \"λ\"");
     let buffer_id = buffers.insert(buffer);
     let mut windows: SlotMap<WindowId, Window> = SlotMap::default();
     let window_id = windows.insert(Window {
@@ -26,7 +26,7 @@ fn editor_fixture() -> Editor {
         width_chars: 80,
         height_chars: 23,
         active_buffer: buffer_id,
-        cursor: 5,
+        cursor: 13,
         window_type: WindowType::Normal,
     });
     Editor {
@@ -99,8 +99,15 @@ fn terminal_and_vello_consume_the_same_production_mica_session_stream() {
         }
 
         let current = terminal.session_presentation().current().unwrap();
-        assert!(current.views[0].visible_text.starts_with("one λ"));
-        assert!(current.views[0].visible_text.len() > "one λ".len());
+        assert!(current.views[0].visible_text.starts_with("let one = \"λ\""));
+        assert!(current.views[0].visible_text.len() > "let one = \"λ\"".len());
+        assert!(!current.views[0].styled_ranges.is_empty());
+        assert!(
+            current
+                .styles
+                .iter()
+                .any(|style| style.name == "mica-keyword")
+        );
         session.terminate_workspace().await.unwrap();
     });
 }
