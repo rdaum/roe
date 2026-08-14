@@ -270,6 +270,7 @@ impl Editor {
             KeyAction::Enter => self.insert_text("\n".to_owned(), &ActionPosition::Cursor),
             KeyAction::Tab => self.insert_text("\t".to_owned(), &ActionPosition::Cursor),
             KeyAction::MarkStart => self.set_mark(),
+            KeyAction::MarkWholeBuffer => self.mark_whole_buffer(),
             KeyAction::KillRegion(true) => self.kill_region(),
             KeyAction::KillRegion(false) => self.copy_region(),
             KeyAction::KillLine(_) => self.kill_line(),
@@ -1679,6 +1680,22 @@ impl Editor {
         buffer.set_mark(window.cursor);
 
         vec![ChromeAction::Echo("Mark set".to_string())]
+    }
+
+    /// Select the entire active buffer using Emacs mark-whole-buffer
+    /// orientation: point at the beginning and mark at the end.
+    pub fn mark_whole_buffer(&mut self) -> Vec<ChromeAction> {
+        let window = &mut self.windows[self.active_window];
+        let buffer = &self.buffers[window.active_buffer];
+        buffer.undo_boundary();
+        buffer.set_mark(buffer.buffer_len_chars());
+        window.cursor = 0;
+        vec![
+            ChromeAction::Echo("Marked whole buffer".to_owned()),
+            ChromeAction::MarkDirty(DirtyRegion::Buffer {
+                buffer_id: window.active_buffer,
+            }),
+        ]
     }
 
     /// Clear the mark

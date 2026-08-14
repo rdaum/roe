@@ -3562,6 +3562,7 @@ fn mica_native_action(action: &str) -> Option<KeyAction> {
         "kill_word" => Some(KeyAction::DeleteWord),
         "backward_kill_word" => Some(KeyAction::BackspaceWord),
         "set_mark" => Some(KeyAction::MarkStart),
+        "mark_whole_buffer" => Some(KeyAction::MarkWholeBuffer),
         "cancel" => Some(KeyAction::Cancel),
         "escape" => Some(KeyAction::Escape),
         "undo" => Some(KeyAction::Undo),
@@ -4628,6 +4629,44 @@ mod tests {
                     .iter()
                     .all(|event| { !matches!(event, LifecycleEvent::Error(_)) }),
                 "{marked:#?}"
+            );
+
+            session.terminate_workspace().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn mica_mark_whole_buffer_selects_the_active_buffer_with_c_x_h() {
+        let _guard = MICA_TEST_LOCK.lock().unwrap();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut session =
+                test_mica_client(test_editor(), CapabilityGrants::editor_default()).unwrap();
+            let selected = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![
+                    control(),
+                    LogicalKey::AlphaNumeric('x'),
+                    LogicalKey::AlphaNumeric('h'),
+                ])))
+                .await
+                .unwrap();
+
+            let window = session.workspace.editor.active_window;
+            let buffer = session.workspace.editor.windows[window].active_buffer;
+            assert_eq!(session.workspace.editor.windows[window].cursor, 0);
+            assert_eq!(session.workspace.editor.buffers[buffer].get_mark(), Some(5));
+            assert_eq!(
+                snapshot(&selected).views[0].selection,
+                Some(TextSelection {
+                    anchor: 0,
+                    active: 5,
+                })
+            );
+            assert_eq!(snapshot(&selected).echo_area, "Marked whole buffer");
+            assert!(
+                selected
+                    .lifecycle
+                    .iter()
+                    .all(|event| !matches!(event, LifecycleEvent::Error(_)))
             );
 
             session.terminate_workspace().await.unwrap();

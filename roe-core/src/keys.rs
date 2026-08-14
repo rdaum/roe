@@ -19,6 +19,7 @@ pub enum KeyAction {
     Enter,
     Tab,
     MarkStart,
+    MarkWholeBuffer,
     KillRegion(bool),
     KillLine(bool),
     Yank(Option<usize>),
