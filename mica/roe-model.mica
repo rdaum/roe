@@ -68,6 +68,8 @@ make_relation(:roe/PackageDisabled, 1, :volatile)
 make_relation(:roe/PackageCommand, 2)
 make_relation(:roe/PackageKeymap, 2)
 make_relation(:roe/PackageMode, 2)
+make_functional_relation(:roe/BufferCreationPolicy, 2, [0])
+make_functional_relation(:roe/BufferSelectionPolicy, 2, [0])
 
 // Session-volatile logical state. Phase 4 asserts and retracts these tuples at
 // endpoint open/close using the public mica-driver volatile-tuple API.
@@ -77,6 +79,13 @@ make_functional_relation(:roe/SessionFrame, 2, [0], :volatile)
 make_functional_relation(:roe/SessionEndpoint, 2, [0], :volatile)
 make_relation(:roe/LogicalBuffer, 1, :volatile)
 make_functional_relation(:roe/BufferName, 2, [0], :volatile)
+make_functional_relation(:roe/BufferKind, 2, [0], :volatile)
+make_functional_relation(:roe/BufferVisitedFile, 2, [0], :volatile)
+make_functional_relation(:roe/BufferLastSavedRevision, 2, [0], :volatile)
+make_functional_relation(:roe/BufferModified, 2, [0], :volatile)
+make_functional_relation(:roe/BufferReadOnly, 2, [0], :volatile)
+make_functional_relation(:roe/BufferSourceLanguage, 2, [0], :volatile)
+make_functional_relation(:roe/BufferSourceUnit, 2, [0], :volatile)
 make_functional_relation(:roe/BufferMajorMode, 2, [0], :volatile)
 make_relation(:roe/BufferMinorMode, 2, :volatile)
 make_relation(:roe/Frame, 1, :volatile)
@@ -139,6 +148,9 @@ make_relation(:roe/EffectiveFaceAttribute, 3)
 make_relation(:roe/EffectiveSyntaxRule, 5)
 make_relation(:roe/LocalConfiguration, 2)
 make_relation(:roe/EffectiveConfiguration, 3)
+make_functional_relation(:roe/BufferSavePolicy, 2, [0])
+make_functional_relation(:roe/BufferKillPolicy, 2, [0])
+make_relation(:roe/BufferHasVisitedFile, 1)
 
 CanRead(actor, relation) :-
   roe/ActorRole(actor, role),
@@ -232,6 +244,69 @@ roe/VisibleBuffer(session, buffer) :-
   roe/SessionLeafView(session, view),
   roe/ViewBuffer(view, buffer)
 
+roe/BufferSourceLanguage(buffer, :mica) :-
+  roe/BufferKind(buffer, :scratch)
+
+roe/BufferSourceUnit(buffer, :roe/user_scratch) :-
+  roe/BufferKind(buffer, :scratch)
+
+roe/BufferHasVisitedFile(buffer) :-
+  roe/BufferVisitedFile(buffer, path)
+
+roe/BufferSavePolicy(buffer, :visited_file) :-
+  roe/BufferVisitedFile(buffer, path)
+
+roe/BufferSavePolicy(buffer, :prompt_destination) :-
+  roe/BufferKind(buffer, :scratch),
+  not roe/BufferHasVisitedFile(buffer)
+
+roe/BufferSavePolicy(buffer, :prompt_destination) :-
+  roe/BufferKind(buffer, :ordinary),
+  not roe/BufferHasVisitedFile(buffer)
+
+roe/BufferSavePolicy(buffer, :deny) :-
+  roe/BufferKind(buffer, :internal)
+
+roe/BufferSavePolicy(buffer, :deny) :-
+  roe/BufferKind(buffer, :prompt)
+
+roe/BufferSavePolicy(buffer, :deny) :-
+  roe/BufferKind(buffer, :results)
+
+roe/BufferSavePolicy(buffer, :deny) :-
+  roe/BufferKind(buffer, :diagnostics)
+
+roe/BufferKillPolicy(buffer, :deny_special) :-
+  roe/BufferKind(buffer, :scratch)
+
+roe/BufferKillPolicy(buffer, :deny_special) :-
+  roe/BufferKind(buffer, :internal)
+
+roe/BufferKillPolicy(buffer, :deny_special) :-
+  roe/BufferKind(buffer, :prompt)
+
+roe/BufferKillPolicy(buffer, :deny_modified) :-
+  roe/BufferKind(buffer, :ordinary),
+  roe/BufferModified(buffer, true)
+
+roe/BufferKillPolicy(buffer, :deny_modified) :-
+  roe/BufferKind(buffer, :file),
+  roe/BufferModified(buffer, true)
+
+roe/BufferKillPolicy(buffer, :allow) :-
+  roe/BufferKind(buffer, :ordinary),
+  roe/BufferModified(buffer, false)
+
+roe/BufferKillPolicy(buffer, :allow) :-
+  roe/BufferKind(buffer, :file),
+  roe/BufferModified(buffer, false)
+
+roe/BufferKillPolicy(buffer, :allow) :-
+  roe/BufferKind(buffer, :results)
+
+roe/BufferKillPolicy(buffer, :allow) :-
+  roe/BufferKind(buffer, :diagnostics)
+
 roe/ArgumentCandidate(:visible_views, actor, session, view, name) :-
   roe/SessionActor(session, actor),
   roe/SessionLeafView(session, view),
@@ -319,6 +394,19 @@ assert roe/PackageEnabled(#roe/core_package, true)
 assert roe/PackageCommand(#roe/core_package, #roe/other_window)
 assert roe/PackageKeymap(#roe/core_package, #roe/global_map)
 assert roe/PackageMode(#roe/core_package, #roe/fundamental_mode)
+assert roe/BufferCreationPolicy(:ordinary, :allow)
+assert roe/BufferCreationPolicy(:scratch, :single)
+assert roe/BufferCreationPolicy(:internal, :host_only)
+assert roe/BufferCreationPolicy(:prompt, :host_only)
+assert roe/BufferCreationPolicy(:results, :host_only)
+assert roe/BufferCreationPolicy(:diagnostics, :host_only)
+assert roe/BufferSelectionPolicy(:ordinary, :allow)
+assert roe/BufferSelectionPolicy(:scratch, :allow)
+assert roe/BufferSelectionPolicy(:file, :allow)
+assert roe/BufferSelectionPolicy(:internal, :allow)
+assert roe/BufferSelectionPolicy(:prompt, :deny)
+assert roe/BufferSelectionPolicy(:results, :allow)
+assert roe/BufferSelectionPolicy(:diagnostics, :allow)
 
 assert RoleCanRead(#roe/editor_role, :roe/ActiveView)
 assert RoleCanRead(#roe/editor_role, :roe/SessionActor)
@@ -335,6 +423,18 @@ assert RoleCanRead(#roe/editor_role, :roe/ViewSelection)
 assert RoleCanRead(#roe/editor_role, :roe/PointerSelection)
 assert RoleCanRead(#roe/editor_role, :roe/LogicalBuffer)
 assert RoleCanRead(#roe/editor_role, :roe/BufferName)
+assert RoleCanRead(#roe/editor_role, :roe/BufferKind)
+assert RoleCanRead(#roe/editor_role, :roe/BufferVisitedFile)
+assert RoleCanRead(#roe/editor_role, :roe/BufferLastSavedRevision)
+assert RoleCanRead(#roe/editor_role, :roe/BufferModified)
+assert RoleCanRead(#roe/editor_role, :roe/BufferReadOnly)
+assert RoleCanRead(#roe/editor_role, :roe/BufferSourceLanguage)
+assert RoleCanRead(#roe/editor_role, :roe/BufferSourceUnit)
+assert RoleCanRead(#roe/editor_role, :roe/NativeBufferRevision)
+assert RoleCanRead(#roe/editor_role, :roe/BufferCreationPolicy)
+assert RoleCanRead(#roe/editor_role, :roe/BufferSelectionPolicy)
+assert RoleCanRead(#roe/editor_role, :roe/BufferSavePolicy)
+assert RoleCanRead(#roe/editor_role, :roe/BufferKillPolicy)
 assert RoleCanRead(#roe/editor_role, :roe/CanUseBuffer)
 assert RoleCanRead(#roe/editor_role, :roe/CanRequestService)
 assert RoleCanRead(#roe/editor_role, :roe/EffectiveSessionKeymap)
@@ -407,6 +507,8 @@ assert roe/RoleCanRequestService(#roe/editor_role, :clock_read)
 assert roe/RoleCanRequestService(#roe/editor_role, :process_spawn)
 assert roe/RoleCanRequestService(#roe/editor_role, :watch_register)
 assert roe/RoleCanRequestService(#roe/editor_role, :watch_unregister)
+assert roe/RoleCanRequestService(#roe/editor_role, :mica_eval)
+assert roe/RoleCanRequestService(#roe/editor_role, :mica_filein)
 
 verb roe/other_window(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor

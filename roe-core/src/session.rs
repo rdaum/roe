@@ -40,6 +40,8 @@ pub const MAX_NATIVE_RESULT_BYTES: usize = 1_048_576;
 pub const MAX_FRONTEND_REQUESTS: usize = 16;
 pub const MAX_FRONTEND_TEXT_CHARS: usize = 65_536;
 pub const MAX_SESSION_VIEWS: usize = 64;
+pub const MAX_BUFFER_NAME_CHARS: usize = 256;
+pub const MAX_MICA_SOURCE_CHARS: usize = 1_048_576;
 pub const MAX_FRAME_COLUMNS: u16 = 1_000;
 pub const MAX_FRAME_ROWS: u16 = 1_000;
 const MICA_PROMPT_HEIGHT: u16 = 10;
@@ -377,6 +379,12 @@ pub struct PresentedView {
     pub id: ViewId,
     pub resource: ResourceId,
     pub name: String,
+    pub buffer_kind: String,
+    pub visited_file: Option<PathBuf>,
+    pub text_revision: u64,
+    pub last_saved_revision: u64,
+    pub modified: bool,
+    pub read_only: bool,
     /// Renderer-neutral visible slice, bounded by the logical view height.
     pub visible_text: String,
     pub visible_start_char: usize,
@@ -761,7 +769,11 @@ impl WorkspaceHost {
     /// Open the public-driver Mica endpoint used by the first integration
     /// wave. The ordinary constructor remains available for headless and
     /// protocol and native-mechanism tests that do not need policy dispatch.
-    pub fn open_with_mica(editor: Editor, grants: CapabilityGrants) -> Result<Self, MicaHostError> {
+    pub fn open_with_mica(
+        mut editor: Editor,
+        grants: CapabilityGrants,
+    ) -> Result<Self, MicaHostError> {
+        editor.ensure_scratch_buffer();
         let mut workspace = Self::open(editor, grants)?;
         workspace.mica = Some(MicaHost::open(
             &workspace.editor,
@@ -772,10 +784,11 @@ impl WorkspaceHost {
     }
 
     pub fn open_with_mica_clock(
-        editor: Editor,
+        mut editor: Editor,
         grants: CapabilityGrants,
         clock: Arc<dyn NativeClock>,
     ) -> Result<Self, MicaHostError> {
+        editor.ensure_scratch_buffer();
         let mut workspace = Self::open_with_kernel(
             editor,
             Arc::new(Mutex::new(NativeKernel::with_clock(grants, clock))),
@@ -1488,6 +1501,7 @@ impl WorkspaceHost {
                     "kill_buffer" => CommandType::KillBuffer,
                     "find_file" => CommandType::OpenFile(crate::editor::OpenType::New),
                     "visit_file" => CommandType::OpenFile(crate::editor::OpenType::Visit),
+                    "save_file" => CommandType::SaveFile,
                     "isearch_forward" => CommandType::ISearch { forward: true },
                     "isearch_backward" => CommandType::ISearch { forward: false },
                     _ => {
@@ -1884,13 +1898,241 @@ impl WorkspaceHost {
                     }
                 }
                 "save_buffer" => {
-                    self.resolve_actions(
-                        attachment,
-                        vec![ChromeAction::Save],
-                        lifecycle,
-                        invalidations,
-                    )
-                    .await;
+                    if let Some(buffer) = action.buffer {
+                        let actions = self.save_buffer_via_kernel(buffer, lifecycle);
+                        self.resolve_actions(attachment, actions, lifecycle, invalidations)
+                            .await;
+                    } else {
+                        lifecycle.push(LifecycleEvent::Error(
+                            "Mica save decision lost its buffer identity".to_owned(),
+                        ));
+                    }
+                }
+                "save_buffer_as_selected" => {
+                    let (Some(buffer), Some(path)) = (action.buffer, action.path) else {
+                        lifecycle.push(LifecycleEvent::Error(
+                            "Mica save-as decision lost its buffer or path".to_owned(),
+                        ));
+                        continue;
+                    };
+                    if path.is_empty() {
+                        lifecycle.push(LifecycleEvent::Error(
+                            "save destination must not be empty".to_owned(),
+                        ));
+                        continue;
+                    }
+                    let was_scratch =
+                        self.editor.buffers.get(buffer).is_some_and(|value| {
+                            value.kind() == crate::buffer::BufferKind::Scratch
+                        });
+                    if let Err(error) = self
+                        .editor
+                        .visit_file_for_buffer(buffer, std::path::PathBuf::from(path))
+                    {
+                        lifecycle.push(LifecycleEvent::Error(error));
+                        continue;
+                    }
+                    if was_scratch {
+                        self.editor.ensure_scratch_buffer();
+                    }
+                    let actions = self.save_buffer_via_kernel(buffer, lifecycle);
+                    self.resolve_actions(attachment, actions, lifecycle, invalidations)
+                        .await;
+                }
+                "create_buffer" => {
+                    let (Some(name), Some(view)) = (action.buffer_name, action.view) else {
+                        lifecycle.push(LifecycleEvent::Error(
+                            "Mica buffer creation lost its name or target view".to_owned(),
+                        ));
+                        continue;
+                    };
+                    let name_len = name.chars().count();
+                    if name.is_empty() || name_len > MAX_BUFFER_NAME_CHARS {
+                        lifecycle.push(LifecycleEvent::Overloaded {
+                            detail: format!(
+                                "buffer name must contain 1..={MAX_BUFFER_NAME_CHARS} characters"
+                            ),
+                        });
+                        continue;
+                    }
+                    let buffer = self.editor.create_buffer(name, String::new());
+                    if let Some(window) = self.editor.windows.get_mut(view) {
+                        window.active_buffer = buffer;
+                        window.cursor = 0;
+                        self.editor.active_window = view;
+                        self.editor.record_buffer_access(buffer);
+                        invalidations.push(Invalidation::Full);
+                    } else {
+                        self.editor.buffers.remove(buffer);
+                        lifecycle.push(LifecycleEvent::Error(
+                            "Mica buffer creation targeted a stale view".to_owned(),
+                        ));
+                    }
+                }
+                "eval_region" => {
+                    if let Err(error) = self
+                        .kernel
+                        .lock()
+                        .unwrap()
+                        .authorize(Capability::MicaEvaluate)
+                    {
+                        lifecycle.push(LifecycleEvent::Error(format!(
+                            "Mica region evaluation was denied: {error}"
+                        )));
+                        continue;
+                    }
+                    let (Some(buffer_id), Some(view)) = (action.buffer, action.view) else {
+                        lifecycle.push(LifecycleEvent::Error(
+                            "Mica region evaluation lost its buffer or view".to_owned(),
+                        ));
+                        continue;
+                    };
+                    let Some(window) = self.editor.windows.get(view) else {
+                        lifecycle.push(LifecycleEvent::Error(
+                            "Mica region evaluation targeted a stale view".to_owned(),
+                        ));
+                        continue;
+                    };
+                    if window.active_buffer != buffer_id {
+                        lifecycle.push(LifecycleEvent::Error(
+                            "Mica region evaluation targeted a stale buffer".to_owned(),
+                        ));
+                        continue;
+                    }
+                    let Some(source) =
+                        self.editor.buffers[buffer_id].get_region_text(window.cursor)
+                    else {
+                        lifecycle.push(LifecycleEvent::Error(
+                            "Mica region evaluation requires an active region".to_owned(),
+                        ));
+                        continue;
+                    };
+                    if source.chars().count() > MAX_MICA_SOURCE_CHARS {
+                        lifecycle.push(LifecycleEvent::Overloaded {
+                            detail: format!(
+                                "Mica source exceeds the {MAX_MICA_SOURCE_CHARS}-character limit"
+                            ),
+                        });
+                        continue;
+                    }
+                    let evaluation = if let Some(mut mica) = self.mica.take() {
+                        let result = mica
+                            .evaluate_source(&self.editor, &self.buffer_resources, source)
+                            .await;
+                        self.mica = Some(mica);
+                        result
+                    } else {
+                        Err(MicaHostError::Closed)
+                    };
+                    match evaluation {
+                        Ok(result) => {
+                            Box::pin(self.apply_mica_events(
+                                attachment,
+                                result.events,
+                                lifecycle,
+                                invalidations,
+                            ))
+                            .await;
+                            if result.value.chars().count() > 1_024 {
+                                self.editor.show_special_buffer(
+                                    "*Mica Results*",
+                                    crate::buffer::BufferKind::Results,
+                                    &format!("{}\n", result.value),
+                                );
+                                invalidations.push(Invalidation::Full);
+                            }
+                            self.editor
+                                .set_echo_message(format!("Mica => {}", result.value));
+                            invalidations.push(Invalidation::EchoArea);
+                        }
+                        Err(error) => {
+                            let message = error.to_string();
+                            self.editor.show_special_buffer(
+                                "*Mica Diagnostics*",
+                                crate::buffer::BufferKind::Diagnostics,
+                                &format!("{message}\n"),
+                            );
+                            self.editor.set_echo_message(message.clone());
+                            lifecycle.push(LifecycleEvent::Error(message));
+                            invalidations.push(Invalidation::Full);
+                        }
+                    }
+                }
+                "eval_buffer" => {
+                    if let Err(error) = self
+                        .kernel
+                        .lock()
+                        .unwrap()
+                        .authorize(Capability::MicaFilein)
+                    {
+                        lifecycle.push(LifecycleEvent::Error(format!(
+                            "Mica buffer file-in was denied: {error}"
+                        )));
+                        continue;
+                    }
+                    let (Some(buffer_id), Some(unit)) = (action.buffer, action.unit) else {
+                        lifecycle.push(LifecycleEvent::Error(
+                            "Mica buffer file-in lost its buffer or unit".to_owned(),
+                        ));
+                        continue;
+                    };
+                    let Some(buffer) = self.editor.buffers.get(buffer_id) else {
+                        lifecycle.push(LifecycleEvent::Error(
+                            "Mica buffer file-in targeted a stale buffer".to_owned(),
+                        ));
+                        continue;
+                    };
+                    let source = buffer.content();
+                    let revision = buffer.text_revision();
+                    if source.chars().count() > MAX_MICA_SOURCE_CHARS {
+                        lifecycle.push(LifecycleEvent::Overloaded {
+                            detail: format!(
+                                "Mica source exceeds the {MAX_MICA_SOURCE_CHARS}-character limit"
+                            ),
+                        });
+                        continue;
+                    }
+                    let filein = if let Some(mut mica) = self.mica.take() {
+                        let result = mica.replace_unit(&unit, source).await;
+                        let policy = if result.is_ok() {
+                            mica.publish_policy(&self.editor, &self.buffer_resources)
+                                .await
+                        } else {
+                            Ok(MicaEventBatch::default())
+                        };
+                        self.mica = Some(mica);
+                        result.and(policy)
+                    } else {
+                        Err(MicaHostError::Closed)
+                    };
+                    match filein {
+                        Ok(policy) => {
+                            let report = format!(
+                                "Filed in {unit} from {} at native revision {revision}",
+                                self.editor.buffers[buffer_id].display_name()
+                            );
+                            self.editor.set_echo_message(report);
+                            invalidations.push(Invalidation::EchoArea);
+                            Box::pin(self.apply_mica_events(
+                                attachment,
+                                policy,
+                                lifecycle,
+                                invalidations,
+                            ))
+                            .await;
+                        }
+                        Err(error) => {
+                            let message = error.to_string();
+                            self.editor.show_special_buffer(
+                                "*Mica Diagnostics*",
+                                crate::buffer::BufferKind::Diagnostics,
+                                &format!("{message}\n"),
+                            );
+                            self.editor.set_echo_message(message.clone());
+                            lifecycle.push(LifecycleEvent::Error(message));
+                            invalidations.push(Invalidation::Full);
+                        }
+                    }
                 }
                 "switch_buffer_selected" => {
                     if let Some(buffer) = action.buffer {
@@ -1906,6 +2148,7 @@ impl WorkspaceHost {
                 "kill_buffer_selected" => {
                     if let Some(buffer) = action.buffer {
                         let actions = self.editor.select_mica_buffer(buffer, true);
+                        self.editor.ensure_scratch_buffer();
                         self.resolve_actions(attachment, actions, lifecycle, invalidations)
                             .await;
                     } else {
@@ -2262,10 +2505,25 @@ impl WorkspaceHost {
     ) -> Vec<ChromeAction> {
         let window = self.editor.active_window;
         let buffer_id = self.editor.windows[window].active_buffer;
+        self.save_buffer_via_kernel(buffer_id, lifecycle)
+    }
+
+    fn save_buffer_via_kernel(
+        &mut self,
+        buffer_id: BufferId,
+        lifecycle: &mut Vec<LifecycleEvent>,
+    ) -> Vec<ChromeAction> {
         let Some(buffer) = self.editor.buffers.get(buffer_id).cloned() else {
             return vec![ChromeAction::Echo("No active buffer".to_owned())];
         };
-        let path = std::path::PathBuf::from(buffer.object());
+        let Some(path) = buffer.visited_file() else {
+            let message = format!(
+                "buffer {} has no visited file; choose a destination",
+                buffer.display_name()
+            );
+            lifecycle.push(LifecycleEvent::Error(message.clone()));
+            return vec![ChromeAction::Echo(message)];
+        };
         let content = buffer.content();
         match self
             .kernel
@@ -2293,6 +2551,7 @@ impl WorkspaceHost {
             .watch_file(buffer_id, &path, content)
             .err();
         let mut actions = vec![ChromeAction::Echo(format!("Saved: {}", path.display()))];
+        buffer.mark_saved();
         if let Some(error) = watch_error {
             actions.push(ChromeAction::Echo(format!(
                 "Saved {}, but failed to watch it: {error}",
@@ -2643,7 +2902,7 @@ impl WorkspaceHost {
                     }
                     Err(error) => cleanup_warnings.push(format!(
                         "buffer {} has no native resource: {error}",
-                        buffer.object()
+                        buffer.display_name()
                     )),
                 }
             }
@@ -2792,16 +3051,29 @@ impl WorkspaceHost {
                 .get(&window.active_buffer)
                 .cloned()
                 .unwrap_or_else(|| "unpublished".to_string());
+            let status = if buffer.is_read_only() {
+                "%"
+            } else if buffer.is_modified() {
+                "*"
+            } else {
+                "-"
+            };
             let modeline = format!(
-                "{} ({mode}) {}:{}",
-                buffer.object(),
+                "{status} {} ({mode}) {}:{}",
+                buffer.display_name(),
                 line.saturating_add(1),
                 column.saturating_add(1)
             );
             views.push(PresentedView {
                 id,
                 resource,
-                name: buffer.object(),
+                name: buffer.display_name(),
+                buffer_kind: buffer.kind().as_str().to_owned(),
+                visited_file: buffer.visited_file(),
+                text_revision: buffer.text_revision(),
+                last_saved_revision: buffer.last_saved_revision(),
+                modified: buffer.is_modified(),
+                read_only: buffer.is_read_only(),
                 visible_text,
                 visible_start_char,
                 visible_end_char,
@@ -3342,6 +3614,7 @@ fn mica_prompt_content(update: &MicaPromptUpdate) -> MicaPromptContent {
         "kill_buffer" => "Kill buffer: ",
         "find_file" => "Find file: ",
         "visit_file" => "Visit file: ",
+        "save_file" => "Save buffer as: ",
         "isearch_forward" => "I-search: ",
         "isearch_backward" => "I-search backward: ",
         _ => "Prompt: ",
@@ -3833,8 +4106,7 @@ mod tests {
 
     fn test_editor() -> Editor {
         let mut buffers: SlotMap<BufferId, Buffer> = SlotMap::default();
-        let buffer = Buffer::new();
-        buffer.set_object("*test*".to_string());
+        let buffer = Buffer::named("*test*", crate::buffer::BufferKind::Ordinary);
         buffer.load_str("hello");
         let buffer_id = buffers.insert(buffer);
         let mut windows = SlotMap::default();
@@ -3929,11 +4201,328 @@ mod tests {
         test_session_with_grants(CapabilityGrants::editor_default())
     }
 
+    fn control() -> LogicalKey {
+        LogicalKey::Modifier(crate::keys::KeyModifier::Control(crate::keys::Side::Left))
+    }
+
     fn snapshot(output: &SessionOutput) -> &PresentationSnapshot {
         match output.presentation.as_ref().unwrap() {
             PresentationUpdate::Full(snapshot) => snapshot,
             PresentationUpdate::Delta(delta) => &delta.snapshot,
         }
+    }
+
+    #[test]
+    fn production_mica_workspace_always_has_a_distinguished_scratch_buffer() {
+        let _guard = MICA_TEST_LOCK.lock().unwrap();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut session =
+                test_mica_client(test_editor(), CapabilityGrants::editor_default()).unwrap();
+            let scratch: Vec<_> = session
+                .workspace
+                .editor
+                .buffers
+                .iter()
+                .filter(|(_, buffer)| buffer.kind() == crate::buffer::BufferKind::Scratch)
+                .collect();
+            assert_eq!(scratch.len(), 1);
+            assert_eq!(scratch[0].1.display_name(), "*scratch*");
+            assert_eq!(scratch[0].1.visited_file(), None);
+            session.terminate_workspace().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn mica_projects_buffer_metadata_and_prompts_before_saving_a_non_file_buffer() {
+        let _guard = MICA_TEST_LOCK.lock().unwrap();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut session =
+                test_mica_client(test_editor(), CapabilityGrants::editor_default()).unwrap();
+            let save = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![
+                    control(),
+                    LogicalKey::AlphaNumeric('x'),
+                    control(),
+                    LogicalKey::AlphaNumeric('s'),
+                ])))
+                .await
+                .unwrap();
+
+            let ordinary = snapshot(&save)
+                .views
+                .iter()
+                .find(|view| !view.command_view)
+                .unwrap();
+            assert_eq!(ordinary.name, "*test*");
+            assert_eq!(ordinary.buffer_kind, "ordinary");
+            assert_eq!(ordinary.visited_file, None);
+            assert_eq!(ordinary.text_revision, 1);
+            assert_eq!(ordinary.last_saved_revision, 1);
+            assert!(!ordinary.modified);
+            assert!(!ordinary.read_only);
+            assert!(snapshot(&save).views.iter().any(|view| {
+                view.command_view && view.visible_text.starts_with("Save buffer as: ")
+            }));
+
+            session.terminate_workspace().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn switch_to_buffer_creates_a_missing_ordinary_buffer() {
+        let _guard = MICA_TEST_LOCK.lock().unwrap();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut session =
+                test_mica_client(test_editor(), CapabilityGrants::editor_default()).unwrap();
+            session
+                .dispatch(session.envelope(InputEvent::Keys(vec![
+                    control(),
+                    LogicalKey::AlphaNumeric('x'),
+                    LogicalKey::AlphaNumeric('b'),
+                ])))
+                .await
+                .unwrap();
+            session
+                .dispatch(session.envelope(InputEvent::Text("new-notes".to_owned())))
+                .await
+                .unwrap();
+            let created = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Enter])))
+                .await
+                .unwrap();
+
+            let active = snapshot(&created)
+                .views
+                .iter()
+                .find(|view| view.active)
+                .unwrap();
+            assert_eq!(active.name, "new-notes");
+            assert_eq!(active.buffer_kind, "ordinary");
+            assert_eq!(active.visited_file, None);
+            assert!(active.visible_text.is_empty());
+
+            session.terminate_workspace().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn mica_kill_policy_rejects_a_modified_ordinary_buffer() {
+        let _guard = MICA_TEST_LOCK.lock().unwrap();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut session =
+                test_mica_client(test_editor(), CapabilityGrants::editor_default()).unwrap();
+            let active = session.workspace.editor.windows[session.workspace.editor.active_window]
+                .active_buffer;
+            session
+                .dispatch(session.envelope(InputEvent::Text("!".to_owned())))
+                .await
+                .unwrap();
+            assert!(session.workspace.editor.buffers[active].is_modified());
+
+            session
+                .dispatch(session.envelope(InputEvent::Keys(vec![
+                    control(),
+                    LogicalKey::AlphaNumeric('x'),
+                    LogicalKey::AlphaNumeric('k'),
+                ])))
+                .await
+                .unwrap();
+            session
+                .dispatch(session.envelope(InputEvent::Text("test".to_owned())))
+                .await
+                .unwrap();
+            let denied = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Enter])))
+                .await
+                .unwrap();
+            assert!(
+                denied.lifecycle.iter().any(|event| {
+                    matches!(event, LifecycleEvent::Error(message) if message.contains("modified"))
+                }),
+                "{denied:#?}"
+            );
+            assert!(session.workspace.editor.buffers.contains_key(active));
+
+            session.terminate_workspace().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn saving_scratch_to_a_destination_preserves_a_fresh_scratch_buffer() {
+        let _guard = MICA_TEST_LOCK.lock().unwrap();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let editor = test_editor();
+            let original = editor.windows[editor.active_window].active_buffer;
+            editor.buffers[original].set_kind(crate::buffer::BufferKind::Scratch);
+            editor.buffers[original].set_display_name("*scratch*");
+            let path = std::env::temp_dir().join(format!(
+                "roe-scratch-save-{}-{}.mica",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let mut session = test_mica_client(editor, CapabilityGrants::editor_default()).unwrap();
+
+            session
+                .dispatch(session.envelope(InputEvent::Keys(vec![
+                    control(),
+                    LogicalKey::AlphaNumeric('x'),
+                    control(),
+                    LogicalKey::AlphaNumeric('s'),
+                ])))
+                .await
+                .unwrap();
+            session
+                .dispatch(session.envelope(InputEvent::Text(path.to_string_lossy().into_owned())))
+                .await
+                .unwrap();
+            let saved = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Enter])))
+                .await
+                .unwrap();
+            assert!(
+                saved
+                    .lifecycle
+                    .iter()
+                    .all(|event| { !matches!(event, LifecycleEvent::Error(_)) }),
+                "{saved:#?}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
+            assert_eq!(
+                session.workspace.editor.buffers[original].visited_file(),
+                Some(path.clone())
+            );
+            assert_eq!(
+                session.workspace.editor.buffers[original].kind(),
+                crate::buffer::BufferKind::File
+            );
+            assert!(!session.workspace.editor.buffers[original].is_modified());
+            assert_eq!(
+                session
+                    .workspace
+                    .editor
+                    .buffers
+                    .iter()
+                    .filter(|(_, buffer)| buffer.kind() == crate::buffer::BufferKind::Scratch)
+                    .count(),
+                1
+            );
+
+            session.terminate_workspace().await.unwrap();
+            std::fs::remove_file(path).unwrap();
+        });
+    }
+
+    #[test]
+    fn mica_eval_buffer_atomically_files_in_the_scratch_unit() {
+        let _guard = MICA_TEST_LOCK.lock().unwrap();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let editor = test_editor();
+            let scratch = editor.windows[editor.active_window].active_buffer;
+            editor.buffers[scratch].set_kind(crate::buffer::BufferKind::Scratch);
+            editor.buffers[scratch].set_display_name("*scratch*");
+            editor.buffers[scratch].load_str("make_identity(:roe/scratch_probe)\n");
+            let mut session = test_mica_client(editor, CapabilityGrants::editor_default()).unwrap();
+
+            let filed_in = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![
+                    control(),
+                    LogicalKey::AlphaNumeric('c'),
+                    control(),
+                    LogicalKey::AlphaNumeric('b'),
+                ])))
+                .await
+                .unwrap();
+            assert!(
+                filed_in
+                    .lifecycle
+                    .iter()
+                    .all(|event| { !matches!(event, LifecycleEvent::Error(_)) }),
+                "{filed_in:#?}"
+            );
+            assert!(
+                snapshot(&filed_in)
+                    .echo_area
+                    .contains("Filed in roe/user_scratch")
+            );
+            let retained = session
+                .workspace
+                .export_mica_unit("roe/user_scratch")
+                .await
+                .unwrap();
+            assert!(retained.contains("scratch_probe"));
+
+            session.workspace.editor.buffers[scratch].load_str("verb this is malformed");
+            let rejected = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![
+                    control(),
+                    LogicalKey::AlphaNumeric('c'),
+                    control(),
+                    LogicalKey::AlphaNumeric('b'),
+                ])))
+                .await
+                .unwrap();
+            assert!(
+                rejected
+                    .lifecycle
+                    .iter()
+                    .any(|event| { matches!(event, LifecycleEvent::Error(_)) }),
+                "{rejected:#?}"
+            );
+            let diagnostics = snapshot(&rejected)
+                .views
+                .iter()
+                .find(|view| view.active)
+                .unwrap();
+            assert_eq!(diagnostics.buffer_kind, "diagnostics");
+            assert!(diagnostics.read_only);
+            assert_eq!(
+                session
+                    .workspace
+                    .export_mica_unit("roe/user_scratch")
+                    .await
+                    .unwrap(),
+                retained
+            );
+
+            session.terminate_workspace().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn mica_eval_region_runs_selected_task_code_in_endpoint_context() {
+        let _guard = MICA_TEST_LOCK.lock().unwrap();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut editor = test_editor();
+            let buffer = editor.windows[editor.active_window].active_buffer;
+            editor.buffers[buffer].load_str("1 + 2");
+            editor.buffers[buffer].set_mark(0);
+            editor.windows[editor.active_window].cursor = 5;
+            let mut session = test_mica_client(editor, CapabilityGrants::editor_default()).unwrap();
+
+            let evaluated = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![
+                    control(),
+                    LogicalKey::AlphaNumeric('c'),
+                    control(),
+                    LogicalKey::AlphaNumeric('r'),
+                ])))
+                .await
+                .unwrap();
+            assert!(
+                evaluated
+                    .lifecycle
+                    .iter()
+                    .all(|event| { !matches!(event, LifecycleEvent::Error(_)) }),
+                "{evaluated:#?}"
+            );
+            assert!(snapshot(&evaluated).echo_area.contains("Mica => 3"));
+            assert_eq!(session.workspace.editor.buffers[buffer].content(), "1 + 2");
+
+            session.terminate_workspace().await.unwrap();
+        });
     }
 
     #[test]
@@ -4007,6 +4596,41 @@ mod tests {
                     .lifecycle
                     .contains(&LifecycleEvent::WorkspaceTerminated)
             );
+        });
+    }
+
+    #[test]
+    fn unmodified_space_inserts_text_while_control_space_remains_a_key_chord() {
+        let _guard = MICA_TEST_LOCK.lock().unwrap();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut session =
+                test_mica_client(test_editor(), CapabilityGrants::editor_default()).unwrap();
+            let inserted = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::AlphaNumeric(' ')])))
+                .await
+                .unwrap();
+            assert_eq!(snapshot(&inserted).views[0].visible_text, "hello ");
+            assert!(!snapshot(&inserted).echo_area.contains("undefined"));
+
+            let marked = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![
+                    control(),
+                    LogicalKey::AlphaNumeric(' '),
+                ])))
+                .await
+                .unwrap();
+            let active = session.workspace.editor.active_window;
+            let buffer = session.workspace.editor.windows[active].active_buffer;
+            assert_eq!(session.workspace.editor.buffers[buffer].get_mark(), Some(6));
+            assert!(
+                marked
+                    .lifecycle
+                    .iter()
+                    .all(|event| { !matches!(event, LifecycleEvent::Error(_)) }),
+                "{marked:#?}"
+            );
+
+            session.terminate_workspace().await.unwrap();
         });
     }
 
@@ -4219,7 +4843,7 @@ mod tests {
                     .as_ref()
                     .unwrap()
                     .identity_counts_for_test(),
-                (3, 2)
+                (4, 2)
             );
 
             session.workspace.editor.active_window = original_view;
@@ -4238,7 +4862,7 @@ mod tests {
                     .as_ref()
                     .unwrap()
                     .identity_counts_for_test(),
-                (2, 1)
+                (3, 1)
             );
             assert_eq!(
                 snapshot(&after_removal).views[0].visible_text,
@@ -4284,8 +4908,13 @@ mod tests {
     fn mica_host_effects_cannot_bypass_native_capabilities() {
         let _guard = MICA_TEST_LOCK.lock().unwrap();
         compio::runtime::Runtime::new().unwrap().block_on(async {
+            let editor = test_editor();
+            let active = editor.windows[editor.active_window].active_buffer;
+            editor.buffers[active]
+                .set_visited_file(Some(std::path::PathBuf::from("denied-save.txt")));
+            editor.buffers[active].set_kind(crate::buffer::BufferKind::File);
             let mut session = test_mica_client(
-                test_editor(),
+                editor,
                 CapabilityGrants::new([]),
             )
             .unwrap();
@@ -4294,7 +4923,9 @@ mod tests {
                 .dispatch(session.envelope(InputEvent::Text("x".to_owned())))
                 .await
                 .unwrap();
-            let active = session.workspace.editor.windows[session.workspace.editor.active_window].active_buffer;
+            let active = session.workspace.editor.windows
+                [session.workspace.editor.active_window]
+                .active_buffer;
             assert_eq!(session.workspace.editor.buffers[active].content(), "hello");
             assert!(insertion.lifecycle.iter().any(|event| matches!(
                 event,

@@ -64,6 +64,8 @@ pub enum Capability {
     ClockRead,
     ProcessSpawn,
     Watch,
+    MicaEvaluate,
+    MicaFilein,
 }
 
 /// Explicit authority supplied when a session is opened.
@@ -89,6 +91,8 @@ impl CapabilityGrants {
             Capability::ClockRead,
             Capability::ProcessSpawn,
             Capability::Watch,
+            Capability::MicaEvaluate,
+            Capability::MicaFilein,
         ])
     }
 
@@ -107,6 +111,11 @@ pub struct TextSelection {
 pub struct TextSnapshot {
     pub resource: ResourceId,
     pub name: String,
+    pub visited_file: Option<PathBuf>,
+    pub text_revision: u64,
+    pub last_saved_revision: u64,
+    pub modified: bool,
+    pub read_only: bool,
     pub text: String,
     pub character_len: usize,
     pub line_count: usize,
@@ -249,6 +258,8 @@ pub enum KernelError {
         end: usize,
         len: usize,
     },
+    #[error("native text resource {0:?} is read-only")]
+    ReadOnly(ResourceId),
     #[error("invalid logical layout: {0}")]
     InvalidLayout(String),
     #[error("native I/O operation failed: {0}")]
@@ -333,8 +344,7 @@ impl NativeKernel {
         match operation {
             NativeOperation::CreateText { name, initial } => {
                 self.require(Capability::TextWrite)?;
-                let buffer = Buffer::new();
-                buffer.set_object(name);
+                let buffer = Buffer::named(name, crate::buffer::BufferKind::Ordinary);
                 buffer.load_str(&initial);
                 Ok(NativeResult::ResourceCreated(self.register_buffer(buffer)?))
             }
@@ -354,7 +364,9 @@ impl NativeKernel {
                 let entry = self.resource_mut(resource)?;
                 let len = entry.buffer.buffer_len_chars();
                 validate_range(at, at, len)?;
-                entry.buffer.insert_pos(text, at);
+                if !entry.buffer.insert_pos(text, at) {
+                    return Err(KernelError::ReadOnly(resource));
+                }
                 Ok(text_changed(resource, entry))
             }
             NativeOperation::Delete {
@@ -366,7 +378,14 @@ impl NativeKernel {
                 let entry = self.resource_mut(resource)?;
                 let len = entry.buffer.buffer_len_chars();
                 validate_range(start, end, len)?;
-                entry.buffer.delete_pos(start, (end - start) as isize);
+                if entry
+                    .buffer
+                    .delete_pos(start, (end - start) as isize)
+                    .is_none()
+                    && start != end
+                {
+                    return Err(KernelError::ReadOnly(resource));
+                }
                 clamp_selection(entry);
                 Ok(text_changed(resource, entry))
             }
@@ -381,8 +400,19 @@ impl NativeKernel {
                 let len = entry.buffer.buffer_len_chars();
                 validate_range(start, end, len)?;
                 entry.buffer.begin_undo_group();
-                entry.buffer.delete_pos(start, (end - start) as isize);
-                entry.buffer.insert_pos(text, start);
+                if start != end
+                    && entry
+                        .buffer
+                        .delete_pos(start, (end - start) as isize)
+                        .is_none()
+                {
+                    entry.buffer.end_undo_group();
+                    return Err(KernelError::ReadOnly(resource));
+                }
+                if !entry.buffer.insert_pos(text, start) {
+                    entry.buffer.end_undo_group();
+                    return Err(KernelError::ReadOnly(resource));
+                }
                 entry.buffer.end_undo_group();
                 clamp_selection(entry);
                 Ok(text_changed(resource, entry))
@@ -404,6 +434,9 @@ impl NativeKernel {
             NativeOperation::Undo { resource } => {
                 self.require(Capability::TextWrite)?;
                 let entry = self.resource_mut(resource)?;
+                if entry.buffer.is_read_only() {
+                    return Err(KernelError::ReadOnly(resource));
+                }
                 entry.buffer.undo();
                 clamp_selection(entry);
                 Ok(text_changed(resource, entry))
@@ -411,6 +444,9 @@ impl NativeKernel {
             NativeOperation::Redo { resource } => {
                 self.require(Capability::TextWrite)?;
                 let entry = self.resource_mut(resource)?;
+                if entry.buffer.is_read_only() {
+                    return Err(KernelError::ReadOnly(resource));
+                }
                 entry.buffer.redo();
                 clamp_selection(entry);
                 Ok(text_changed(resource, entry))
@@ -766,7 +802,12 @@ fn validate_range(start: usize, end: usize, len: usize) -> Result<(), KernelErro
 fn snapshot_entry(resource: ResourceId, entry: &TextResource) -> TextSnapshot {
     TextSnapshot {
         resource,
-        name: entry.buffer.object(),
+        name: entry.buffer.display_name(),
+        visited_file: entry.buffer.visited_file(),
+        text_revision: entry.buffer.text_revision(),
+        last_saved_revision: entry.buffer.last_saved_revision(),
+        modified: entry.buffer.is_modified(),
+        read_only: entry.buffer.is_read_only(),
         text: entry.buffer.content(),
         character_len: entry.buffer.buffer_len_chars(),
         line_count: entry.buffer.buffer_len_lines(),

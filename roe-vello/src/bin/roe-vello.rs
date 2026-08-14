@@ -13,6 +13,7 @@
 
 //! Roe editor with Vello/GPU rendering backend.
 
+use roe_core::buffer::BufferKind;
 use roe_core::session::StartupRecoveryOperation;
 use roe_core::{Buffer, BufferId, Editor, Frame, Window, WindowId, editor, kill_ring};
 use slotmap::SlotMap;
@@ -146,25 +147,25 @@ struct EditorConfig {
 async fn create_editor(config: EditorConfig) -> std::io::Result<Editor> {
     let mut buffers: SlotMap<BufferId, Buffer> = SlotMap::default();
 
-    let mut first_buffer_id = None;
+    buffers.insert(Buffer::named("*scratch*", BufferKind::Scratch));
+    let first_buffer_id;
 
     if config.file_paths.is_empty() {
         // No files specified, create welcome screen buffer
-        let buffer = Buffer::new();
-        buffer.set_object("*Welcome*".to_string());
+        let buffer = Buffer::named("*Welcome*", BufferKind::Internal);
         buffer.load_str(&create_welcome_screen_content());
+        buffer.set_read_only(true);
 
         let buffer_id = buffers.insert(buffer);
-        first_buffer_id = Some(buffer_id);
+        first_buffer_id = buffer_id;
     } else {
         // Create buffers for all specified files
+        let mut first_file = None;
         for file_path in config.file_paths {
             let buffer = match Buffer::from_file(&file_path).await {
                 Ok(buffer) => buffer,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    let buffer = Buffer::new();
-                    buffer.set_object(file_path.clone());
-                    buffer
+                    Buffer::visiting(file_path.clone())
                 }
                 Err(error) => {
                     return Err(std::io::Error::new(
@@ -176,16 +177,17 @@ async fn create_editor(config: EditorConfig) -> std::io::Result<Editor> {
 
             let buffer_id = buffers.insert(buffer);
 
-            if first_buffer_id.is_none() {
-                first_buffer_id = Some(buffer_id);
+            if first_file.is_none() {
+                first_file = Some(buffer_id);
             }
         }
+        first_buffer_id = first_file.expect("non-empty startup file list");
     }
 
     // Create single window (Vello will resize it properly)
     let mut windows: SlotMap<WindowId, Window> = SlotMap::default();
 
-    let active_buffer = first_buffer_id.expect("Should have at least one buffer");
+    let active_buffer = first_buffer_id;
     let window = Window {
         x: 0,
         y: 0,
@@ -226,15 +228,15 @@ async fn create_editor(config: EditorConfig) -> std::io::Result<Editor> {
 
     // Register file-backed buffers with the file watcher
     for (buffer_id, buffer) in &editor.buffers {
-        let file_path = buffer.object();
-        if !file_path.is_empty() && std::path::Path::new(&file_path).exists() {
+        if let Some(file_path) = buffer.visited_file()
+            && file_path.exists()
+        {
             let content = buffer.content();
-            if let Err(error) =
-                editor
-                    .file_watcher
-                    .watch_file(buffer_id, std::path::Path::new(&file_path), content)
+            if let Err(error) = editor
+                .file_watcher
+                .watch_file(buffer_id, &file_path, content)
             {
-                tracing::warn!(%error, %file_path, "failed to watch file");
+                tracing::warn!(%error, file_path = %file_path.display(), "failed to watch file");
             }
         }
     }

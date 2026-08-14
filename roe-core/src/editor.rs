@@ -11,7 +11,7 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
-use crate::buffer::Buffer;
+use crate::buffer::{Buffer, BufferKind};
 use crate::keys::{CursorDirection, KeyAction};
 use crate::kill_ring::KillRing;
 use crate::native_services::Clock;
@@ -59,6 +59,8 @@ pub enum CommandType {
     KillBuffer,
     /// File opening
     OpenFile(OpenType),
+    /// Destination acquisition for a non-file buffer.
+    SaveFile,
     /// Incremental search
     ISearch { forward: bool },
 }
@@ -383,9 +385,9 @@ impl Editor {
         content: String,
         cursor: usize,
     ) -> WindowId {
-        let command_buffer = Buffer::new();
-        command_buffer.set_object("*Mica Prompt*".to_owned());
+        let command_buffer = Buffer::named("*Mica Prompt*", BufferKind::Prompt);
         command_buffer.load_str(&content);
+        command_buffer.set_read_only(true);
         let command_buffer_id = self.buffers.insert(command_buffer);
         let position = CommandWindowPosition::Bottom;
         let window = self.windows.insert(Window {
@@ -428,13 +430,13 @@ impl Editor {
             return vec![
                 ChromeAction::Echo(format!(
                     "Switched to buffer: {}",
-                    self.buffers[buffer_id].object()
+                    self.buffers[buffer_id].display_name()
                 )),
                 ChromeAction::MarkDirty(DirtyRegion::FullScreen),
             ];
         }
 
-        let name = self.buffers[buffer_id].object();
+        let name = self.buffers[buffer_id].display_name();
         let replacement = self
             .buffers
             .iter()
@@ -526,8 +528,7 @@ impl Editor {
         if !self.windows.contains_key(window) {
             return Err("Window no longer exists".to_owned());
         }
-        let buffer = Buffer::new();
-        buffer.set_object(path.to_string_lossy().to_string());
+        let buffer = Buffer::visiting(path.clone());
         if let Some(content) = content {
             buffer.load_str(&content);
             buffer.set_show_gutter(true);
@@ -613,8 +614,7 @@ impl Editor {
             // Messages buffer already exists, return it
             buffer_id
         } else {
-            let messages_buffer = Buffer::new();
-            messages_buffer.set_object("*Messages*".to_string());
+            let messages_buffer = Buffer::named("*Messages*", BufferKind::Internal);
             messages_buffer
                 .load_str("Messages buffer - echo messages and logs will appear here.\n\n");
 
@@ -651,10 +651,96 @@ impl Editor {
     /// Create an in-memory buffer. Mica assigns its logical mode when the
     /// session synchronizes the new buffer identity.
     pub fn create_buffer(&mut self, buffer_name: String, initial_content: String) -> BufferId {
-        let buffer = Buffer::new();
-        buffer.set_object(buffer_name);
+        let buffer_name = self.unique_buffer_name(&buffer_name);
+        let buffer = Buffer::named(buffer_name, BufferKind::Ordinary);
         buffer.load_str(&initial_content);
         self.buffers.insert(buffer)
+    }
+
+    /// Ensure the workspace retains its distinguished scratch buffer.
+    pub fn ensure_scratch_buffer(&mut self) -> BufferId {
+        if let Some((buffer_id, _)) = self
+            .buffers
+            .iter()
+            .find(|(_, buffer)| buffer.kind() == BufferKind::Scratch)
+        {
+            return buffer_id;
+        }
+        let name = self.unique_buffer_name("*scratch*");
+        self.buffers
+            .insert(Buffer::named(name, BufferKind::Scratch))
+    }
+
+    /// Replace or create a bounded host-produced special buffer and display it
+    /// in the active logical view. `load_str` is the trusted replacement path;
+    /// ordinary editing remains blocked by the read-only flag.
+    pub fn show_special_buffer(&mut self, name: &str, kind: BufferKind, content: &str) -> BufferId {
+        let buffer_id = self
+            .buffers
+            .iter()
+            .find_map(|(id, buffer)| {
+                (buffer.kind() == kind && buffer.display_name() == name).then_some(id)
+            })
+            .unwrap_or_else(|| self.buffers.insert(Buffer::named(name, kind)));
+        let buffer = &self.buffers[buffer_id];
+        buffer.load_str(content);
+        buffer.set_read_only(true);
+        self.windows[self.active_window].active_buffer = buffer_id;
+        self.windows[self.active_window].cursor = 0;
+        self.record_buffer_access(buffer_id);
+        buffer_id
+    }
+
+    /// Associate an existing logical buffer with a visited file. The display
+    /// name remains presentation data and is uniquified independently.
+    pub fn visit_file_for_buffer(
+        &mut self,
+        buffer_id: BufferId,
+        path: std::path::PathBuf,
+    ) -> Result<(), String> {
+        let Some(buffer) = self.buffers.get(buffer_id).cloned() else {
+            return Err("buffer no longer exists".to_owned());
+        };
+        let requested = path.to_string_lossy().into_owned();
+        let name =
+            if self.buffers.iter().any(|(candidate, value)| {
+                candidate != buffer_id && value.display_name() == requested
+            }) {
+                self.unique_buffer_name(&requested)
+            } else {
+                requested
+            };
+        buffer.set_display_name(name);
+        buffer.set_visited_file(Some(path));
+        Ok(())
+    }
+
+    /// Return a display name unique within this workspace. Logical names are
+    /// presentation data and never serve as native identity.
+    pub fn unique_buffer_name(&self, requested: &str) -> String {
+        let requested = if requested.is_empty() {
+            "untitled"
+        } else {
+            requested
+        };
+        if !self
+            .buffers
+            .values()
+            .any(|buffer| buffer.display_name() == requested)
+        {
+            return requested.to_owned();
+        }
+        for suffix in 2..=self.buffers.len().saturating_add(2) {
+            let candidate = format!("{requested}<{suffix}>");
+            if !self
+                .buffers
+                .values()
+                .any(|buffer| buffer.display_name() == candidate)
+            {
+                return candidate;
+            }
+        }
+        format!("{requested}<{}>", self.buffers.len().saturating_add(3))
     }
 
     /// Set the echo area message (this will override any chord display)
@@ -1157,13 +1243,18 @@ impl Editor {
             .buffers
             .get_mut(window.active_buffer)
             .expect("Active buffer should exist");
+        if buffer.is_read_only() {
+            return vec![ChromeAction::Echo("Buffer is read-only".to_owned())];
+        }
         match position {
             ActionPosition::Cursor => {
                 let start = window.cursor;
                 let length = text.chars().count();
                 let has_newline = text.contains('\n');
                 let buffer_id = window.active_buffer;
-                buffer.insert_pos(text, window.cursor);
+                if !buffer.insert_pos(text, window.cursor) {
+                    return vec![ChromeAction::Echo("Buffer is read-only".to_owned())];
+                }
 
                 // Advance the cursor
                 window.cursor += length;
@@ -1197,7 +1288,9 @@ impl Editor {
                 let buffer_id = window.active_buffer;
                 let start = buffer.to_char_index(*c, *l);
                 let length = text.chars().count();
-                buffer.insert_col_line(text.clone(), (*l, *c));
+                if !buffer.insert_col_line(text.clone(), (*l, *c)) {
+                    return vec![ChromeAction::Echo("Buffer is read-only".to_owned())];
+                }
 
                 let dirty_action = if text.contains('\n') {
                     // Newlines affect multiple lines, mark entire buffer dirty
@@ -1239,6 +1332,9 @@ impl Editor {
             .buffers
             .get_mut(window.active_buffer)
             .expect("Active buffer should exist");
+        if buffer.is_read_only() {
+            return vec![ChromeAction::Echo("Buffer is read-only".to_owned())];
+        }
 
         match position {
             ActionPosition::Cursor => {
@@ -1710,9 +1806,7 @@ impl Editor {
             Ok(buffer) => buffer,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 // A missing file is the normal create-new-file path.
-                let buffer = Buffer::new();
-                buffer.set_object(file_path.to_string_lossy().to_string());
-                buffer
+                Buffer::visiting(file_path.clone())
             }
             Err(error) => {
                 return Err(format!("Failed to open {}: {error}", file_path.display()));
@@ -1779,6 +1873,7 @@ impl Editor {
                     let new_len = content.chars().count();
                     buffer.insert_pos(content.clone(), 0);
                     buffer.end_undo_group();
+                    buffer.mark_saved();
 
                     // Update base
                     self.file_watcher.update_base(event.buffer_id, content);
@@ -1927,8 +2022,7 @@ mod tests {
 
     fn test_editor() -> Editor {
         let mut buffers: SlotMap<BufferId, Buffer> = SlotMap::default();
-        let scratch_buffer = Buffer::new();
-        scratch_buffer.set_object("test".to_string());
+        let scratch_buffer = Buffer::named("test", BufferKind::Scratch);
         scratch_buffer.load_str("Hello\nWorld\nTest");
         let scratch_buffer_id = buffers.insert(scratch_buffer);
 

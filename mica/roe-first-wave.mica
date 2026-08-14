@@ -6,6 +6,9 @@ make_identity(:roe/insert_current_time)
 make_identity(:roe/isearch_match_face)
 make_identity(:roe/isearch_current_face)
 make_identity(:roe/completion_selection_face)
+make_identity(:roe/mica_mode)
+make_identity(:roe/eval_buffer)
+make_identity(:roe/eval_region)
 
 assert Delegates(#roe/insert_current_time, #roe/command, 0)
 assert roe/Command(#roe/insert_current_time)
@@ -28,6 +31,16 @@ assert roe/FaceName(#roe/completion_selection_face, "completion-selection")
 assert roe/FaceAttribute(#roe/completion_selection_face, :background, "#3a3a3a")
 assert roe/Configuration(#roe/core_configuration, :tab_width, 4)
 assert roe/SyntaxRule(#roe/fundamental_mode, :word, "[[:alnum:]_]", 100)
+assert Delegates(#roe/mica_mode, #roe/mode, 0)
+assert roe/MajorMode(#roe/mica_mode)
+assert roe/ModeName(#roe/mica_mode, "mica")
+assert roe/ModeKeymap(#roe/mica_mode, #roe/global_map, 100)
+assert roe/ModeHook(#roe/mica_mode, :roe/invalidate_syntax_hook, 100)
+assert roe/SyntaxRule(#roe/mica_mode, :word, "[[:alnum:]_/-]", 200)
+assert roe/PackageMode(#roe/core_package, #roe/mica_mode)
+
+roe/BufferMajorMode(buffer, #roe/mica_mode) :-
+  roe/BufferSourceLanguage(buffer, :mica)
 
 verb roe/insert_current_time(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor
@@ -85,6 +98,7 @@ make_identity(:roe/isearch_forward)
 make_identity(:roe/isearch_backward)
 make_identity(:roe/redraw)
 make_identity(:roe/select_window)
+assert roe/KeyPrefix("C-c")
 
 assert roe/KeyPrefix("C-x")
 
@@ -299,6 +313,7 @@ assert roe/CommandHostAction(#roe/kill_buffer, :kill_buffer)
 assert roe/KeyBinding(#roe/global_map, "C-x k", #roe/kill_buffer, 1000)
 assert roe/PackageCommand(#roe/core_package, #roe/kill_buffer)
 assert RoleCanInvoke(#roe/editor_role, :roe/kill_buffer)
+assert RoleCanInvoke(#roe/editor_role, :roe/request_kill_buffer)
 
 assert roe/Command(#roe/execute_command)
 assert roe/CommandSelector(#roe/execute_command, :roe/execute_command)
@@ -334,6 +349,46 @@ assert roe/CommandHostAction(#roe/redraw, :redraw)
 assert roe/KeyBinding(#roe/global_map, "C-l", #roe/redraw, 1000)
 assert roe/PackageCommand(#roe/core_package, #roe/redraw)
 assert RoleCanInvoke(#roe/editor_role, :roe/redraw)
+
+assert roe/Command(#roe/eval_buffer)
+assert roe/CommandSelector(#roe/eval_buffer, :roe/eval_buffer)
+assert roe/CommandSummary(#roe/eval_buffer, "Check and file in the active Mica source buffer")
+assert roe/CommandName(#roe/eval_buffer, "mica-eval-buffer")
+assert roe/KeyBinding(#roe/global_map, "C-c C-b", #roe/eval_buffer, 1000)
+assert roe/PackageCommand(#roe/core_package, #roe/eval_buffer)
+assert RoleCanInvoke(#roe/editor_role, :roe/eval_buffer)
+
+assert roe/Command(#roe/eval_region)
+assert roe/CommandSelector(#roe/eval_region, :roe/eval_region)
+assert roe/CommandSummary(#roe/eval_region, "Evaluate selected Mica task code in the editor endpoint")
+assert roe/CommandName(#roe/eval_region, "mica-eval-region")
+assert roe/KeyBinding(#roe/global_map, "C-c C-r", #roe/eval_region, 1000)
+assert roe/PackageCommand(#roe/core_package, #roe/eval_region)
+assert RoleCanInvoke(#roe/editor_role, :roe/eval_region)
+
+verb roe/eval_buffer(actor, session)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  roe/CanRequestService(actor, :mica_filein) || return :mica_filein_denied
+  let exactly {:view -> view} = roe/ActiveView(session, ?view)
+  let exactly {:buffer -> buffer} = roe/ViewBuffer(view, ?buffer)
+  roe/CanUseBuffer(actor, buffer) || return :buffer_denied
+  let exactly {:language -> language} = roe/BufferSourceLanguage(buffer, ?language)
+  language == :mica || return :not_mica_source
+  let exactly {:unit -> unit} = roe/BufferSourceUnit(buffer, ?unit)
+  emit(session, {:kind -> :host_action, :action -> :eval_buffer, :buffer -> buffer, :unit -> unit})
+  return :ok
+end
+
+verb roe/eval_region(actor, session)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  roe/CanRequestService(actor, :mica_eval) || return :mica_eval_denied
+  let exactly {:view -> view} = roe/ActiveView(session, ?view)
+  let exactly {:buffer -> buffer} = roe/ViewBuffer(view, ?buffer)
+  roe/CanUseBuffer(actor, buffer) || return :buffer_denied
+  roe/ViewSelection(view, ?anchor, ?active) || return :no_region
+  emit(session, {:kind -> :host_action, :action -> :eval_region, :buffer -> buffer, :view -> view})
+  return :ok
+end
 
 assert roe/Command(#roe/select_window)
 assert roe/CommandSelector(#roe/select_window, :roe/select_window)
@@ -384,9 +439,15 @@ verb roe/save_buffer(actor, session)
   let exactly {:view -> view} = roe/ActiveView(session, ?view)
   let exactly {:buffer -> buffer} = roe/ViewBuffer(view, ?buffer)
   roe/CanUseBuffer(actor, buffer) || return :buffer_denied
-  roe/CanRequestService(actor, :file_write) || return :file_write_denied
-  emit(session, {:kind -> :host_action, :action -> :save_buffer})
-  return :ok
+  let exactly {:policy -> policy} = roe/BufferSavePolicy(buffer, ?policy)
+  if policy == :visited_file
+    roe/CanRequestService(actor, :file_write) || return :file_write_denied
+    emit(session, {:kind -> :host_action, :action -> :save_buffer, :buffer -> buffer})
+    return :ok
+  elseif policy == :prompt_destination
+    return roe/start_file_prompt(actor, session, :save_file, some(buffer))
+  end
+  raise E_INVARG, "this buffer cannot be saved"
 end
 
 verb roe/quit(actor, session)
@@ -397,16 +458,19 @@ end
 
 verb roe/find_file(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor
-  return roe/start_file_prompt(actor, session, :find_file)
+  return roe/start_file_prompt(actor, session, :find_file, none)
 end
 
 verb roe/visit_file(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor
-  return roe/start_file_prompt(actor, session, :visit_file)
+  return roe/start_file_prompt(actor, session, :visit_file, none)
 end
 
-verb roe/start_file_prompt(actor, session, prompt_kind)
+verb roe/start_file_prompt(actor, session, prompt_kind, aux)
   roe/CanRequestService(actor, :file_read) || return :file_read_denied
+  if prompt_kind == :save_file
+    roe/CanRequestService(actor, :file_write) || return :file_write_denied
+  end
   for old in roe/FileCandidate(session, ?path, ?is_dir)
     retract roe/FileCandidate(session, old[:path], old[:is_dir])
   end
@@ -418,7 +482,7 @@ verb roe/start_file_prompt(actor, session, prompt_kind)
     assert roe/FileCandidate(session, path, false)
   end
   let exactly {:view -> target} = roe/ActiveView(session, ?view)
-  assert roe/PromptState(session, prompt_kind, "", 0, some(target), none)
+  assert roe/PromptState(session, prompt_kind, "", 0, some(target), aux)
   return roe/refresh_prompt(actor, session)
 end
 
@@ -518,15 +582,21 @@ verb roe/prompt_candidates(actor, session, prompt_kind, query)
     for found in roe/LogicalBuffer(?buffer)
       if roe/CanUseBuffer(actor, found[:buffer])
         let name_rows = roe/BufferName(found[:buffer], ?name)
-        if name_rows
+        let kind_rows = roe/BufferKind(found[:buffer], ?buffer_kind)
+        if name_rows && kind_rows
           let exactly {:name -> name} = name_rows
-          if (query == "" || string_contains(lower(name), lower(query))) && roe/list_length(candidates) < 256
-            candidates = [@candidates, [name, found[:buffer]]]
+          let exactly {:buffer_kind -> buffer_kind} = kind_rows
+          let selection_rows = roe/BufferSelectionPolicy(buffer_kind, ?policy)
+          if selection_rows
+            let exactly {:policy -> selection_policy} = selection_rows
+            if selection_policy == :allow && (query == "" || string_contains(lower(name), lower(query))) && roe/list_length(candidates) < 256
+              candidates = [@candidates, [name, found[:buffer]]]
+            end
           end
         end
       end
     end
-  elseif prompt_kind == :find_file || prompt_kind == :visit_file
+  elseif prompt_kind == :find_file || prompt_kind == :visit_file || prompt_kind == :save_file
     for found in roe/FileCandidate(session, ?path, ?is_dir)
       if query == "" || string_contains(lower(found[:path]), lower(query))
         if roe/list_length(candidates) < 256
@@ -644,10 +714,23 @@ verb roe/prompt_key(actor, session, sequence)
       selected = selected + 1
     end
   elseif sequence == "⏎"
-    if roe/list_length(candidates) == 0
+    let chosen_option = none
+    if roe/list_length(candidates) > 0
+      chosen_option = some(candidates[selected])
+    elseif prompt_kind == :switch_buffer && query != ""
+      let exactly {:policy -> creation_policy} = roe/BufferCreationPolicy(:ordinary, ?policy)
+      creation_policy == :allow || return :creation_denied
+      retract roe/PromptState(session, _, _, _, _, _)
+      emit(session, {:kind -> :prompt_close})
+      let exactly {:value -> target_view} = target
+      emit(session, {:kind -> :host_action, :action -> :create_buffer, :buffer_name -> query, :view -> target_view})
+      return :ok
+    elseif (prompt_kind == :find_file || prompt_kind == :visit_file || prompt_kind == :save_file) && query != ""
+      chosen_option = some([query, query])
+    else
       return roe/refresh_prompt(actor, session)
     end
-    let chosen = candidates[selected]
+    let exactly {:value -> chosen} = chosen_option
     retract roe/PromptState(session, _, _, _, _, _)
     emit(session, {:kind -> :prompt_close})
     if target
@@ -667,8 +750,7 @@ verb roe/prompt_key(actor, session, sequence)
       emit(session, {:kind -> :host_action, :action -> :switch_buffer_selected, :buffer -> chosen[1]})
       return :ok
     elseif prompt_kind == :kill_buffer
-      emit(session, {:kind -> :host_action, :action -> :kill_buffer_selected, :buffer -> chosen[1]})
-      return :ok
+      return roe/request_kill_buffer(actor, session, chosen[1])
     elseif prompt_kind == :find_file
       roe/CanRequestService(actor, :file_read) || return :file_read_denied
       emit(session, {:kind -> :host_action, :action -> :find_file_selected, :path -> chosen[1]})
@@ -676,6 +758,11 @@ verb roe/prompt_key(actor, session, sequence)
     elseif prompt_kind == :visit_file
       roe/CanRequestService(actor, :file_read) || return :file_read_denied
       emit(session, {:kind -> :host_action, :action -> :visit_file_selected, :path -> chosen[1]})
+      return :ok
+    elseif prompt_kind == :save_file
+      roe/CanRequestService(actor, :file_write) || return :file_write_denied
+      let exactly {:value -> save_buffer} = aux
+      emit(session, {:kind -> :host_action, :action -> :save_buffer_as_selected, :buffer -> save_buffer, :path -> chosen[1]})
       return :ok
     elseif prompt_kind == :command_argument
       let exactly {:value -> command_state} = aux
@@ -695,6 +782,19 @@ verb roe/prompt_key(actor, session, sequence)
   retract roe/PromptState(session, _, _, _, _, _)
   assert roe/PromptState(session, prompt_kind, query, selected, target, aux)
   return roe/refresh_prompt(actor, session)
+end
+
+verb roe/request_kill_buffer(actor, session, buffer)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  roe/CanUseBuffer(actor, buffer) || return :buffer_denied
+  let exactly {:policy -> policy} = roe/BufferKillPolicy(buffer, ?policy)
+  if policy == :allow
+    emit(session, {:kind -> :host_action, :action -> :kill_buffer_selected, :buffer -> buffer})
+    return :ok
+  elseif policy == :deny_modified
+    raise E_INVARG, "buffer is modified; save it before killing"
+  end
+  raise E_INVARG, "special buffer cannot be killed"
 end
 
 verb roe/isearch_forward(actor, session)

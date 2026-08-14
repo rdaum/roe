@@ -16,8 +16,7 @@ use std::sync::Arc;
 
 fn editor_fixture() -> Editor {
     let mut buffers: SlotMap<BufferId, Buffer> = SlotMap::default();
-    let buffer = Buffer::new();
-    buffer.set_object("*conformance*".to_owned());
+    let buffer = Buffer::named("*conformance*", roe_core::buffer::BufferKind::Ordinary);
     buffer.load_str("one λ");
     let buffer_id = buffers.insert(buffer);
     let mut windows: SlotMap<WindowId, Window> = SlotMap::default();

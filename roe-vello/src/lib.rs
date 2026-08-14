@@ -1512,8 +1512,7 @@ mod lifecycle_tests {
 
     fn session_editor() -> Editor {
         let mut buffers: SlotMap<BufferId, Buffer> = SlotMap::default();
-        let buffer = Buffer::new();
-        buffer.set_object("*vello-session*".to_owned());
+        let buffer = Buffer::named("*vello-session*", roe_core::buffer::BufferKind::Ordinary);
         buffer.load_str("headless scene λ");
         let buffer_id = buffers.insert(buffer);
         let mut windows: SlotMap<WindowId, EditorWindow> = SlotMap::default();
@@ -1630,6 +1629,12 @@ mod lifecycle_tests {
                 generation: 1,
             },
             name: "test".to_owned(),
+            buffer_kind: "ordinary".to_owned(),
+            visited_file: None,
+            text_revision: 0,
+            last_saved_revision: 0,
+            modified: false,
+            read_only: false,
             visible_text: String::new(),
             visible_start_char: 0,
             visible_end_char: 0,

@@ -37,8 +37,7 @@ impl Write for CountingWriter {
 
 fn fixture() -> Editor {
     let mut buffers: SlotMap<BufferId, Buffer> = SlotMap::default();
-    let buffer = Buffer::new();
-    buffer.set_object("*baseline*".to_string());
+    let buffer = Buffer::named("*baseline*", roe_core::buffer::BufferKind::Ordinary);
     let mut content = String::with_capacity(FIXTURE_LINES * 64);
     for line in 0..FIXTURE_LINES {
         content.push_str(&format!(

@@ -136,6 +136,8 @@ pub struct MicaPromptUpdate {
 pub struct MicaHostAction {
     pub name: String,
     pub buffer: Option<BufferId>,
+    pub buffer_name: Option<String>,
+    pub unit: Option<String>,
     pub view: Option<WindowId>,
     pub path: Option<String>,
     pub position: Option<usize>,
@@ -213,6 +215,12 @@ impl MicaEventBatch {
 #[derive(Debug)]
 pub struct MicaDispatchResult {
     pub key: MicaKeyResult,
+    pub events: MicaEventBatch,
+}
+
+#[derive(Debug)]
+pub struct MicaEvaluationResult {
+    pub value: String,
     pub events: MicaEventBatch,
 }
 
@@ -394,20 +402,49 @@ pub struct MicaHost {
     editor_role: Identity,
     global_map: Identity,
     buffer_ids: HashMap<BufferId, Identity>,
-    buffer_names: HashMap<BufferId, String>,
+    buffer_metadata: HashMap<BufferId, MicaBufferMetadata>,
     native_ids: HashMap<BufferId, Identity>,
     resource_ids: HashMap<BufferId, ResourceId>,
     view_ids: HashMap<WindowId, Identity>,
     view_buffers: HashMap<WindowId, BufferId>,
     view_cursors: HashMap<WindowId, usize>,
+    view_marks: HashMap<WindowId, Option<usize>>,
     layout_nodes: HashMap<Vec<usize>, Identity>,
     layout_tuples: Vec<LayoutFact>,
     disabled_packages: HashSet<Identity>,
+    loaded_units: HashSet<Symbol>,
     first_wave_loaded: bool,
     active_view: WindowId,
     pending_key_prefix: Option<String>,
     prompt_active: bool,
     closed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MicaBufferMetadata {
+    name: String,
+    kind: String,
+    visited_file: Option<String>,
+    text_revision: u64,
+    last_saved_revision: u64,
+    modified: bool,
+    read_only: bool,
+}
+
+impl MicaBufferMetadata {
+    fn from_buffer(buffer: &crate::Buffer) -> Self {
+        Self {
+            name: buffer.display_name(),
+            kind: buffer.kind().as_str().to_owned(),
+            visited_file: buffer
+                .visited_file()
+                .map(|path| path.to_string_lossy().into_owned()),
+            text_revision: buffer.text_revision(),
+            last_saved_revision: buffer.last_saved_revision(),
+            modified: buffer.is_modified(),
+            read_only: buffer.is_read_only(),
+        }
+    }
 }
 
 impl MicaHost {
@@ -491,7 +528,7 @@ impl MicaHost {
         let global_map = client.named_identity(sym("roe/global_map"))?;
 
         let mut buffer_ids = HashMap::new();
-        let mut buffer_names = HashMap::new();
+        let mut buffer_metadata = HashMap::new();
         let mut native_ids = HashMap::new();
         let mut bridge_resources = HashMap::new();
         for (buffer_id, _buffer) in &editor.buffers {
@@ -501,7 +538,7 @@ impl MicaHost {
                 .get(&buffer_id)
                 .ok_or(MicaHostError::MissingIdentity)?;
             buffer_ids.insert(buffer_id, buffer);
-            buffer_names.insert(buffer_id, _buffer.object());
+            buffer_metadata.insert(buffer_id, MicaBufferMetadata::from_buffer(_buffer));
             native_ids.insert(buffer_id, native);
             bridge_resources.insert(buffer, resource);
         }
@@ -509,10 +546,12 @@ impl MicaHost {
         let mut view_ids = HashMap::new();
         let mut view_buffers = HashMap::new();
         let mut view_cursors = HashMap::new();
+        let mut view_marks = HashMap::new();
         for (window_id, window) in &editor.windows {
             view_ids.insert(window_id, client.allocate_ephemeral_identity()?);
             view_buffers.insert(window_id, window.active_buffer);
             view_cursors.insert(window_id, window.cursor);
+            view_marks.insert(window_id, editor.buffers[window.active_buffer].get_mark());
         }
         let active_view = editor.active_window;
         let active_view_identity = *view_ids
@@ -556,15 +595,48 @@ impl MicaHost {
                 .into(),
             ),
         ];
-        for (buffer_id, buffer) in &editor.buffers {
+        for (buffer_id, _buffer) in &editor.buffers {
             let logical = buffer_ids[&buffer_id];
             let native = native_ids[&buffer_id];
             let resource = resource_ids[&buffer_id];
             tuples.push((sym("roe/LogicalBuffer"), [Value::identity(logical)].into()));
+            let metadata = &buffer_metadata[&buffer_id];
             tuples.push((
                 sym("roe/BufferName"),
-                [Value::identity(logical), Value::string(buffer.object())].into(),
+                [Value::identity(logical), Value::string(&metadata.name)].into(),
             ));
+            tuples.push((
+                sym("roe/BufferKind"),
+                [Value::identity(logical), Value::symbol(sym(&metadata.kind))].into(),
+            ));
+            if let Some(path) = &metadata.visited_file {
+                tuples.push((
+                    sym("roe/BufferVisitedFile"),
+                    [Value::identity(logical), Value::string(path)].into(),
+                ));
+            }
+            tuples.extend([
+                (
+                    sym("roe/NativeBufferRevision"),
+                    [Value::identity(logical), int_value(metadata.text_revision)].into(),
+                ),
+                (
+                    sym("roe/BufferLastSavedRevision"),
+                    [
+                        Value::identity(logical),
+                        int_value(metadata.last_saved_revision),
+                    ]
+                    .into(),
+                ),
+                (
+                    sym("roe/BufferModified"),
+                    [Value::identity(logical), Value::bool(metadata.modified)].into(),
+                ),
+                (
+                    sym("roe/BufferReadOnly"),
+                    [Value::identity(logical), Value::bool(metadata.read_only)].into(),
+                ),
+            ]);
             tuples.push((
                 sym("roe/NativeTextResource"),
                 [Value::identity(logical), Value::identity(native)].into(),
@@ -590,6 +662,21 @@ impl MicaHost {
                 sym("roe/ViewCursor"),
                 [Value::identity(view), int_value(window.cursor)].into(),
             ));
+            if let Some(mark) = editor.buffers[window.active_buffer].get_mark() {
+                tuples.push((
+                    sym("roe/ViewMark"),
+                    [Value::identity(view), int_value(mark)].into(),
+                ));
+                tuples.push((
+                    sym("roe/ViewSelection"),
+                    [
+                        Value::identity(view),
+                        int_value(mark),
+                        int_value(window.cursor),
+                    ]
+                    .into(),
+                ));
+            }
         }
         let mut layout_nodes = HashMap::new();
         let layout_tuples = build_layout_tuples(
@@ -632,15 +719,17 @@ impl MicaHost {
             editor_role,
             global_map,
             buffer_ids,
-            buffer_names,
+            buffer_metadata,
             native_ids,
             resource_ids: resource_ids.clone(),
             view_ids,
             view_buffers,
             view_cursors,
+            view_marks,
             layout_nodes,
             layout_tuples,
             disabled_packages: HashSet::new(),
+            loaded_units: [sym("roe/core")].into_iter().collect(),
             first_wave_loaded: false,
             active_view,
             pending_key_prefix: None,
@@ -833,14 +922,16 @@ impl MicaHost {
         self.administrator
             .check_filein(source.clone(), None)
             .await?;
-        let mode = if unit == "roe/first-wave" && !self.first_wave_loaded {
-            FileinMode::Add
-        } else {
+        let unit_symbol = sym(unit);
+        let mode = if self.loaded_units.contains(&unit_symbol) {
             FileinMode::Replace
+        } else {
+            FileinMode::Add
         };
         self.administrator
-            .filein_unit(sym(unit), source, mode, None)
+            .filein_unit(unit_symbol, source, mode, None)
             .await?;
+        self.loaded_units.insert(unit_symbol);
         if unit == "roe/first-wave" {
             self.first_wave_loaded = true;
         }
@@ -874,8 +965,50 @@ impl MicaHost {
                 None,
             )
             .await?;
+        self.loaded_units.insert(sym("roe/first-wave"));
         self.first_wave_loaded = true;
         Ok(())
+    }
+
+    pub async fn evaluate_source(
+        &mut self,
+        editor: &Editor,
+        resource_ids: &HashMap<BufferId, ResourceId>,
+        source: String,
+    ) -> Result<MicaEvaluationResult, MicaHostError> {
+        if self.closed {
+            return Err(MicaHostError::Closed);
+        }
+        self.ensure_first_wave().await?;
+        self.synchronize_context(editor, resource_ids)?;
+        let invocation = self.endpoint_session().evaluate(source).await?;
+        let mut events = MicaEventBatch::default();
+        let mut pump = self
+            .event_pump
+            .take()
+            .expect("open Mica host retains its event pump");
+        let outcome = pump
+            .drive_invocation(&invocation, |event| {
+                self.record_background_event(event, &mut events);
+            })
+            .await;
+        self.event_pump = Some(pump);
+        match outcome {
+            InvocationOutcome::Completed(value) => Ok(MicaEvaluationResult {
+                value: self.format_value(&value),
+                events,
+            }),
+            InvocationOutcome::Aborted(error) => Err(MicaHostError::Policy(format!(
+                "evaluation aborted: {}",
+                self.format_value(&error)
+            ))),
+            InvocationOutcome::Failed(error) => {
+                Err(MicaHostError::Policy(format!("evaluation failed: {error}")))
+            }
+            InvocationOutcome::Cancelled(reason) => Err(MicaHostError::Policy(format!(
+                "evaluation cancelled: {reason:?}"
+            ))),
+        }
     }
 
     pub fn set_package_enabled(
@@ -1020,11 +1153,12 @@ end
             self.view_ids.remove(&window_id);
             self.view_buffers.remove(&window_id);
             self.view_cursors.remove(&window_id);
+            self.view_marks.remove(&window_id);
         }
         for buffer_id in stale_buffers {
             let logical = self.buffer_ids.remove(&buffer_id).unwrap();
             self.bridge.remove_resource(logical);
-            self.buffer_names.remove(&buffer_id);
+            self.buffer_metadata.remove(&buffer_id);
             self.native_ids.remove(&buffer_id);
             self.resource_ids.remove(&buffer_id);
         }
@@ -1058,7 +1192,8 @@ end
                 .get(*buffer_id)
                 .ok_or(MicaHostError::MissingIdentity)?;
             self.buffer_ids.insert(*buffer_id, logical);
-            self.buffer_names.insert(*buffer_id, buffer.object());
+            self.buffer_metadata
+                .insert(*buffer_id, MicaBufferMetadata::from_buffer(buffer));
             self.native_ids.insert(*buffer_id, native);
             self.resource_ids.insert(*buffer_id, resource);
             self.bridge.add_resource(logical, resource);
@@ -1081,6 +1216,17 @@ end
             self.view_ids.insert(window_id, logical_view);
             self.view_buffers.insert(window_id, candidate.active_buffer);
             self.view_cursors.insert(window_id, candidate.cursor);
+            self.view_marks.insert(
+                window_id,
+                editor.buffers[candidate.active_buffer].get_mark(),
+            );
+        }
+
+        for buffer_id in &live_buffers {
+            if let Some(buffer) = editor.buffers.get(*buffer_id) {
+                self.buffer_metadata
+                    .insert(*buffer_id, MicaBufferMetadata::from_buffer(buffer));
+            }
         }
 
         for (window_id, candidate) in &editor.windows {
@@ -1102,6 +1248,10 @@ end
             if self.view_cursors.get(&window_id).copied() != Some(candidate.cursor) {
                 self.view_cursors.insert(window_id, candidate.cursor);
             }
+            self.view_marks.insert(
+                window_id,
+                editor.buffers[candidate.active_buffer].get_mark(),
+            );
         }
 
         if !self.view_ids.contains_key(&active) {
@@ -1109,9 +1259,13 @@ end
             self.view_ids.insert(active, view);
             self.view_buffers.insert(active, window.active_buffer);
             self.view_cursors.insert(active, window.cursor);
+            self.view_marks
+                .insert(active, editor.buffers[window.active_buffer].get_mark());
         }
         self.view_buffers.insert(active, window.active_buffer);
         self.view_cursors.insert(active, window.cursor);
+        self.view_marks
+            .insert(active, editor.buffers[window.active_buffer].get_mark());
         self.active_view = active;
         self.synchronize_layout(editor)?;
         let facts = self.volatile_context_facts();
@@ -1185,15 +1339,40 @@ end
         for (buffer_id, logical) in &self.buffer_ids {
             let native = self.native_ids[buffer_id];
             let resource = self.resource_ids[buffer_id];
+            let metadata = &self.buffer_metadata[buffer_id];
             facts.extend([
                 (sym("roe/LogicalBuffer"), [Value::identity(*logical)].into()),
                 (
                     sym("roe/BufferName"),
+                    [Value::identity(*logical), Value::string(&metadata.name)].into(),
+                ),
+                (
+                    sym("roe/BufferKind"),
                     [
                         Value::identity(*logical),
-                        Value::string(&self.buffer_names[buffer_id]),
+                        Value::symbol(sym(&metadata.kind)),
                     ]
                     .into(),
+                ),
+                (
+                    sym("roe/NativeBufferRevision"),
+                    [Value::identity(*logical), int_value(metadata.text_revision)].into(),
+                ),
+                (
+                    sym("roe/BufferLastSavedRevision"),
+                    [
+                        Value::identity(*logical),
+                        int_value(metadata.last_saved_revision),
+                    ]
+                    .into(),
+                ),
+                (
+                    sym("roe/BufferModified"),
+                    [Value::identity(*logical), Value::bool(metadata.modified)].into(),
+                ),
+                (
+                    sym("roe/BufferReadOnly"),
+                    [Value::identity(*logical), Value::bool(metadata.read_only)].into(),
                 ),
                 (
                     sym("roe/NativeTextResource"),
@@ -1208,6 +1387,12 @@ end
                     [Value::identity(self.actor), Value::identity(*logical)].into(),
                 ),
             ]);
+            if let Some(path) = &metadata.visited_file {
+                facts.push((
+                    sym("roe/BufferVisitedFile"),
+                    [Value::identity(*logical), Value::string(path)].into(),
+                ));
+            }
         }
         for (window_id, view) in &self.view_ids {
             let Some(buffer_id) = self.view_buffers.get(window_id) else {
@@ -1231,6 +1416,18 @@ end
                     [Value::identity(*view), int_value(*cursor)].into(),
                 ),
             ]);
+            if let Some(mark) = self.view_marks.get(window_id).copied().flatten() {
+                facts.extend([
+                    (
+                        sym("roe/ViewMark"),
+                        [Value::identity(*view), int_value(mark)].into(),
+                    ),
+                    (
+                        sym("roe/ViewSelection"),
+                        [Value::identity(*view), int_value(mark), int_value(*cursor)].into(),
+                    ),
+                ]);
+            }
         }
         facts.extend(layout_named_tuples!(&self.layout_tuples));
         facts
@@ -1433,6 +1630,12 @@ end
                     .find_map(|(buffer, identity)| (*identity == logical).then_some(*buffer))
             });
         let path = map_value(value, "path").and_then(|value| value.with_str(str::to_owned));
+        let buffer_name =
+            map_value(value, "buffer_name").and_then(|value| value.with_str(str::to_owned));
+        let unit = map_value(value, "unit")
+            .and_then(|value| value.as_symbol())
+            .and_then(Symbol::name)
+            .map(str::to_owned);
         let view = map_value(value, "view")
             .and_then(|value| value.as_identity())
             .and_then(|logical| {
@@ -1466,6 +1669,8 @@ end
         Some(MicaHostAction {
             name,
             buffer,
+            buffer_name,
+            unit,
             view,
             path,
             position,
@@ -1776,6 +1981,7 @@ pub fn normalized_key_sequence(keys: &[crate::keys::LogicalKey]) -> String {
         let key = keys[index];
         index += 1;
         let key_name = match key {
+            crate::keys::LogicalKey::AlphaNumeric(' ') if modifiers.is_empty() => " ".to_owned(),
             crate::keys::LogicalKey::AlphaNumeric(' ') => "Space".to_owned(),
             _ => key.as_display_string(),
         };
@@ -1805,6 +2011,10 @@ mod tests {
     #[test]
     fn normalized_keys_use_the_mica_keymap_spelling() {
         assert_eq!(normalized_key_sequence(&[LogicalKey::Function(12)]), "F12");
+        assert_eq!(
+            normalized_key_sequence(&[LogicalKey::AlphaNumeric(' ')]),
+            " "
+        );
         assert_eq!(
             normalized_key_sequence(&[
                 LogicalKey::Modifier(KeyModifier::Control(Side::Right)),

@@ -14,14 +14,53 @@
 use crate::undo::{EditOp, UndoManager};
 use compio::buf::BufResult;
 use compio::io::AsyncReadAtExt;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+
+/// Native classification used to project a buffer into Mica's logical model.
+/// The classification carries no authority and does not replace the stable
+/// [`crate::BufferId`] or the generation-checked native text resource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferKind {
+    Ordinary,
+    Scratch,
+    File,
+    Internal,
+    Prompt,
+    Results,
+    Diagnostics,
+}
+
+impl BufferKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ordinary => "ordinary",
+            Self::Scratch => "scratch",
+            Self::File => "file",
+            Self::Internal => "internal",
+            Self::Prompt => "prompt",
+            Self::Results => "results",
+            Self::Diagnostics => "diagnostics",
+        }
+    }
+}
 
 /// The internal data structure for a buffer
 /// Contains the actual text and metadata
 pub struct BufferInner {
-    // Title / filename
-    pub(crate) object: String,
+    /// User-visible logical name. This is never interpreted as a path.
+    pub(crate) display_name: String,
+    /// Optional file association. A path is descriptive native state, not a
+    /// capability; every file operation still passes normal authority checks.
+    pub(crate) visited_file: Option<PathBuf>,
+    pub(crate) kind: BufferKind,
     pub(crate) buffer: ropey::Rope,
+    /// Monotonic native text revision. It advances only when text changes.
+    pub(crate) text_revision: u64,
+    /// Revision whose contents most recently became the clean baseline.
+    pub(crate) last_saved_revision: u64,
+    /// Native mutation guard for mechanically protected buffers.
+    pub(crate) read_only: bool,
     /// Mark position for region selection (None = no mark set)
     pub(crate) mark: Option<usize>,
     /// Whether the mark is transient (CUA-style shift-select) vs persistent (Emacs C-Space)
@@ -36,8 +75,13 @@ pub struct BufferInner {
 impl BufferInner {
     pub fn new() -> Self {
         Self {
-            object: String::new(),
+            display_name: String::new(),
+            visited_file: None,
+            kind: BufferKind::Ordinary,
             buffer: ropey::Rope::new(),
+            text_revision: 0,
+            last_saved_revision: 0,
+            read_only: false,
             mark: None,
             transient_mark: false,
             show_gutter: false, // Default to no gutter for scratch buffers
@@ -46,7 +90,12 @@ impl BufferInner {
     }
 
     pub fn load_str(&mut self, text: &str) {
-        self.buffer = ropey::Rope::from_str(text);
+        if self.buffer != text {
+            self.buffer = ropey::Rope::from_str(text);
+            self.text_revision = self.text_revision.saturating_add(1);
+        }
+        self.last_saved_revision = self.text_revision;
+        self.undo_manager = UndoManager::new();
     }
 
     /// Create a new buffer inner and load content from a file
@@ -55,8 +104,13 @@ impl BufferInner {
         let BufResult(result, content) = file.read_to_string_at(String::new(), 0).await;
         result?;
         let buffer_inner = Self {
-            object: file_path.to_string(),
+            display_name: file_path.to_string(),
+            visited_file: Some(PathBuf::from(file_path)),
+            kind: BufferKind::File,
             buffer: ropey::Rope::from_str(&content),
+            text_revision: 0,
+            last_saved_revision: 0,
+            read_only: false,
             mark: None,
             transient_mark: false,
             show_gutter: true, // Default to show gutter for file buffers
@@ -66,17 +120,25 @@ impl BufferInner {
     }
 
     /// Insert a fragment of text into the buffer at the given line/col position.
-    pub fn insert_col_line(&mut self, fragment: String, position: (u16, u16)) {
+    pub fn insert_col_line(&mut self, fragment: String, position: (u16, u16)) -> bool {
         let buffer_location = self.to_char_index(position.0, position.1);
-        self.insert_pos(fragment, buffer_location);
+        self.insert_pos(fragment, buffer_location)
     }
 
-    pub fn insert_pos(&mut self, fragment: String, position: usize) {
+    pub fn insert_pos(&mut self, fragment: String, position: usize) -> bool {
+        if self.read_only {
+            return false;
+        }
+        if fragment.is_empty() {
+            return true;
+        }
         let len = fragment.chars().count();
-        tracing::trace!(position, inserted_chars = len, object = %self.object, "buffer mutation: insert");
+        tracing::trace!(position, inserted_chars = len, buffer = %self.display_name, "buffer mutation: insert");
         // Record for undo before modifying
         self.undo_manager.record_insert(position, fragment.clone());
         self.buffer.insert(position, &fragment);
+        self.text_revision = self.text_revision.saturating_add(1);
+        true
     }
 
     /// Delete a fragment of text from the buffer at the given line/col position.
@@ -87,6 +149,12 @@ impl BufferInner {
     }
 
     pub fn delete_pos(&mut self, position: usize, count: isize) -> Option<String> {
+        if self.read_only {
+            return None;
+        }
+        if count == 0 {
+            return Some(String::new());
+        }
         let position = position as isize;
 
         // If count is negative then start is buffer_location - count and end is buffer_location
@@ -106,13 +174,14 @@ impl BufferInner {
             start,
             end,
             deleted_chars = deleted.chars().count(),
-            object = %self.object,
+            buffer = %self.display_name,
             "buffer mutation: delete"
         );
         // Record for undo before modifying
         self.undo_manager
             .record_delete(start as usize, deleted.clone());
         self.buffer.remove(start as usize..end as usize);
+        self.text_revision = self.text_revision.saturating_add(1);
         Some(deleted)
     }
 
@@ -517,6 +586,9 @@ impl BufferInner {
     /// Delete the region and return the deleted text and new cursor position
     /// Returns None if no mark is set
     pub fn delete_region(&mut self, cursor_pos: usize) -> Option<(String, usize)> {
+        if self.read_only {
+            return None;
+        }
         let (start, end) = self.get_region(cursor_pos)?;
         if start == end {
             self.clear_mark();
@@ -527,6 +599,7 @@ impl BufferInner {
         // Record for undo before modifying
         self.undo_manager.record_delete(start, deleted.clone());
         self.buffer.remove(start..end);
+        self.text_revision = self.text_revision.saturating_add(1);
         self.clear_mark();
         // Cursor should be at the start of the deleted region
         Some((deleted, start))
@@ -534,6 +607,9 @@ impl BufferInner {
 
     /// Delete a range of text from start to end (exclusive), returns deleted text
     pub fn delete_range(&mut self, start: usize, end: usize) -> Option<String> {
+        if self.read_only {
+            return None;
+        }
         if start >= end || end > self.buffer.len_chars() {
             return None;
         }
@@ -542,6 +618,7 @@ impl BufferInner {
         // Record for undo before modifying
         self.undo_manager.record_delete(start, deleted.clone());
         self.buffer.remove(start..end);
+        self.text_revision = self.text_revision.saturating_add(1);
         Some(deleted)
     }
 
@@ -549,17 +626,25 @@ impl BufferInner {
 
     /// Perform undo, returns the new cursor position if successful
     pub fn undo(&mut self) -> Option<usize> {
+        if self.read_only {
+            return None;
+        }
         let op = self.undo_manager.pop_undo()?;
         let cursor = self.apply_edit_op(&op.reverse());
         self.undo_manager.did_undo(op);
+        self.text_revision = self.text_revision.saturating_add(1);
         Some(cursor)
     }
 
     /// Perform redo, returns the new cursor position if successful
     pub fn redo(&mut self) -> Option<usize> {
+        if self.read_only {
+            return None;
+        }
         let op = self.undo_manager.pop_redo()?;
         let cursor = self.apply_edit_op(&op);
         self.undo_manager.did_redo(op);
+        self.text_revision = self.text_revision.saturating_add(1);
         Some(cursor)
     }
 
@@ -637,6 +722,24 @@ impl Buffer {
         Self {
             inner: Arc::new(RwLock::new(BufferInner::new())),
         }
+    }
+
+    /// Create a named non-file buffer with an explicit logical kind.
+    pub fn named(name: impl Into<String>, kind: BufferKind) -> Self {
+        let buffer = Self::new();
+        buffer.with_write(|inner| {
+            inner.display_name = name.into();
+            inner.kind = kind;
+        });
+        buffer
+    }
+
+    /// Create a file-visiting buffer before contents are available.
+    pub fn visiting(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let buffer = Self::named(path.to_string_lossy(), BufferKind::File);
+        buffer.with_write(|inner| inner.visited_file = Some(path));
+        buffer
     }
 
     /// Create a new buffer and load content from a file
@@ -735,11 +838,11 @@ impl Buffer {
     }
 
     // Write operations that need mutable access
-    pub fn insert_pos(&self, fragment: String, position: usize) {
+    pub fn insert_pos(&self, fragment: String, position: usize) -> bool {
         self.with_write(|b| b.insert_pos(fragment, position))
     }
 
-    pub fn insert_col_line(&self, fragment: String, position: (u16, u16)) {
+    pub fn insert_col_line(&self, fragment: String, position: (u16, u16)) -> bool {
         self.with_write(|b| b.insert_col_line(fragment, position))
     }
 
@@ -809,8 +912,57 @@ impl Buffer {
     }
 
     // Properties that need read access
-    pub fn object(&self) -> String {
-        self.with_read(|b| b.object.clone())
+    pub fn display_name(&self) -> String {
+        self.with_read(|b| b.display_name.clone())
+    }
+
+    pub fn visited_file(&self) -> Option<PathBuf> {
+        self.with_read(|b| b.visited_file.clone())
+    }
+
+    pub fn kind(&self) -> BufferKind {
+        self.with_read(|b| b.kind)
+    }
+
+    pub fn text_revision(&self) -> u64 {
+        self.with_read(|b| b.text_revision)
+    }
+
+    pub fn last_saved_revision(&self) -> u64 {
+        self.with_read(|b| b.last_saved_revision)
+    }
+
+    pub fn is_modified(&self) -> bool {
+        self.with_read(|b| b.text_revision != b.last_saved_revision)
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.with_read(|b| b.read_only)
+    }
+
+    pub fn mark_saved(&self) {
+        self.with_write(|b| b.last_saved_revision = b.text_revision)
+    }
+
+    pub fn set_read_only(&self, read_only: bool) {
+        self.with_write(|b| b.read_only = read_only)
+    }
+
+    pub fn set_display_name(&self, name: impl Into<String>) {
+        self.with_write(|b| b.display_name = name.into())
+    }
+
+    pub fn set_visited_file(&self, path: Option<PathBuf>) {
+        self.with_write(|b| {
+            b.visited_file = path;
+            if b.visited_file.is_some() {
+                b.kind = BufferKind::File;
+            }
+        })
+    }
+
+    pub fn set_kind(&self, kind: BufferKind) {
+        self.with_write(|b| b.kind = kind)
     }
 
     pub fn load_str(&self, text: &str) {
@@ -832,11 +984,6 @@ impl Buffer {
 
     pub fn buffer_lines(&self) -> Vec<String> {
         self.with_read(|b| b.buffer.lines().map(|line| line.to_string()).collect())
-    }
-
-    // Add mutable field access for main.rs compatibility
-    pub fn set_object(&self, object: String) {
-        self.with_write(|b| b.object = object)
     }
 
     /// Get whether the gutter should be shown for this buffer
@@ -1348,5 +1495,66 @@ mod tests {
 
         // From start of first paragraph, should stay at start
         assert_eq!(buffer.move_paragraph_backward(0), 0);
+    }
+
+    #[test]
+    fn native_metadata_tracks_file_identity_and_saved_revision_separately() {
+        let buffer = Buffer::named("notes", BufferKind::Ordinary);
+        assert_eq!(buffer.display_name(), "notes");
+        assert_eq!(buffer.visited_file(), None);
+        assert_eq!(buffer.kind(), BufferKind::Ordinary);
+        assert_eq!(buffer.text_revision(), 0);
+        assert!(!buffer.is_modified());
+
+        buffer.load_str("saved");
+        assert_eq!(buffer.text_revision(), 1);
+        assert_eq!(buffer.last_saved_revision(), 1);
+        assert!(!buffer.is_modified());
+
+        assert!(buffer.insert_pos("!".to_owned(), 5));
+        assert_eq!(buffer.text_revision(), 2);
+        assert_eq!(buffer.last_saved_revision(), 1);
+        assert!(buffer.is_modified());
+
+        let path = PathBuf::from("elsewhere/notes.mica");
+        buffer.set_visited_file(Some(path.clone()));
+        buffer.set_display_name("notes.mica<2>");
+        assert_eq!(buffer.visited_file(), Some(path));
+        assert_eq!(buffer.display_name(), "notes.mica<2>");
+        assert_eq!(buffer.kind(), BufferKind::File);
+
+        buffer.mark_saved();
+        assert_eq!(buffer.last_saved_revision(), 2);
+        assert!(!buffer.is_modified());
+    }
+
+    #[test]
+    fn read_only_buffers_mechanically_reject_every_text_mutation() {
+        let buffer = Buffer::named("*Results*", BufferKind::Results);
+        buffer.load_str("answer");
+        let revision = buffer.text_revision();
+        buffer.set_read_only(true);
+
+        assert!(!buffer.insert_pos("!".to_owned(), 6));
+        assert_eq!(buffer.delete_pos(0, 1), None);
+        buffer.set_mark(0);
+        assert_eq!(buffer.delete_region(6), None);
+        assert_eq!(buffer.delete_region_range(0, 1), None);
+        assert_eq!(buffer.undo(), None);
+        assert_eq!(buffer.redo(), None);
+        assert_eq!(buffer.content(), "answer");
+        assert_eq!(buffer.text_revision(), revision);
+        assert!(buffer.is_read_only());
+    }
+
+    #[test]
+    fn no_op_edits_do_not_advance_native_revision() {
+        let buffer = Buffer::named("empty", BufferKind::Ordinary);
+        buffer.load_str("");
+        assert_eq!(buffer.text_revision(), 0);
+        assert!(buffer.insert_pos(String::new(), 0));
+        assert_eq!(buffer.delete_pos(0, 0), Some(String::new()));
+        assert_eq!(buffer.text_revision(), 0);
+        assert!(!buffer.is_modified());
     }
 }

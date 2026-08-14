@@ -17,6 +17,7 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::disable_raw_mode;
+use roe_core::buffer::BufferKind;
 use roe_core::native_kernel::CapabilityGrants;
 use roe_core::session::{
     AttachmentConfiguration, DirectSessionClient, LifecycleEvent, SessionClient,
@@ -235,16 +236,17 @@ async fn terminal_main<W: Write>(
         recovery,
     } = config;
 
-    let mut first_buffer_id = None;
+    buffers.insert(Buffer::named("*scratch*", BufferKind::Scratch));
+    let mut startup_buffer_ids = Vec::new();
 
     if file_paths.is_empty() {
         // No files specified, create welcome screen buffer
-        let buffer = Buffer::new();
-        buffer.set_object("*Welcome*".to_string());
+        let buffer = Buffer::named("*Welcome*", BufferKind::Internal);
         buffer.load_str(&create_welcome_screen_content());
+        buffer.set_read_only(true);
 
         let buffer_id = buffers.insert(buffer);
-        first_buffer_id = Some(buffer_id);
+        startup_buffer_ids.push(buffer_id);
     } else {
         // Create buffers for all specified files
         for file_path in file_paths {
@@ -252,9 +254,7 @@ async fn terminal_main<W: Write>(
             let buffer = match Buffer::from_file(&file_path).await {
                 Ok(buffer) => buffer,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    let buffer = Buffer::new();
-                    buffer.set_object(file_path.clone());
-                    buffer
+                    Buffer::visiting(file_path.clone())
                 }
                 Err(error) => {
                     return Err(std::io::Error::new(
@@ -266,10 +266,7 @@ async fn terminal_main<W: Write>(
 
             let buffer_id = buffers.insert(buffer);
 
-            // Remember the first buffer for the initial window
-            if first_buffer_id.is_none() {
-                first_buffer_id = Some(buffer_id);
-            }
+            startup_buffer_ids.push(buffer_id);
         }
     }
 
@@ -278,7 +275,7 @@ async fn terminal_main<W: Write>(
     let window_tree;
     let active_window_id;
 
-    let buffer_ids: Vec<BufferId> = buffers.keys().collect();
+    let buffer_ids = startup_buffer_ids;
 
     if buffer_ids.len() >= 2 {
         // Two-window horizontal split - frame already accounts for echo area
@@ -320,7 +317,9 @@ async fn terminal_main<W: Write>(
         active_window_id = top_window_id; // Start with top window active
     } else {
         // Single window (full screen)
-        let active_buffer = first_buffer_id.expect("Should have at least one buffer");
+        let active_buffer = *buffer_ids
+            .first()
+            .expect("startup always displays a buffer");
         let window = Window {
             x: 0,
             y: 0,
@@ -363,15 +362,15 @@ async fn terminal_main<W: Write>(
 
     // Register file-backed buffers with the file watcher
     for (buffer_id, buffer) in &editor.buffers {
-        let file_path = buffer.object();
-        if !file_path.is_empty() && std::path::Path::new(&file_path).exists() {
+        if let Some(file_path) = buffer.visited_file()
+            && file_path.exists()
+        {
             let content = buffer.content();
-            if let Err(e) =
-                editor
-                    .file_watcher
-                    .watch_file(buffer_id, std::path::Path::new(&file_path), content)
+            if let Err(e) = editor
+                .file_watcher
+                .watch_file(buffer_id, &file_path, content)
             {
-                eprintln!("Warning: Failed to watch file {file_path}: {e}");
+                eprintln!("Warning: Failed to watch file {}: {e}", file_path.display());
             }
         }
     }
