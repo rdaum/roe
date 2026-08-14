@@ -1,11 +1,11 @@
 [package]
 name = "roe-terminal"
 version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
 authors.workspace = true
+edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "Terminal rendering for Roe (Ryan's Own Emacs)"
 
 [dependencies]

@@ -1,11 +1,11 @@
 [package]
 name = "roe-vello"
 version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
 authors.workspace = true
+edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "Vello/GPU rendering for Roe (Ryan's Own Emacs)"
 
 [[bin]]
@@ -14,8 +14,8 @@ path = "src/bin/roe-vello.rs"
 
 [dependencies]
 # Core roe
-roe-core = { path = "../roe-core" }
 arboard = { workspace = true }
+roe-core = { path = "../roe-core" }
 
 # Rendering
 vello = "0.9"
@@ -33,9 +33,9 @@ pollster = "1.0"
 
 # Utilities
 slotmap = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-thiserror = { workspace = true }
 
 [dev-dependencies]
 roe-terminal = { path = "../roe-terminal" }

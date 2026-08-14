@@ -199,11 +199,11 @@ should use `BufferId` rather than treating file paths as buffer identity.
 
 ### Host session protocol
 
-`SessionClient` is the frontend contract. `DirectSessionClient` is its in-process implementation;
-a remote implementation must preserve the same messages and lifecycle rather than wrapping a
-different editor API. Every `InputEnvelope` carries protocol version, attachment epoch, and exact
-sequence number. Accepted inputs are at-most-once; duplicates, gaps, stale epochs, and unsupported
-versions are rejected.
+`SessionClient` is the frontend contract. `DirectSessionClient` is its in-process implementation; a
+remote implementation must preserve the same messages and lifecycle rather than wrapping a different
+editor API. Every `InputEnvelope` carries protocol version, attachment epoch, and exact sequence
+number. Accepted inputs are at-most-once; duplicates, gaps, stale epochs, and unsupported versions
+are rejected.
 
 `WorkspaceHost` owns durable editor state, Mica, native resources, watchers, and processes.
 `Attachment` owns viewport/focus, input ordering, presentation revision, pointer and scroll state,
