@@ -468,9 +468,6 @@ assert RoleCanRead(#roe/editor_role, :roe/EffectiveFaceAttribute)
 assert RoleCanRead(#roe/editor_role, :roe/EffectiveSyntaxRule)
 assert RoleCanRead(#roe/editor_role, :roe/EffectiveConfiguration)
 assert RoleCanWrite(#roe/editor_role, :roe/ActiveView)
-assert RoleCanWrite(#roe/editor_role, :roe/ViewCursor)
-assert RoleCanWrite(#roe/editor_role, :roe/ViewMark)
-assert RoleCanWrite(#roe/editor_role, :roe/ViewSelection)
 assert RoleCanWrite(#roe/editor_role, :roe/PointerSelection)
 assert RoleCanWrite(#roe/editor_role, :roe/ViewSplitRatio)
 assert RoleCanWrite(#roe/editor_role, :roe/PromptState)
@@ -698,20 +695,6 @@ verb roe/pointer_event(actor, session, view, position, phase, button)
       end
     end
     assert roe/ActiveView(session, view)
-    let old_cursor_rows = roe/ViewCursor(view, ?cursor)
-    if old_cursor_rows
-      let exactly {:cursor -> old_cursor} = old_cursor_rows
-      retract roe/ViewCursor(view, old_cursor)
-    end
-    let old_mark_rows = roe/ViewMark(view, ?mark)
-    if old_mark_rows
-      let exactly {:mark -> old_mark} = old_mark_rows
-      retract roe/ViewMark(view, old_mark)
-    end
-    for old_selection in roe/ViewSelection(view, ?anchor, ?active)
-      retract roe/ViewSelection(view, old_selection[:anchor], old_selection[:active])
-    end
-    assert roe/ViewCursor(view, position)
     assert roe/PointerSelection(session, view, position)
     emit(session, {:kind -> :host_action, :action -> :pointer_selection, :view -> view, :position -> position, :anchor -> position, :phase -> phase})
     return :handled
@@ -721,22 +704,6 @@ verb roe/pointer_event(actor, session, view, position, phase, button)
     pointer_rows || return :no_pointer_selection
     let exactly {:view -> pointer_view, :anchor -> pointer_anchor} = pointer_rows
     pointer_view == view || return :pointer_view_mismatch
-    let old_cursor_rows = roe/ViewCursor(view, ?cursor)
-    if old_cursor_rows
-      let exactly {:cursor -> old_cursor} = old_cursor_rows
-      retract roe/ViewCursor(view, old_cursor)
-    end
-    let old_mark_rows = roe/ViewMark(view, ?mark)
-    if old_mark_rows
-      let exactly {:mark -> old_mark} = old_mark_rows
-      retract roe/ViewMark(view, old_mark)
-    end
-    for old_selection in roe/ViewSelection(view, ?anchor, ?active)
-      retract roe/ViewSelection(view, old_selection[:anchor], old_selection[:active])
-    end
-    assert roe/ViewCursor(view, position)
-    assert roe/ViewMark(view, pointer_anchor)
-    assert roe/ViewSelection(view, pointer_anchor, position)
     emit(session, {:kind -> :host_action, :action -> :pointer_selection, :view -> view, :position -> position, :anchor -> pointer_anchor, :phase -> phase})
     return :handled
   end

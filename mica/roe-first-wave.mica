@@ -74,8 +74,6 @@ verb roe/insert_current_time(actor, session)
   end
 
   let next_cursor = cursor + string_len(text)
-  retract roe/ViewCursor(view, cursor)
-  assert roe/ViewCursor(view, next_cursor)
   emit(session, {:kind -> :presentation_invalidated, :view -> view, :buffer -> buffer, :cursor -> next_cursor})
   return :inserted
 end

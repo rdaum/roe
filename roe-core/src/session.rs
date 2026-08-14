@@ -5483,6 +5483,45 @@ mod tests {
             assert_eq!(session.workspace.editor.buffers[buffer].get_mark(), Some(1));
             assert_eq!(session.workspace.editor.windows[window].cursor, 3);
 
+            let moved = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Home])))
+                .await
+                .unwrap();
+            assert!(
+                moved
+                    .lifecycle
+                    .iter()
+                    .all(|event| !matches!(event, LifecycleEvent::Error(_)))
+            );
+            assert_eq!(session.workspace.editor.windows[window].cursor, 0);
+            for event in [
+                PointerEvent {
+                    column: 2,
+                    row: 1,
+                    kind: PointerKind::Down,
+                    button: PointerButton::Primary,
+                },
+                PointerEvent {
+                    column: 2,
+                    row: 1,
+                    kind: PointerKind::Up,
+                    button: PointerButton::Primary,
+                },
+            ] {
+                let repeated = session
+                    .dispatch(session.envelope(InputEvent::Pointer(event)))
+                    .await
+                    .unwrap();
+                assert!(
+                    repeated
+                        .lifecycle
+                        .iter()
+                        .all(|event| !matches!(event, LifecycleEvent::Error(_))),
+                    "{repeated:#?}"
+                );
+            }
+            assert_eq!(session.workspace.editor.windows[window].cursor, 1);
+
             let scrolled = session
                 .dispatch(session.envelope(InputEvent::SetViewScroll {
                     view,
