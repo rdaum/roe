@@ -1,4 +1,4 @@
-// Roe's Phase 3 Mica object-model prototype.
+// Roe's Mica object model and generic editor behavior.
 //
 // This unit deliberately contains editor policy and logical identities only.
 // Native ResourceId values and endpoint capabilities are asserted as volatile
@@ -72,7 +72,7 @@ make_relation(:roe/PackageMode, 2)
 make_functional_relation(:roe/BufferCreationPolicy, 2, [0])
 make_functional_relation(:roe/BufferSelectionPolicy, 2, [0])
 
-// Session-volatile logical state. Phase 4 asserts and retracts these tuples at
+// Session-volatile logical state. The host asserts and retracts these tuples at
 // endpoint open/close using the public mica-driver volatile-tuple API.
 make_relation(:roe/EditorSession, 1, :volatile)
 make_functional_relation(:roe/SessionActor, 2, [0], :volatile)
@@ -753,7 +753,7 @@ verb roe/set_split_ratio(actor, session, node, ratio)
 end
 
 // Return either a supplied value or the declarative prompt/completion request
-// that a Mica-owned minibuffer will realize in Phase 5.
+// consumed by Mica-owned prompt handling.
 verb roe/acquire_argument(actor, session, command, position, supplied: option<dynamic>)
   roe/SessionActor(session, actor) || return :not_session_actor
   roe/DiscoverableCommand(actor, command) || return :not_discoverable

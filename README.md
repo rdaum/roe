@@ -155,8 +155,7 @@ presentation, terminal cells, and Vello/WGPU resources.
 
 The shipped ontology and generic behavior are in [`mica/roe-model.mica`](mica/roe-model.mica). The
 default package, commands, bindings, faces, Mica mode, and prompt behavior are in
-[`mica/roe-first-wave.mica`](mica/roe-first-wave.mica). `mica/roe-model-demo.mica` is a development
-fixture rather than production policy.
+[`mica/roe-first-wave.mica`](mica/roe-first-wave.mica).
 
 The distinguished scratch buffer is Mica source associated with the volatile `roe/user_scratch`
 unit. `C-c C-b` validates the whole buffer before replacing that unit, so malformed source leaves

@@ -45,8 +45,7 @@ Mica owns:
 - logical active-view and window-target decisions.
 
 The core ontology and generic behaviors live in `mica/roe-model.mica`. Shipped editor policy and
-bindings live in `mica/roe-first-wave.mica`. `mica/roe-model-demo.mica` is a non-production Phase 3
-fixture.
+bindings live in `mica/roe-first-wave.mica`.
 
 ### Rust owns mechanisms
 
@@ -86,8 +85,7 @@ roe/
 ├── mica/
 │   ├── MICA-REVISION
 │   ├── roe-model.mica           # ontology, derived rules, generic behaviors
-│   ├── roe-first-wave.mica      # shipped commands, bindings, modes, faces, policy
-│   └── roe-model-demo.mica      # non-production model fixture
+│   └── roe-first-wave.mica      # shipped commands, bindings, modes, faces, policy
 ├── roe-core/src/
 │   ├── buffer.rs                # Rope storage, marks, gutter intent, undo primitives
 │   ├── editor.rs                # buffers/windows plus native mechanism realization

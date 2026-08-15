@@ -1,6 +1,6 @@
-// Phase 4's first production vertical slice. The keymap, command definition,
-// native-request sequencing, cursor policy, and effect are all Mica-owned.
-// Rust supplies volatile session/resource facts and realizes native requests.
+// Roe's shipped editor policy. Keymaps, commands, request sequencing, cursor
+// policy, and effects are Mica-owned. Rust supplies volatile session/resource
+// facts and realizes native requests.
 
 make_identity(:roe/insert_current_time)
 make_identity(:roe/isearch_match_face)
@@ -134,7 +134,7 @@ verb roe/insert_current_time(actor, session)
   return :inserted
 end
 
-// Phase 5's global command/keymap slice. Rust realizes these as native editor
+// Global command and keymap policy. Rust realizes these as native editor
 // mechanisms, but their names, discovery, bindings, and dispatch live here.
 make_identity(:roe/save_buffer)
 make_identity(:roe/quit)
