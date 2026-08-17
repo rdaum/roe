@@ -21,6 +21,15 @@ make_identity(:roe/eval_buffer)
 make_identity(:roe/eval_region)
 make_identity(:roe/mark_whole_buffer)
 
+// Shipped source composition. Rust registers bounded native providers and
+// projects the workspace/revision context; Mica owns which providers are live
+// and how their precedence composes.
+assert source/ProviderEnabled("roe-buffer", true)
+assert source/ProviderEnabled("local-worktree", true)
+assert source/RepositoryProvider(#roe/source_repository, "roe-buffer", "read", 100)
+assert source/RepositoryProvider(#roe/source_repository, "local-worktree", "read", 0)
+assert source/RepositoryProvider(#roe/source_repository, "local-worktree", "list", 0)
+
 assert Delegates(#roe/insert_current_time, #roe/command, 0)
 assert roe/Command(#roe/insert_current_time)
 assert roe/CommandSelector(#roe/insert_current_time, :roe/insert_current_time)

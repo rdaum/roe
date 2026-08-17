@@ -48,6 +48,8 @@ In short Mica takes the place that Lisp usually takes in the rest of the Emacs p
   buffers.
 - Mica buffer and region evaluation with recoverable diagnostics; region results appear in an
   inset, pageable [typeout window](docs/TYPEOUT-WINDOWS.md) attached to the invoking view.
+- Composable Mica source providers: live Roe buffers shadow the local worktree, so source queries
+  see unsaved edits while files without a live buffer fall through to bounded disk access.
 - Mica syntax highlighting in scratch and `.mica` files. Rust and other language modes are future
   additions.
 - Safe Mica experimentation: Roe rejects invalid code and keeps the last working editor behavior.
@@ -166,6 +168,13 @@ unit. `C-c C-b` validates the whole buffer before replacing that unit, so malfor
 the previous working unit live. `C-c C-r` evaluates a selected task fragment in the editor endpoint
 without replacing the source unit.
 
+Roe configures its startup directory as a bounded source root. The `roe-buffer` provider has higher
+precedence for files currently visited by Roe and returns the buffer's current Rope text; an absent
+live buffer falls through to Mica's `local-worktree` provider. Provider selection remains Mica
+policy in `source/RepositoryProvider`, so more providers can be composed without creating a second
+Rust command or mode registry. Source facts and native provider state are workspace-local and are
+not persisted as authority.
+
 Durable user/workspace Mica persistence is not enabled yet. Live changes last for the workspace, and
 explicit export/recovery operations are available, but there is not yet a user init-file, schema
 migration, backup, or automatic restore policy.
@@ -226,7 +235,7 @@ It runs formatting, all-target workspace checks, strict Clippy, the complete tes
 dependency-policy check. Useful focused checks include:
 
 ```bash
-cargo +1.95.0 check --workspace --all-targets
+cargo +1.96.0 check --workspace --all-targets
 cargo test -p roe-core mica_ -- --test-threads=1
 cargo test -p roe-vello --test session_conformance
 cargo test -p roe-vello production_mica_session_builds_a_vello_scene_without_a_display
@@ -247,7 +256,7 @@ missing pieces include:
 
 - first-class inspectors for Mica objects, relations, tasks, packages, and authority;
 - durable, recoverable workspace and user-policy state;
-- richer source, diagnostic, task, and relation views;
+- richer source navigation, diagnostic, task, and relation views;
 - promotion of typeout output into a results buffer, plus help and inspection producers;
 - syntax modes beyond Mica, starting with Rust;
 - keyboard macros, query replace, and broader GNU Emacs command coverage;

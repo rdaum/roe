@@ -1,9 +1,10 @@
 # Toolchain and dependency policy
 
-Roe's declared minimum supported Rust version (MSRV) is 1.95. The repository pins Rust 1.97.1 in
-`rust-toolchain.toml` for reproducible development and CI. Phase 4 raised the MSRV from 1.88 in the
-same dedicated cutover that pinned the Mica driver; later raises must likewise update this document,
-workspace metadata, and CI together.
+Roe's declared minimum supported Rust version (MSRV) is 1.96, matching Mica. The repository pins
+Rust 1.97.1 in `rust-toolchain.toml` for reproducible development and CI. Phase 4 raised the MSRV
+from 1.88 in the same dedicated cutover that pinned the Mica driver. The source-provider integration
+raised it to 1.96 alongside Mica; later raises must likewise update this document, workspace
+metadata, and CI together.
 
 ## Update groups
 
@@ -14,13 +15,17 @@ metadata, and upstream release notes.
 | ------------------ | --------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
 | Routine compatible | `arboard`, `crossterm`, `notify`, `ropey`, `similar`, `slotmap` | Follow current stable releases compatible with the MSRV.                                                       |
 | Runtime pins       | `compio = 0.18.0`, exact `mica-driver` revision                 | Change together with Mica lifecycle, replacement, cancellation, and terminal workflow tests.                   |
-| Mica features      | `mica-driver` with `default-features = false`                   | Keep CPU relation execution; do not initialize Mica WGPU, Fjall, Cranelift, or source-provider feature graphs. |
+| Mica features      | `mica-driver` with `default-features = false`, `source-provider` enabled | Keep CPU relation execution and Roe's bounded source-provider graph; do not initialize Mica WGPU, Fjall, or Cranelift. |
 | Coupled graphics   | `vello`, its WGPU graph, `parley`, `winit`, `pollster`          | Upgrade as one reviewed group with Vello build and frontend conformance checks.                                |
 | Removed            | `async-trait`, direct `futures`                                 | Unused actor/event-stream dependencies removed in Phase 1.                                                     |
 
 Ropey 2 is currently a prerelease and is not treated as the current stable target. Winit 0.31 is
-also prerelease. Mica's first integration must use `default-features = false`, leaving its WGPU
-relation accelerator disabled until Roe and Mica intentionally choose a device/version strategy.
+also prerelease. Mica uses `default-features = false`, leaving its WGPU relation accelerator, Fjall
+persistence, and Cranelift compilation disabled until Roe and Mica intentionally choose those
+strategies. The `source-provider` feature is enabled deliberately. It brings Mica's bounded
+local-worktree and composable provider contract, together with its Git/JJ, tree-sitter, and Tokio
+dependency group; Roe currently configures only local-worktree access and its host-owned live-buffer
+overlay.
 
 ## Required checks
 

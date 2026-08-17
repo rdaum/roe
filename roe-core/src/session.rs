@@ -4989,6 +4989,65 @@ mod tests {
     }
 
     #[test]
+    fn mica_source_provider_prefers_live_roe_buffers_and_falls_back_to_disk() {
+        let _guard = MICA_TEST_LOCK.lock().unwrap();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let editor = test_editor();
+            let buffer = editor.windows[editor.active_window].active_buffer;
+            let cargo_toml = std::env::current_dir()
+                .unwrap()
+                .canonicalize()
+                .unwrap()
+                .join("Cargo.toml");
+            editor.buffers[buffer].set_visited_file(Some(cargo_toml));
+            editor.buffers[buffer].load_str("unsaved Roe source\n");
+            let mut session = test_mica_client(editor, CapabilityGrants::editor_default()).unwrap();
+            let query = concat!(
+                "let exactly {provider, text, hash, source_version} = ",
+                "source/FileText(#roe/source_repository, #roe/source_worktree, ",
+                "\"Cargo.toml\", ?provider, ?text, ?hash, ?source_version)\n",
+                "return [provider, text, source_version]"
+            );
+
+            let live = {
+                let WorkspaceHost {
+                    editor,
+                    buffer_resources,
+                    mica,
+                    ..
+                } = &mut session.workspace;
+                mica.as_mut()
+                    .unwrap()
+                    .evaluate_source(editor, buffer_resources, query.to_owned())
+                    .await
+                    .unwrap()
+            };
+            assert!(live.value.contains("roe-buffer"), "{live:#?}");
+            assert!(live.value.contains("unsaved Roe source"), "{live:#?}");
+            assert!(live.value.contains("roe-buffer:"), "{live:#?}");
+
+            session.workspace.editor.buffers[buffer].set_visited_file(None);
+            let disk = {
+                let WorkspaceHost {
+                    editor,
+                    buffer_resources,
+                    mica,
+                    ..
+                } = &mut session.workspace;
+                mica.as_mut()
+                    .unwrap()
+                    .evaluate_source(editor, buffer_resources, query.to_owned())
+                    .await
+                    .unwrap()
+            };
+            assert!(disk.value.contains("local-worktree"), "{disk:#?}");
+            assert!(!disk.value.contains("unsaved Roe source"), "{disk:#?}");
+
+            session.terminate_workspace().await.unwrap();
+        });
+    }
+
+    #[test]
     fn typeout_pages_are_attachment_local_and_the_final_page_closes() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let editor = test_editor();

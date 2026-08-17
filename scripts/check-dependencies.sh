@@ -5,8 +5,8 @@ project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$project_root"
 
 grep -q '^compio = { version = "=0\.18\.0",' Cargo.toml
-grep -q '^mica-compiler = { git = "https://github.com/timbran-project/mica.git", rev = "bea4fbd786e2601af1a682bd723b527000979f70" }' Cargo.toml
-grep -q '^mica-driver = { git = "https://github.com/timbran-project/mica.git", rev = "bea4fbd786e2601af1a682bd723b527000979f70", default-features = false }' Cargo.toml
+grep -q '^mica-compiler = { git = "https://github.com/timbran-project/mica.git", rev = "5a1e387e5a82f742122e3273b9e89699aa118b82" }' Cargo.toml
+grep -q '^mica-driver = { git = "https://github.com/timbran-project/mica.git", rev = "5a1e387e5a82f742122e3273b9e89699aa118b82", default-features = false, features = \["source-provider"\] }' Cargo.toml
 
 direct_declarations="$(
     rg -n '^(arboard|compio|crossterm|mica-compiler|mica-driver|notify|ropey|signal-hook|similar|slotmap|thiserror|tracing|tracing-subscriber)\s*=' \

@@ -12,11 +12,14 @@ use mica_driver::{
     DriverAdministrator, DriverClient, DriverError, DriverEvent, DriverEventPump, DriverOwner,
     DriverResources, EndpointConfiguration, EndpointSession, ExternalRequestContext,
     ExternalRequestFuture, ExternalRequestHandler, FileinMode, Identity, InvocationHandle,
-    InvocationOutcome, RelationAcceleration, Symbol, TaskId, TaskLimits, Value,
+    InvocationOutcome, ProviderResult, ReadRequest, RelationAcceleration, SourceCapabilities,
+    SourceConfig, SourceDocument, SourceFailure, SourceProvider, SourceProviderKey, Symbol, TaskId,
+    TaskLimits, Value,
 };
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
 
 #[derive(Debug, Clone)]
 enum LayoutFact {
@@ -83,6 +86,158 @@ const TERMINAL_TASK_RETENTION: usize = 256;
 const MAX_PROMPT_CANDIDATES: usize = 256;
 const MAX_SEARCH_MATCHES: usize = 1_024;
 const MAX_POLICY_FACTS: usize = 256;
+const ROE_BUFFER_SOURCE_PROVIDER: &str = "roe-buffer";
+
+#[derive(Default)]
+struct RoeSourceBuffers {
+    by_path: HashMap<PathBuf, crate::Buffer>,
+}
+
+struct RoeBufferSourceProvider {
+    root: PathBuf,
+    buffers: Arc<RwLock<RoeSourceBuffers>>,
+}
+
+impl SourceProvider for RoeBufferSourceProvider {
+    fn key(&self) -> SourceProviderKey {
+        SourceProviderKey::new(ROE_BUFFER_SOURCE_PROVIDER)
+    }
+
+    fn name(&self) -> &str {
+        "live Roe buffers"
+    }
+
+    fn capabilities(&self) -> SourceCapabilities {
+        SourceCapabilities::READ
+    }
+
+    fn supports_revision_kind(&self, kind: &str) -> bool {
+        kind == "worktree"
+    }
+
+    fn read(&self, request: &ReadRequest) -> ProviderResult<SourceDocument> {
+        if request.revision_kind != "worktree" {
+            return ProviderResult::Absent;
+        }
+        if request.root != self.root {
+            return ProviderResult::Absent;
+        }
+        let Some(path) = source_path(&self.root, &request.relative_path) else {
+            return ProviderResult::Absent;
+        };
+        let buffer = self
+            .buffers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .by_path
+            .get(&path)
+            .cloned();
+        let Some(buffer) = buffer else {
+            return ProviderResult::Absent;
+        };
+        let text = buffer.content();
+        if text.len() > request.max_bytes {
+            return ProviderResult::Failed(SourceFailure::new(format!(
+                "live Roe buffer exceeds the {} byte source bound",
+                request.max_bytes
+            )));
+        }
+        ProviderResult::Found(SourceDocument::from_text(
+            text,
+            format!("roe-buffer:{}", buffer.text_revision()),
+        ))
+    }
+}
+
+fn source_path(root: &Path, relative: &str) -> Option<PathBuf> {
+    let relative = Path::new(relative);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
+    {
+        return None;
+    }
+    Some(root.join(relative))
+}
+
+fn source_relative_path(root: &Path, path: &Path) -> Option<String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    let absolute = absolute.canonicalize().unwrap_or(absolute);
+    let relative = absolute.strip_prefix(root).ok()?;
+    let components: Option<Vec<_>> = relative
+        .components()
+        .map(|component| match component {
+            Component::Normal(value) => value.to_str().map(str::to_owned),
+            Component::CurDir => Some(String::new()),
+            _ => None,
+        })
+        .collect();
+    let path = components?
+        .into_iter()
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>()
+        .join("/");
+    (!path.is_empty()).then_some(path)
+}
+
+fn synchronize_source_buffers(root: &Path, state: &Arc<RwLock<RoeSourceBuffers>>, editor: &Editor) {
+    let by_path = editor
+        .buffers
+        .iter()
+        .filter(|(buffer, _)| !editor.is_command_buffer(*buffer))
+        .filter_map(|(_, buffer)| {
+            let relative = source_relative_path(root, &buffer.visited_file()?)?;
+            Some((source_path(root, &relative)?, buffer.clone()))
+        })
+        .collect();
+    state
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .by_path = by_path;
+}
+
+fn source_context_facts(
+    repository: Identity,
+    revision: Identity,
+    root: &Path,
+) -> Vec<(Symbol, mica_driver::Tuple)> {
+    vec![
+        (
+            sym("source/Repository"),
+            [Value::identity(repository)].into(),
+        ),
+        (
+            sym("source/RepositoryName"),
+            [Value::identity(repository), Value::string("workspace")].into(),
+        ),
+        (
+            sym("source/RepositoryRoot"),
+            [
+                Value::identity(repository),
+                Value::string(root.to_string_lossy()),
+            ]
+            .into(),
+        ),
+        (sym("source/Revision"), [Value::identity(revision)].into()),
+        (
+            sym("source/RevisionOf"),
+            [Value::identity(revision), Value::identity(repository)].into(),
+        ),
+        (
+            sym("source/RevisionKind"),
+            [Value::identity(revision), Value::string("worktree")].into(),
+        ),
+        (
+            sym("source/RevisionLabel"),
+            [Value::identity(revision), Value::string("live worktree")].into(),
+        ),
+    ]
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum MicaHostError {
@@ -96,6 +251,8 @@ pub enum MicaHostError {
     Kernel(#[from] KernelError),
     #[error("Mica editor policy rejected the operation: {0}")]
     Policy(String),
+    #[error("Mica source-provider configuration failed: {0}")]
+    SourceConfiguration(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -425,6 +582,10 @@ pub struct MicaHost {
     frame: Identity,
     editor_role: Identity,
     global_map: Identity,
+    source_repository: Identity,
+    source_revision: Identity,
+    source_root: PathBuf,
+    source_buffers: Arc<RwLock<RoeSourceBuffers>>,
     buffer_ids: HashMap<BufferId, Identity>,
     buffer_metadata: HashMap<BufferId, MicaBufferMetadata>,
     native_ids: HashMap<BufferId, Identity>,
@@ -516,6 +677,17 @@ impl MicaHost {
         kernel: Arc<Mutex<NativeKernel>>,
         resource_ids: &HashMap<BufferId, ResourceId>,
     ) -> Result<Self, MicaHostError> {
+        let source_root = std::env::current_dir()
+            .and_then(|path| path.canonicalize())
+            .map_err(|error| MicaHostError::SourceConfiguration(error.to_string()))?;
+        let source_buffers = Arc::new(RwLock::new(RoeSourceBuffers::default()));
+        synchronize_source_buffers(&source_root, &source_buffers, editor);
+        let source_config = SourceConfig::new([source_root.clone()]).with_shared_provider(
+            Arc::new(RoeBufferSourceProvider {
+                root: source_root.clone(),
+                buffers: Arc::clone(&source_buffers),
+            }),
+        );
         let bridge = Arc::new(NativeBridge::new(kernel));
         let handler_bridge = Arc::clone(&bridge);
         let external_handler: ExternalRequestHandler = Arc::new(move |context, request| {
@@ -546,6 +718,7 @@ impl MicaHost {
         resources.relation_acceleration = RelationAcceleration::Disabled;
 
         let mut owner = mica_driver::DriverOwner::builder(resources)
+            .source_config(source_config)
             .initial_filein_unit(sym("roe/core"), CORE_SOURCE, FileinMode::Add, None)
             .external_request_handler(external_handler)
             .build()?;
@@ -559,6 +732,8 @@ impl MicaHost {
         let frame = client.allocate_ephemeral_identity()?;
         let editor_role = client.named_identity(sym("roe/editor_role"))?;
         let global_map = client.named_identity(sym("roe/global_map"))?;
+        let source_repository = client.named_identity(sym("roe/source_repository"))?;
+        let source_revision = client.named_identity(sym("roe/source_worktree"))?;
 
         let mut buffer_ids = HashMap::new();
         let mut buffer_metadata = HashMap::new();
@@ -628,6 +803,11 @@ impl MicaHost {
                 .into(),
             ),
         ];
+        tuples.extend(source_context_facts(
+            source_repository,
+            source_revision,
+            &source_root,
+        ));
         for (buffer_id, _buffer) in &editor.buffers {
             let logical = buffer_ids[&buffer_id];
             let native = native_ids[&buffer_id];
@@ -647,6 +827,12 @@ impl MicaHost {
                     sym("roe/BufferVisitedFile"),
                     [Value::identity(logical), Value::string(path)].into(),
                 ));
+                if let Some(relative) = source_relative_path(&source_root, Path::new(path)) {
+                    tuples.push((
+                        sym("roe/BufferSourcePath"),
+                        [Value::identity(logical), Value::string(relative)].into(),
+                    ));
+                }
             }
             if let Some(extension) = &metadata.file_extension {
                 tuples.push((
@@ -757,6 +943,10 @@ impl MicaHost {
             frame,
             editor_role,
             global_map,
+            source_repository,
+            source_revision,
+            source_root,
+            source_buffers,
             buffer_ids,
             buffer_metadata,
             native_ids,
@@ -1348,6 +1538,7 @@ end
             .insert(active, editor.buffers[window.active_buffer].get_mark());
         self.active_view = active;
         self.synchronize_layout(editor)?;
+        synchronize_source_buffers(&self.source_root, &self.source_buffers, editor);
         let facts = self.volatile_context_facts();
         self.endpoint_session
             .as_mut()
@@ -1410,6 +1601,11 @@ end
                 .into(),
             ),
         ]);
+        facts.extend(source_context_facts(
+            self.source_repository,
+            self.source_revision,
+            &self.source_root,
+        ));
         if let Some(active) = self.view_ids.get(&self.active_view).copied() {
             facts.push((
                 sym("roe/ActiveView"),
@@ -1472,6 +1668,12 @@ end
                     sym("roe/BufferVisitedFile"),
                     [Value::identity(*logical), Value::string(path)].into(),
                 ));
+                if let Some(relative) = source_relative_path(&self.source_root, Path::new(path)) {
+                    facts.push((
+                        sym("roe/BufferSourcePath"),
+                        [Value::identity(*logical), Value::string(relative)].into(),
+                    ));
+                }
             }
             if let Some(extension) = &metadata.file_extension {
                 facts.push((
@@ -2117,8 +2319,21 @@ pub fn normalized_key_sequence(keys: &[crate::keys::LogicalKey]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::normalized_key_sequence;
+    use super::{normalized_key_sequence, source_path};
     use crate::keys::{KeyModifier, LogicalKey, Side};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn roe_buffer_source_paths_cannot_escape_the_workspace_root() {
+        let root = Path::new("/workspace");
+
+        assert_eq!(
+            source_path(root, "src/main.rs"),
+            Some(PathBuf::from("/workspace/src/main.rs"))
+        );
+        assert_eq!(source_path(root, "../outside"), None);
+        assert_eq!(source_path(root, "/etc/passwd"), None);
+    }
 
     #[test]
     fn normalized_keys_use_the_mica_keymap_spelling() {

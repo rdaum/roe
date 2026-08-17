@@ -14,7 +14,7 @@ modes, and syntax/face registries have been removed. Mica is now the authoritati
 of editor policy; Rust owns bounded native mechanisms, the session boundary, and renderer-specific
 realization.
 
-The workspace uses Rust edition 2024, declares Rust 1.95 as its MSRV, and pins Rust 1.97.1 for
+The workspace uses Rust edition 2024, declares Rust 1.96 as its MSRV, and pins Rust 1.97.1 for
 development and CI. `mica-driver` is pinned to the exact revision in `Cargo.toml` with default
 features disabled.
 
@@ -133,7 +133,7 @@ Useful focused checks:
 
 ```bash
 # Declared MSRV
-cargo +1.95.0 check --workspace --all-targets
+cargo +1.96.0 check --workspace --all-targets
 
 # Mica/session tests; serialize focused driver tests
 cargo test -p roe-core mica_ -- --test-threads=1
