@@ -43,6 +43,8 @@ pub const MAX_FRONTEND_TEXT_CHARS: usize = 65_536;
 pub const MAX_SESSION_VIEWS: usize = 64;
 pub const MAX_BUFFER_NAME_CHARS: usize = 256;
 pub const MAX_MICA_SOURCE_CHARS: usize = 1_048_576;
+pub const MAX_TYPEOUT_TEXT_CHARS: usize = 65_536;
+pub const MAX_TYPEOUT_TITLE_CHARS: usize = 256;
 pub const MAX_FRAME_COLUMNS: u16 = 1_000;
 pub const MAX_FRAME_ROWS: u16 = 1_000;
 const MICA_PROMPT_HEIGHT: u16 = 10;
@@ -64,6 +66,9 @@ pub struct Revision(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AttachmentId(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TypeoutId(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttachmentViewport {
@@ -361,6 +366,7 @@ pub enum Invalidation {
     Resource(ResourceId),
     EchoArea,
     Cursor(ViewId),
+    Typeout(ViewId),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -403,6 +409,21 @@ pub struct PresentedView {
     pub styled_ranges: Vec<StyledRange>,
     #[serde(default)]
     pub styled_lines: Vec<StyledLine>,
+    #[serde(default)]
+    pub typeout: Option<PresentedTypeout>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresentedTypeout {
+    pub id: TypeoutId,
+    pub kind: String,
+    pub title: String,
+    pub visible_text: String,
+    pub first_visible_line: usize,
+    pub total_lines: usize,
+    pub more_before: bool,
+    pub more_after: bool,
+    pub complete: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -624,7 +645,19 @@ pub struct WorkspaceHost {
     mica_policy_revision: u64,
     mica_search_ranges: HashMap<WindowId, Vec<(usize, usize, String)>>,
     mica_styled_lines: HashMap<WindowId, Vec<(usize, String)>>,
+    typeout: Option<TypeoutState>,
+    next_typeout_id: u64,
     terminated: bool,
+}
+
+#[derive(Debug, Clone)]
+struct TypeoutState {
+    id: TypeoutId,
+    view: WindowId,
+    origin_buffer: BufferId,
+    kind: String,
+    title: String,
+    text: String,
 }
 
 /// State belonging to one frontend attachment. None of these values survive a
@@ -640,6 +673,7 @@ pub struct Attachment {
     frontend_capabilities: BTreeSet<FrontendCapability>,
     view_scroll: HashMap<WindowId, ViewScroll>,
     presented_cursors: HashMap<WindowId, usize>,
+    typeout_page: Option<(TypeoutId, usize)>,
     pointer_selection: Option<(WindowId, usize)>,
     pending_pointer_drag: Option<(BorderInfo, WindowId, (u16, u16))>,
     next_frontend_request: u64,
@@ -768,6 +802,8 @@ impl WorkspaceHost {
             mica_policy_revision: 0,
             mica_search_ranges: HashMap::new(),
             mica_styled_lines: HashMap::new(),
+            typeout: None,
+            next_typeout_id: 1,
             terminated: false,
         };
         for (buffer, value) in &workspace.editor.buffers {
@@ -850,6 +886,7 @@ impl WorkspaceHost {
             frontend_capabilities: configuration.frontend_capabilities,
             view_scroll,
             presented_cursors: HashMap::new(),
+            typeout_page: None,
             pointer_selection: None,
             pending_pointer_drag: None,
             next_frontend_request: 1,
@@ -1432,6 +1469,7 @@ impl WorkspaceHost {
         lifecycle: &mut Vec<LifecycleEvent>,
         invalidations: &mut Vec<Invalidation>,
     ) {
+        let mut settle_typeout_closed = false;
         if events.policy_reset {
             self.mica_modes.clear();
             self.mica_faces.clear();
@@ -1708,6 +1746,52 @@ impl WorkspaceHost {
         }
         for action in events.host_actions {
             match action.name.as_str() {
+                "show_typeout" => {
+                    let (Some(view), Some(buffer), Some(text)) =
+                        (action.view, action.buffer, action.text)
+                    else {
+                        lifecycle.push(LifecycleEvent::Error(
+                            "Mica typeout decision lost its view, buffer, or text".to_owned(),
+                        ));
+                        continue;
+                    };
+                    match self.show_typeout(
+                        attachment,
+                        view,
+                        buffer,
+                        action
+                            .typeout_kind
+                            .unwrap_or_else(|| "information".to_owned()),
+                        action.title.unwrap_or_else(|| "Output".to_owned()),
+                        text,
+                    ) {
+                        Ok(view) => invalidations.push(Invalidation::Typeout(view)),
+                        Err(detail) if detail.contains("limit") => {
+                            lifecycle.push(LifecycleEvent::Overloaded { detail })
+                        }
+                        Err(message) => lifecycle.push(LifecycleEvent::Error(message)),
+                    }
+                }
+                "dismiss_typeout" => {
+                    if let Some(view) = self.dismiss_typeout(attachment) {
+                        invalidations.push(Invalidation::Typeout(view));
+                    }
+                }
+                "typeout_page_forward" | "typeout_page_backward" => {
+                    if let Some((view, closed)) =
+                        self.page_typeout(attachment, action.name == "typeout_page_forward")
+                    {
+                        invalidations.push(Invalidation::Typeout(view));
+                        settle_typeout_closed |= closed;
+                    } else {
+                        settle_typeout_closed = true;
+                    }
+                }
+                "echo" => {
+                    self.editor
+                        .set_echo_message(action.text.unwrap_or_default());
+                    invalidations.push(Invalidation::EchoArea);
+                }
                 "quit" => lifecycle.push(LifecycleEvent::QuitRequested),
                 "redraw" => invalidations.push(Invalidation::Full),
                 "split_horizontal" => {
@@ -2069,28 +2153,87 @@ impl WorkspaceHost {
                                 invalidations,
                             ))
                             .await;
-                            if result.value.chars().count() > 1_024 {
-                                self.editor.show_special_buffer(
-                                    "*Mica Results*",
-                                    crate::buffer::BufferKind::Results,
-                                    &format!("{}\n", result.value),
-                                );
-                                invalidations.push(Invalidation::Full);
+                            let text = format!("Mica => {}\n", result.value);
+                            if text.chars().count() > MAX_TYPEOUT_TEXT_CHARS {
+                                lifecycle.push(LifecycleEvent::Overloaded {
+                                    detail: format!(
+                                        "Mica evaluation output exceeds the {MAX_TYPEOUT_TEXT_CHARS}-character typeout limit"
+                                    ),
+                                });
+                                continue;
                             }
-                            self.editor
-                                .set_echo_message(format!("Mica => {}", result.value));
-                            invalidations.push(Invalidation::EchoArea);
+                            let routed = if let Some(mut mica) = self.mica.take() {
+                                let result = mica
+                                    .present_evaluation_result(
+                                        &self.editor,
+                                        &self.buffer_resources,
+                                        view,
+                                        buffer_id,
+                                        text,
+                                        false,
+                                    )
+                                    .await;
+                                self.mica = Some(mica);
+                                result
+                            } else {
+                                Err(MicaHostError::Closed)
+                            };
+                            match routed {
+                                Ok(events) => {
+                                    Box::pin(self.apply_mica_events(
+                                        attachment,
+                                        events,
+                                        lifecycle,
+                                        invalidations,
+                                    ))
+                                    .await;
+                                }
+                                Err(error) => lifecycle.push(LifecycleEvent::Error(format!(
+                                    "Mica could not route evaluation output: {error}"
+                                ))),
+                            }
                         }
                         Err(error) => {
                             let message = error.to_string();
-                            self.editor.show_special_buffer(
-                                "*Mica Diagnostics*",
-                                crate::buffer::BufferKind::Diagnostics,
-                                &format!("{message}\n"),
-                            );
-                            self.editor.set_echo_message(message.clone());
-                            lifecycle.push(LifecycleEvent::Error(message));
-                            invalidations.push(Invalidation::Full);
+                            lifecycle.push(LifecycleEvent::Error(message.clone()));
+                            if message.chars().count() > MAX_TYPEOUT_TEXT_CHARS {
+                                lifecycle.push(LifecycleEvent::Overloaded {
+                                    detail: format!(
+                                        "Mica evaluation diagnostic exceeds the {MAX_TYPEOUT_TEXT_CHARS}-character typeout limit"
+                                    ),
+                                });
+                                continue;
+                            }
+                            let routed = if let Some(mut mica) = self.mica.take() {
+                                let result = mica
+                                    .present_evaluation_result(
+                                        &self.editor,
+                                        &self.buffer_resources,
+                                        view,
+                                        buffer_id,
+                                        format!("{message}\n"),
+                                        true,
+                                    )
+                                    .await;
+                                self.mica = Some(mica);
+                                result
+                            } else {
+                                Err(MicaHostError::Closed)
+                            };
+                            match routed {
+                                Ok(events) => {
+                                    Box::pin(self.apply_mica_events(
+                                        attachment,
+                                        events,
+                                        lifecycle,
+                                        invalidations,
+                                    ))
+                                    .await;
+                                }
+                                Err(error) => lifecycle.push(LifecycleEvent::Error(format!(
+                                    "Mica could not route evaluation diagnostic: {error}"
+                                ))),
+                            }
                         }
                     }
                 }
@@ -2256,6 +2399,26 @@ impl WorkspaceHost {
                 .into_iter()
                 .map(|mailbox| LifecycleEvent::MicaSubscriptionReady { mailbox }),
         );
+        if settle_typeout_closed {
+            let settlement = if let Some(mut mica) = self.mica.take() {
+                let result = mica
+                    .settle_typeout_closed(&self.editor, &self.buffer_resources)
+                    .await;
+                self.mica = Some(mica);
+                result
+            } else {
+                Err(MicaHostError::Closed)
+            };
+            match settlement {
+                Ok(events) => {
+                    Box::pin(self.apply_mica_events(attachment, events, lifecycle, invalidations))
+                        .await;
+                }
+                Err(error) => lifecycle.push(LifecycleEvent::Error(format!(
+                    "failed to settle closed typeout state: {error}"
+                ))),
+            }
+        }
     }
 
     fn mica_kill_word(&mut self, forward: bool) -> Result<Vec<ChromeAction>, String> {
@@ -2945,6 +3108,14 @@ impl WorkspaceHost {
         }
 
         let live_windows: HashSet<_> = self.editor.windows.keys().collect();
+        if self.typeout.as_ref().is_some_and(|typeout| {
+            self.editor
+                .windows
+                .get(typeout.view)
+                .is_none_or(|window| window.active_buffer != typeout.origin_buffer)
+        }) {
+            self.typeout = None;
+        }
         self.view_ids
             .retain(|window, _| live_windows.contains(window));
         self.mica_search_ranges
@@ -3045,6 +3216,124 @@ impl WorkspaceHost {
             return None;
         }
         Some(selected.face.as_str())
+    }
+
+    fn show_typeout(
+        &mut self,
+        attachment: &mut Attachment,
+        view: WindowId,
+        origin_buffer: BufferId,
+        kind: String,
+        title: String,
+        text: String,
+    ) -> Result<ViewId, String> {
+        let Some(window) = self.editor.windows.get(view) else {
+            return Err("typeout targeted a stale view".to_owned());
+        };
+        if window.active_buffer != origin_buffer {
+            return Err("typeout targeted a stale buffer".to_owned());
+        }
+        if text.chars().count() > MAX_TYPEOUT_TEXT_CHARS {
+            return Err(format!(
+                "typeout text exceeds the {MAX_TYPEOUT_TEXT_CHARS}-character limit"
+            ));
+        }
+        if title.chars().count() > MAX_TYPEOUT_TITLE_CHARS {
+            return Err(format!(
+                "typeout title exceeds the {MAX_TYPEOUT_TITLE_CHARS}-character limit"
+            ));
+        }
+        let id = TypeoutId(self.next_typeout_id);
+        self.next_typeout_id = self.next_typeout_id.saturating_add(1);
+        self.typeout = Some(TypeoutState {
+            id,
+            view,
+            origin_buffer,
+            kind,
+            title,
+            text,
+        });
+        attachment.typeout_page = Some((id, 0));
+        self.view_ids
+            .get(&view)
+            .copied()
+            .ok_or_else(|| "typeout targeted a view without a presentation identity".to_owned())
+    }
+
+    fn dismiss_typeout(&mut self, attachment: &mut Attachment) -> Option<ViewId> {
+        attachment.typeout_page = None;
+        self.typeout
+            .take()
+            .and_then(|typeout| self.view_ids.get(&typeout.view).copied())
+    }
+
+    /// Move an attachment-local page. Returns the owning view and whether the
+    /// final page was dismissed.
+    fn page_typeout(
+        &mut self,
+        attachment: &mut Attachment,
+        forward: bool,
+    ) -> Option<(ViewId, bool)> {
+        let typeout = self.typeout.as_ref()?;
+        let view = self.view_ids.get(&typeout.view).copied()?;
+        let window = self.editor.windows.get(typeout.view)?;
+        if window.active_buffer != typeout.origin_buffer {
+            self.typeout = None;
+            attachment.typeout_page = None;
+            return Some((view, true));
+        }
+        let page_rows = typeout_body_rows(window.height_chars);
+        let total_lines = typeout_text_lines(&typeout.text).len();
+        let (_, first_line) = attachment.typeout_page.get_or_insert((typeout.id, 0));
+        if forward {
+            let next = first_line.saturating_add(page_rows);
+            if next >= total_lines {
+                self.typeout = None;
+                attachment.typeout_page = None;
+                return Some((view, true));
+            }
+            *first_line = next;
+        } else {
+            *first_line = first_line.saturating_sub(page_rows);
+        }
+        Some((view, false))
+    }
+
+    fn presented_typeout(
+        &self,
+        attachment: &mut Attachment,
+        window: WindowId,
+        height_rows: u16,
+    ) -> Option<PresentedTypeout> {
+        let typeout = self.typeout.as_ref()?;
+        if typeout.view != window
+            || self.editor.windows.get(window)?.active_buffer != typeout.origin_buffer
+        {
+            return None;
+        }
+        let page_rows = typeout_body_rows(height_rows);
+        let lines = typeout_text_lines(&typeout.text);
+        let total_lines = lines.len();
+        if attachment.typeout_page.map(|(id, _)| id) != Some(typeout.id) {
+            attachment.typeout_page = Some((typeout.id, 0));
+        }
+        let (_, first_line) = attachment
+            .typeout_page
+            .as_mut()
+            .expect("typeout page was initialized above");
+        let first_line = (*first_line).min(total_lines.saturating_sub(1));
+        let end_line = first_line.saturating_add(page_rows).min(total_lines);
+        Some(PresentedTypeout {
+            id: typeout.id,
+            kind: typeout.kind.clone(),
+            title: typeout.title.clone(),
+            visible_text: lines[first_line..end_line].join("\n"),
+            first_visible_line: first_line,
+            total_lines,
+            more_before: first_line > 0,
+            more_after: end_line < total_lines,
+            complete: true,
+        })
     }
 
     fn capture_snapshot(&mut self, attachment: &mut Attachment) -> PresentationSnapshot {
@@ -3189,6 +3478,7 @@ impl WorkspaceHost {
                 line.saturating_add(1),
                 column.saturating_add(1)
             );
+            let typeout = self.presented_typeout(attachment, window_id, window.height_chars);
             views.push(PresentedView {
                 id,
                 resource,
@@ -3227,6 +3517,7 @@ impl WorkspaceHost {
                 modeline,
                 styled_ranges,
                 styled_lines,
+                typeout,
             });
         }
         views.sort_by_key(|view| view.id.0);
@@ -3830,6 +4121,17 @@ fn capability_list(grants: &CapabilityGrants) -> Vec<Capability> {
     .into_iter()
     .filter(|capability| grants.contains(*capability))
     .collect()
+}
+
+fn typeout_body_rows(view_rows: u16) -> usize {
+    let content_rows = usize::from(view_rows.saturating_sub(2)).max(1);
+    let overlay_rows = (content_rows * 2).div_ceil(3);
+    overlay_rows.saturating_sub(2).max(1)
+}
+
+fn typeout_text_lines(text: &str) -> Vec<&str> {
+    let lines: Vec<_> = text.lines().collect();
+    if lines.is_empty() { vec![""] } else { lines }
 }
 
 fn ensure_cursor_visible(
@@ -4649,10 +4951,104 @@ mod tests {
                     .all(|event| { !matches!(event, LifecycleEvent::Error(_)) }),
                 "{evaluated:#?}"
             );
-            assert!(snapshot(&evaluated).echo_area.contains("Mica => 3"));
+            let typeout = snapshot(&evaluated).views[0]
+                .typeout
+                .as_ref()
+                .expect("region evaluation should route output to a typeout");
+            assert_eq!(typeout.kind, "evaluation");
+            assert_eq!(typeout.title, "Mica evaluation");
+            assert_eq!(typeout.visible_text, "Mica => 3");
             assert_eq!(session.workspace.editor.buffers[buffer].content(), "1 + 2");
 
+            let dismissed = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::AlphaNumeric(' ')])))
+                .await
+                .unwrap();
+            assert!(snapshot(&dismissed).views[0].typeout.is_none());
+            assert_eq!(session.workspace.editor.buffers[buffer].content(), "1 + 2");
+
+            let reevaluated = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![
+                    control(),
+                    LogicalKey::AlphaNumeric('c'),
+                    control(),
+                    LogicalKey::AlphaNumeric('r'),
+                ])))
+                .await
+                .unwrap();
+            assert!(snapshot(&reevaluated).views[0].typeout.is_some());
+            let redispatched = session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::AlphaNumeric('z')])))
+                .await
+                .unwrap();
+            assert!(snapshot(&redispatched).views[0].typeout.is_none());
+            assert_eq!(session.workspace.editor.buffers[buffer].content(), "1 + 2z");
+
             session.terminate_workspace().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn typeout_pages_are_attachment_local_and_the_final_page_closes() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let editor = test_editor();
+            let mut session = attach_test_workspace(
+                WorkspaceHost::open(editor, CapabilityGrants::editor_default()).unwrap(),
+            );
+            let view = session.workspace.editor.active_window;
+            let buffer = session.workspace.editor.windows[view].active_buffer;
+            let text = (0..40)
+                .map(|line| format!("line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            session
+                .workspace
+                .show_typeout(
+                    &mut session.attachment,
+                    view,
+                    buffer,
+                    "information".to_owned(),
+                    "Paged output".to_owned(),
+                    text,
+                )
+                .unwrap();
+
+            let first = session
+                .workspace
+                .capture_snapshot(&mut session.attachment)
+                .views
+                .into_iter()
+                .find(|presented| presented.active)
+                .unwrap()
+                .typeout
+                .unwrap();
+            assert_eq!(first.first_visible_line, 0);
+            assert!(first.more_after);
+
+            let (_, closed) = session
+                .workspace
+                .page_typeout(&mut session.attachment, true)
+                .unwrap();
+            assert!(!closed);
+            let second = session
+                .workspace
+                .capture_snapshot(&mut session.attachment)
+                .views
+                .into_iter()
+                .find(|presented| presented.active)
+                .unwrap()
+                .typeout
+                .unwrap();
+            assert!(second.first_visible_line > 0);
+            assert!(second.more_before);
+
+            while session.workspace.typeout.is_some() {
+                session
+                    .workspace
+                    .page_typeout(&mut session.attachment, true)
+                    .unwrap();
+            }
+            assert!(session.attachment.typeout_page.is_none());
         });
     }
 

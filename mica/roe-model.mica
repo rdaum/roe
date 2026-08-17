@@ -16,6 +16,7 @@ make_identity(:roe/hook)
 make_identity(:roe/face)
 make_identity(:roe/syntax_rule)
 make_identity(:roe/package)
+make_identity(:roe/typeout)
 
 make_identity(:roe/global_map)
 make_identity(:roe/other_window)
@@ -111,6 +112,12 @@ make_functional_relation(:roe/PromptState, 6, [0], :volatile)
 make_functional_relation(:roe/PromptLast, 3, [0, 1], :volatile)
 make_relation(:roe/FileCandidate, 4, :volatile)
 make_functional_relation(:roe/FilePromptDirectory, 2, [0], :volatile)
+make_relation(:roe/Typeout, 1, :volatile)
+make_functional_relation(:roe/SessionTypeout, 2, [0], :volatile)
+make_functional_relation(:roe/TypeoutView, 2, [0], :volatile)
+make_functional_relation(:roe/TypeoutOriginBuffer, 2, [0], :volatile)
+make_functional_relation(:roe/TypeoutKind, 2, [0], :volatile)
+make_functional_relation(:roe/TypeoutTitle, 2, [0], :volatile)
 
 // Ephemeral host associations and native-cached observations. The host owns
 // their invalidation and never persists them in a named unit or durable store.
@@ -465,6 +472,12 @@ assert RoleCanRead(#roe/editor_role, :roe/PromptState)
 assert RoleCanRead(#roe/editor_role, :roe/PromptLast)
 assert RoleCanRead(#roe/editor_role, :roe/FileCandidate)
 assert RoleCanRead(#roe/editor_role, :roe/FilePromptDirectory)
+assert RoleCanRead(#roe/editor_role, :roe/Typeout)
+assert RoleCanRead(#roe/editor_role, :roe/SessionTypeout)
+assert RoleCanRead(#roe/editor_role, :roe/TypeoutView)
+assert RoleCanRead(#roe/editor_role, :roe/TypeoutOriginBuffer)
+assert RoleCanRead(#roe/editor_role, :roe/TypeoutKind)
+assert RoleCanRead(#roe/editor_role, :roe/TypeoutTitle)
 assert RoleCanRead(#roe/editor_role, :roe/CommandSelector)
 assert RoleCanRead(#roe/editor_role, :roe/CommandName)
 assert RoleCanRead(#roe/editor_role, :roe/CommandHostAction)
@@ -495,6 +508,12 @@ assert RoleCanWrite(#roe/editor_role, :roe/PromptState)
 assert RoleCanWrite(#roe/editor_role, :roe/PromptLast)
 assert RoleCanWrite(#roe/editor_role, :roe/FileCandidate)
 assert RoleCanWrite(#roe/editor_role, :roe/FilePromptDirectory)
+assert RoleCanWrite(#roe/editor_role, :roe/Typeout)
+assert RoleCanWrite(#roe/editor_role, :roe/SessionTypeout)
+assert RoleCanWrite(#roe/editor_role, :roe/TypeoutView)
+assert RoleCanWrite(#roe/editor_role, :roe/TypeoutOriginBuffer)
+assert RoleCanWrite(#roe/editor_role, :roe/TypeoutKind)
+assert RoleCanWrite(#roe/editor_role, :roe/TypeoutTitle)
 assert RoleCanInvoke(#roe/editor_role, :roe/dispatch_key)
 assert RoleCanInvoke(#roe/editor_role, :roe/run_native_action)
 assert RoleCanInvoke(#roe/editor_role, :roe/emit_edit_hooks)
@@ -514,6 +533,10 @@ assert RoleCanInvoke(#roe/editor_role, :roe/publish_policy)
 assert RoleCanInvoke(#roe/editor_role, :roe/pointer_event)
 assert RoleCanInvoke(#roe/editor_role, :roe/set_view_scroll)
 assert RoleCanInvoke(#roe/editor_role, :roe/set_split_ratio)
+assert RoleCanInvoke(#roe/editor_role, :roe/show_typeout)
+assert RoleCanInvoke(#roe/editor_role, :roe/dismiss_typeout)
+assert RoleCanInvoke(#roe/editor_role, :roe/typeout_closed)
+assert RoleCanInvoke(#roe/editor_role, :roe/clear_typeout_state)
 assert RoleCanEffect(#roe/editor_role)
 assert roe/RoleCanRequestService(#roe/editor_role, :text_read)
 assert roe/RoleCanRequestService(#roe/editor_role, :text_write)
@@ -550,6 +573,19 @@ end
 
 verb roe/dispatch_key(actor, session, sequence @ #string)
   roe/publish_policy(actor, session)
+  if roe/SessionTypeout(session, ?typeout)
+    if sequence == " "
+      emit(session, {:kind -> :host_action, :action -> :typeout_page_forward})
+      return :handled
+    elseif sequence == "⌫" || sequence == "Del"
+      emit(session, {:kind -> :host_action, :action -> :typeout_page_backward})
+      return :handled
+    elseif sequence == "C-g" || sequence == "Esc"
+      return roe/dismiss_typeout(actor, session)
+    else
+      roe/dismiss_typeout(actor, session)
+    end
+  end
   let native_action = none
   let native_precedence = -2147483648
   let native_ambiguous = false
@@ -615,6 +651,50 @@ verb roe/dispatch_key(actor, session, sequence @ #string)
   end
   let exactly {:selector -> selector} = selector_rows
   return invoke(selector, {:actor -> actor, :session -> session})
+end
+
+verb roe/clear_typeout_state(actor, session)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  let current = roe/SessionTypeout(session, ?typeout)
+  if current
+    let exactly {:typeout -> typeout} = current
+    retract roe/SessionTypeout(session, typeout)
+    retract roe/TypeoutView(typeout, _)
+    retract roe/TypeoutOriginBuffer(typeout, _)
+    retract roe/TypeoutKind(typeout, _)
+    retract roe/TypeoutTitle(typeout, _)
+    retract roe/Typeout(typeout)
+  end
+  return :ok
+end
+
+verb roe/show_typeout(actor, session, view, buffer, kind, title @ #string, text @ #string)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  roe/SessionLeafView(session, view) || return :invalid_view
+  roe/ViewBuffer(view, buffer) || return :stale_buffer
+  roe/CanUseBuffer(actor, buffer) || return :buffer_denied
+  roe/clear_typeout_state(actor, session)
+  let typeout = frob(#roe/typeout, session)
+  assert roe/Typeout(typeout)
+  assert roe/SessionTypeout(session, typeout)
+  assert roe/TypeoutView(typeout, view)
+  assert roe/TypeoutOriginBuffer(typeout, buffer)
+  assert roe/TypeoutKind(typeout, kind)
+  assert roe/TypeoutTitle(typeout, title)
+  emit(session, {:kind -> :host_action, :action -> :show_typeout, :view -> view, :buffer -> buffer, :typeout_kind -> kind, :title -> title, :text -> text})
+  return :handled
+end
+
+verb roe/dismiss_typeout(actor, session)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  roe/clear_typeout_state(actor, session)
+  emit(session, {:kind -> :host_action, :action -> :dismiss_typeout})
+  return :handled
+end
+
+verb roe/typeout_closed(actor, session)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  return roe/clear_typeout_state(actor, session)
 end
 
 verb roe/run_native_action(actor, session, action)
@@ -684,6 +764,9 @@ verb roe/pointer_event(actor, session, view, position, phase, button)
   roe/SessionLeafView(session, view) || return :invalid_view
   let exactly {:buffer -> buffer} = roe/ViewBuffer(view, ?buffer)
   roe/CanUseBuffer(actor, buffer) || return :buffer_denied
+  if roe/SessionTypeout(session, ?typeout) && (phase == :down || phase == :layout_down)
+    roe/dismiss_typeout(actor, session)
+  end
   if button != :primary && phase != :move && phase != :up
     return :ignored
   end

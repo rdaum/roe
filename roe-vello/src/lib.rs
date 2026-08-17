@@ -217,6 +217,15 @@ fn session_view_metrics(view: &PresentedView, char_width: f64) -> SessionViewMet
     }
 }
 
+fn typeout_body_capacity(body_top: f64, footer_top: f64, line_height: f64) -> usize {
+    if line_height <= 0.0 || footer_top <= body_top {
+        return 0;
+    }
+    // Font metrics are fractional. A half-pixel tolerance keeps an exact
+    // logical row from disappearing through harmless floating-point rounding.
+    (((footer_top - body_top) + 0.5) / line_height).floor() as usize
+}
+
 /// Gutter colors
 const GUTTER_FG_COLOR: Color = Color::from_rgba8(0x60, 0x60, 0x60, 0xFF); // Dimmed line numbers
 
@@ -759,7 +768,11 @@ impl<'a> RoeVelloApp<'a> {
                     );
                 }
             }
-            if view.active && view.cursor >= display_start && view.cursor <= display_end {
+            if view.active
+                && view.typeout.is_none()
+                && view.cursor >= display_start
+                && view.cursor <= display_end
+            {
                 let cursor_x = content_x + (view.cursor - display_start) as f64 * char_width;
                 self.scene.fill(
                     Fill::NonZero,
@@ -901,6 +914,120 @@ impl<'a> RoeVelloApp<'a> {
                 ),
             );
         }
+
+        self.draw_session_typeout(view, x, y, width, height, line_height);
+    }
+
+    fn draw_session_typeout(
+        &mut self,
+        view: &PresentedView,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        line_height: f64,
+    ) {
+        let Some(typeout) = view.typeout.as_ref() else {
+            return;
+        };
+        let inset = (width * 0.025)
+            .clamp(16.0, 32.0)
+            .min((width / 4.0).max(2.0));
+        let body: Vec<_> = if typeout.visible_text.is_empty() {
+            vec![""]
+        } else {
+            typeout.visible_text.lines().collect()
+        };
+        let vertical_padding = 6.0;
+        let desired_height =
+            (body.len().saturating_add(2) as f64) * line_height + vertical_padding * 4.0;
+        let max_height =
+            ((height - line_height).max(line_height) * 2.0 / 3.0).max(line_height * 3.0);
+        let overlay_height = desired_height.min(max_height).min(height - line_height);
+        let left = x + inset;
+        let top = y + line_height + 4.0;
+        let right = (x + width - inset).max(left + 1.0);
+        let available_bottom = y + height - line_height - 4.0;
+        if available_bottom <= top + line_height {
+            return;
+        }
+        let bottom = (top + overlay_height).min(available_bottom);
+        let shadow = Rect::new(left + 4.0, top + 6.0, right + 4.0, bottom + 6.0);
+        self.scene.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            Color::from_rgba8(0x00, 0x00, 0x00, 0x70),
+            None,
+            &shadow,
+        );
+        let panel = Rect::new(left, top, right, bottom);
+        self.scene.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            Color::from_rgba8(0x18, 0x1d, 0x21, 0xf2),
+            None,
+            &panel,
+        );
+        let border = if typeout.kind == "diagnostic" {
+            Color::from_rgba8(0xc7, 0x91, 0x4f, 0xe0)
+        } else {
+            Color::from_rgba8(0x55, 0x7d, 0x8d, 0xd0)
+        };
+        for rect in [
+            Rect::new(left, top, right, top + 1.0),
+            Rect::new(left, bottom - 1.0, right, bottom),
+            Rect::new(left, top, left + 1.0, bottom),
+            Rect::new(right - 1.0, top, right, bottom),
+        ] {
+            self.scene
+                .fill(Fill::NonZero, Affine::IDENTITY, border, None, &rect);
+        }
+        let header_bottom = top + line_height + vertical_padding * 2.0;
+        self.scene.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            Color::from_rgba8(0x24, 0x2c, 0x31, 0xc0),
+            None,
+            &Rect::new(left + 1.0, top + 1.0, right - 1.0, header_bottom),
+        );
+        let text_x = (left + 12.0) as f32;
+        let max_text_width = ((right - left) - 24.0).max(1.0) as f32;
+        self.text_renderer.render_line(
+            &mut self.scene,
+            &typeout.title,
+            text_x,
+            (top + vertical_padding) as f32,
+            border,
+            Some(max_text_width),
+        );
+        let body_top = header_bottom;
+        let footer_top = bottom - line_height - vertical_padding * 2.0;
+        let available_body_rows = typeout_body_capacity(body_top, footer_top, line_height);
+        for (row, line) in body.into_iter().take(available_body_rows).enumerate() {
+            self.text_renderer.render_line(
+                &mut self.scene,
+                line,
+                text_x,
+                (body_top + line_height * row as f64) as f32,
+                self.theme.fg_color,
+                Some(max_text_width),
+            );
+        }
+        let status = if typeout.more_after {
+            "More — Space"
+        } else if typeout.more_before {
+            "End — Backspace"
+        } else {
+            "End"
+        };
+        self.text_renderer.render_line(
+            &mut self.scene,
+            status,
+            text_x,
+            (footer_top + vertical_padding) as f32,
+            Color::from_rgb8(0xa9, 0xb2, 0xb7),
+            Some(max_text_width),
+        );
     }
 
     async fn handle_key_event(&mut self, event: winit::event::KeyEvent) {
@@ -1621,6 +1748,48 @@ mod lifecycle_tests {
         );
     }
 
+    #[test]
+    fn production_mica_typeout_builds_a_vello_scene_without_a_display() {
+        let runtime = compio::runtime::Runtime::new().unwrap();
+        let mut editor = session_editor();
+        let view = editor.active_window;
+        let buffer = editor.windows[view].active_buffer;
+        editor.buffers[buffer].load_str("1 + 2");
+        editor.buffers[buffer].set_mark(0);
+        editor.windows[view].cursor = 5;
+        let mut app = RoeVelloApp::new(
+            editor,
+            VelloTheme::default(),
+            runtime,
+            Arc::new(WakeState::default()),
+            Arc::new(NoopWake),
+            &[],
+        )
+        .unwrap();
+        let control = LogicalKey::Modifier(KeyModifier::Control(Side::Left));
+        let output = app.runtime.block_on(async {
+            let envelope = app.session.envelope(InputEvent::Keys(vec![
+                control,
+                LogicalKey::AlphaNumeric('c'),
+                control,
+                LogicalKey::AlphaNumeric('r'),
+            ]));
+            app.session.dispatch(envelope).await
+        });
+        app.apply_session_output(output.unwrap());
+        let snapshot = app.redraw_state.session_presentation().current().unwrap();
+        assert_eq!(
+            snapshot.views[0]
+                .typeout
+                .as_ref()
+                .map(|typeout| typeout.visible_text.as_str()),
+            Some("Mica => 3")
+        );
+        app.scene.reset();
+        app.build_session_scene(DEFAULT_WIDTH, DEFAULT_HEIGHT)
+            .unwrap();
+    }
+
     fn presented_view(columns: u16, rows: u16, max_line_chars: usize) -> PresentedView {
         PresentedView {
             id: ViewId(1),
@@ -1658,6 +1827,7 @@ mod lifecycle_tests {
             modeline: String::new(),
             styled_ranges: Vec::new(),
             styled_lines: Vec::new(),
+            typeout: None,
         }
     }
 
@@ -1678,6 +1848,12 @@ mod lifecycle_tests {
         assert_eq!(command.content_rows, 8);
         assert_eq!(command.content_width_chars, 78);
         assert!(!command.horizontal_overflow);
+    }
+
+    #[test]
+    fn typeout_layout_retains_a_single_body_row_between_header_and_footer() {
+        assert_eq!(typeout_body_capacity(92.0, 110.0, 18.0), 1);
+        assert_eq!(typeout_body_capacity(92.0, 91.0, 18.0), 0);
     }
 
     #[test]

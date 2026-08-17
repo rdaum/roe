@@ -135,6 +135,9 @@ pub struct MicaPromptUpdate {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MicaHostAction {
     pub name: String,
+    pub text: Option<String>,
+    pub title: Option<String>,
+    pub typeout_kind: Option<String>,
     pub buffer: Option<BufferId>,
     pub buffer_name: Option<String>,
     pub unit: Option<String>,
@@ -887,6 +890,47 @@ impl MicaHost {
             vec![(sym("node"), Value::identity(node)), (sym("ratio"), ratio)],
         )
         .await
+    }
+
+    pub async fn present_evaluation_result(
+        &mut self,
+        editor: &Editor,
+        resource_ids: &HashMap<BufferId, ResourceId>,
+        view: WindowId,
+        buffer: BufferId,
+        text: String,
+        failed: bool,
+    ) -> Result<MicaEventBatch, MicaHostError> {
+        self.ensure_first_wave().await?;
+        self.synchronize_context(editor, resource_ids)?;
+        let view = *self
+            .view_ids
+            .get(&view)
+            .ok_or(MicaHostError::MissingIdentity)?;
+        let buffer = *self
+            .buffer_ids
+            .get(&buffer)
+            .ok_or(MicaHostError::MissingIdentity)?;
+        self.invoke_editor_verb(
+            "roe/present_evaluation_result",
+            vec![
+                (sym("view"), Value::identity(view)),
+                (sym("buffer"), Value::identity(buffer)),
+                (sym("text"), Value::string(&text)),
+                (sym("failed"), Value::bool(failed)),
+            ],
+        )
+        .await
+    }
+
+    pub async fn settle_typeout_closed(
+        &mut self,
+        editor: &Editor,
+        resource_ids: &HashMap<BufferId, ResourceId>,
+    ) -> Result<MicaEventBatch, MicaHostError> {
+        self.synchronize_context(editor, resource_ids)?;
+        self.invoke_editor_verb("roe/typeout_closed", Vec::new())
+            .await
     }
 
     async fn invoke_editor_verb(
@@ -1681,6 +1725,12 @@ end
             .as_symbol()?
             .name()
             .map(str::to_owned)?;
+        let text = map_value(value, "text").and_then(|value| value.with_str(str::to_owned));
+        let title = map_value(value, "title").and_then(|value| value.with_str(str::to_owned));
+        let typeout_kind = map_value(value, "typeout_kind")
+            .and_then(|value| value.as_symbol())
+            .and_then(Symbol::name)
+            .map(str::to_owned);
         let buffer = map_value(value, "buffer")
             .and_then(|value| value.as_identity())
             .and_then(|logical| {
@@ -1727,6 +1777,9 @@ end
         let ratio = map_value(value, "ratio").and_then(|value| value.as_float());
         Some(MicaHostAction {
             name,
+            text,
+            title,
+            typeout_kind,
             buffer,
             buffer_name,
             unit,

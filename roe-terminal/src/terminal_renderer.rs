@@ -339,11 +339,14 @@ impl<W: Write> TerminalRenderer<W> {
                 || old.selection != view.selection
                 || old.styled_ranges != view.styled_ranges
                 || old.styled_lines != view.styled_lines
+                || old.typeout != view.typeout
                 || old.show_gutter != view.show_gutter
-                || old.visible_text.lines().count() != view.visible_text.lines().count();
+                || old.visible_text.lines().count() != view.visible_text.lines().count()
+                || (view.typeout.is_some() && old.visible_text != view.visible_text);
             if redraw_all_content {
                 self.hide_cursor_once(&mut drew)?;
                 self.draw_session_view_content(view, &snapshot.styles)?;
+                self.draw_session_typeout(view)?;
             } else if old.visible_text != view.visible_text {
                 for row in 0..usize::from(view.geometry.rows.saturating_sub(2)) {
                     if session_view_line(old, row) != session_view_line(view, row) {
@@ -412,7 +415,7 @@ impl<W: Write> TerminalRenderer<W> {
             .saturating_add(column.saturating_sub(view.scroll.start_column));
         let y = view.geometry.y.saturating_add(1).saturating_add(line);
         queue!(&mut self.device, cursor::MoveTo(x, y))?;
-        if view.command_view {
+        if view.command_view || view.typeout.is_some() {
             queue!(&mut self.device, cursor::Hide)
         } else {
             queue!(&mut self.device, cursor::Show)
@@ -426,6 +429,7 @@ impl<W: Write> TerminalRenderer<W> {
     ) -> Result<(), std::io::Error> {
         self.draw_session_view_border(view)?;
         self.draw_session_view_content(view, styles)?;
+        self.draw_session_typeout(view)?;
         self.draw_session_view_modeline(view)
     }
 
@@ -589,6 +593,84 @@ impl<W: Write> TerminalRenderer<W> {
         )?;
         Ok(())
     }
+
+    fn draw_session_typeout(&mut self, view: &PresentedView) -> Result<(), std::io::Error> {
+        let Some(typeout) = view.typeout.as_ref() else {
+            return Ok(());
+        };
+        let geometry = view.geometry;
+        let content_rows = usize::from(geometry.rows.saturating_sub(2));
+        let available_columns = usize::from(geometry.columns.saturating_sub(2));
+        if content_rows == 0 || available_columns == 0 {
+            return Ok(());
+        }
+        let inset = usize::from(geometry.columns >= 8);
+        let width = available_columns.saturating_sub(inset * 2).max(1);
+        let x = geometry.x.saturating_add(1 + inset as u16);
+        let y = geometry.y.saturating_add(1);
+        let body: Vec<_> = if typeout.visible_text.is_empty() {
+            vec![""]
+        } else {
+            typeout.visible_text.lines().collect()
+        };
+        let framed = width >= 4 && content_rows >= 3;
+        let height = if framed {
+            body.len().saturating_add(2).min(content_rows)
+        } else {
+            body.len().max(1).min(content_rows)
+        };
+        let foreground = if typeout.kind == "diagnostic" {
+            Color::Yellow
+        } else {
+            self.theme.fg_color
+        };
+        for row in 0..height {
+            let line = if framed && row == 0 {
+                typeout_frame_line('┌', &typeout.title, '┐', width, '─')
+            } else if framed && row + 1 == height {
+                let status = if typeout.more_after {
+                    "More — Space"
+                } else if typeout.more_before {
+                    "End — Backspace"
+                } else {
+                    "End"
+                };
+                typeout_frame_line('└', status, '┘', width, '─')
+            } else {
+                let body_row = row.saturating_sub(usize::from(framed));
+                let text = body.get(body_row).copied().unwrap_or("");
+                if framed {
+                    typeout_frame_line('│', text, '│', width, ' ')
+                } else {
+                    format!("{:<width$}", truncate_echo(text, width), width = width)
+                }
+            };
+            queue!(
+                &mut self.device,
+                cursor::MoveTo(x, y.saturating_add(row as u16)),
+                Print(line.with(foreground).on(Color::DarkGrey))
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn typeout_frame_line(left: char, text: &str, right: char, width: usize, fill: char) -> String {
+    if width < 2 {
+        return fill.to_string().repeat(width);
+    }
+    let inner_width = width - 2;
+    let text = truncate_echo(text, inner_width);
+    let text_width = text.chars().count();
+    let mut line = String::with_capacity(width);
+    line.push(left);
+    line.push_str(&text);
+    line.extend(std::iter::repeat_n(
+        fill,
+        inner_width.saturating_sub(text_width),
+    ));
+    line.push(right);
+    line
 }
 
 fn session_layout_matches(
@@ -876,7 +958,7 @@ mod tests {
     use roe_core::native_kernel::{ResourceId, ViewId};
     use roe_core::session::{
         Invalidation, PresentationColor, PresentationDelta, Revision, SessionEpoch, StyleRef,
-        StyledLine, ViewGeometry, ViewScroll,
+        StyledLine, TypeoutId, ViewGeometry, ViewScroll,
     };
 
     fn test_snapshot(revision: u64, text: &str) -> PresentationSnapshot {
@@ -926,6 +1008,7 @@ mod tests {
                 modeline: "*test* 1:1".to_owned(),
                 styled_ranges: Vec::new(),
                 styled_lines: Vec::new(),
+                typeout: None,
             }],
             styles: Vec::new(),
             echo_area: String::new(),
@@ -1002,6 +1085,31 @@ mod tests {
                 b: 0x3a
             }
         );
+    }
+
+    #[test]
+    fn session_typeout_is_drawn_as_an_inset_child_surface() {
+        let mut snapshot = test_snapshot(1, "underlying text\n");
+        snapshot.views[0].typeout = Some(roe_core::session::PresentedTypeout {
+            id: TypeoutId(1),
+            kind: "information".to_owned(),
+            title: "Evaluation".to_owned(),
+            visible_text: "Mica => 3\nnext line".to_owned(),
+            first_visible_line: 0,
+            total_lines: 4,
+            more_before: false,
+            more_after: true,
+            complete: true,
+        });
+        let mut renderer = TerminalRenderer::new(Vec::new());
+        renderer
+            .apply_session_presentation(&PresentationUpdate::Full(snapshot))
+            .unwrap();
+        renderer.render_session().unwrap();
+        let rendered = String::from_utf8_lossy(&renderer.device);
+        assert!(rendered.contains("Evaluation"));
+        assert!(rendered.contains("Mica => 3"));
+        assert!(rendered.contains("More — Space"));
     }
 
     #[test]

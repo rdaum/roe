@@ -442,6 +442,33 @@ assert roe/CommandName(#roe/eval_region, "mica-eval-region")
 assert roe/KeyBinding(#roe/global_map, "C-c C-r", #roe/eval_region, 1000)
 assert roe/PackageCommand(#roe/core_package, #roe/eval_region)
 assert RoleCanInvoke(#roe/editor_role, :roe/eval_region)
+assert RoleCanInvoke(#roe/editor_role, :roe/present_evaluation_result)
+
+make_functional_relation(:roe/OutputRoute, 3, [0, 1])
+assert RoleCanRead(#roe/editor_role, :roe/OutputRoute)
+assert roe/OutputRoute(:evaluation, :success, :typeout)
+assert roe/OutputRoute(:evaluation, :failure, :typeout)
+
+verb roe/present_evaluation_result(actor, session, view, buffer, text @ #string, failed)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  roe/SessionLeafView(session, view) || return :invalid_view
+  roe/ViewBuffer(view, buffer) || return :stale_buffer
+  roe/CanUseBuffer(actor, buffer) || return :buffer_denied
+  let outcome = :success
+  let title = "Mica evaluation"
+  let kind = :evaluation
+  if failed == true
+    outcome = :failure
+    title = "Mica evaluation failed"
+    kind = :diagnostic
+  end
+  let exactly {:route -> route} = roe/OutputRoute(:evaluation, outcome, ?route)
+  if route == :typeout
+    return roe/show_typeout(actor, session, view, buffer, kind, title, text)
+  end
+  emit(session, {:kind -> :host_action, :action -> :echo, :text -> text})
+  return :handled
+end
 
 verb roe/mark_whole_buffer(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor

@@ -1,6 +1,6 @@
 use roe_core::editor::{WindowNode, WindowType};
 use roe_core::file_watcher::FileWatcher;
-use roe_core::keys::LogicalKey;
+use roe_core::keys::{KeyModifier, LogicalKey, Side};
 use roe_core::kill_ring::KillRing;
 use roe_core::native_kernel::CapabilityGrants;
 use roe_core::native_services::SystemClock;
@@ -17,7 +17,8 @@ use std::sync::Arc;
 fn editor_fixture() -> Editor {
     let mut buffers: SlotMap<BufferId, Buffer> = SlotMap::default();
     let buffer = Buffer::named("*conformance*", roe_core::buffer::BufferKind::Scratch);
-    buffer.load_str("let one = \"λ\"");
+    buffer.load_str("let one = \"λ\"\n1 + 2");
+    buffer.set_mark(14);
     let buffer_id = buffers.insert(buffer);
     let mut windows: SlotMap<WindowId, Window> = SlotMap::default();
     let window_id = windows.insert(Window {
@@ -26,7 +27,7 @@ fn editor_fixture() -> Editor {
         width_chars: 80,
         height_chars: 23,
         active_buffer: buffer_id,
-        cursor: 13,
+        cursor: 19,
         window_type: WindowType::Normal,
     });
     Editor {
@@ -56,6 +57,32 @@ fn terminal_and_vello_consume_the_same_production_mica_session_stream() {
         let mut session =
             DirectSessionClient::new(workspace, AttachmentConfiguration::headless(80, 23));
         let mut outputs = vec![session.initial_output().await];
+        let control = || LogicalKey::Modifier(KeyModifier::Control(Side::Left));
+        outputs.push(
+            session
+                .dispatch(session.envelope(InputEvent::Keys(vec![
+                    control(),
+                    LogicalKey::AlphaNumeric('c'),
+                    control(),
+                    LogicalKey::AlphaNumeric('r'),
+                ])))
+                .await
+                .unwrap(),
+        );
+        assert!(
+            outputs
+                .last()
+                .unwrap()
+                .presentation
+                .as_ref()
+                .is_some_and(|update| update_snapshot(update).views[0].typeout.is_some())
+        );
+        outputs.push(
+            session
+                .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::AlphaNumeric(' ')])))
+                .await
+                .unwrap(),
+        );
         outputs.push(
             session
                 .dispatch(session.envelope(InputEvent::Text("x".to_owned())))
@@ -110,4 +137,11 @@ fn terminal_and_vello_consume_the_same_production_mica_session_stream() {
         );
         session.terminate_workspace().await.unwrap();
     });
+}
+
+fn update_snapshot(update: &PresentationUpdate) -> &roe_core::session::PresentationSnapshot {
+    match update {
+        PresentationUpdate::Full(snapshot) => snapshot,
+        PresentationUpdate::Delta(delta) => &delta.snapshot,
+    }
 }

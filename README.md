@@ -46,7 +46,8 @@ In short Mica takes the place that Lisp usually takes in the rest of the Emacs p
 - Mouse positioning, selection, view activation, scrolling, and split-border dragging.
 - An always-present `*scratch*` Mica buffer plus welcome, messages, prompt, result, and diagnostic
   buffers.
-- Mica buffer and region evaluation with recoverable diagnostics.
+- Mica buffer and region evaluation with recoverable diagnostics; region results appear in an
+  inset, pageable [typeout window](docs/TYPEOUT-WINDOWS.md) attached to the invoking view.
 - Mica syntax highlighting in scratch and `.mica` files. Rust and other language modes are future
   additions.
 - Safe Mica experimentation: Roe rejects invalid code and keeps the last working editor behavior.
@@ -136,6 +137,9 @@ ascends. Typed relative paths resolve against the directory shown in the prompt.
 | `C-l`     | Redraw the frame.                                                          |
 | `C-x C-c` | Quit Roe.                                                                  |
 | `F12`     | Insert the current Unix time; this is a small shipped Mica/native example. |
+
+While a typeout is visible, `Space` advances or closes its final page, Backspace/Delete moves back,
+and `C-g`/`Esc` dismisses it. Any other editor key dismisses the typeout and then runs normally.
 
 ## Mica programming model
 
@@ -244,6 +248,7 @@ missing pieces include:
 - first-class inspectors for Mica objects, relations, tasks, packages, and authority;
 - durable, recoverable workspace and user-policy state;
 - richer source, diagnostic, task, and relation views;
+- promotion of typeout output into a results buffer, plus help and inspection producers;
 - syntax modes beyond Mica, starting with Rust;
 - keyboard macros, query replace, and broader GNU Emacs command coverage;
 - LSP integration and other language tooling;
