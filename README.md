@@ -50,6 +50,9 @@ In short Mica takes the place that Lisp usually takes in the rest of the Emacs p
   inset, pageable [typeout window](docs/TYPEOUT-WINDOWS.md) attached to the invoking view.
 - Composable Mica source providers: live Roe buffers shadow the local worktree, so source queries
   see unsaved edits while files without a live buffer fall through to bounded disk access.
+- A streaming, read-only workspace agent in `*Agent*`, with Mica-owned transcripts and `read`,
+  `grep`, `glob`, and `ls` tools over those same composable source providers. Tool activity appears
+  in typeout windows.
 - Mica syntax highlighting in scratch and `.mica` files. Rust and other language modes are future
   additions.
 - Safe Mica experimentation: Roe rejects invalid code and keeps the last working editor behavior.
@@ -143,6 +146,34 @@ ascends. Typed relative paths resolve against the directory shown in the prompt.
 While a typeout is visible, `Space` advances or closes its final page, Backspace/Delete moves back,
 and `C-g`/`Esc` dismisses it. Any other editor key dismisses the typeout and then runs normally.
 
+## Workspace agent
+
+Set an API key, start either frontend from the workspace you want the agent to inspect, then run
+`M-x agent-chat`:
+
+```bash
+export OPENROUTER_API_KEY="..."
+./scripts/run-vello.sh
+```
+
+The default model is `deepseek/deepseek-v4-pro`. Set `MICA_AGENT_MODEL` to use another
+OpenAI-compatible model. To use a compatible service other than OpenRouter, set
+`MICA_OPENAI_BASE_URL` and `OPENAI_API_KEY` as well.
+
+The conversation is rendered in the read-only `*Agent*` results buffer. Responses stream into that
+buffer, and each tool invocation is shown in a typeout attached to its view. The current tool set is
+deliberately read-only: `read`, `grep`, `glob`, and `ls`. All paths are relative to Roe's startup
+directory. Source lookup is provider-composed, so a visited file's unsaved buffer text takes
+precedence over its on-disk contents; files not open in Roe fall through to the bounded local
+worktree provider. You can switch buffers while it works; incoming text does not move focus back
+to `*Agent*`. Prompts and tool results (including unsaved text) are sent to the configured model
+service when you invoke the agent.
+
+Agent transcripts are currently workspace-local and in-memory. They disappear when the workspace
+terminates, and the agent cannot edit files or execute commands. Each prompt allows four tool
+rounds, with at most 16 calls per response; the conversation is capped at 128 messages. Closing
+the workspace cancels any pending response.
+
 ## Mica programming model
 
 Mica is not an optional command plugin layered over a Rust editor policy stack. In the production
@@ -161,7 +192,8 @@ presentation, terminal cells, and Vello/WGPU resources.
 
 The shipped ontology and generic behavior are in [`mica/roe-model.mica`](mica/roe-model.mica). The
 default package, commands, bindings, faces, Mica mode, and prompt behavior are in
-[`mica/roe-first-wave.mica`](mica/roe-first-wave.mica).
+[`mica/roe-first-wave.mica`](mica/roe-first-wave.mica). The agent transcript, command, tool policy,
+and streaming loop are in [`mica/roe-agent.mica`](mica/roe-agent.mica).
 
 The distinguished scratch buffer is Mica source associated with the volatile `roe/user_scratch`
 unit. `C-c C-b` validates the whole buffer before replacing that unit, so malformed source leaves

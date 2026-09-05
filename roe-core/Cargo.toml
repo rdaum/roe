@@ -12,6 +12,7 @@ description = "Core editor logic for Roe (Ryan's Own Emacs)"
 compio = { workspace = true }
 mica-compiler = { workspace = true }
 mica-driver = { workspace = true }
+mica-external-http = { workspace = true }
 notify = { workspace = true }
 ropey = { workspace = true }
 serde = { workspace = true }

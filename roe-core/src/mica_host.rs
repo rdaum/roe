@@ -11,12 +11,12 @@ use crate::{BufferId, Editor, WindowId};
 use mica_driver::{
     DriverAdministrator, DriverClient, DriverError, DriverEvent, DriverEventPump, DriverOwner,
     DriverResources, EndpointConfiguration, EndpointSession, ExternalRequestContext,
-    ExternalRequestFuture, ExternalRequestHandler, FileinMode, Identity, InvocationHandle,
-    InvocationOutcome, ProviderResult, ReadRequest, RelationAcceleration, SourceCapabilities,
-    SourceConfig, SourceDocument, SourceFailure, SourceProvider, SourceProviderKey, Symbol, TaskId,
-    TaskLimits, Value,
+    ExternalRequestFuture, ExternalRequestHandler, ExternalStreamRequestHandler, FileinMode,
+    Identity, InvocationHandle, InvocationOutcome, ListRequest, ProviderResult, ReadRequest,
+    RelationAcceleration, SourceCapabilities, SourceConfig, SourceDocument, SourceEntry,
+    SourceFailure, SourceProvider, SourceProviderKey, Symbol, TaskId, TaskLimits, Value,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -76,6 +76,7 @@ macro_rules! layout_named_tuples {
 
 const CORE_SOURCE: &str = include_str!("../../mica/roe-model.mica");
 const FIRST_WAVE_SOURCE: &str = include_str!("../../mica/roe-first-wave.mica");
+const AGENT_SOURCE: &str = include_str!("../../mica/roe-agent.mica");
 const EVENT_QUEUE_CAPACITY: usize = 256;
 const EXTERNAL_REQUEST_CAPACITY: usize = 16;
 const SUBSCRIPTION_QUEUE_BUDGET: usize = 64;
@@ -87,6 +88,27 @@ const MAX_PROMPT_CANDIDATES: usize = 256;
 const MAX_SEARCH_MATCHES: usize = 1_024;
 const MAX_POLICY_FACTS: usize = 256;
 const ROE_BUFFER_SOURCE_PROVIDER: &str = "roe-buffer";
+
+/// Keep each HTTP future inside the driver's bounded external-request slot.
+/// Mica runs the producer as an endpoint-owned child while the transcript task
+/// receives its mailbox events. Closing the endpoint drops the network future.
+fn agent_stream_handler() -> ExternalStreamRequestHandler {
+    Arc::new(|_, request, emitter| {
+        Box::pin(async move {
+            if let Err(message) =
+                mica_external_http::perform_external_stream_request(request, &emitter).await
+            {
+                let _ = emitter
+                    .emit(Value::map([
+                        (Value::symbol(sym("type")), Value::symbol(sym("error"))),
+                        (Value::symbol(sym("message")), Value::string(message)),
+                    ]))
+                    .await;
+            }
+            Value::bool(true)
+        })
+    })
+}
 
 #[derive(Default)]
 struct RoeSourceBuffers {
@@ -108,7 +130,7 @@ impl SourceProvider for RoeBufferSourceProvider {
     }
 
     fn capabilities(&self) -> SourceCapabilities {
-        SourceCapabilities::READ
+        SourceCapabilities::READ.union(SourceCapabilities::LIST)
     }
 
     fn supports_revision_kind(&self, kind: &str) -> bool {
@@ -146,6 +168,58 @@ impl SourceProvider for RoeBufferSourceProvider {
             text,
             format!("roe-buffer:{}", buffer.text_revision()),
         ))
+    }
+
+    fn list(&self, request: &ListRequest) -> ProviderResult<Vec<SourceEntry>> {
+        if request.revision_kind != "worktree" || request.root != self.root {
+            return ProviderResult::Absent;
+        }
+        let Some(directory) = source_path(&self.root, &request.relative_path) else {
+            return ProviderResult::Absent;
+        };
+        let buffers = self
+            .buffers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut entries = BTreeMap::new();
+        for path in buffers.by_path.keys() {
+            let Ok(relative) = path.strip_prefix(&directory) else {
+                continue;
+            };
+            let mut components = relative.components();
+            let Some(Component::Normal(first)) = components.next() else {
+                continue;
+            };
+            let name = first.to_string_lossy().into_owned();
+            let is_directory = components.next().is_some();
+            let child = directory.join(first);
+            let Ok(child) = child.strip_prefix(&self.root) else {
+                continue;
+            };
+            let relative_path = child
+                .components()
+                .filter_map(|component| match component {
+                    Component::Normal(value) => value.to_str(),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("/");
+            entries.entry(relative_path.clone()).or_insert_with(|| {
+                SourceEntry::new(
+                    relative_path,
+                    if is_directory { "directory" } else { "file" },
+                    name,
+                )
+            });
+            if entries.len() >= request.limit {
+                break;
+            }
+        }
+        if entries.is_empty() {
+            ProviderResult::Absent
+        } else {
+            ProviderResult::Found(entries.into_values().collect())
+        }
     }
 }
 
@@ -677,6 +751,25 @@ impl MicaHost {
         kernel: Arc<Mutex<NativeKernel>>,
         resource_ids: &HashMap<BufferId, ResourceId>,
     ) -> Result<Self, MicaHostError> {
+        Self::open_with_stream_handler(editor, kernel, resource_ids, agent_stream_handler())
+    }
+
+    #[cfg(test)]
+    pub fn open_with_stream_handler_for_test(
+        editor: &Editor,
+        kernel: Arc<Mutex<NativeKernel>>,
+        resource_ids: &HashMap<BufferId, ResourceId>,
+        stream_handler: ExternalStreamRequestHandler,
+    ) -> Result<Self, MicaHostError> {
+        Self::open_with_stream_handler(editor, kernel, resource_ids, stream_handler)
+    }
+
+    fn open_with_stream_handler(
+        editor: &Editor,
+        kernel: Arc<Mutex<NativeKernel>>,
+        resource_ids: &HashMap<BufferId, ResourceId>,
+        stream_handler: ExternalStreamRequestHandler,
+    ) -> Result<Self, MicaHostError> {
         let source_root = std::env::current_dir()
             .and_then(|path| path.canonicalize())
             .map_err(|error| MicaHostError::SourceConfiguration(error.to_string()))?;
@@ -690,7 +783,14 @@ impl MicaHost {
         );
         let bridge = Arc::new(NativeBridge::new(kernel));
         let handler_bridge = Arc::clone(&bridge);
+        let http_handler = mica_external_http::handler();
         let external_handler: ExternalRequestHandler = Arc::new(move |context, request| {
+            if matches!(
+                request.service.name(),
+                Some("http" | "openai" | "openai_responses" | "embedding")
+            ) {
+                return http_handler(context, request);
+            }
             let bridge = Arc::clone(&handler_bridge);
             Box::pin(async move {
                 if request.service == sym("test_pending") {
@@ -721,6 +821,7 @@ impl MicaHost {
             .source_config(source_config)
             .initial_filein_unit(sym("roe/core"), CORE_SOURCE, FileinMode::Add, None)
             .external_request_handler(external_handler)
+            .external_stream_request_handler(stream_handler)
             .build()?;
         let event_pump = owner.take_event_pump()?;
         let client = owner.client();
@@ -1123,6 +1224,16 @@ impl MicaHost {
             .await
     }
 
+    pub async fn start_agent(
+        &mut self,
+        editor: &Editor,
+        resource_ids: &HashMap<BufferId, ResourceId>,
+    ) -> Result<MicaEventBatch, MicaHostError> {
+        self.ensure_first_wave().await?;
+        self.synchronize_context(editor, resource_ids)?;
+        self.invoke_editor_verb("roe/agent_start", Vec::new()).await
+    }
+
     async fn invoke_editor_verb(
         &mut self,
         selector: &str,
@@ -1217,26 +1328,41 @@ impl MicaHost {
 
     pub async fn restore_first_wave(&mut self) -> Result<(), MicaHostError> {
         self.replace_unit("roe/first-wave", FIRST_WAVE_SOURCE.to_owned())
+            .await?;
+        self.replace_unit("roe/agent", AGENT_SOURCE.to_owned())
             .await
     }
 
     async fn ensure_first_wave(&mut self) -> Result<(), MicaHostError> {
-        if self.first_wave_loaded {
-            return Ok(());
+        if !self.first_wave_loaded {
+            self.administrator
+                .check_filein(FIRST_WAVE_SOURCE.to_owned(), None)
+                .await?;
+            self.administrator
+                .filein_unit(
+                    sym("roe/first-wave"),
+                    FIRST_WAVE_SOURCE.to_owned(),
+                    FileinMode::Add,
+                    None,
+                )
+                .await?;
+            self.loaded_units.insert(sym("roe/first-wave"));
+            self.first_wave_loaded = true;
         }
-        self.administrator
-            .check_filein(FIRST_WAVE_SOURCE.to_owned(), None)
-            .await?;
-        self.administrator
-            .filein_unit(
-                sym("roe/first-wave"),
-                FIRST_WAVE_SOURCE.to_owned(),
-                FileinMode::Add,
-                None,
-            )
-            .await?;
-        self.loaded_units.insert(sym("roe/first-wave"));
-        self.first_wave_loaded = true;
+        if !self.loaded_units.contains(&sym("roe/agent")) {
+            self.administrator
+                .check_filein(AGENT_SOURCE.to_owned(), None)
+                .await?;
+            self.administrator
+                .filein_unit(
+                    sym("roe/agent"),
+                    AGENT_SOURCE.to_owned(),
+                    FileinMode::Add,
+                    None,
+                )
+                .await?;
+            self.loaded_units.insert(sym("roe/agent"));
+        }
         Ok(())
     }
 

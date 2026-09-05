@@ -1,0 +1,775 @@
+// Roe's relation-owned, read-only coding agent.
+//
+// Rust realizes the *Agent* buffer, streaming HTTP, and typeout surfaces. This
+// unit owns the transcript, prompt command, tool policy, loop, and rendering
+// decisions.
+
+make_identity(:roe/agent)
+make_identity(:roe/agent_transcript)
+make_identity(:roe/agent_message)
+make_identity(:roe/agent_tool)
+make_identity(:roe/agent_tool_call)
+make_identity(:roe/agent_tool_result)
+make_identity(:roe/default_agent)
+make_identity(:roe/agent_package)
+make_identity(:roe/agent_mode)
+make_identity(:roe/agent_chat)
+make_identity(:roe/tool_read)
+make_identity(:roe/tool_grep)
+make_identity(:roe/tool_glob)
+make_identity(:roe/tool_ls)
+
+make_relation(:roe/Agent, 1)
+make_functional_relation(:roe/AgentModel, 2, [0])
+make_functional_relation(:roe/AgentTranscript, 2, [0], :volatile)
+make_functional_relation(:roe/AgentView, 2, [0], :volatile)
+make_functional_relation(:roe/AgentBuffer, 2, [0], :volatile)
+make_functional_relation(:roe/AgentStreaming, 2, [0], :volatile)
+make_relation(:roe/AgentMessage, 1, :volatile)
+make_functional_relation(:roe/AgentMessageTranscript, 2, [0], :volatile)
+make_functional_relation(:roe/AgentMessageSequence, 2, [0], :volatile)
+make_functional_relation(:roe/AgentMessageRole, 2, [0], :volatile)
+make_functional_relation(:roe/AgentMessageContent, 2, [0], :volatile)
+make_functional_relation(:roe/AgentMessageStatus, 2, [0], :volatile)
+make_relation(:roe/AgentTool, 1)
+make_functional_relation(:roe/AgentToolName, 2, [0])
+make_functional_relation(:roe/AgentToolDescription, 2, [0])
+make_functional_relation(:roe/AgentToolParameters, 2, [0])
+make_relation(:roe/AgentToolEnabled, 2)
+make_relation(:roe/AgentToolCall, 1, :volatile)
+make_functional_relation(:roe/AgentToolCallMessage, 2, [0], :volatile)
+make_functional_relation(:roe/AgentToolCallId, 2, [0], :volatile)
+make_functional_relation(:roe/AgentToolCallName, 2, [0], :volatile)
+make_functional_relation(:roe/AgentToolCallArguments, 2, [0], :volatile)
+make_functional_relation(:roe/AgentToolCallStatus, 2, [0], :volatile)
+make_relation(:roe/AgentToolResult, 1, :volatile)
+make_functional_relation(:roe/AgentToolResultCall, 2, [0], :volatile)
+make_functional_relation(:roe/AgentToolResultContent, 2, [0], :volatile)
+make_functional_relation(:roe/AgentToolResultFailed, 2, [0], :volatile)
+
+assert Delegates(#roe/default_agent, #roe/agent, 0)
+assert roe/Agent(#roe/default_agent)
+assert roe/AgentModel(#roe/default_agent, "deepseek/deepseek-v4-pro")
+
+assert Delegates(#roe/agent_package, #roe/package, 0)
+assert roe/Package(#roe/agent_package)
+assert roe/PackageUnit(#roe/agent_package, :roe/agent)
+assert roe/PackageEnabled(#roe/agent_package, true)
+
+assert Delegates(#roe/agent_mode, #roe/mode, 0)
+assert roe/MajorMode(#roe/agent_mode)
+assert roe/ModeName(#roe/agent_mode, "agent")
+assert roe/ModeKeymap(#roe/agent_mode, #roe/global_map, 100)
+assert roe/PackageMode(#roe/agent_package, #roe/agent_mode)
+
+roe/BufferMajorMode(buffer, #roe/agent_mode) :-
+  roe/BufferName(buffer, "*Agent*"),
+  roe/BufferKind(buffer, :results)
+
+assert Delegates(#roe/agent_chat, #roe/command, 0)
+assert roe/Command(#roe/agent_chat)
+assert roe/CommandSelector(#roe/agent_chat, :roe/agent_chat)
+assert roe/CommandImplementation(#roe/agent_chat, :roe/agent_chat_value)
+assert roe/CommandSummary(#roe/agent_chat, "Ask the workspace agent")
+assert roe/CommandName(#roe/agent_chat, "agent-chat")
+assert roe/CommandArgument(#roe/agent_chat, 2, :prompt, :string)
+assert roe/ArgumentPrompt(#roe/agent_chat, 2, "Ask agent")
+assert roe/PackageCommand(#roe/agent_package, #roe/agent_chat)
+
+assert roe/AgentTool(#roe/tool_read)
+assert roe/AgentToolName(#roe/tool_read, "read")
+assert roe/AgentToolDescription(#roe/tool_read, "Read a file relative to the workspace root. Unsaved Roe buffers take precedence over disk.")
+assert roe/AgentToolParameters(#roe/tool_read, "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}")
+assert roe/AgentToolEnabled(#roe/default_agent, #roe/tool_read)
+
+assert roe/AgentTool(#roe/tool_grep)
+assert roe/AgentToolName(#roe/tool_grep, "grep")
+assert roe/AgentToolDescription(#roe/tool_grep, "Search workspace text. Unsaved Roe buffers take precedence over disk.")
+assert roe/AgentToolParameters(#roe/tool_grep, "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\"}},\"required\":[\"pattern\"]}")
+assert roe/AgentToolEnabled(#roe/default_agent, #roe/tool_grep)
+
+assert roe/AgentTool(#roe/tool_glob)
+assert roe/AgentToolName(#roe/tool_glob, "glob")
+assert roe/AgentToolDescription(#roe/tool_glob, "Find workspace paths matching *, **, and ? glob patterns.")
+assert roe/AgentToolParameters(#roe/tool_glob, "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"}},\"required\":[\"pattern\"]}")
+assert roe/AgentToolEnabled(#roe/default_agent, #roe/tool_glob)
+
+assert roe/AgentTool(#roe/tool_ls)
+assert roe/AgentToolName(#roe/tool_ls, "ls")
+assert roe/AgentToolDescription(#roe/tool_ls, "List files and directories under a workspace path.")
+assert roe/AgentToolParameters(#roe/tool_ls, "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[]}")
+assert roe/AgentToolEnabled(#roe/default_agent, #roe/tool_ls)
+
+// Agent tasks execute with the editor endpoint's ordinary role. Explicit
+// grants keep the loop and its host requests discoverable to authority setup.
+assert RoleCanInvoke(#roe/editor_role, :roe/agent_chat)
+assert RoleCanInvoke(#roe/editor_role, :roe/agent_chat_value)
+assert RoleCanInvoke(#roe/editor_role, :roe/agent_start)
+assert RoleCanInvoke(#roe/editor_role, :roe/agent_run)
+assert RoleCanInvoke(#roe/editor_role, :roe/agent_run_body)
+assert RoleCanInvoke(#roe/editor_role, :roe/agent_stream_turn)
+assert RoleCanInvoke(#roe/editor_role, :roe/agent_request)
+assert RoleCanInvoke(#roe/editor_role, :roe/agent_execute_tools)
+assert RoleCanInvoke(#roe/editor_role, :roe/agent_invoke_tool)
+assert RoleCanInvoke(#roe/editor_role, :roe/agent_read)
+assert RoleCanInvoke(#roe/editor_role, :roe/agent_grep)
+assert RoleCanInvoke(#roe/editor_role, :roe/agent_glob)
+assert RoleCanInvoke(#roe/editor_role, :roe/agent_ls)
+assert RoleCanInvoke(#roe/editor_role, :roe/agent_glob_match)
+assert RoleCanInvoke(#roe/editor_role, :roe/agent_glob_closure)
+assert RoleCanInvoke(#roe/editor_role, :roe/agent_render)
+assert RoleCanInvoke(#roe/editor_role, :roe/agent_append_message)
+assert RoleCanInvoke(#roe/editor_role, :roe/agent_messages)
+assert RoleCanInvoke(#roe/editor_role, :roe/agent_build_input)
+assert RoleCanInvoke(#roe/editor_role, :roe/agent_build_tools)
+assert RoleCanInvoke(#roe/editor_role, :roe/agent_record_tool_call)
+assert RoleCanInvoke(#roe/editor_role, :roe/agent_set_tool_status)
+assert RoleCanInvoke(#roe/editor_role, :roe/agent_model)
+assert RoleCanInvoke(#roe/editor_role, :roe/agent_trim)
+assert RoleCanInvoke(#roe/editor_role, :roe/agent_args_string)
+assert RoleCanInvoke(#roe/editor_role, :roe/agent_args_int)
+assert RoleCanInvoke(#roe/editor_role, :roe/agent_stream_events)
+assert RoleCanInvoke(#roe/editor_role, :llm_responses_stream)
+assert RoleCanInvoke(#roe/editor_role, :mailbox)
+assert RoleCanInvoke(#roe/editor_role, :mailbox_recv)
+assert RoleCanInvoke(#roe/editor_role, :mailbox_send)
+assert RoleCanInvoke(#roe/editor_role, :mailbox_close)
+assert RoleCanInvoke(#roe/editor_role, :os_getenv)
+assert RoleCanInvoke(#roe/editor_role, :json_decode)
+assert RoleCanInvoke(#roe/editor_role, :from_literal)
+assert RoleCanInvoke(#roe/editor_role, :to_literal)
+assert RoleCanInvoke(#roe/editor_role, :frob)
+
+assert RoleCanRead(#roe/editor_role, :roe/Agent)
+assert RoleCanRead(#roe/editor_role, :roe/AgentModel)
+assert RoleCanRead(#roe/editor_role, :roe/AgentTranscript)
+assert RoleCanRead(#roe/editor_role, :roe/AgentView)
+assert RoleCanRead(#roe/editor_role, :roe/AgentBuffer)
+assert RoleCanRead(#roe/editor_role, :roe/AgentStreaming)
+assert RoleCanRead(#roe/editor_role, :roe/AgentMessage)
+assert RoleCanRead(#roe/editor_role, :roe/AgentMessageTranscript)
+assert RoleCanRead(#roe/editor_role, :roe/AgentMessageSequence)
+assert RoleCanRead(#roe/editor_role, :roe/AgentMessageRole)
+assert RoleCanRead(#roe/editor_role, :roe/AgentMessageContent)
+assert RoleCanRead(#roe/editor_role, :roe/AgentMessageStatus)
+assert RoleCanRead(#roe/editor_role, :roe/AgentTool)
+assert RoleCanRead(#roe/editor_role, :roe/AgentToolName)
+assert RoleCanRead(#roe/editor_role, :roe/AgentToolDescription)
+assert RoleCanRead(#roe/editor_role, :roe/AgentToolParameters)
+assert RoleCanRead(#roe/editor_role, :roe/AgentToolEnabled)
+assert RoleCanRead(#roe/editor_role, :roe/AgentToolCall)
+assert RoleCanRead(#roe/editor_role, :roe/AgentToolCallMessage)
+assert RoleCanRead(#roe/editor_role, :roe/AgentToolCallId)
+assert RoleCanRead(#roe/editor_role, :roe/AgentToolCallName)
+assert RoleCanRead(#roe/editor_role, :roe/AgentToolCallArguments)
+assert RoleCanRead(#roe/editor_role, :roe/AgentToolCallStatus)
+assert RoleCanRead(#roe/editor_role, :roe/AgentToolResult)
+assert RoleCanRead(#roe/editor_role, :roe/AgentToolResultCall)
+assert RoleCanRead(#roe/editor_role, :roe/AgentToolResultContent)
+assert RoleCanRead(#roe/editor_role, :roe/AgentToolResultFailed)
+assert RoleCanRead(#roe/editor_role, :source/TextSearch)
+
+assert RoleCanWrite(#roe/editor_role, :roe/AgentTranscript)
+assert RoleCanWrite(#roe/editor_role, :roe/AgentView)
+assert RoleCanWrite(#roe/editor_role, :roe/AgentBuffer)
+assert RoleCanWrite(#roe/editor_role, :roe/AgentStreaming)
+assert RoleCanWrite(#roe/editor_role, :roe/AgentMessage)
+assert RoleCanWrite(#roe/editor_role, :roe/AgentMessageTranscript)
+assert RoleCanWrite(#roe/editor_role, :roe/AgentMessageSequence)
+assert RoleCanWrite(#roe/editor_role, :roe/AgentMessageRole)
+assert RoleCanWrite(#roe/editor_role, :roe/AgentMessageContent)
+assert RoleCanWrite(#roe/editor_role, :roe/AgentMessageStatus)
+assert RoleCanWrite(#roe/editor_role, :roe/AgentToolCall)
+assert RoleCanWrite(#roe/editor_role, :roe/AgentToolCallMessage)
+assert RoleCanWrite(#roe/editor_role, :roe/AgentToolCallId)
+assert RoleCanWrite(#roe/editor_role, :roe/AgentToolCallName)
+assert RoleCanWrite(#roe/editor_role, :roe/AgentToolCallArguments)
+assert RoleCanWrite(#roe/editor_role, :roe/AgentToolCallStatus)
+assert RoleCanWrite(#roe/editor_role, :roe/AgentToolResult)
+assert RoleCanWrite(#roe/editor_role, :roe/AgentToolResultCall)
+assert RoleCanWrite(#roe/editor_role, :roe/AgentToolResultContent)
+assert RoleCanWrite(#roe/editor_role, :roe/AgentToolResultFailed)
+
+verb roe/agent_chat(actor, session)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  let streaming = roe/AgentStreaming(session, ?active)
+  if streaming
+    let exactly {:active -> active} = streaming
+    active == false || return :agent_busy
+  end
+  return roe/begin_argument_prompt(actor, session, #roe/agent_chat, 2)
+end
+
+verb roe/agent_chat_value(actor, session, value @ #string)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  if roe/AgentStreaming(session, true)
+    return :agent_busy
+  end
+  let prompt = roe/agent_trim(value)
+  prompt != "" || return :empty_prompt
+  string_len(prompt) <= 65536 || return :prompt_too_large
+  let exactly {:view -> view} = roe/ActiveView(session, ?view)
+  let transcript_rows = roe/AgentTranscript(session, ?transcript)
+  let transcript
+  if transcript_rows
+    let exactly {:transcript -> current} = transcript_rows
+    transcript = current
+  else
+    transcript = frob(#roe/agent_transcript, session)
+    assert roe/AgentTranscript(session, transcript)
+  end
+  retract roe/AgentView(session, _)
+  assert roe/AgentView(session, view)
+  roe/agent_append_message(session, transcript, "user", prompt, "complete")
+  retract roe/AgentStreaming(session, _)
+  assert roe/AgentStreaming(session, true)
+  roe/agent_render(actor, session, true)
+  emit(session, {:kind -> :host_action, :action -> :start_agent, :view -> view})
+  return :started
+end
+
+// Rust invokes this continuation after creating and synchronizing *Agent* so
+// the background task has a proper logical buffer identity for typeouts.
+verb roe/agent_start(actor, session)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  let exactly {:view -> view} = roe/AgentView(session, ?view)
+  let exactly {:buffer -> buffer} = roe/ViewBuffer(view, ?buffer)
+  let exactly {:name -> name} = roe/BufferName(buffer, ?name)
+  name == "*Agent*" || return :agent_buffer_missing
+  retract roe/AgentBuffer(session, _)
+  assert roe/AgentBuffer(session, buffer)
+  roe/publish_policy(actor, session)
+  let exactly {:transcript -> transcript} = roe/AgentTranscript(session, ?transcript)
+  let child = spawn :roe/agent_run(actor: actor, session: session, transcript: transcript)
+  return child
+end
+
+verb roe/agent_append_message(session, transcript, role @ #string, content @ #string, status @ #string)
+  let sequence = 0
+  for found in roe/AgentMessageTranscript(?message, transcript)
+    let exactly {:existing -> existing} = roe/AgentMessageSequence(found[:message], ?existing)
+    if existing >= sequence
+      sequence = existing + 1
+    end
+  end
+  sequence < 128 || raise E_BOUNDS, "agent transcript exceeds 128 messages"
+  let bounded = content
+  if string_len(bounded) > 262144
+    bounded = string_slice(bounded, 0, 262144)
+  end
+  let message = frob(#roe/agent_message, [session, sequence])
+  assert roe/AgentMessage(message)
+  assert roe/AgentMessageTranscript(message, transcript)
+  assert roe/AgentMessageSequence(message, sequence)
+  assert roe/AgentMessageRole(message, role)
+  assert roe/AgentMessageContent(message, bounded)
+  assert roe/AgentMessageStatus(message, status)
+  return message
+end
+
+verb roe/agent_messages(transcript)
+  let ordered = []
+  for found in roe/AgentMessageTranscript(?message, transcript)
+    let exactly {:sequence -> sequence} = roe/AgentMessageSequence(found[:message], ?sequence)
+    ordered = [@ordered, [sequence, found[:message]]]
+  end
+  ordered = sort(ordered)
+  let messages = []
+  for pair in ordered
+    messages = [@messages, pair[1]]
+  end
+  return messages
+end
+
+verb roe/agent_render(actor, session, display)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  let transcript_rows = roe/AgentTranscript(session, ?transcript)
+  transcript_rows || return :no_agent_transcript
+  let exactly {:transcript -> transcript} = transcript_rows
+  let text = "Roe Agent\n=========\n\n"
+  for message in roe/agent_messages(transcript)
+    let exactly {:role -> role} = roe/AgentMessageRole(message, ?role)
+    let exactly {:content -> content} = roe/AgentMessageContent(message, ?content)
+    let label = role
+    if role == "user"
+      label = "You"
+    elseif role == "assistant"
+      label = "Agent"
+    elseif role == "tool"
+      label = "Tool"
+    end
+    text = string_concat(text, string_concat(label, ":\n"))
+    text = string_concat(text, string_concat(content, "\n\n"))
+    for found in roe/AgentToolCallMessage(?call, message)
+      let exactly {:name -> name} = roe/AgentToolCallName(found[:call], ?name)
+      let exactly {:status -> status} = roe/AgentToolCallStatus(found[:call], ?status)
+      text = string_concat(text, string_concat("  [tool ", string_concat(name, string_concat(": ", string_concat(status, ")]\n")))))
+    end
+    if string_len(text) >= 524288
+      break
+    end
+  end
+  let streaming = roe/AgentStreaming(session, ?active)
+  if streaming
+    let exactly {:active -> active} = streaming
+    if active
+      text = string_concat(text, "Agent is working…\n")
+    end
+  end
+  if string_len(text) > 524288
+    let suffix = "\n[transcript display truncated]\n"
+    text = string_concat(string_slice(text, 0, 524288 - string_len(suffix)), suffix)
+  end
+  if display
+    let exactly {:view -> view} = roe/AgentView(session, ?view)
+    emit(session, {:kind -> :host_action, :action -> :agent_render, :phase -> :open, :view -> view, :buffer_name -> "*Agent*", :text -> text})
+  else
+    let buffers = roe/AgentBuffer(session, ?buffer)
+    buffers || return :no_agent_buffer
+    let exactly {:buffer -> buffer} = buffers
+    roe/LogicalBuffer(buffer) || return :agent_buffer_closed
+    emit(session, {:kind -> :host_action, :action -> :agent_render, :phase -> :update, :buffer -> buffer, :text -> text})
+  end
+  return :rendered
+end
+
+verb roe/agent_model()
+  let configured = os_getenv("MICA_AGENT_MODEL")
+  if configured
+    let exactly {:value -> model} = configured
+    return model
+  end
+  let exactly {:model -> model} = roe/AgentModel(#roe/default_agent, ?model)
+  return model
+end
+
+verb roe/agent_trim(text @ #string)
+  let chars = string_chars(text)
+  let start = 0
+  let end_index = string_len(text)
+  while start < end_index && chars[start] == " "
+    start = start + 1
+  end
+  while end_index > start && chars[end_index - 1] == " "
+    end_index = end_index - 1
+  end
+  return string_slice(text, start, end_index)
+end
+
+verb roe/agent_args_string(arguments, key)
+  let value = index_or(arguments, key, none)
+  if value == none
+    return ""
+  end
+  return roe/agent_trim(value)
+end
+
+verb roe/agent_args_int(arguments, key)
+  let value: int = index_or(arguments, key, 0)
+  return value
+end
+
+verb roe/agent_read(arguments @ #map)
+  let path = roe/agent_args_string(arguments, :path)
+  path != "" || return {:status -> "error", :content -> "missing path"}
+  let rows = source/FileText(#roe/source_repository, #roe/source_worktree, path, ?provider, ?text, ?hash, ?source_version)
+  rows || return {:status -> "error", :content -> string_concat("file not found: ", path)}
+  let exactly {:provider -> provider, :text -> text, :hash -> hash, :source_version -> source_version} = rows
+  let content = text
+  if string_len(content) > 65536
+    content = string_concat(string_slice(content, 0, 65536), "\n[read truncated at 65,536 characters]")
+  end
+  return {:status -> "complete", :content -> content, :summary -> string_concat("read ", path)}
+end
+
+verb roe/agent_grep(arguments @ #map)
+  let pattern = roe/agent_args_string(arguments, :pattern)
+  pattern != "" || return {:status -> "error", :content -> "missing pattern"}
+  let limit = roe/agent_args_int(arguments, :limit)
+  if limit <= 0 || limit > 64
+    limit = 32
+  end
+  let lines = []
+  for found in source/TextSearch(#roe/source_repository, #roe/source_worktree, pattern, limit, "all", ?subject, ?score, ?path, ?start_line, ?end_line, ?kind, ?title, ?snippet, ?provider, ?source_version)
+    lines = [@lines, string_concat(found[:path], string_concat(":", string_concat(to_literal(found[:start_line]), string_concat(": ", found[:snippet]))))]
+  end
+  let content = "No matches."
+  if lines != []
+    content = string_join(lines, "\n")
+  end
+  return {:status -> "complete", :content -> content, :summary -> string_concat("grep ", pattern)}
+end
+
+verb roe/agent_glob_match(pattern @ #string, path @ #string)
+  string_len(pattern) <= 256 || raise E_BOUNDS, "glob pattern exceeds 256 characters"
+  let p = string_chars(pattern)
+  let plen = string_len(pattern)
+  let states = {0 -> true}
+  for ch in string_chars(path)
+    states = roe/agent_glob_closure(p, states)
+    let next = {}
+    let pi = 0
+    while pi < plen
+      if index_or(states, pi, false)
+        if p[pi] == "*"
+          if ch != "/" || (pi + 1 < plen && p[pi + 1] == "*")
+            next[pi] = true
+          end
+        elseif p[pi] == ch || (p[pi] == "?" && ch != "/")
+          next[pi + 1] = true
+        end
+      end
+      pi = pi + 1
+    end
+    states = next
+  end
+  states = roe/agent_glob_closure(p, states)
+  return index_or(states, plen, false)
+end
+
+// Epsilon transitions: stars may match nothing, including the slash in **/.
+// A bounded set of pattern positions avoids exponential glob backtracking.
+verb roe/agent_glob_closure(p, initial_states)
+  let states = initial_states
+  let plen = roe/list_length(p)
+  let pi = 0
+  while pi < plen
+    if index_or(states, pi, false) && p[pi] == "*"
+      let successor = pi + 1
+      if successor < plen && p[successor] == "*"
+        successor = successor + 1
+        if successor < plen && p[successor] == "/"
+          states[successor + 1] = true
+        end
+      end
+      states[successor] = true
+    end
+    pi = pi + 1
+  end
+  return states
+end
+
+verb roe/agent_glob(arguments @ #map)
+  let pattern = roe/agent_args_string(arguments, :pattern)
+  pattern != "" || return {:status -> "error", :content -> "missing pattern"}
+  let prefix = roe/agent_args_string(arguments, :path)
+  if prefix == "." || prefix == "./"
+    prefix = ""
+  end
+  let directories = [prefix]
+  let cursor = 0
+  let examined = 0
+  let matches = []
+  while cursor < roe/list_length(directories) && examined < 4096 && roe/list_length(matches) < 100
+    let directory = directories[cursor]
+    cursor = cursor + 1
+    for entry in source/RepositoryEntry(#roe/source_repository, #roe/source_worktree, directory, ?path, ?kind, ?name, ?provider)
+      examined = examined + 1
+      if entry[:kind] == "directory"
+        if entry[:name] != ".git" && entry[:name] != ".cache" && entry[:name] != "target" && entry[:name] != "node_modules"
+          directories = [@directories, entry[:path]]
+        end
+      elseif roe/agent_glob_match(pattern, entry[:path])
+        matches = [@matches, entry[:path]]
+      end
+      if examined >= 4096 || roe/list_length(matches) >= 100
+        break
+      end
+    end
+  end
+  let content = "No matching files."
+  if matches != []
+    content = string_join(sort(matches), "\n")
+  end
+  return {:status -> "complete", :content -> content, :summary -> string_concat("glob ", pattern)}
+end
+
+verb roe/agent_ls(arguments @ #map)
+  let path = roe/agent_args_string(arguments, :path)
+  if path == "." || path == "./"
+    path = ""
+  end
+  let lines = []
+  let count = 0
+  for entry in source/RepositoryEntry(#roe/source_repository, #roe/source_worktree, path, ?child_path, ?kind, ?name, ?provider)
+    if count < 256
+      let prefix = "file  "
+      if entry[:kind] == "directory"
+        prefix = "dir   "
+      end
+      lines = [@lines, string_concat(prefix, entry[:child_path])]
+      count = count + 1
+    end
+  end
+  let content = "No entries."
+  if lines != []
+    content = string_join(lines, "\n")
+  end
+  return {:status -> "complete", :content -> content, :summary -> string_concat("ls ", path)}
+end
+
+verb roe/agent_invoke_tool(name @ #string, arguments @ #map)
+  if name == "read"
+    return roe/agent_read(arguments)
+  elseif name == "grep"
+    return roe/agent_grep(arguments)
+  elseif name == "glob"
+    return roe/agent_glob(arguments)
+  elseif name == "ls"
+    return roe/agent_ls(arguments)
+  end
+  return {:status -> "error", :content -> string_concat("unknown tool: ", name), :summary -> name}
+end
+
+verb roe/agent_build_tools()
+  let tools = []
+  for found in roe/AgentToolEnabled(#roe/default_agent, ?tool)
+    let exactly {:name -> name} = roe/AgentToolName(found[:tool], ?name)
+    let exactly {:description -> description} = roe/AgentToolDescription(found[:tool], ?description)
+    let exactly {:parameters -> parameters} = roe/AgentToolParameters(found[:tool], ?parameters)
+    tools = [@tools, {:type -> "function", :name -> name, :description -> description, :parameters -> json_decode(parameters)}]
+  end
+  return tools
+end
+
+verb roe/agent_build_input(transcript)
+  let input = []
+  for message in roe/agent_messages(transcript)
+    let exactly {:role -> role} = roe/AgentMessageRole(message, ?role)
+    let exactly {:content -> content} = roe/AgentMessageContent(message, ?content)
+    if role == "user"
+      input = [@input, {:role -> "user", :content -> content}]
+    elseif role == "assistant"
+      if content != ""
+        input = [@input, {:role -> "assistant", :content -> content}]
+      end
+      for found in roe/AgentToolCallMessage(?call, message)
+        let exactly {:id -> call_id} = roe/AgentToolCallId(found[:call], ?id)
+        let exactly {:name -> name} = roe/AgentToolCallName(found[:call], ?name)
+        let exactly {:arguments -> arguments} = roe/AgentToolCallArguments(found[:call], ?arguments)
+        input = [@input, {:type -> "function_call", :call_id -> call_id, :name -> name, :arguments -> arguments}]
+      end
+    elseif role == "tool"
+      let parsed = from_literal(content)
+      if let ok(value) = parsed
+        input = [@input, {:type -> "function_call_output", :call_id -> value[:tool_call_id], :output -> value[:content]}]
+      end
+    end
+  end
+  return input
+end
+
+verb roe/agent_record_tool_call(message, event)
+  let call_id = index_or(event, :call_id, none)
+  let name = index_or(event, :name, none)
+  let arguments = index_or(event, :arguments, none)
+  if call_id == none || name == none || arguments == none
+    return none
+  end
+  let call = frob(#roe/agent_tool_call, [message, call_id])
+  if roe/AgentToolCall(call)
+    return none
+  end
+  string_len(call_id) <= 256 || raise E_BOUNDS, "agent tool call ID is too long"
+  string_len(name) <= 64 || raise E_BOUNDS, "agent tool name is too long"
+  string_len(arguments) <= 16384 || raise E_BOUNDS, "agent tool arguments are too long"
+  assert roe/AgentToolCall(call)
+  assert roe/AgentToolCallMessage(call, message)
+  assert roe/AgentToolCallId(call, call_id)
+  assert roe/AgentToolCallName(call, name)
+  assert roe/AgentToolCallArguments(call, arguments)
+  assert roe/AgentToolCallStatus(call, "pending")
+  return some(call)
+end
+
+verb roe/agent_set_tool_status(call, status @ #string)
+  retract roe/AgentToolCallStatus(call, _)
+  assert roe/AgentToolCallStatus(call, status)
+end
+
+verb roe/agent_stream_events(message)
+  if index_or(message, :type, none) == :batch
+    return index_or(message, :events, [])
+  end
+  return [message]
+end
+
+verb roe/agent_stream_turn(actor, session, transcript)
+  let assistant = roe/agent_append_message(session, transcript, "assistant", "", "streaming")
+  roe/agent_render(actor, session, false)
+  let [receiver, sender] = mailbox()
+  let instructions = "You are the read-only coding agent inside Roe. Inspect the workspace before answering questions about it. You may use read, grep, glob, and ls. Unsaved editor buffers are authoritative. Do not claim to edit files or run commands."
+  let model = roe/agent_model()
+  let input = roe/agent_build_input(transcript)
+  let tools = roe/agent_build_tools()
+  let text = ""
+  let calls = []
+  let done = false
+  let failed = false
+  try
+    let producer = spawn :roe/agent_request(model: model, input: input, instructions: instructions, tools: tools, sender: sender)
+    while done == false
+      let ready = mailbox_recv([receiver])
+      for group in ready
+        for message in group[1]
+          for event in roe/agent_stream_events(message)
+            let kind = index_or(event, :type, none)
+            if kind == :text_delta
+              let delta = index_or(event, :delta, "")
+              if string_len(text) < 262144
+                text = string_concat(text, delta)
+                if string_len(text) > 262144
+                  text = string_slice(text, 0, 262144)
+                end
+              end
+            elseif kind == :tool_call_ready
+              roe/list_length(calls) < 16 || raise E_BOUNDS, "agent response exceeds 16 tool calls"
+              let call = roe/agent_record_tool_call(assistant, event)
+              if call
+                let exactly {:value -> call} = call
+                calls = [@calls, call]
+              end
+            elseif kind == :completed
+              if text == ""
+                text = index_or(event, :text, "")
+              end
+              done = true
+            elseif kind == :incomplete
+              text = string_concat(text, "\n(LLM response was incomplete)")
+              failed = true
+              done = true
+            elseif kind == :error
+              text = string_concat(text, string_concat("\n(LLM error: ", string_concat(index_or(event, :message, "unknown error"), ")")))
+              failed = true
+              done = true
+            end
+          end
+          if string_len(text) > 262144
+            text = string_slice(text, 0, 262144)
+          end
+          retract roe/AgentMessageContent(assistant, _)
+          assert roe/AgentMessageContent(assistant, text)
+          roe/agent_render(actor, session, false)
+        end
+      end
+    end
+  catch err
+    failed = true
+    text = string_concat("(agent stream error: ", string_concat(to_literal(err), ")"))
+    retract roe/AgentMessageContent(assistant, _)
+    assert roe/AgentMessageContent(assistant, text)
+  end
+  mailbox_close(receiver)
+  retract roe/AgentMessageStatus(assistant, _)
+  let status = "complete"
+  if failed
+    status = "failed"
+  end
+  assert roe/AgentMessageStatus(assistant, status)
+  if failed
+    // Failed streams never execute their pending calls. Do not carry orphaned
+    // function calls (without outputs) into the next model request.
+    for found in roe/AgentToolCallMessage(?call, assistant)
+      let call = found[:call]
+      retract roe/AgentToolCall(call)
+      retract roe/AgentToolCallMessage(call, _)
+      retract roe/AgentToolCallId(call, _)
+      retract roe/AgentToolCallName(call, _)
+      retract roe/AgentToolCallArguments(call, _)
+      retract roe/AgentToolCallStatus(call, _)
+    end
+    roe/agent_render(actor, session, false)
+    return none
+  end
+  roe/agent_render(actor, session, false)
+  return some({:message -> assistant, :calls -> calls, :text -> text})
+end
+
+verb roe/agent_request(model, input, instructions, tools, sender)
+  try
+    return llm_responses_stream(model, input, instructions, {:stream -> true}, tools, sender)
+  catch err
+    mailbox_send(sender, {:type -> :error, :message -> to_literal(err)})
+  end
+end
+
+verb roe/agent_execute_tools(actor, session, transcript, response)
+  let assistant = response[:message]
+  for call in response[:calls]
+    let exactly {:name -> name} = roe/AgentToolCallName(call, ?name)
+    let exactly {:arguments -> arguments_text} = roe/AgentToolCallArguments(call, ?arguments)
+    roe/agent_set_tool_status(call, "executing")
+    roe/agent_render(actor, session, false)
+    let exactly {:view -> view} = roe/AgentView(session, ?view)
+    let exactly {:buffer -> buffer} = roe/AgentBuffer(session, ?buffer)
+    roe/show_typeout(actor, session, view, buffer, :agent_tool, string_concat("Agent tool: ", name), string_concat(arguments_text, "\n\nRunning…"))
+    commit()
+    let result
+    try
+      let arguments = json_decode(arguments_text)
+      result = roe/agent_invoke_tool(name, arguments)
+    catch err
+      result = {:status -> "error", :content -> string_concat("tool error: ", to_literal(err)), :summary -> name}
+    end
+    let status = result[:status]
+    roe/agent_set_tool_status(call, status)
+    let tool_result = frob(#roe/agent_tool_result, call)
+    assert roe/AgentToolResult(tool_result)
+    assert roe/AgentToolResultCall(tool_result, call)
+    assert roe/AgentToolResultContent(tool_result, result[:content])
+    assert roe/AgentToolResultFailed(tool_result, status == "error")
+    let exactly {:call_id -> call_id} = roe/AgentToolCallId(call, ?call_id)
+    let encoded = to_literal({:tool_call_id -> call_id, :content -> result[:content]})
+    roe/agent_append_message(session, transcript, "tool", encoded, status)
+    roe/agent_render(actor, session, false)
+    let summary = index_or(result, :summary, name)
+    roe/show_typeout(actor, session, view, buffer, :agent_tool, string_concat("Agent tool: ", name), string_concat(summary, string_concat("\n\n", status)))
+  end
+  return :complete
+end
+
+verb roe/agent_run_body(actor, session, transcript)
+  let round = 0
+  while round < 4
+    round = round + 1
+    let response_option = roe/agent_stream_turn(actor, session, transcript)
+    if not response_option
+      return :failed
+    end
+    let exactly {:value -> response} = response_option
+    if response[:calls] == []
+      if response[:text] == ""
+        let message = response[:message]
+        retract roe/AgentMessageContent(message, _)
+        assert roe/AgentMessageContent(message, "(no response)")
+      end
+      return :complete
+    end
+    roe/agent_execute_tools(actor, session, transcript, response)
+  end
+  roe/agent_append_message(session, transcript, "assistant", "(tool round limit reached)", "failed")
+  return :round_limit
+end
+
+verb roe/agent_run(actor, session, transcript)
+  retract roe/AgentStreaming(session, _)
+  assert roe/AgentStreaming(session, true)
+  roe/agent_render(actor, session, false)
+  try
+    roe/agent_run_body(actor, session, transcript)
+  catch err
+    // A full transcript must still release the busy flag without discarding
+    // earlier messages to make room for an error.
+    let messages = roe/agent_messages(transcript)
+    let error_text = string_concat("(agent error: ", string_concat(to_literal(err), ")"))
+    if roe/list_length(messages) < 128
+      roe/agent_append_message(session, transcript, "assistant", error_text, "failed")
+    else
+      emit(session, {:kind -> :host_action, :action -> :echo, :text -> error_text})
+    end
+  end
+  retract roe/AgentStreaming(session, _)
+  assert roe/AgentStreaming(session, false)
+  roe/agent_render(actor, session, false)
+  return :complete
+end

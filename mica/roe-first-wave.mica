@@ -27,6 +27,7 @@ make_identity(:roe/mark_whole_buffer)
 assert source/ProviderEnabled("roe-buffer", true)
 assert source/ProviderEnabled("local-worktree", true)
 assert source/RepositoryProvider(#roe/source_repository, "roe-buffer", "read", 100)
+assert source/RepositoryProvider(#roe/source_repository, "roe-buffer", "list", 100)
 assert source/RepositoryProvider(#roe/source_repository, "local-worktree", "read", 0)
 assert source/RepositoryProvider(#roe/source_repository, "local-worktree", "list", 0)
 
@@ -870,6 +871,8 @@ verb roe/prompt_key(actor, session, sequence)
       let exactly {:value -> target_view} = target
       emit(session, {:kind -> :host_action, :action -> :create_buffer, :buffer_name -> query, :view -> target_view})
       return :ok
+    elseif prompt_kind == :command_argument && query != ""
+      chosen_option = some([query, query])
     elseif (prompt_kind == :find_file || prompt_kind == :visit_file || prompt_kind == :save_file) && query != ""
       let chosen_path = query
       if not string_starts_with(query, "/")
@@ -958,7 +961,13 @@ verb roe/prompt_key(actor, session, sequence)
       return :ok
     elseif prompt_kind == :command_argument
       let exactly {:value -> command_state} = aux
-      let accepted = invoke(:roe/accept_argument_candidate, {:actor -> actor, :session -> session, :command -> command_state[0], :position -> command_state[1], :candidate -> chosen[1]})
+      let completion_rows = roe/ArgumentCompletion(command_state[0], command_state[1], ?selector)
+      let accepted
+      if completion_rows
+        accepted = invoke(:roe/accept_argument_candidate, {:actor -> actor, :session -> session, :command -> command_state[0], :position -> command_state[1], :candidate -> chosen[1]})
+      else
+        accepted = invoke(:roe/accept_argument_text, {:actor -> actor, :session -> session, :command -> command_state[0], :position -> command_state[1], :text -> query})
+      end
       accepted[:kind] == :argument_value || return :invalid_argument
       let implementation_rows = roe/CommandImplementation(command_state[0], ?selector)
       implementation_rows || return :missing_implementation

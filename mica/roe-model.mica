@@ -142,6 +142,7 @@ make_relation(:source/FileText, 7)
 make_relation(:source/FileLines, 9)
 make_relation(:source/FileLineCount, 6)
 make_relation(:source/RepositoryEntry, 7)
+make_relation(:source/TextSearch, 15)
 
 // Ephemeral host associations and native-cached observations. The host owns
 // their invalidation and never persists them in a named unit or durable store.
@@ -520,6 +521,7 @@ assert RoleCanRead(#roe/editor_role, :source/FileText)
 assert RoleCanRead(#roe/editor_role, :source/FileLines)
 assert RoleCanRead(#roe/editor_role, :source/FileLineCount)
 assert RoleCanRead(#roe/editor_role, :source/RepositoryEntry)
+assert RoleCanRead(#roe/editor_role, :source/TextSearch)
 assert RoleCanRead(#roe/editor_role, :roe/CommandSelector)
 assert RoleCanRead(#roe/editor_role, :roe/CommandName)
 assert RoleCanRead(#roe/editor_role, :roe/CommandHostAction)
@@ -563,6 +565,7 @@ assert RoleCanInvoke(#roe/editor_role, :roe/invalidate_syntax_hook)
 assert RoleCanInvoke(#roe/editor_role, :roe/other_window)
 assert RoleCanInvoke(#roe/editor_role, :roe/acquire_argument)
 assert RoleCanInvoke(#roe/editor_role, :roe/accept_argument_candidate)
+assert RoleCanInvoke(#roe/editor_role, :roe/accept_argument_text)
 assert RoleCanInvoke(#roe/editor_role, :roe/prompt_candidates)
 assert RoleCanInvoke(#roe/editor_role, :roe/refresh_prompt)
 assert RoleCanInvoke(#roe/editor_role, :roe/prompt_key)
@@ -939,4 +942,23 @@ verb roe/accept_argument_candidate(actor, session, command, position, candidate)
     return :unsupported_candidate_type
   end
   return {:kind -> :argument_value, :value -> candidate, :label -> selected_label, :value_kind -> argument_kind}
+end
+
+// Accept free-form minibuffer text only for command arguments that deliberately
+// omit a completion provider. Completion-backed arguments continue through the
+// candidate validator above.
+verb roe/accept_argument_text(actor, session, command, position, text @ #string)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  roe/DiscoverableCommand(actor, command) || return :not_discoverable
+  let completion_rows = roe/ArgumentCompletion(command, position, ?selector)
+  if completion_rows
+    return :completion_required
+  end
+  let argument_rows = roe/CommandArgument(command, position, ?name, ?value_kind)
+  argument_rows || return :missing_argument
+  let exactly {:name -> argument_name, :value_kind -> value_kind} = argument_rows
+  if value_kind != :string && value_kind != :opaque && value_kind != :path
+    return :unsupported_argument_type
+  end
+  return {:kind -> :argument_value, :value -> text, :name -> argument_name, :value_kind -> value_kind}
 end

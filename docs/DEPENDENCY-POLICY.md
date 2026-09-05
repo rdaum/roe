@@ -14,7 +14,7 @@ metadata, and upstream release notes.
 | Group              | Dependencies                                                    | Policy                                                                                                         |
 | ------------------ | --------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
 | Routine compatible | `arboard`, `crossterm`, `notify`, `ropey`, `similar`, `slotmap` | Follow current stable releases compatible with the MSRV.                                                       |
-| Runtime pins       | `compio = 0.18.0`, exact `mica-driver` revision                 | Change together with Mica lifecycle, replacement, cancellation, and terminal workflow tests.                   |
+| Runtime pins       | `compio = 0.18.0`, exact Mica crate revision                    | Change together with Mica lifecycle, replacement, cancellation, streaming, and terminal workflow tests.        |
 | Mica features      | `mica-driver` with `default-features = false`, `source-provider` enabled | Keep CPU relation execution and Roe's bounded source-provider graph; do not initialize Mica WGPU, Fjall, or Cranelift. |
 | Coupled graphics   | `vello`, its WGPU graph, `parley`, `winit`, `pollster`          | Upgrade as one reviewed group with Vello build and frontend conformance checks.                                |
 | Removed            | `async-trait`, direct `futures`                                 | Unused actor/event-stream dependencies removed in Phase 1.                                                     |
@@ -25,7 +25,8 @@ persistence, and Cranelift compilation disabled until Roe and Mica intentionally
 strategies. The `source-provider` feature is enabled deliberately. It brings Mica's bounded
 local-worktree and composable provider contract, together with its Git/JJ, tree-sitter, and Tokio
 dependency group; Roe currently configures only local-worktree access and its host-owned live-buffer
-overlay.
+overlay. `mica-external-http` is pinned to the same Mica revision and supplies the reusable HTTP and
+streaming LLM host handlers used by the workspace agent.
 
 ## Required checks
 
