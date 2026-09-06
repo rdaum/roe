@@ -53,8 +53,9 @@ In short Mica takes the place that Lisp usually takes in the rest of the Emacs p
 - A streaming, read-only workspace agent in `*Agent*`, with Mica-owned transcripts and `read`,
   `grep`, `glob`, and `ls` tools over those same composable source providers. Tool activity appears
   in typeout windows.
-- Mica syntax highlighting in scratch and `.mica` files. Rust and other language modes are future
-  additions.
+- Mica syntax highlighting in scratch and `.mica` files.
+- [Rust mode](docs/RUST-MODE.md) with syntax highlighting, Tab indentation, and newline indentation.
+  Rust mode activates for `.rs` files or through `M-x rust-mode`.
 - Safe Mica experimentation: Roe rejects invalid code and keeps the last working editor behavior.
 
 ## Building and running

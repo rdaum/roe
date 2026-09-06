@@ -84,6 +84,7 @@ mod buffers;
 mod clipboard;
 mod commands;
 mod file_prompts;
+mod indentation;
 mod layout;
 mod native;
 mod pointer;
@@ -91,6 +92,7 @@ mod policy;
 mod presentation;
 mod protocol;
 mod recovery;
+mod rust_mode;
 mod sources;
 
 mod frontend;

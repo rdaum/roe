@@ -154,6 +154,32 @@ impl MicaHost {
         use MicaHostAction::*;
         let name = symbol(value, "action")?;
         Ok(match name.as_str() {
+            "indent_line" => {
+                let logical = field(value, "buffer")?
+                    .as_identity()
+                    .ok_or("indent buffer must be an identity")?;
+                let state = self.bridge.state.lock().unwrap();
+                if state.actor != Some(self.actor)
+                    || !state.resources.contains_key(&logical)
+                    || !state.services.contains(&sym("text_read"))
+                    || !state.services.contains(&sym("text_write"))
+                {
+                    return Err(
+                        "indentation is not authorized for this endpoint, buffer, or service"
+                            .into(),
+                    );
+                }
+                Indent {
+                    view: self.decode_view(value)?,
+                    buffer: self.decode_buffer(value, "buffer")?,
+                    revision: position(value, "revision")? as u64,
+                    newline: field(value, "newline")?
+                        .as_bool()
+                        .ok_or("indent newline must be a boolean")?,
+                    width: position(value, "width")?,
+                    tab_width: position(value, "tab_width")?,
+                }
+            }
             "agent_render" => match symbol(value, "phase")?.as_str() {
                 "open" => AgentOpen {
                     view: self.decode_view(value)?,
@@ -286,6 +312,20 @@ impl MicaHost {
                 .ok_or_else(|| "Mica precedence must be an integer".to_owned())
         };
         Ok(match kind.as_str() {
+            "parser_policy" => Parser {
+                mode: string(value, "mode")?,
+                grammar: symbol(value, "grammar")?,
+                query: string(value, "query")?,
+            },
+            "indentation_policy" => Indentation {
+                mode: string(value, "mode")?,
+                query: string(value, "query")?,
+                anchor: symbol(value, "anchor")?,
+                offset: field(value, "offset")?
+                    .as_int()
+                    .ok_or("indentation offset must be an integer")?,
+                precedence: precedence()?,
+            },
             "mode_policy" => Mode {
                 buffer: self.decode_buffer(value, "buffer")?,
                 name: string(value, "name")?,
@@ -305,12 +345,30 @@ impl MicaHost {
                 pattern: string(value, "pattern")?,
                 precedence: precedence()?,
             },
-            "highlight_policy" => Highlight {
-                mode: string(value, "mode")?,
-                capture: symbol(value, "capture")?,
-                face: string(value, "face")?,
-                precedence: precedence()?,
-            },
+            "highlight_policy" => {
+                let list = field(value, "rules")?;
+                let count = list.list_len().ok_or("highlight rules must be a list")?;
+                if count > MAX_POLICY_FACTS {
+                    return Err("highlight rules exceed the 256-rule limit".into());
+                }
+                let mut rules = Vec::with_capacity(count);
+                for index in 0..count {
+                    let rule = list.list_get(index).ok_or("missing highlight rule")?;
+                    rules.push((
+                        symbol(&rule, "capture")?,
+                        string(&rule, "face")?,
+                        field(&rule, "precedence")?
+                            .as_int()
+                            .ok_or("highlight precedence must be an integer")?,
+                    ));
+                }
+                rules.sort_unstable();
+                rules.dedup();
+                Highlights {
+                    buffer: self.decode_buffer(value, "buffer")?,
+                    rules,
+                }
+            }
             _ => return Err(format!("unknown Mica policy fact: {kind}")),
         })
     }

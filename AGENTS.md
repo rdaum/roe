@@ -46,6 +46,8 @@ Mica owns:
 
 The core ontology and generic behaviors live in `mica/roe-model.mica`. Shipped editor policy and
 bindings live in `mica/roe-first-wave.mica`.
+Rust-mode policy lives in `mica/roe-rust.mica`. Its package is `roe/rust_package`.
+The usage and configuration guide is `docs/RUST-MODE.md`.
 
 ### Rust owns mechanisms
 
@@ -396,6 +398,9 @@ should use one test thread when they share driver/recovery state.
 - Dependency policy and temporary advisory exceptions live in `docs/DEPENDENCY-POLICY.md`.
 - `scripts/check-dependencies.sh` parses manifests and the lockfile to enforce runtime policy and centralized dependencies.
 - Rust formatting is checked with `cargo fmt`; strict Clippy is part of `scripts/check.sh`.
+- Tree-sitter and its Rust grammar use the versions already fixed by the Mica dependency graph.
+  The native syntax service shares bounded buffer trees between highlighting and indentation.
+  Keep grammar selection, queries, faces, indentation rules, and mode bindings in Mica.
 
 Do not update Compio, Mica, or the graphics stack as an incidental change. A Mica revision change
 requires rechecking source compatibility, lifecycle, authority, replacement, recovery, backpressure,

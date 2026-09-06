@@ -31,13 +31,24 @@ impl Write for CountingWriter {
     }
 }
 
-fn fixture() -> Editor {
+fn fixture(rust: bool) -> Editor {
     let buffer = Buffer::named("*baseline*", roe_core::buffer::BufferKind::Ordinary);
     let mut content = String::with_capacity(FIXTURE_LINES * 64);
+    if rust {
+        buffer.set_visited_file(Some("baseline.rs".into()));
+        content.push_str("fn baseline() {\n");
+    }
     for line in 0..FIXTURE_LINES {
-        content.push_str(&format!(
-            "line {line:04}: Roe baseline text with unicode lambda λ\n"
-        ));
+        if rust {
+            content.push_str(&format!("    let value_{line} = \"Rust source with λ\";\n"));
+        } else {
+            content.push_str(&format!(
+                "line {line:04}: Roe baseline text with unicode lambda λ\n"
+            ));
+        }
+    }
+    if rust {
+        content.push_str("}\n");
     }
     buffer.load_str(&content);
     Editor::new(buffer, Frame::new(120, 40))
@@ -61,13 +72,15 @@ fn main() -> io::Result<()> {
 
 async fn run() -> io::Result<()> {
     let process_started = Instant::now();
-    let editor = fixture();
+    let rust = std::env::args().any(|argument| argument == "--rust");
+    let editor = fixture(rust);
     let fixture_construction = process_started.elapsed();
     let workspace = WorkspaceHost::open_with_mica(editor, CapabilityGrants::editor_default())
         .map_err(io::Error::other)?;
     let mut session =
         DirectSessionClient::new(workspace, AttachmentConfiguration::headless(80, 23));
     let initial = session.initial_output().await;
+    check_output(&initial)?;
     let ready = process_started.elapsed();
     let post_fixture_rss_kib = resident_memory_kib();
 
@@ -77,11 +90,13 @@ async fn run() -> io::Result<()> {
             .dispatch(session.envelope(InputEvent::Text("x".to_owned())))
             .await
             .map_err(io::Error::other)?;
+        check_output(&inserted)?;
         black_box(inserted);
         let deleted = session
             .dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Backspace])))
             .await
             .map_err(io::Error::other)?;
+        check_output(&deleted)?;
         black_box(deleted);
     }
     let editing_elapsed = editing_started.elapsed();
@@ -105,6 +120,7 @@ async fn run() -> io::Result<()> {
     let redraw_elapsed = redraw_started.elapsed();
     let post_workload_rss_kib = resident_memory_kib();
 
+    println!("syntax_mode={}", if rust { "rust" } else { "fundamental" });
     println!("fixture_lines={FIXTURE_LINES}");
     println!(
         "fixture_construction_us={}",
@@ -148,5 +164,14 @@ async fn run() -> io::Result<()> {
         println!("mica_workload_rss_growth_kib=unavailable");
     }
 
+    Ok(())
+}
+
+fn check_output(output: &roe_core::session::SessionOutput) -> io::Result<()> {
+    for event in &output.lifecycle {
+        if let roe_core::session::LifecycleEvent::Error(error) = event {
+            return Err(io::Error::other(error.clone()));
+        }
+    }
     Ok(())
 }

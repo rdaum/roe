@@ -185,6 +185,14 @@ pub enum NativeOperation {
         end: usize,
         text: String,
     },
+    /// Atomic, bounded edit calculated from an observed native text revision.
+    ReplaceAtRevision {
+        resource: ResourceId,
+        revision: u64,
+        start: usize,
+        end: usize,
+        text: String,
+    },
     SetSelection {
         resource: ResourceId,
         selection: Option<TextSelection>,
@@ -252,6 +260,8 @@ pub enum NativeResult {
 
 #[derive(Debug, thiserror::Error)]
 pub enum KernelError {
+    #[error("native text revision changed (expected {expected}, observed {actual})")]
+    StaleRevision { expected: u64, actual: u64 },
     #[error("native capability {0:?} was not granted")]
     CapabilityDenied(Capability),
     #[error("native resource {0:?} is stale or unknown")]
@@ -302,6 +312,20 @@ pub struct NativeKernel {
 }
 
 impl NativeKernel {
+    /// Authorize before resolving the generation, then capture one coherent Rope.
+    pub(crate) fn observe_text(
+        &self,
+        resource: ResourceId,
+    ) -> Result<(u64, ropey::Rope), KernelError> {
+        self.require(Capability::TextRead)?;
+        let entry = self.resource(resource)?;
+        entry.buffer.with_read(|inner| {
+            if inner.buffer.len_bytes() > crate::syntax_highlighting::MAX_HIGHLIGHT_SOURCE_BYTES {
+                return Err(KernelError::IoLimit("syntax source exceeds 1 MiB".into()));
+            }
+            Ok((inner.text_revision, inner.buffer.clone()))
+        })
+    }
     pub fn new(grants: CapabilityGrants) -> Self {
         Self::with_clock(grants, Arc::new(SystemNativeClock))
     }
@@ -351,6 +375,49 @@ impl NativeKernel {
 
     pub fn execute(&mut self, operation: NativeOperation) -> Result<NativeResult, KernelError> {
         match operation {
+            NativeOperation::ReplaceAtRevision {
+                resource,
+                revision,
+                start,
+                end,
+                text,
+            } => {
+                self.require(Capability::TextWrite)?;
+                if text.len() > crate::native_io::MAX_IO_BYTES {
+                    return Err(KernelError::IoLimit("replacement exceeds 1 MiB".into()));
+                }
+                let entry = self.resource_mut(resource)?;
+                entry.buffer.with_write(|inner| {
+                    if inner.text_revision != revision {
+                        return Err(KernelError::StaleRevision {
+                            expected: revision,
+                            actual: inner.text_revision,
+                        });
+                    }
+                    validate_range(start, end, inner.buffer.len_chars())?;
+                    if inner.read_only {
+                        return Err(KernelError::ReadOnly(resource));
+                    }
+                    if inner.buffer.slice(start..end) == text {
+                        return Ok(());
+                    }
+                    inner.begin_undo_group();
+                    inner.delete_pos(start, (end - start) as isize);
+                    inner.insert_pos(text.clone(), start);
+                    inner.end_undo_group();
+                    let inserted = text.chars().count();
+                    inner.mark = inner
+                        .mark
+                        .map(|mark| map_edit_position(mark, start, end, inserted));
+                    Ok(())
+                })?;
+                if let Some(selection) = entry.selection.as_mut() {
+                    let inserted = text.chars().count();
+                    selection.anchor = map_edit_position(selection.anchor, start, end, inserted);
+                    selection.active = map_edit_position(selection.active, start, end, inserted);
+                }
+                Ok(text_changed(resource, entry))
+            }
             NativeOperation::CreateText { name, initial } => {
                 self.require(Capability::TextWrite)?;
                 let buffer = Buffer::named(name, crate::buffer::BufferKind::Ordinary);
@@ -638,6 +705,21 @@ impl NativeKernel {
             .filter(|slot| slot.generation == id.generation)
             .and_then(|slot| slot.resource.as_mut())
             .ok_or(KernelError::StaleResource(id))
+    }
+}
+
+pub(crate) fn map_edit_position(
+    position: usize,
+    start: usize,
+    end: usize,
+    inserted: usize,
+) -> usize {
+    if position < start {
+        position
+    } else if position <= end {
+        start + inserted
+    } else {
+        position - (end - start) + inserted
     }
 }
 

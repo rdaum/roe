@@ -16,7 +16,7 @@ pub(crate) const MAX_HIGHLIGHT_SPANS: usize = 16_384;
 pub(crate) struct HighlightSpan {
     pub(crate) start: usize,
     pub(crate) end: usize,
-    pub(crate) capture: &'static str,
+    pub(crate) capture: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,7 +206,7 @@ fn byte_spans_to_chars(source: &str, spans: Vec<ByteHighlightSpan>) -> Vec<Highl
         converted.push(HighlightSpan {
             start,
             end: char_cursor,
-            capture: span.capture,
+            capture: span.capture.into(),
         });
         byte_cursor = span.end;
     }
@@ -226,7 +226,7 @@ mod tests {
             .map(|span| {
                 (
                     &source[char_to_byte(source, span.start)..char_to_byte(source, span.end)],
-                    span.capture,
+                    span.capture.as_str(),
                 )
             })
             .collect();
@@ -245,12 +245,12 @@ mod tests {
         assert!(spans.contains(&HighlightSpan {
             start: 2,
             end: 5,
-            capture: "keyword",
+            capture: "keyword".into(),
         }));
         assert!(spans.contains(&HighlightSpan {
             start: 14,
             end: 17,
-            capture: "string",
+            capture: "string".into(),
         }));
     }
 

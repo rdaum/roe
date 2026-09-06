@@ -1,0 +1,167 @@
+// Copyright (C) 2026 Ryan Daum
+// SPDX-License-Identifier: GPL-3.0-only
+// Rust editing policy. The native syntax service only executes these queries
+// and anchor rules; it does not select modes, faces, or Rust indentation cases.
+
+make_identity(:roe/rust_package)
+make_identity(:roe/rust_mode)
+make_identity(:roe/rust_map)
+make_identity(:roe/enable_rust_mode)
+make_identity(:roe/indent_line)
+make_identity(:roe/newline_and_indent)
+assert roe/Package(#roe/rust_package)
+assert roe/PackageUnit(#roe/rust_package, :roe/rust)
+assert roe/PackageEnabled(#roe/rust_package, true)
+assert Delegates(#roe/rust_mode, #roe/mode, 0)
+assert roe/MajorMode(#roe/rust_mode)
+assert roe/ModeName(#roe/rust_mode, "rust")
+assert roe/PackageMode(#roe/rust_package, #roe/rust_mode)
+assert roe/Keymap(#roe/rust_map)
+assert roe/PackageKeymap(#roe/rust_package, #roe/rust_map)
+assert roe/KeymapParent(#roe/rust_map, #roe/global_map)
+assert roe/ModeKeymap(#roe/rust_mode, #roe/rust_map, 200)
+assert roe/ModeHook(#roe/rust_mode, :roe/invalidate_syntax_hook, 100)
+assert roe/SyntaxRule(#roe/rust_mode, :word, "[[:alnum:]_]", 200)
+assert roe/Configuration(#roe/rust_mode, :indent_width, 4)
+assert roe/ConfigurationParent(#roe/rust_mode, #roe/core_configuration)
+
+roe/BufferSourceLanguage(buffer, :rust) :-
+  roe/BufferFileExtension(buffer, "rs")
+
+roe/BufferMajorMode(buffer, #roe/rust_mode) :-
+  roe/BufferFileExtension(buffer, "rs"),
+  not roe/BufferHasModeOverride(buffer)
+
+// Capture names and face mappings remain independent of the native grammar.
+// Query order resolves overlap: specific captures follow broad captures.
+assert roe/SyntaxParser(#roe/rust_mode, :rust, "(identifier) @variable\n(field_identifier) @variable\n(type_identifier) @type\n(primitive_type) @type\n[\"as\" \"async\" \"await\" \"break\" \"const\" \"continue\" \"default\" \"dyn\" \"else\" \"enum\" \"extern\" \"fn\" \"for\" \"gen\" \"if\" \"impl\" \"in\" \"let\" \"loop\" \"macro_rules!\" \"match\" \"mod\" \"move\" \"pub\" \"raw\" \"ref\" \"return\" \"static\" \"struct\" \"trait\" \"type\" \"union\" \"unsafe\" \"use\" \"where\" \"while\" \"yield\"] @keyword\n[(crate) (self) (super) (mutable_specifier)] @keyword\n[(integer_literal) (float_literal) (boolean_literal)] @number\n[(string_literal) (raw_string_literal) (char_literal)] @string\n[(line_comment) (block_comment)] @comment\n(function_item name: (identifier) @function)\n(function_signature_item name: (identifier) @function)\n(call_expression function: (identifier) @function)\n(call_expression function: (field_expression field: (field_identifier) @function))\n(call_expression function: (scoped_identifier name: (identifier) @function))\n(macro_invocation macro: (identifier) @macro)\n(lifetime) @lifetime\n[(attribute_item) (inner_attribute_item)] @attribute\n(ERROR) @error")
+
+make_identity(:roe/syntax_comment_face)
+assert roe/Face(#roe/syntax_comment_face)
+assert roe/FaceName(#roe/syntax_comment_face, "syntax-comment")
+assert roe/FaceAttribute(#roe/syntax_comment_face, :foreground, "#6a9955")
+assert roe/SyntaxHighlightRule(#roe/rust_mode, :comment, #roe/syntax_comment_face, 200)
+make_identity(:roe/syntax_string_face)
+assert roe/Face(#roe/syntax_string_face)
+assert roe/FaceName(#roe/syntax_string_face, "syntax-string")
+assert roe/FaceAttribute(#roe/syntax_string_face, :foreground, "#ce9178")
+assert roe/SyntaxHighlightRule(#roe/rust_mode, :string, #roe/syntax_string_face, 200)
+make_identity(:roe/syntax_number_face)
+assert roe/Face(#roe/syntax_number_face)
+assert roe/FaceName(#roe/syntax_number_face, "syntax-number")
+assert roe/FaceAttribute(#roe/syntax_number_face, :foreground, "#b5cea8")
+assert roe/SyntaxHighlightRule(#roe/rust_mode, :number, #roe/syntax_number_face, 200)
+make_identity(:roe/syntax_keyword_face)
+assert roe/Face(#roe/syntax_keyword_face)
+assert roe/FaceName(#roe/syntax_keyword_face, "syntax-keyword")
+assert roe/FaceAttribute(#roe/syntax_keyword_face, :foreground, "#c586c0")
+assert roe/SyntaxHighlightRule(#roe/rust_mode, :keyword, #roe/syntax_keyword_face, 200)
+make_identity(:roe/syntax_variable_face)
+assert roe/Face(#roe/syntax_variable_face)
+assert roe/FaceName(#roe/syntax_variable_face, "syntax-variable")
+assert roe/FaceAttribute(#roe/syntax_variable_face, :foreground, "#9cdcfe")
+assert roe/SyntaxHighlightRule(#roe/rust_mode, :variable, #roe/syntax_variable_face, 200)
+make_identity(:roe/syntax_type_face)
+assert roe/Face(#roe/syntax_type_face)
+assert roe/FaceName(#roe/syntax_type_face, "syntax-type")
+assert roe/FaceAttribute(#roe/syntax_type_face, :foreground, "#4ec9b0")
+assert roe/SyntaxHighlightRule(#roe/rust_mode, :type, #roe/syntax_type_face, 200)
+make_identity(:roe/syntax_function_face)
+assert roe/Face(#roe/syntax_function_face)
+assert roe/FaceName(#roe/syntax_function_face, "syntax-function")
+assert roe/FaceAttribute(#roe/syntax_function_face, :foreground, "#dcdcaa")
+assert roe/SyntaxHighlightRule(#roe/rust_mode, :function, #roe/syntax_function_face, 200)
+make_identity(:roe/syntax_macro_face)
+assert roe/Face(#roe/syntax_macro_face)
+assert roe/FaceName(#roe/syntax_macro_face, "syntax-macro")
+assert roe/FaceAttribute(#roe/syntax_macro_face, :foreground, "#dcdcaa")
+assert roe/SyntaxHighlightRule(#roe/rust_mode, :macro, #roe/syntax_macro_face, 200)
+make_identity(:roe/syntax_lifetime_face)
+assert roe/Face(#roe/syntax_lifetime_face)
+assert roe/FaceName(#roe/syntax_lifetime_face, "syntax-lifetime")
+assert roe/FaceAttribute(#roe/syntax_lifetime_face, :foreground, "#4ec9b0")
+assert roe/SyntaxHighlightRule(#roe/rust_mode, :lifetime, #roe/syntax_lifetime_face, 200)
+make_identity(:roe/syntax_attribute_face)
+assert roe/Face(#roe/syntax_attribute_face)
+assert roe/FaceName(#roe/syntax_attribute_face, "syntax-attribute")
+assert roe/FaceAttribute(#roe/syntax_attribute_face, :foreground, "#d4d4d4")
+assert roe/SyntaxHighlightRule(#roe/rust_mode, :attribute, #roe/syntax_attribute_face, 200)
+make_identity(:roe/syntax_error_face)
+assert roe/Face(#roe/syntax_error_face)
+assert roe/FaceName(#roe/syntax_error_face, "syntax-error")
+assert roe/FaceAttribute(#roe/syntax_error_face, :foreground, "#f44747")
+assert roe/SyntaxHighlightRule(#roe/rust_mode, :error, #roe/syntax_error_face, 200)
+
+// Rules are (mode, query, anchor, offset in indent-width units, precedence, enabled).
+// @scope contains the line; @target restricts a rule to a particular token.
+// @anchor defaults to @scope. More specific scopes break equal-priority ties.
+assert roe/IndentationRule(#roe/rust_mode, "[(block) (declaration_list) (field_declaration_list) (field_initializer_list) (enum_variant_list) (match_block) (arguments) (parameters) (array_expression) (tuple_expression) (tuple_type) (type_arguments) (type_parameters)] @scope", :line, 1, 100, true)
+assert roe/IndentationRule(#roe/rust_mode, "[(block \"}\" @target) (declaration_list \"}\" @target) (field_declaration_list \"}\" @target) (field_initializer_list \"}\" @target) (enum_variant_list \"}\" @target) (match_block \"}\" @target) (arguments \")\" @target) (parameters \")\" @target) (array_expression \"]\" @target) (tuple_expression \")\" @target) (tuple_type \")\" @target) (type_arguments \">\" @target) (type_parameters \">\" @target)] @scope", :line, 0, 200, true)
+assert roe/IndentationRule(#roe/rust_mode, "[(arguments . (_) @anchor) (parameters . (_) @anchor) (array_expression . (_) @anchor)] @scope", :first_child, 0, 110, true)
+assert roe/IndentationRule(#roe/rust_mode, "[(binary_expression) (field_expression) (where_clause)] @scope", :line, 1, 120, true)
+assert roe/IndentationRule(#roe/rust_mode, "(let_declaration value: (_) @scope @target) @anchor", :line, 1, 130, true)
+assert roe/IndentationRule(#roe/rust_mode, "(match_arm value: (_) @scope @target) @anchor", :line, 1, 130, true)
+assert roe/IndentationRule(#roe/rust_mode, "(ERROR \"{\" @anchor) @scope", :line, 1, 80, true)
+assert roe/IndentationRule(#roe/rust_mode, "[(raw_string_literal) (string_literal) (block_comment) (token_tree)] @scope", :preserve, 0, 1000, true)
+assert roe/IndentationRule(#roe/rust_mode, "(source_file) @scope", :zero, 0, 0, true)
+
+assert Delegates(#roe/enable_rust_mode, #roe/command, 0)
+assert roe/Command(#roe/enable_rust_mode)
+assert roe/CommandSelector(#roe/enable_rust_mode, :roe/enable_rust_mode)
+assert roe/CommandName(#roe/enable_rust_mode, "rust-mode")
+assert roe/CommandSummary(#roe/enable_rust_mode, "Use Rust editing policy in the active buffer")
+assert roe/PackageCommand(#roe/rust_package, #roe/enable_rust_mode)
+assert RoleCanInvoke(#roe/editor_role, :roe/enable_rust_mode)
+
+verb roe/enable_rust_mode(actor, session)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  let exactly {:view -> view} = roe/ActiveView(session, ?view)
+  let exactly {:buffer -> buffer} = roe/ViewBuffer(view, ?buffer)
+  roe/CanUseBuffer(actor, buffer) || return :buffer_denied
+  retract roe/BufferModeOverride(buffer, _)
+  assert roe/BufferModeOverride(buffer, #roe/rust_mode)
+  roe/publish_policy(actor, session)
+  return :ok
+end
+
+assert Delegates(#roe/indent_line, #roe/command, 0)
+assert roe/Command(#roe/indent_line)
+assert roe/CommandSelector(#roe/indent_line, :roe/indent_line)
+assert roe/CommandName(#roe/indent_line, "indent-line")
+assert roe/CommandSummary(#roe/indent_line, "Indent this line with the active mode's syntax rules")
+assert roe/PackageCommand(#roe/rust_package, #roe/indent_line)
+assert roe/KeyBinding(#roe/rust_map, "Tab", #roe/indent_line, 2000)
+assert RoleCanInvoke(#roe/editor_role, :roe/indent_line)
+assert Delegates(#roe/newline_and_indent, #roe/command, 0)
+assert roe/Command(#roe/newline_and_indent)
+assert roe/CommandSelector(#roe/newline_and_indent, :roe/newline_and_indent)
+assert roe/CommandName(#roe/newline_and_indent, "newline-and-indent")
+assert roe/CommandSummary(#roe/newline_and_indent, "Insert a newline and indent it in one undo group")
+assert roe/PackageCommand(#roe/rust_package, #roe/newline_and_indent)
+assert roe/KeyBinding(#roe/rust_map, "⏎", #roe/newline_and_indent, 2000)
+assert RoleCanInvoke(#roe/editor_role, :roe/newline_and_indent)
+assert RoleCanInvoke(#roe/editor_role, :roe/indent_current_line)
+
+verb roe/indent_line(actor, session)
+  return roe/indent_current_line(actor, session, false)
+end
+
+verb roe/newline_and_indent(actor, session)
+  return roe/indent_current_line(actor, session, true)
+end
+
+verb roe/indent_current_line(actor, session, newline)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  roe/CanRequestService(actor, :text_read) || return :text_read_denied
+  roe/CanRequestService(actor, :text_write) || return :text_write_denied
+  let exactly {:view -> view} = roe/ActiveView(session, ?view)
+  let exactly {:buffer -> buffer} = roe/ViewBuffer(view, ?buffer)
+  roe/CanUseBuffer(actor, buffer) || return :buffer_denied
+  let exactly {:mode -> mode} = roe/EffectiveMajorMode(buffer, ?mode)
+  let exactly {:revision -> revision} = roe/NativeBufferRevision(buffer, ?revision)
+  let exactly {:width -> width} = roe/EffectiveConfiguration(mode, :indent_width, ?width)
+  let exactly {:tab_width -> tab_width} = roe/EffectiveConfiguration(mode, :tab_width, ?tab_width)
+  emit(session, {:kind -> :host_action, :action -> :indent_line, :view -> view, :buffer -> buffer, :revision -> revision, :newline -> newline, :width -> width, :tab_width -> tab_width})
+  roe/emit_edit_hooks(actor, session)
+  return :ok
+end

@@ -265,6 +265,30 @@ impl WorkspaceHost {
     ) -> bool {
         use MicaHostAction::*;
         match action {
+            Indent {
+                view,
+                buffer,
+                revision,
+                newline,
+                width,
+                tab_width,
+            } => {
+                if let Err(message) = self.apply_indentation(
+                    view,
+                    buffer,
+                    revision,
+                    indentation::IndentationSettings {
+                        newline,
+                        width,
+                        tab_width,
+                    },
+                    invalidations,
+                ) {
+                    self.editor.set_echo_message(message.clone());
+                    lifecycle.push(LifecycleEvent::Error(message));
+                    invalidations.push(Invalidation::EchoArea);
+                }
+            }
             AgentOpen { view, name, text } => {
                 if text.chars().count() > MAX_AGENT_BUFFER_CHARS {
                     lifecycle.push(LifecycleEvent::Overloaded { detail: format!("agent transcript display exceeds the {MAX_AGENT_BUFFER_CHARS}-character limit") });

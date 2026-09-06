@@ -111,6 +111,7 @@ assert roe/SyntaxRule(#roe/fundamental_mode, :word, "[[:alnum:]_]", 100)
 assert Delegates(#roe/mica_mode, #roe/mode, 0)
 assert roe/MajorMode(#roe/mica_mode)
 assert roe/ModeName(#roe/mica_mode, "mica")
+assert roe/SyntaxParser(#roe/mica_mode, :mica, "")
 assert roe/ModeKeymap(#roe/mica_mode, #roe/global_map, 100)
 assert roe/ModeHook(#roe/mica_mode, :roe/invalidate_syntax_hook, 100)
 assert roe/SyntaxRule(#roe/mica_mode, :word, "[[:alnum:]_/-]", 200)
@@ -127,7 +128,8 @@ assert roe/SyntaxHighlightRule(#roe/mica_mode, :error, #roe/mica_error_face, 200
 assert roe/PackageMode(#roe/core_package, #roe/mica_mode)
 
 roe/BufferMajorMode(buffer, #roe/mica_mode) :-
-  roe/BufferSourceLanguage(buffer, :mica)
+  roe/BufferSourceLanguage(buffer, :mica),
+  not roe/BufferHasModeOverride(buffer)
 
 verb roe/insert_current_time(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor
@@ -268,6 +270,12 @@ assert roe/NativeBufferReadAction(:mark_whole_buffer)
 
 verb roe/publish_policy(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor
+  // Mode choices follow logical buffer lifetime, including native buffer removal.
+  for choice in roe/BufferModeOverride(?buffer, ?mode)
+    if not roe/LogicalBuffer(choice[:buffer])
+      retract roe/BufferModeOverride(choice[:buffer], _)
+    end
+  end
   // Publish one complete projection. A failed publication leaves the previous one intact.
   let facts = []
   let fact_count = 0
@@ -288,18 +296,37 @@ verb roe/publish_policy(actor, session)
       fact_count = fact_count + 1
       facts = [@facts, {:kind -> :syntax_policy, :buffer -> found[:buffer], :syntax_kind -> syntax[:syntax_kind], :pattern -> syntax[:pattern], :precedence -> syntax[:precedence]}]
     end
+    let highlights = []
+    let highlight_count = 0
+    for highlight in roe/EffectiveSyntaxHighlightRule(found[:buffer], ?mode, ?capture, ?face, ?precedence)
+      let face_name_rows = roe/FaceName(highlight[:face], ?face_name)
+      if face_name_rows
+        let exactly {:face_name -> face_name} = face_name_rows
+        highlight_count < 256 || raise E_INVARG, "Mica highlight rule limit of 256 exceeded"
+        highlight_count = highlight_count + 1
+        highlights = [@highlights, {:capture -> highlight[:capture], :face -> face_name, :precedence -> highlight[:precedence]}]
+      end
+    end
+    if highlights
+      fact_count < 256 || raise E_INVARG, "Mica policy fact limit of 256 exceeded"
+      fact_count = fact_count + 1
+      facts = [@facts, {:kind -> :highlight_policy, :buffer -> found[:buffer], :rules -> highlights}]
+    end
   end
   for found in roe/EnabledMode(?mode)
     let mode_name_rows = roe/ModeName(found[:mode], ?mode_name)
     if mode_name_rows
       let exactly {:mode_name -> mode_name} = mode_name_rows
-      for highlight in roe/SyntaxHighlightRule(found[:mode], ?capture, ?face, ?precedence)
-        let face_name_rows = roe/FaceName(highlight[:face], ?face_name)
-        if face_name_rows
-          let exactly {:face_name -> face_name} = face_name_rows
+      for parser in roe/SyntaxParser(found[:mode], ?grammar, ?query)
+        fact_count < 256 || raise E_INVARG, "Mica policy fact limit of 256 exceeded"
+        fact_count = fact_count + 1
+        facts = [@facts, {:kind -> :parser_policy, :mode -> mode_name, :grammar -> parser[:grammar], :query -> parser[:query]}]
+      end
+      for rule in roe/IndentationRule(found[:mode], ?query, ?anchor, ?offset, ?precedence, ?enabled)
+        if rule[:enabled]
           fact_count < 256 || raise E_INVARG, "Mica policy fact limit of 256 exceeded"
           fact_count = fact_count + 1
-          facts = [@facts, {:kind -> :highlight_policy, :mode -> mode_name, :capture -> highlight[:capture], :face -> face_name, :precedence -> highlight[:precedence]}]
+          facts = [@facts, {:kind -> :indentation_policy, :mode -> mode_name, :query -> rule[:query], :anchor -> rule[:anchor], :offset -> rule[:offset], :precedence -> rule[:precedence]}]
         end
       end
     end

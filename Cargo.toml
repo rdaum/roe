@@ -35,6 +35,8 @@ tempfile = "3.27"
 thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tree-sitter = "=0.26.13"
+tree-sitter-rust = "=0.24.2"
 unicode-segmentation = "1.13"
 unicode-width = "0.2"
 vello = "0.9"

@@ -7,8 +7,10 @@
 use super::{MicaHighlightRule, MicaSyntaxRule};
 use crate::BufferId;
 use crate::mica_host::MicaPolicyFact;
+use crate::syntax::{IndentRule, SyntaxPlan};
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
+use std::sync::Arc;
 
 #[derive(Default)]
 pub(super) struct PolicyProjection {
@@ -16,7 +18,8 @@ pub(super) struct PolicyProjection {
     pub(super) faces: HashMap<String, HashMap<String, String>>,
     pub(super) configuration: HashMap<String, String>,
     pub(super) syntax: HashMap<BufferId, Vec<MicaSyntaxRule>>,
-    pub(super) highlights: HashMap<String, Vec<MicaHighlightRule>>,
+    pub(super) highlights: HashMap<BufferId, Vec<MicaHighlightRule>>,
+    pub(super) parsers: HashMap<String, Arc<SyntaxPlan>>,
     pub(super) revision: u64,
     facts: HashSet<MicaPolicyFact>,
 }
@@ -42,8 +45,36 @@ impl PolicyProjection {
             return Ok(false);
         }
         let mut next = Self::default();
+        let mut grammars = HashMap::new();
+        let mut queries = HashMap::new();
+        let mut indentation: HashMap<String, Vec<IndentRule>> = HashMap::new();
         for fact in &facts {
             match fact {
+                MicaPolicyFact::Parser {
+                    mode,
+                    grammar,
+                    query,
+                } => {
+                    insert_unique(&mut grammars, mode.clone(), grammar)?;
+                    insert_unique(&mut queries, mode.clone(), query)?;
+                }
+                MicaPolicyFact::Indentation {
+                    mode,
+                    query,
+                    anchor,
+                    offset,
+                    precedence,
+                } => {
+                    indentation
+                        .entry(mode.clone())
+                        .or_default()
+                        .push(IndentRule {
+                            query: query.clone(),
+                            anchor: anchor.clone(),
+                            offset: *offset,
+                            precedence: *precedence,
+                        });
+                }
                 MicaPolicyFact::Mode { buffer, name } => {
                     insert_unique(&mut next.modes, *buffer, name)?
                 }
@@ -74,22 +105,42 @@ impl PolicyProjection {
                             precedence: *precedence,
                         });
                 }
-                MicaPolicyFact::Highlight {
-                    mode,
-                    capture,
-                    face,
-                    precedence,
-                } => {
-                    next.highlights
-                        .entry(mode.clone())
-                        .or_default()
-                        .push(MicaHighlightRule {
-                            capture: capture.clone(),
-                            face: face.clone(),
-                            precedence: *precedence,
-                        });
+                MicaPolicyFact::Highlights { buffer, rules } => {
+                    for (capture, face, precedence) in rules {
+                        next.highlights
+                            .entry(*buffer)
+                            .or_default()
+                            .push(MicaHighlightRule {
+                                capture: capture.clone(),
+                                face: face.clone(),
+                                precedence: *precedence,
+                            });
+                    }
                 }
             }
+        }
+        for (mode, grammar) in grammars {
+            let rules = indentation.remove(&mode).unwrap_or_default();
+            // A changed face or buffer association does not recompile unchanged queries.
+            let parser_facts = |set: &HashSet<MicaPolicyFact>| {
+                set.iter().filter(|fact| matches!(fact,
+                MicaPolicyFact::Parser { mode: found, .. } | MicaPolicyFact::Indentation { mode: found, .. } if found == &mode)).cloned().collect::<HashSet<_>>()
+            };
+            let plan = if parser_facts(&facts) == parser_facts(&self.facts) {
+                self.parsers.get(&mode).cloned()
+            } else {
+                None
+            };
+            next.parsers.insert(
+                mode.clone(),
+                match plan {
+                    Some(plan) => plan,
+                    None => Arc::new(SyntaxPlan::compile(&grammar, &queries[&mode], &rules)?),
+                },
+            );
+        }
+        if !indentation.is_empty() {
+            return Err("indentation rules require a syntax parser policy".into());
         }
         next.facts = facts;
         next.revision = self

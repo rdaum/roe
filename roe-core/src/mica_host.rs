@@ -7,6 +7,7 @@
 mod decode;
 mod events;
 mod source_provider;
+mod syntax_policy;
 pub use events::{MicaEvent, MicaEventBatch, MicaHostAction, MicaNativeAction, MicaPolicyFact};
 #[cfg(test)]
 use source_provider::source_path;
@@ -88,6 +89,7 @@ macro_rules! layout_named_tuples {
 
 const CORE_SOURCE: &str = include_str!("../../mica/roe-model.mica");
 const FIRST_WAVE_SOURCE: &str = include_str!("../../mica/roe-first-wave.mica");
+const RUST_SOURCE: &str = include_str!("../../mica/roe-rust.mica");
 const AGENT_SOURCE: &str = include_str!("../../mica/roe-agent.mica");
 const EVENT_QUEUE_CAPACITY: usize = 256;
 const EXTERNAL_REQUEST_CAPACITY: usize = 16;
@@ -413,6 +415,7 @@ pub struct MicaHost {
     disabled_packages: HashSet<Identity>,
     loaded_units: HashSet<Symbol>,
     first_wave_loaded: bool,
+    deferred_events: MicaEventBatch,
     active_view: WindowId,
     pending_key_prefix: Option<String>,
     prompt_active: bool,
@@ -803,6 +806,7 @@ impl MicaHost {
             disabled_packages: HashSet::new(),
             loaded_units: [sym("roe/core")].into_iter().collect(),
             first_wave_loaded: false,
+            deferred_events: MicaEventBatch::default(),
             active_view,
             pending_key_prefix: None,
             prompt_active: false,
@@ -1028,7 +1032,7 @@ impl MicaHost {
     }
 
     pub fn drain_background_events(&mut self) -> MicaEventBatch {
-        let mut batch = MicaEventBatch::default();
+        let mut batch = std::mem::take(&mut self.deferred_events);
         let events = self
             .event_pump
             .as_mut()
@@ -1061,6 +1065,11 @@ impl MicaHost {
 
     pub async fn replace_unit(&mut self, unit: &str, source: String) -> Result<(), MicaHostError> {
         let unit_symbol = sym(unit);
+        let previous = if self.loaded_units.contains(&unit_symbol) {
+            Some(self.administrator.fileout_unit(unit_symbol).await?)
+        } else {
+            None
+        };
         let mode = if self.loaded_units.contains(&unit_symbol) {
             // Replace validates in a staged kernel after retracting the old unit.
             // An additive check_filein would reject legitimate functional-key changes
@@ -1076,6 +1085,20 @@ impl MicaHost {
         self.administrator
             .filein_unit(unit_symbol, source, mode, None)
             .await?;
+        if let Err(error) = self.validate_syntax_policy().await {
+            self.administrator
+                .filein_unit(
+                    unit_symbol,
+                    previous.unwrap_or_default(),
+                    FileinMode::Replace,
+                    None,
+                )
+                .await?;
+            // An empty rollback unit still exists in the driver. Track it so
+            // a later retry uses Replace rather than an additive file-in.
+            self.loaded_units.insert(unit_symbol);
+            return Err(error);
+        }
         self.loaded_units.insert(unit_symbol);
         if unit == "roe/first-wave" {
             self.first_wave_loaded = true;
@@ -1084,7 +1107,7 @@ impl MicaHost {
     }
 
     pub async fn export_unit(&mut self, unit: &str) -> Result<String, MicaHostError> {
-        if unit == "roe/first-wave" {
+        if unit == "roe/first-wave" || unit == "roe/rust" {
             self.ensure_first_wave().await?;
         }
         Ok(self.administrator.fileout_unit(sym(unit)).await?)
@@ -1094,7 +1117,8 @@ impl MicaHost {
         self.replace_unit("roe/first-wave", FIRST_WAVE_SOURCE.to_owned())
             .await?;
         self.replace_unit("roe/agent", AGENT_SOURCE.to_owned())
-            .await
+            .await?;
+        self.replace_unit("roe/rust", RUST_SOURCE.to_owned()).await
     }
 
     async fn ensure_first_wave(&mut self) -> Result<(), MicaHostError> {
@@ -1112,6 +1136,20 @@ impl MicaHost {
                 .await?;
             self.loaded_units.insert(sym("roe/first-wave"));
             self.first_wave_loaded = true;
+        }
+        if !self.loaded_units.contains(&sym("roe/rust")) {
+            self.administrator
+                .check_filein(RUST_SOURCE.to_owned(), None)
+                .await?;
+            self.administrator
+                .filein_unit(
+                    sym("roe/rust"),
+                    RUST_SOURCE.to_owned(),
+                    FileinMode::Add,
+                    None,
+                )
+                .await?;
+            self.loaded_units.insert(sym("roe/rust"));
         }
         if !self.loaded_units.contains(&sym("roe/agent")) {
             self.administrator
@@ -1142,7 +1180,7 @@ impl MicaHost {
         self.ensure_first_wave().await?;
         self.synchronize_context(editor, resource_ids)?;
         let invocation = self.endpoint_session().evaluate(source).await?;
-        let mut events = MicaEventBatch::default();
+        let mut events = std::mem::take(&mut self.deferred_events);
         let mut pump = self
             .event_pump
             .take()
@@ -1616,7 +1654,7 @@ end
         invocation: &InvocationHandle,
         selector: &str,
     ) -> Result<MicaDispatchResult, MicaHostError> {
-        let mut batch = MicaEventBatch::default();
+        let mut batch = std::mem::take(&mut self.deferred_events);
         let mut pump = self
             .event_pump
             .take()

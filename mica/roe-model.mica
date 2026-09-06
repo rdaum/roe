@@ -63,6 +63,8 @@ make_relation(:roe/FaceParent, 2)
 make_relation(:roe/FaceAttribute, 3)
 make_relation(:roe/SyntaxRule, 4)
 make_relation(:roe/SyntaxHighlightRule, 4)
+make_functional_relation(:roe/SyntaxParser, 3, [0])
+make_relation(:roe/IndentationRule, 6)
 make_relation(:roe/Configuration, 3)
 make_relation(:roe/ConfigurationParent, 2)
 make_relation(:roe/Package, 1)
@@ -93,6 +95,7 @@ make_functional_relation(:roe/BufferReadOnly, 2, [0], :volatile)
 make_functional_relation(:roe/BufferSourceLanguage, 2, [0], :volatile)
 make_functional_relation(:roe/BufferSourceUnit, 2, [0], :volatile)
 make_functional_relation(:roe/BufferMajorMode, 2, [0], :volatile)
+make_functional_relation(:roe/BufferModeOverride, 2, [0], :volatile)
 make_relation(:roe/BufferMinorMode, 2, :volatile)
 make_relation(:roe/Frame, 1, :volatile)
 make_functional_relation(:roe/FrameRootView, 2, [0], :volatile)
@@ -176,6 +179,7 @@ make_relation(:roe/ViewInTree, 2)
 make_relation(:roe/SessionLeafView, 2)
 make_relation(:roe/VisibleBuffer, 2)
 make_relation(:roe/BufferHasExplicitMajorMode, 1)
+make_relation(:roe/BufferHasModeOverride, 1)
 make_relation(:roe/EffectiveMajorMode, 2)
 make_relation(:roe/EffectiveModeHook, 3)
 make_relation(:roe/LocalFaceAttribute, 2)
@@ -353,7 +357,14 @@ roe/ArgumentCandidate(:visible_views, actor, session, view, name) :-
   roe/BufferName(buffer, name)
 
 roe/BufferHasExplicitMajorMode(buffer) :-
-  roe/BufferMajorMode(buffer, mode)
+  roe/BufferMajorMode(buffer, mode),
+  roe/EnabledMode(mode)
+
+roe/BufferMajorMode(buffer, mode) :-
+  roe/BufferModeOverride(buffer, mode)
+
+roe/BufferHasModeOverride(buffer) :-
+  roe/BufferModeOverride(buffer, mode)
 
 roe/EffectiveMajorMode(buffer, mode) :-
   roe/BufferMajorMode(buffer, mode),
@@ -481,6 +492,10 @@ assert RoleCanRead(#roe/editor_role, :roe/BufferReadOnly)
 assert RoleCanRead(#roe/editor_role, :roe/BufferSourceLanguage)
 assert RoleCanRead(#roe/editor_role, :roe/BufferSourceUnit)
 assert RoleCanRead(#roe/editor_role, :roe/NativeBufferRevision)
+assert RoleCanRead(#roe/editor_role, :roe/BufferModeOverride)
+assert RoleCanWrite(#roe/editor_role, :roe/BufferModeOverride)
+assert RoleCanRead(#roe/editor_role, :roe/SyntaxParser)
+assert RoleCanRead(#roe/editor_role, :roe/IndentationRule)
 assert RoleCanRead(#roe/editor_role, :roe/BufferCreationPolicy)
 assert RoleCanRead(#roe/editor_role, :roe/BufferSelectionPolicy)
 assert RoleCanRead(#roe/editor_role, :roe/BufferSavePolicy)

@@ -1104,6 +1104,61 @@ mod lifecycle_tests {
     }
 
     #[test]
+    fn production_rust_mode_builds_a_vello_scene_without_a_display() {
+        let buffer = Buffer::named("scene.rs", roe_core::buffer::BufferKind::File);
+        buffer.set_visited_file(Some("scene.rs".into()));
+        buffer.load_str("fn scene() {\nlet λ = 1;\n}\n");
+        let mut editor = Editor::new(buffer, Frame::new(80, 23));
+        editor.move_cursor_to(13, false);
+        let runtime = compio::runtime::Runtime::new().unwrap();
+        let mut app = RoeVelloApp::new(
+            editor,
+            VelloTheme::default(),
+            runtime,
+            Arc::new(WakeState::default()),
+            Arc::new(NoopWake),
+            &[],
+        )
+        .unwrap();
+        app.build_session_scene(DEFAULT_WIDTH, DEFAULT_HEIGHT)
+            .unwrap();
+        let output = app
+            .runtime
+            .block_on(async {
+                app.session
+                    .dispatch(
+                        app.session
+                            .envelope(InputEvent::Keys(vec![LogicalKey::Tab])),
+                    )
+                    .await
+            })
+            .unwrap();
+        assert!(
+            !output
+                .lifecycle
+                .iter()
+                .any(|event| matches!(event, LifecycleEvent::Error(_))),
+            "{output:#?}"
+        );
+        app.apply_session_output(output);
+        app.scene.reset();
+        app.build_session_scene(DEFAULT_WIDTH, DEFAULT_HEIGHT)
+            .unwrap();
+        let snapshot = app.redraw_state.session_presentation().current().unwrap();
+        assert_eq!(
+            snapshot.views[0].visible_text,
+            "fn scene() {\n    let λ = 1;\n}\n"
+        );
+        assert!(
+            snapshot
+                .styles
+                .iter()
+                .any(|style| style.name == "syntax-keyword")
+        );
+        assert!(!app.scene.encoding().path_tags.is_empty());
+    }
+
+    #[test]
     fn production_mica_typeout_builds_a_vello_scene_without_a_display() {
         let runtime = compio::runtime::Runtime::new().unwrap();
         let mut editor = session_editor();

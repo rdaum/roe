@@ -9,7 +9,7 @@ use super::protocol::*;
 use super::{TypeoutState, typeout_body_rows, typeout_text_lines};
 use crate::editor::WindowType;
 use crate::native_kernel::{ResourceId, TextSelection, ViewId};
-use crate::syntax_highlighting::{HighlightSpan, mica_highlights};
+use crate::syntax_highlighting::HighlightSpan;
 use crate::{BufferId, Editor, WindowId};
 use std::collections::{HashMap, HashSet};
 
@@ -61,7 +61,12 @@ impl PresentationProjector {
             .map(|cache| cache.text_revision)
     }
 
-    fn refresh_highlights(&mut self, input: &ProjectionInput<'_>) {
+    fn refresh_highlights(
+        &mut self,
+        input: &ProjectionInput<'_>,
+        syntax: &mut crate::syntax::SyntaxService,
+    ) {
+        syntax.retain_live(&input.editor.buffers.keys().collect());
         let policy_revision = input.policy.revision;
         let visible_buffers: HashSet<_> = input
             .editor
@@ -81,13 +86,7 @@ impl PresentationProjector {
                     .get(buffer)
                     .map(|value| (buffer, value))
             })
-            .filter(|(buffer, _)| {
-                input
-                    .policy
-                    .modes
-                    .get(buffer)
-                    .is_some_and(|mode| input.policy.highlights.contains_key(mode))
-            })
+            .filter(|(buffer, _)| input.policy.highlights.contains_key(buffer))
             .map(|(buffer, value)| (buffer, value.clone()))
             .collect();
 
@@ -105,7 +104,20 @@ impl PresentationProjector {
                 MicaHighlightCache {
                     text_revision,
                     policy_revision,
-                    spans: mica_highlights(&observed.rope.to_string()),
+                    spans: match input
+                        .policy
+                        .modes
+                        .get(&buffer)
+                        .and_then(|mode| input.policy.parsers.get(mode))
+                    {
+                        Some(plan) => syntax
+                            .highlights(buffer, text_revision, &observed.rope, plan)
+                            .unwrap_or_else(|error| {
+                                tracing::warn!(%error, "syntax highlighting unavailable");
+                                Vec::new()
+                            }),
+                        None => Vec::new(),
+                    },
                 },
             );
         }
@@ -115,9 +127,10 @@ impl PresentationProjector {
         &mut self,
         input: ProjectionInput<'_>,
         attachment: ProjectionAttachment<'_>,
+        syntax: &mut crate::syntax::SyntaxService,
     ) -> PresentationSnapshot {
         self.buffers.begin_frame();
-        self.refresh_highlights(&input);
+        self.refresh_highlights(&input, syntax);
         let mut styles = Vec::new();
         let mut style_by_name = HashMap::new();
         let mut views = Vec::new();
@@ -177,7 +190,7 @@ impl PresentationProjector {
                 .filter(|span| span.end > visible_start_char && span.start < visible_end_char)
                 .filter_map(|span| {
                     let face =
-                        mica_highlight_face(input.policy, window.active_buffer, span.capture)?
+                        mica_highlight_face(input.policy, window.active_buffer, &span.capture)?
                             .to_owned();
                     Some(StyledRange {
                         start: span.start,
@@ -322,10 +335,9 @@ fn mica_highlight_face<'a>(
     buffer: BufferId,
     capture: &str,
 ) -> Option<&'a str> {
-    let mode = policy.modes.get(&buffer)?;
     let rules = policy
         .highlights
-        .get(mode)?
+        .get(&buffer)?
         .iter()
         .filter(|rule| rule.capture == capture);
     let selected = rules.clone().max_by_key(|rule| rule.precedence)?;

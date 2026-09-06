@@ -79,6 +79,19 @@ finish_session mica-command
 [[ "$(sed -n '1p' "$mica_file")" =~ ^[0-9]{13}$ ]]
 [[ "$(sed -n '2p' "$mica_file")" == 'alpha' ]]
 
+# Rust-mode policy selects the parser, reindents with Tab, and indents Enter.
+rust_file="$probe_dir/example.rs"
+printf 'fn main() {\nlet x = 1;\n}\n' >"$rust_file"
+start_session rust-mode "$rust_file"
+tmux -L "$tmux_socket" send-keys -t rust-mode C-n Tab C-e Enter
+tmux -L "$tmux_socket" send-keys -t rust-mode -l 'let y = 2; '
+# Keep the semicolon away from tmux's command-separator position.
+tmux -L "$tmux_socket" send-keys -t rust-mode BSpace
+tmux -L "$tmux_socket" send-keys -t rust-mode C-x C-s
+finish_session rust-mode
+[[ "$(sed -n '2p' "$rust_file")" == '    let x = 1;' ]]
+[[ "$(sed -n '3p' "$rust_file")" == '    let y = 2;' ]]
+
 # An ordinary save failure is reported in the UI and leaves the session usable.
 failed_save_path="/proc/roe-phase1-save-$$"
 start_session failed-save "$failed_save_path"
@@ -233,3 +246,4 @@ tmux -L "$tmux_socket" kill-session -t forced-shutdown
 
 printf '%s\n' 'phase0_terminal_workflows=pass'
 printf '%s\n' 'phase1_forced_shutdown=terminal_restored'
+printf '%s\n' 'rust_terminal_workflow=pass'

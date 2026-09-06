@@ -114,3 +114,36 @@ fn update_snapshot(update: &PresentationUpdate) -> &roe_core::session::Presentat
         PresentationUpdate::Delta(delta) => &delta.snapshot,
     }
 }
+
+#[test]
+fn rust_mode_highlights_and_indentation_reach_both_frontends() {
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let buffer = Buffer::named("example.rs", roe_core::buffer::BufferKind::File);
+        buffer.set_visited_file(Some("example.rs".into()));
+        buffer.load_str("fn main() {\nlet λ = 42;\n}\n");
+        let mut editor = Editor::new(buffer, Frame::new(80, 23));
+        editor.move_cursor_to(12, false);
+        let workspace = WorkspaceHost::open_with_mica(editor, CapabilityGrants::editor_default()).unwrap();
+        let mut session = DirectSessionClient::new(workspace, AttachmentConfiguration::headless(80, 23));
+        let mut terminal = TerminalRenderer::new(Vec::new());
+        let mut vello = VelloRenderer::new();
+        let initial = session.initial_output().await;
+        let indented = session.dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Tab]))).await.unwrap();
+        let newline = session.dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Enter]))).await.unwrap();
+        let undo = session.dispatch(session.envelope(InputEvent::Keys(vec![LogicalKey::Modifier(KeyModifier::Control(Side::Left)), LogicalKey::AlphaNumeric('/')]))).await.unwrap();
+        for output in [&initial, &indented, &newline, &undo] {
+            assert!(!output.lifecycle.iter().any(|event| matches!(event, roe_core::session::LifecycleEvent::Error(_))), "{output:#?}");
+            let update = output.presentation.as_ref().unwrap();
+            terminal.apply_session_presentation(update).unwrap();
+            terminal.render_session().unwrap();
+            vello.apply_session_presentation(update).unwrap();
+            assert_eq!(terminal.session_presentation().current(), vello.session_presentation().current());
+        }
+        let snapshot = terminal.session_presentation().current().unwrap();
+        assert_eq!(snapshot.views[0].visible_text, "fn main() {\n    let λ = 42;\n}\n");
+        assert!(snapshot.views[0].modeline.contains("(rust)"));
+        assert!(snapshot.styles.iter().any(|style| style.name == "syntax-keyword"));
+        assert!(matches!(&indented.presentation, Some(PresentationUpdate::Delta(delta)) if !delta.invalidations.contains(&roe_core::session::Invalidation::Full)));
+        session.terminate_workspace().await.unwrap();
+    });
+}

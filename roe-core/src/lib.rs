@@ -27,6 +27,7 @@ pub mod native_services;
 pub mod renderer;
 pub mod session;
 pub mod startup;
+mod syntax;
 mod syntax_highlighting;
 pub mod undo;
 mod watch_backend;

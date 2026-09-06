@@ -15,6 +15,14 @@ pub(crate) const MAX_POLICY_FACTS: usize = 256;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum MicaHostAction {
+    Indent {
+        view: WindowId,
+        buffer: BufferId,
+        revision: u64,
+        newline: bool,
+        width: usize,
+        tab_width: usize,
+    },
     AgentOpen {
         view: WindowId,
         name: String,
@@ -290,6 +298,18 @@ impl MicaNativeAction {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum MicaPolicyFact {
+    Parser {
+        mode: String,
+        grammar: String,
+        query: String,
+    },
+    Indentation {
+        mode: String,
+        query: String,
+        anchor: String,
+        offset: i64,
+        precedence: i64,
+    },
     Mode {
         buffer: BufferId,
         name: String,
@@ -309,17 +329,26 @@ pub enum MicaPolicyFact {
         pattern: String,
         precedence: i64,
     },
-    Highlight {
-        mode: String,
-        capture: String,
-        face: String,
-        precedence: i64,
+    Highlights {
+        buffer: BufferId,
+        rules: Vec<(String, String, i64)>,
     },
 }
 
 impl MicaPolicyFact {
     pub(crate) fn heap_bytes(&self) -> usize {
         match self {
+            Self::Parser {
+                mode,
+                grammar,
+                query,
+            } => mode.len() + grammar.len() + query.len(),
+            Self::Indentation {
+                mode,
+                query,
+                anchor,
+                ..
+            } => mode.len() + query.len() + anchor.len(),
             Self::Mode { name, .. } => name.len(),
             Self::Face {
                 name,
@@ -328,12 +357,12 @@ impl MicaPolicyFact {
             } => name.len() + attribute.len() + value.len(),
             Self::Configuration { key, value } => key.len() + value.len(),
             Self::Syntax { kind, pattern, .. } => kind.len() + pattern.len(),
-            Self::Highlight {
-                mode,
-                capture,
-                face,
-                ..
-            } => mode.len() + capture.len() + face.len(),
+            Self::Highlights { rules, .. } => rules
+                .iter()
+                .map(|(capture, face, _)| {
+                    size_of::<(String, String, i64)>() + capture.len() + face.len()
+                })
+                .sum(),
         }
     }
 }

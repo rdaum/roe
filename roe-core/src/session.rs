@@ -15,6 +15,7 @@ use crate::editor::{ChromeAction, DragType, MouseDragState};
 use crate::keys::{KeyAction, LogicalKey};
 mod attachment;
 mod effects;
+mod indentation;
 mod layout;
 mod native_actions;
 pub use attachment::Attachment;
@@ -83,6 +84,7 @@ pub struct WorkspaceHost {
     mica: Option<MicaHost>,
     policy: PolicyProjection,
     presentation: PresentationProjector,
+    syntax: crate::syntax::SyntaxService,
     mica_effect_depth: usize,
     mica_effect_remaining: usize,
     mica_search_ranges: HashMap<WindowId, Vec<(usize, usize, String)>>,
@@ -141,6 +143,7 @@ impl WorkspaceHost {
             mica: None,
             policy: PolicyProjection::default(),
             presentation: PresentationProjector::default(),
+            syntax: crate::syntax::SyntaxService::default(),
             mica_effect_depth: 0,
             mica_effect_remaining: 0,
             mica_search_ranges: HashMap::new(),
@@ -1421,6 +1424,7 @@ impl WorkspaceHost {
                 presented_cursors: &mut attachment.presented_cursors,
                 typeout_page: &mut attachment.typeout_page,
             },
+            &mut self.syntax,
         )
     }
 
