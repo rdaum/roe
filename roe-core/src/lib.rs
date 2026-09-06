@@ -16,16 +16,20 @@ use slotmap::new_key_type;
 pub mod buffer;
 pub mod editor;
 pub mod file_watcher;
+pub mod frontend;
 pub mod gutter;
 pub mod keys;
 pub mod kill_ring;
 pub mod mica_host;
+mod native_io;
 pub mod native_kernel;
 pub mod native_services;
 pub mod renderer;
 pub mod session;
+pub mod startup;
 mod syntax_highlighting;
 pub mod undo;
+mod watch_backend;
 
 new_key_type! {
     pub struct WindowId;

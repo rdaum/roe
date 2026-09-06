@@ -12,8 +12,6 @@
 //
 
 use crate::undo::{EditOp, UndoManager};
-use compio::buf::BufResult;
-use compio::io::AsyncReadAtExt;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
@@ -99,12 +97,16 @@ impl BufferInner {
     }
 
     /// Create a new buffer inner and load content from a file
-    pub async fn from_file(file_path: &str) -> Result<Self, std::io::Error> {
-        let mut file = compio::fs::File::open(file_path).await?;
-        let BufResult(result, content) = file.read_to_string_at(String::new(), 0).await;
-        result?;
+    pub async fn from_file(file_path: impl AsRef<std::path::Path>) -> Result<Self, std::io::Error> {
+        let file_path = file_path.as_ref();
+        let content = crate::native_io::read_text(file_path, crate::native_io::MAX_IO_BYTES)
+            .await
+            .map_err(|error| match error {
+                crate::native_kernel::KernelError::Io(error) => error,
+                other => std::io::Error::other(other),
+            })?;
         let buffer_inner = Self {
-            display_name: file_path.to_string(),
+            display_name: file_path.display().to_string(),
             visited_file: Some(PathBuf::from(file_path)),
             kind: BufferKind::File,
             buffer: ropey::Rope::from_str(&content),
@@ -120,7 +122,7 @@ impl BufferInner {
     }
 
     /// Insert a fragment of text into the buffer at the given line/col position.
-    pub fn insert_col_line(&mut self, fragment: String, position: (u16, u16)) -> bool {
+    pub fn insert_col_line(&mut self, fragment: String, position: (usize, usize)) -> bool {
         let buffer_location = self.to_char_index(position.0, position.1);
         self.insert_pos(fragment, buffer_location)
     }
@@ -143,7 +145,7 @@ impl BufferInner {
 
     /// Delete a fragment of text from the buffer at the given line/col position.
     /// Returns the deleted text.
-    pub fn delete_col_line(&mut self, position: (u16, u16), count: isize) -> Option<String> {
+    pub fn delete_col_line(&mut self, position: (usize, usize), count: isize) -> Option<String> {
         let buffer_location = self.to_char_index(position.0, position.1);
         self.delete_pos(buffer_location, count)
     }
@@ -210,16 +212,16 @@ impl BufferInner {
         }
     }
 
-    pub fn to_column_line(&self, char_index: usize) -> (u16, u16) {
+    /// Return document character-column and line indices, never screen coordinates.
+    pub fn to_column_line(&self, char_index: usize) -> (usize, usize) {
         // Clamp to valid range to prevent panic from stale cursor positions
         let char_index = self.clamp_position(char_index);
         let line = self.buffer.char_to_line(char_index);
         let col = char_index - self.buffer.line_to_char(line);
-        (col as u16, line as u16)
+        (col, line)
     }
 
-    pub fn to_char_index(&self, col: u16, line: u16) -> usize {
-        let line = line as usize;
+    pub fn to_char_index(&self, col: usize, line: usize) -> usize {
         if line >= self.buffer.len_lines() {
             return self.buffer.len_chars();
         }
@@ -228,7 +230,7 @@ impl BufferInner {
         let content_len = line_slice.len_chars().saturating_sub(usize::from(
             line_slice.len_chars() > 0 && line_slice.char(line_slice.len_chars() - 1) == '\n',
         ));
-        line_start + (col as usize).min(content_len)
+        line_start + col.min(content_len)
     }
 
     // === PHASE 1: CLEAN CHARACTER-POSITION API ===
@@ -743,7 +745,7 @@ impl Buffer {
     }
 
     /// Create a new buffer and load content from a file
-    pub async fn from_file(file_path: &str) -> Result<Self, std::io::Error> {
+    pub async fn from_file(file_path: impl AsRef<std::path::Path>) -> Result<Self, std::io::Error> {
         let buffer_inner = BufferInner::from_file(file_path).await?;
         Ok(Self {
             inner: Arc::new(RwLock::new(buffer_inner)),
@@ -768,11 +770,11 @@ impl Buffer {
 
     // Convenience methods for common operations that don't need multiple calls
 
-    pub fn to_column_line(&self, char_index: usize) -> (u16, u16) {
+    pub fn to_column_line(&self, char_index: usize) -> (usize, usize) {
         self.with_read(|b| b.to_column_line(char_index))
     }
 
-    pub fn to_char_index(&self, col: u16, line: u16) -> usize {
+    pub fn to_char_index(&self, col: usize, line: usize) -> usize {
         self.with_read(|b| b.to_char_index(col, line))
     }
 
@@ -842,7 +844,7 @@ impl Buffer {
         self.with_write(|b| b.insert_pos(fragment, position))
     }
 
-    pub fn insert_col_line(&self, fragment: String, position: (u16, u16)) -> bool {
+    pub fn insert_col_line(&self, fragment: String, position: (usize, usize)) -> bool {
         self.with_write(|b| b.insert_col_line(fragment, position))
     }
 
@@ -850,7 +852,7 @@ impl Buffer {
         self.with_write(|b| b.delete_pos(position, count))
     }
 
-    pub fn delete_col_line(&self, position: (u16, u16), count: isize) -> Option<String> {
+    pub fn delete_col_line(&self, position: (usize, usize), count: isize) -> Option<String> {
         self.with_write(|b| b.delete_col_line(position, count))
     }
 
@@ -1085,21 +1087,28 @@ mod tests {
     }
 
     #[test]
-    fn position_conversions_round_trip_at_u16_boundaries() {
-        let mut buffer = BufferInner::new();
-        buffer.load_str(&"λ".repeat(u16::MAX as usize));
-        let last_column = u16::MAX;
-        assert_eq!(
-            buffer.to_column_line(last_column as usize),
-            (last_column, 0)
-        );
-        assert_eq!(buffer.to_char_index(last_column, 0), last_column as usize);
+    fn position_conversions_round_trip_beyond_screen_coordinate_range() {
+        for position in [65_535, 65_536, 70_000] {
+            let mut buffer = BufferInner::new();
+            buffer.load_str(&"λ".repeat(position));
+            assert_eq!(buffer.to_column_line(position), (position, 0));
+            assert_eq!(buffer.to_char_index(position, 0), position);
+            buffer.insert_col_line("!".into(), (position, 0));
+            assert_eq!(buffer.to_column_line(position + 1), (position + 1, 0));
+            assert_eq!(
+                buffer.delete_col_line((position + 1, 0), -1),
+                Some("!".into())
+            );
 
-        let mut buffer = BufferInner::new();
-        buffer.load_str(&("λ\n".repeat(u16::MAX as usize) + "x"));
-        let last_line_start = 2 * u16::MAX as usize;
-        assert_eq!(buffer.to_column_line(last_line_start), (0, u16::MAX));
-        assert_eq!(buffer.to_char_index(0, u16::MAX), last_line_start);
+            buffer.load_str(&("λ\n".repeat(position) + "x"));
+            let last_line_start = 2 * position;
+            assert_eq!(buffer.to_column_line(last_line_start), (0, position));
+            assert_eq!(buffer.to_char_index(0, position), last_line_start);
+            assert_eq!(
+                buffer.to_char_index(usize::MAX, usize::MAX),
+                buffer.buffer.len_chars()
+            );
+        }
     }
 
     #[test]

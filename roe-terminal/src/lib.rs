@@ -12,5 +12,6 @@
 //
 
 pub mod terminal_renderer;
+mod text_cells;
 
 pub use terminal_renderer::{ECHO_AREA_HEIGHT, TerminalRenderer};

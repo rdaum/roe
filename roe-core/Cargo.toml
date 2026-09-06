@@ -9,7 +9,9 @@ rust-version.workspace = true
 description = "Core editor logic for Roe (Ryan's Own Emacs)"
 
 [dependencies]
+arboard = { workspace = true }
 compio = { workspace = true }
+futures-util = { workspace = true }
 mica-compiler = { workspace = true }
 mica-driver = { workspace = true }
 mica-external-http = { workspace = true }
@@ -20,3 +22,6 @@ similar = { workspace = true }
 slotmap = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -19,12 +19,12 @@
 //! - Line-based diff and merge with conflict detection
 //! - Integration with undo system for safety
 
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use similar::{ChangeTag, TextDiff};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::mpsc::TrySendError;
 use std::time::{Duration, Instant};
 
 use crate::BufferId;
@@ -32,7 +32,8 @@ use crate::native_services::{Clock, FrontendWake, SystemClock};
 
 /// File notifications are hints to reread current disk state. A bounded FIFO
 /// protects the host from notify storms without retaining file contents.
-const EVENT_QUEUE_CAPACITY: usize = 256;
+#[cfg(test)]
+use crate::watch_backend::EVENT_QUEUE_CAPACITY;
 
 /// Represents a change to a specific line range
 #[derive(Debug, Clone)]
@@ -113,22 +114,9 @@ pub struct FileChangeEvent {
 
 /// Manages file watching for all open buffers
 pub struct FileWatcher {
-    /// The notify watcher instance
-    watcher: Option<RecommendedWatcher>,
-    /// Sender for file change events
-    event_tx: SyncSender<FileChangeEvent>,
-    /// Receiver for file change events (polled by editor)
-    event_rx: Receiver<FileChangeEvent>,
-    /// Map of file paths to buffer IDs (Arc for sharing with callback)
-    path_to_buffer: Arc<RwLock<HashMap<PathBuf, HashSet<BufferId>>>>,
-    wake_handler: Arc<RwLock<Option<Arc<dyn FrontendWake>>>>,
-    /// Latest backend error; a single replaceable slot bounds failure delivery.
-    backend_error: Arc<Mutex<Option<String>>>,
+    backend: crate::watch_backend::WatchBackend<BufferId>,
     clock: Arc<dyn Clock>,
-    /// Sync state per buffer
     sync_states: HashMap<BufferId, BufferSyncState>,
-    /// Backend directory watches shared by files in the same parent.
-    watched_parent_counts: HashMap<PathBuf, usize>,
 }
 
 impl FileWatcher {
@@ -137,239 +125,83 @@ impl FileWatcher {
     }
 
     pub fn with_clock(clock: Arc<dyn Clock>) -> Self {
-        let (event_tx, event_rx) = sync_channel(EVENT_QUEUE_CAPACITY);
         Self {
-            watcher: None,
-            event_tx,
-            event_rx,
-            path_to_buffer: Arc::new(RwLock::new(HashMap::new())),
-            wake_handler: Arc::new(RwLock::new(None)),
-            backend_error: Arc::new(Mutex::new(None)),
+            backend: crate::watch_backend::WatchBackend::new(),
             clock,
             sync_states: HashMap::new(),
-            watched_parent_counts: HashMap::new(),
         }
     }
 
-    /// Initialize the file watcher
     pub fn init(&mut self) -> Result<(), notify::Error> {
-        let tx = self.event_tx.clone();
-        let path_to_buffer = self.path_to_buffer.clone();
-        let wake_handler = self.wake_handler.clone();
-        let backend_error = self.backend_error.clone();
-
-        let watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
-            let event = match res {
-                Ok(event) => event,
-                Err(error) => {
-                    tracing::warn!(%error, "file watcher backend error");
-                    if let Ok(mut current) = backend_error.lock() {
-                        *current = Some(error.to_string());
-                    }
-                    if let Ok(handler) = wake_handler.read()
-                        && let Some(handler) = handler.as_ref()
-                    {
-                        handler.wake();
-                    }
-                    return;
-                }
-            };
-
-            // Only care about modify/create/remove events
-            if !matches!(
-                event.kind,
-                EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
-            ) {
-                return;
-            }
-
-            for path in &event.paths {
-                let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
-                let Ok(map) = path_to_buffer.read() else {
-                    continue;
-                };
-                let Some(buffer_ids) = map.get(&canonical) else {
-                    continue;
-                };
-                let buffer_ids: Vec<_> = buffer_ids.iter().copied().collect();
-                drop(map);
-
-                for buffer_id in buffer_ids {
-                    let change = FileChangeEvent {
-                        buffer_id,
-                        file_path: canonical.clone(),
-                    };
-                    match tx.try_send(change) {
-                        Ok(()) => {}
-                        Err(TrySendError::Full(change)) => {
-                            tracing::warn!(
-                                buffer_id = ?change.buffer_id,
-                                path = %change.file_path.display(),
-                                capacity = EVENT_QUEUE_CAPACITY,
-                                "file notification queue is full; dropping notification hint"
-                            );
-                        }
-                        Err(TrySendError::Disconnected(_)) => return,
-                    }
-                }
-
-                if let Ok(handler) = wake_handler.read()
-                    && let Some(handler) = handler.as_ref()
-                {
-                    handler.wake();
-                }
-            }
-        })?;
-
-        self.watcher = Some(watcher);
-        Ok(())
+        self.backend.init()
     }
 
     pub fn set_wake_handler(&mut self, handler: Arc<dyn FrontendWake>) {
-        if let Ok(mut current) = self.wake_handler.write() {
-            *current = Some(handler);
-        }
+        self.backend.set_wake(Some(handler));
     }
 
     pub fn clear_wake_handler(&mut self) {
-        if let Ok(mut current) = self.wake_handler.write() {
-            *current = None;
-        }
+        self.backend.set_wake(None);
     }
 
-    /// Release all logical associations and backend watches deterministically.
     pub fn shutdown(&mut self) -> Vec<String> {
-        self.clear_wake_handler();
-        let buffer_ids: Vec<_> = self.sync_states.keys().copied().collect();
-        let mut errors = Vec::new();
-        for buffer_id in buffer_ids {
-            if let Err(error) = self.unwatch_file(buffer_id) {
-                errors.push(error.to_string());
-            }
-        }
-        self.watcher = None;
-        // Dropping the backend releases any watch whose explicit unwatch
-        // failed. The session is closing, so logical ownership ends here too.
+        let errors = self.backend.shutdown();
         self.sync_states.clear();
-        self.watched_parent_counts.clear();
-        if let Ok(mut map) = self.path_to_buffer.write() {
-            map.clear();
-        }
         errors
     }
 
-    /// Take the latest backend failure for one-time presentation by the host.
     pub fn take_backend_error(&self) -> Option<String> {
-        self.backend_error
-            .lock()
-            .ok()
-            .and_then(|mut error| error.take())
+        self.backend.take_error()
     }
 
-    /// Start watching a file for a buffer
     pub fn watch_file(
         &mut self,
         buffer_id: BufferId,
         file_path: &Path,
         initial_content: String,
     ) -> Result<(), notify::Error> {
-        // Initialize watcher if needed
-        if self.watcher.is_none() {
-            self.init()?;
-        }
-
-        let canonical = file_path
-            .canonicalize()
-            .unwrap_or_else(|_| file_path.to_path_buf());
-
+        let canonical = self.backend.register(buffer_id, file_path)?;
         let now = self.clock.now();
-        if let Some(existing) = self.sync_states.get_mut(&buffer_id) {
-            if existing.file_path == canonical {
-                existing.update_base(initial_content, now);
-                return Ok(());
-            }
-            return Err(notify::Error::generic(
-                "a live buffer watch cannot be rebound to a different path",
-            )
-            .add_path(existing.file_path.clone())
-            .add_path(canonical));
+        if let Some(state) = self.sync_states.get_mut(&buffer_id) {
+            state.update_base(initial_content, now);
+        } else {
+            self.sync_states.insert(
+                buffer_id,
+                BufferSyncState::new(canonical, initial_content, now),
+            );
         }
-
-        // Establish the fallible backend watch before publishing any logical
-        // association. Files in one directory share one backend watch.
-        let parent = canonical.parent().map(Path::to_path_buf);
-        if let Some(parent) = parent.as_ref()
-            && !self.watched_parent_counts.contains_key(parent)
-            && let Some(ref mut watcher) = self.watcher
-        {
-            watcher.watch(parent, RecursiveMode::NonRecursive)?;
-        }
-
-        if let Some(parent) = parent {
-            *self.watched_parent_counts.entry(parent).or_insert(0) += 1;
-        }
-        if let Ok(mut map) = self.path_to_buffer.write() {
-            map.entry(canonical.clone()).or_default().insert(buffer_id);
-        }
-        self.sync_states.insert(
-            buffer_id,
-            BufferSyncState::new(canonical, initial_content, now),
-        );
-
         Ok(())
     }
 
-    /// Stop watching a file
     pub fn unwatch_file(&mut self, buffer_id: BufferId) -> Result<(), notify::Error> {
-        let Some(state) = self.sync_states.get(&buffer_id).cloned() else {
-            return Ok(());
-        };
-
-        let parent = state.file_path.parent().map(Path::to_path_buf);
-        let remove_backend_watch = parent
-            .as_ref()
-            .is_some_and(|parent| self.watched_parent_counts.get(parent).copied() == Some(1));
-        // The only fallible step happens before logical state mutation.
-        if remove_backend_watch
-            && let (Some(watcher), Some(parent)) = (self.watcher.as_mut(), parent.as_ref())
-        {
-            watcher.unwatch(parent)?;
-        }
-
+        self.backend.unregister(buffer_id)?;
         self.sync_states.remove(&buffer_id);
-        if let Ok(mut map) = self.path_to_buffer.write()
-            && let Some(buffer_ids) = map.get_mut(&state.file_path)
-        {
-            buffer_ids.remove(&buffer_id);
-            if buffer_ids.is_empty() {
-                map.remove(&state.file_path);
-            }
-        }
-        if let Some(parent) = parent {
-            match self.watched_parent_counts.get_mut(&parent) {
-                Some(count) if *count > 1 => *count -= 1,
-                Some(_) => {
-                    self.watched_parent_counts.remove(&parent);
-                }
-                None => {}
-            }
-        }
         Ok(())
     }
 
-    /// Poll for file change events (non-blocking)
     pub fn poll_events(&self) -> Vec<FileChangeEvent> {
-        let mut events = Vec::new();
         let now = self.clock.now();
-        while let Ok(event) = self.event_rx.try_recv() {
-            // Check if we should ignore this event
-            if let Some(state) = self.sync_states.get(&event.buffer_id)
-                && !state.should_ignore(now)
-            {
-                events.push(event);
-            }
-        }
-        events
+        self.backend
+            .poll()
+            .into_iter()
+            .filter_map(|hint| {
+                let state = self.sync_states.get(&hint.owner)?;
+                (!state.should_ignore(now) && state.file_path == hint.path).then_some(
+                    FileChangeEvent {
+                        buffer_id: hint.owner,
+                        file_path: hint.path,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn inject_event(
+        &self,
+        event: FileChangeEvent,
+    ) -> Result<(), std::sync::mpsc::TrySendError<crate::watch_backend::WatchHint<BufferId>>> {
+        self.backend.inject(event.buffer_id, event.file_path)
     }
 
     /// Get sync state for a buffer
@@ -400,23 +232,21 @@ impl FileWatcher {
 
     /// Get diagnostic info about the file watcher state
     pub fn status(&self) -> String {
-        let watcher_status = if self.watcher.is_some() {
+        let watcher_status = if self.backend.is_initialized() {
             "active"
         } else {
             "inactive"
         };
-
-        let watched_files: Vec<String> = match self.path_to_buffer.read() {
-            Ok(map) => map
-                .keys()
-                .map(|path| {
-                    path.file_name()
-                        .map(|name| name.to_string_lossy().to_string())
-                        .unwrap_or_default()
-                })
-                .collect(),
-            Err(_) => vec![],
-        };
+        let watched_files: Vec<_> = self
+            .backend
+            .paths()
+            .iter()
+            .map(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            })
+            .collect();
 
         format!(
             "FileWatcher {}: {} file(s) watched: {}",
@@ -729,8 +559,7 @@ mod tests {
 
         watcher.mark_saving(buffer_id);
         watcher
-            .event_tx
-            .send(FileChangeEvent {
+            .inject_event(FileChangeEvent {
                 buffer_id,
                 file_path: path.clone(),
             })
@@ -739,8 +568,7 @@ mod tests {
 
         *clock.now.lock().unwrap() = start + Duration::from_secs(1);
         watcher
-            .event_tx
-            .send(FileChangeEvent {
+            .inject_event(FileChangeEvent {
                 buffer_id,
                 file_path: path,
             })
@@ -809,8 +637,8 @@ mod tests {
                 .is_err()
         );
         assert!(watcher.get_sync_state(buffer_id).is_none());
-        assert!(watcher.watched_parent_counts.is_empty());
-        assert!(watcher.path_to_buffer.read().unwrap().is_empty());
+        assert!(watcher.backend.paths().is_empty());
+        assert!(watcher.backend.paths().is_empty());
     }
 
     #[test]
@@ -836,10 +664,10 @@ mod tests {
         watcher
             .watch_file(second, &second_path, "second".to_string())
             .unwrap();
-        assert_eq!(watcher.watched_parent_counts.get(&directory), Some(&2));
+        assert_eq!(watcher.backend.parent_count(&directory), Some(2));
 
         watcher.unwatch_file(first).unwrap();
-        assert_eq!(watcher.watched_parent_counts.get(&directory), Some(&1));
+        assert_eq!(watcher.backend.parent_count(&directory), Some(1));
         std::fs::write(&second_path, "changed").unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         while !watcher
@@ -855,7 +683,7 @@ mod tests {
         }
 
         watcher.unwatch_file(second).unwrap();
-        assert!(watcher.watched_parent_counts.is_empty());
+        assert!(watcher.backend.paths().is_empty());
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -879,28 +707,16 @@ mod tests {
 
         // Desynchronize only the backend to force the production unwatch call
         // to fail. The logical transaction must remain intact for retry/drop.
-        watcher
-            .watcher
-            .as_mut()
-            .unwrap()
-            .unwatch(&directory)
-            .unwrap();
+        watcher.backend.force_unwatch(&directory).unwrap();
         assert!(watcher.unwatch_file(buffer_id).is_err());
         assert!(watcher.get_sync_state(buffer_id).is_some());
-        assert_eq!(watcher.watched_parent_counts.get(&directory), Some(&1));
-        assert!(
-            watcher
-                .path_to_buffer
-                .read()
-                .unwrap()
-                .get(&path)
-                .is_some_and(|ids| ids.contains(&buffer_id))
-        );
+        assert_eq!(watcher.backend.parent_count(&directory), Some(1));
+        assert!(watcher.backend.paths().contains(&path));
 
         let errors = watcher.shutdown();
         assert!(!errors.is_empty());
         assert!(watcher.get_sync_state(buffer_id).is_none());
-        assert!(watcher.path_to_buffer.read().unwrap().is_empty());
+        assert!(watcher.backend.paths().is_empty());
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -951,18 +767,17 @@ mod tests {
             ),
         );
 
-        for index in 0..EVENT_QUEUE_CAPACITY {
+        for _ in 0..EVENT_QUEUE_CAPACITY {
             watcher
-                .event_tx
-                .try_send(FileChangeEvent {
+                .inject_event(FileChangeEvent {
                     buffer_id,
-                    file_path: PathBuf::from(format!("/virtual/{index}")),
+                    file_path: PathBuf::from("/virtual/file"),
                 })
                 .expect("events through the documented capacity must fit");
         }
 
         assert!(matches!(
-            watcher.event_tx.try_send(FileChangeEvent {
+            watcher.inject_event(FileChangeEvent {
                 buffer_id,
                 file_path: PathBuf::from("/virtual/overflow"),
             }),
@@ -974,8 +789,8 @@ mod tests {
     #[test]
     fn backend_errors_use_a_bounded_latest_value_slot() {
         let watcher = FileWatcher::new();
-        *watcher.backend_error.lock().unwrap() = Some("first".to_string());
-        *watcher.backend_error.lock().unwrap() = Some("latest".to_string());
+        watcher.backend.inject_error("first");
+        watcher.backend.inject_error("latest");
 
         assert_eq!(watcher.take_backend_error().as_deref(), Some("latest"));
         assert_eq!(watcher.take_backend_error(), None);

@@ -1,14 +1,10 @@
-use roe_core::editor::{WindowNode, WindowType};
-use roe_core::file_watcher::FileWatcher;
 use roe_core::keys::LogicalKey;
-use roe_core::kill_ring::KillRing;
 use roe_core::native_kernel::CapabilityGrants;
 use roe_core::session::{
     AttachmentConfiguration, DirectSessionClient, InputEvent, SessionClient, WorkspaceHost,
 };
-use roe_core::{Buffer, BufferId, Editor, Frame, Window, WindowId};
+use roe_core::{Buffer, Editor, Frame};
 use roe_terminal::TerminalRenderer;
-use slotmap::SlotMap;
 use std::hint::black_box;
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -36,7 +32,6 @@ impl Write for CountingWriter {
 }
 
 fn fixture() -> Editor {
-    let mut buffers: SlotMap<BufferId, Buffer> = SlotMap::default();
     let buffer = Buffer::named("*baseline*", roe_core::buffer::BufferKind::Ordinary);
     let mut content = String::with_capacity(FIXTURE_LINES * 64);
     for line in 0..FIXTURE_LINES {
@@ -45,36 +40,7 @@ fn fixture() -> Editor {
         ));
     }
     buffer.load_str(&content);
-    let buffer_id = buffers.insert(buffer);
-
-    let window = Window {
-        x: 0,
-        y: 0,
-        width_chars: 120,
-        height_chars: 39,
-        active_buffer: buffer_id,
-        cursor: 0,
-        window_type: WindowType::Normal,
-    };
-    let mut windows: SlotMap<WindowId, Window> = SlotMap::default();
-    let window_id = windows.insert(window);
-
-    Editor {
-        frame: Frame::new(120, 40),
-        buffers,
-        windows,
-        active_window: window_id,
-        window_tree: WindowNode::new_leaf(window_id),
-        kill_ring: KillRing::with_capacity(60),
-        previous_active_window: None,
-        buffer_history: Vec::new(),
-        echo_message: String::new(),
-        echo_message_time: None,
-        clock: Arc::new(roe_core::native_services::SystemClock),
-        mouse_drag_state: None,
-        messages_buffer_id: None,
-        file_watcher: FileWatcher::new(),
-    }
+    Editor::new(buffer, Frame::new(120, 40))
 }
 
 #[cfg(target_os = "linux")]

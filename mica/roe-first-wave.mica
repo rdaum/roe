@@ -2,6 +2,27 @@
 // policy, and effects are Mica-owned. Rust supplies volatile session/resource
 // facts and realizes native requests.
 
+// Startup operands are volatile identities supplied by the native constructor.
+// Shipped policy shows the first two requested buffers, with the first active.
+assert RoleCanInvoke(#roe/editor_role, :roe/initialize_startup)
+verb roe/initialize_startup(actor, session, buffers)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  let count = roe/list_length(buffers)
+  count > 0 && count <= 64 || return :invalid_startup_buffers
+  for buffer in buffers
+    roe/CanUseBuffer(actor, buffer) || return :buffer_denied
+  end
+  let exactly {:view -> target} = roe/ActiveView(session, ?view)
+  roe/SessionLeafView(session, target) || return :invalid_active_view
+  if count > 1
+    roe/CanRequestService(actor, :layout_validate) || return :layout_denied
+    emit(session, {:kind -> :host_action, :action -> :switch_buffer_selected, :buffer -> buffers[1]})
+    emit(session, {:kind -> :host_action, :action -> :split_horizontal, :view -> target})
+  end
+  emit(session, {:kind -> :host_action, :action -> :switch_buffer_selected, :buffer -> buffers[0]})
+  return :ok
+end
+
 make_identity(:roe/insert_current_time)
 make_identity(:roe/isearch_match_face)
 make_identity(:roe/isearch_current_face)
@@ -247,10 +268,9 @@ assert roe/NativeBufferReadAction(:mark_whole_buffer)
 
 verb roe/publish_policy(actor, session)
   roe/SessionActor(session, actor) || return :not_session_actor
-  // The host applies this emission as an atomic snapshot boundary. This makes
-  // unit replacement retract removed settings instead of leaving stale Rust
-  // projections behind.
-  emit(session, {:kind -> :policy_reset})
+  // Publish one complete projection. A failed publication leaves the previous one intact.
+  let facts = []
+  let fact_count = 0
   for found in roe/LogicalBuffer(?buffer)
     let mode_rows = roe/EffectiveMajorMode(found[:buffer], ?mode)
     if mode_rows
@@ -258,11 +278,15 @@ verb roe/publish_policy(actor, session)
       let name_rows = roe/ModeName(mode, ?name)
       if name_rows
         let exactly {:name -> name} = name_rows
-        emit(session, {:kind -> :mode_policy, :buffer -> found[:buffer], :name -> name})
+        fact_count < 256 || raise E_INVARG, "Mica policy fact limit of 256 exceeded"
+        fact_count = fact_count + 1
+        facts = [@facts, {:kind -> :mode_policy, :buffer -> found[:buffer], :name -> name}]
       end
     end
     for syntax in roe/EffectiveSyntaxRule(found[:buffer], ?mode, ?syntax_kind, ?pattern, ?precedence)
-      emit(session, {:kind -> :syntax_policy, :buffer -> found[:buffer], :syntax_kind -> syntax[:syntax_kind], :pattern -> syntax[:pattern], :precedence -> syntax[:precedence]})
+      fact_count < 256 || raise E_INVARG, "Mica policy fact limit of 256 exceeded"
+      fact_count = fact_count + 1
+      facts = [@facts, {:kind -> :syntax_policy, :buffer -> found[:buffer], :syntax_kind -> syntax[:syntax_kind], :pattern -> syntax[:pattern], :precedence -> syntax[:precedence]}]
     end
   end
   for found in roe/EnabledMode(?mode)
@@ -273,7 +297,9 @@ verb roe/publish_policy(actor, session)
         let face_name_rows = roe/FaceName(highlight[:face], ?face_name)
         if face_name_rows
           let exactly {:face_name -> face_name} = face_name_rows
-          emit(session, {:kind -> :highlight_policy, :mode -> mode_name, :capture -> highlight[:capture], :face -> face_name, :precedence -> highlight[:precedence]})
+          fact_count < 256 || raise E_INVARG, "Mica policy fact limit of 256 exceeded"
+          fact_count = fact_count + 1
+          facts = [@facts, {:kind -> :highlight_policy, :mode -> mode_name, :capture -> highlight[:capture], :face -> face_name, :precedence -> highlight[:precedence]}]
         end
       end
     end
@@ -283,13 +309,18 @@ verb roe/publish_policy(actor, session)
     if name_rows
       let exactly {:name -> name} = name_rows
       for attribute in roe/EffectiveFaceAttribute(found[:face], ?attribute, ?value)
-        emit(session, {:kind -> :face_policy, :face -> name, :attribute -> attribute[:attribute], :value -> attribute[:value]})
+        fact_count < 256 || raise E_INVARG, "Mica policy fact limit of 256 exceeded"
+        fact_count = fact_count + 1
+        facts = [@facts, {:kind -> :face_policy, :face -> name, :attribute -> attribute[:attribute], :value -> attribute[:value]}]
       end
     end
   end
   for setting in roe/EffectiveConfiguration(#roe/core_configuration, ?key, ?value)
-    emit(session, {:kind -> :configuration_policy, :key -> setting[:key], :value -> setting[:value]})
+    fact_count < 256 || raise E_INVARG, "Mica policy fact limit of 256 exceeded"
+    fact_count = fact_count + 1
+    facts = [@facts, {:kind -> :configuration_policy, :key -> setting[:key], :value -> setting[:value]}]
   end
+  emit(session, {:kind -> :policy_snapshot, :facts -> facts})
   return :ok
 end
 
@@ -541,14 +572,7 @@ end
 verb roe/select_window_value(actor, session, value)
   roe/SessionActor(session, actor) || return :not_session_actor
   roe/SessionLeafView(session, value) || return :invalid_view
-  let current_rows = roe/ActiveView(session, ?view)
-  if current_rows
-    let exactly {:view -> current} = current_rows
-    if current != value
-      retract roe/ActiveView(session, current)
-    end
-  end
-  assert roe/ActiveView(session, value)
+  // The decision is Mica-owned. The host republishes realized volatile context.
   emit(session, {:kind -> :host_action, :action -> :other_window, :view -> value})
   return :ok
 end
@@ -634,8 +658,6 @@ verb roe/native_other_window(actor, session)
   next_rows || return :no_next_view
   let exactly {:view -> next} = next_rows
   roe/SessionLeafView(session, next) || return :invalid_next_view
-  retract roe/ActiveView(session, current)
-  assert roe/ActiveView(session, next)
   emit(session, {:kind -> :host_action, :action -> :other_window, :view -> next})
   return :ok
 end
@@ -769,27 +791,33 @@ verb roe/refresh_prompt(actor, session)
     retract roe/PromptState(session, _, _, _, _, _)
     assert roe/PromptState(session, prompt_kind, query, selected, target, aux)
   end
-  let prompt = ""
+  let prefix = ""
   if prompt_kind == :command_argument
     let exactly {:value -> command_state} = aux
-    prompt = command_state[3]
-    emit(session, {:kind -> :prompt_update, :prompt_kind -> prompt_kind, :value_kind -> command_state[2], :prompt -> prompt, :query -> query, :selected -> selected, :candidates -> candidates})
+    prefix = string_concat(command_state[3], ": ")
   elseif prompt_kind == :find_file || prompt_kind == :visit_file || prompt_kind == :save_file
+    let action = "Find file"
+    if prompt_kind == :visit_file
+      action = "Visit file"
+    elseif prompt_kind == :save_file
+      action = "Save buffer as"
+    end
     let directory_rows = roe/FilePromptDirectory(session, ?directory)
     if directory_rows
       let exactly {:directory -> directory} = directory_rows
-      let action = "Find file"
-      if prompt_kind == :visit_file
-        action = "Visit file"
-      elseif prompt_kind == :save_file
-        action = "Save buffer as"
-      end
-      prompt = string_concat(action, " ", directory)
+      action = string_concat(action, " ", directory)
     end
-    emit(session, {:kind -> :prompt_update, :prompt_kind -> prompt_kind, :prompt -> prompt, :query -> query, :selected -> selected, :candidates -> candidates})
+    prefix = string_concat(action, ": ")
+  elseif prompt_kind == :command
+    prefix = "M-x "
+  elseif prompt_kind == :switch_buffer
+    prefix = "Switch to buffer: "
+  elseif prompt_kind == :kill_buffer
+    prefix = "Kill buffer: "
   else
-    emit(session, {:kind -> :prompt_update, :prompt_kind -> prompt_kind, :prompt -> prompt, :query -> query, :selected -> selected, :candidates -> candidates})
+    raise E_INVARG, "prompt kind has no presentation"
   end
+  emit(session, {:kind -> :prompt_update, :prefix -> prefix, :query -> query, :selected -> selected, :candidates -> candidates})
   return :ok
 end
 
@@ -930,14 +958,7 @@ verb roe/prompt_key(actor, session, sequence)
     emit(session, {:kind -> :prompt_close})
     if target
       let exactly {:value -> target_view} = target
-      let current_rows = roe/ActiveView(session, ?view)
-      if current_rows
-        let exactly {:view -> current} = current_rows
-        if current != target_view
-          retract roe/ActiveView(session, current)
-          assert roe/ActiveView(session, target_view)
-        end
-      end
+      emit(session, {:kind -> :host_action, :action -> :other_window, :view -> target_view})
     end
     if prompt_kind == :command
       return invoke(chosen[1], {:actor -> actor, :session -> session})
@@ -990,8 +1011,21 @@ verb roe/request_kill_buffer(actor, session, buffer)
   roe/CanUseBuffer(actor, buffer) || return :buffer_denied
   let exactly {:policy -> policy} = roe/BufferKillPolicy(buffer, ?policy)
   if policy == :allow
-    emit(session, {:kind -> :host_action, :action -> :kill_buffer_selected, :buffer -> buffer})
-    return :ok
+    // Prefer scratch, then the same sorted candidates as buffer selection.
+    let candidates = roe/prompt_candidates(actor, session, :switch_buffer, "")
+    for candidate in candidates
+      if candidate[1] != buffer && roe/BufferKind(candidate[1], :scratch)
+        emit(session, {:kind -> :host_action, :action -> :kill_buffer_selected, :buffer -> buffer, :replacement -> candidate[1]})
+        return :ok
+      end
+    end
+    for candidate in candidates
+      if candidate[1] != buffer
+        emit(session, {:kind -> :host_action, :action -> :kill_buffer_selected, :buffer -> buffer, :replacement -> candidate[1]})
+        return :ok
+      end
+    end
+    raise E_INVARG, "no replacement buffer is available"
   elseif policy == :deny_modified
     raise E_INVARG, "buffer is modified; save it before killing"
   end
@@ -1046,7 +1080,11 @@ verb roe/refresh_search(actor, session)
     retract roe/PromptState(session, _, _, _, _, _)
     assert roe/PromptState(session, prompt_kind, query, selected, target, aux)
   end
-  emit(session, {:kind -> :prompt_update, :prompt_kind -> prompt_kind, :query -> query, :selected -> selected, :candidates -> []})
+  let prefix = "I-search: "
+  if prompt_kind == :isearch_backward
+    prefix = "I-search backward: "
+  end
+  emit(session, {:kind -> :prompt_update, :prefix -> prefix, :query -> query, :selected -> selected, :candidates -> []})
   emit(session, {:kind -> :search_update, :view -> target_view, :matches -> matches, :selected -> selected})
   return :ok
 end

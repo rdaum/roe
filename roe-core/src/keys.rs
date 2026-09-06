@@ -21,7 +21,7 @@ pub enum KeyAction {
     MarkStart,
     MarkWholeBuffer,
     KillRegion(bool),
-    KillLine(bool),
+    KillLine,
     Yank(Option<usize>),
     Escape,
     Cancel,

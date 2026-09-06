@@ -4832,7 +4832,6 @@ dependencies = [
  "roe-core",
  "roe-terminal",
  "signal-hook 0.4.4",
- "slotmap",
  "tracing",
  "tracing-subscriber",
 ]
@@ -4841,7 +4840,9 @@ dependencies = [
 name = "roe-core"
 version = "0.1.0"
 dependencies = [
+ "arboard",
  "compio",
+ "futures-util",
  "mica-compiler",
  "mica-driver",
  "mica-external-http",
@@ -4850,6 +4851,7 @@ dependencies = [
  "serde",
  "similar",
  "slotmap",
+ "tempfile",
  "thiserror 2.0.20",
  "tracing",
 ]
@@ -4858,25 +4860,23 @@ dependencies = [
 name = "roe-terminal"
 version = "0.1.0"
 dependencies = [
- "arboard",
  "compio",
  "crossterm",
  "roe-core",
- "slotmap",
  "tracing",
+ "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]
 name = "roe-vello"
 version = "0.1.0"
 dependencies = [
- "arboard",
  "compio",
  "parley",
  "pollster 1.0.1",
  "roe-core",
  "roe-terminal",
- "slotmap",
  "thiserror 2.0.20",
  "tracing",
  "tracing-subscriber",

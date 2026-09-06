@@ -11,6 +11,7 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
+use crate::text_cells::{CellRow, fitted, start_for_cursor};
 use compio::time::interval;
 use crossterm::event::{
     Event, KeyCode, KeyModifiers, ModifierKeyCode, MouseButton, MouseEvent, MouseEventKind,
@@ -18,17 +19,15 @@ use crossterm::event::{
 use crossterm::style::{Color, Print, Stylize};
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::{cursor, queue};
+use roe_core::frontend::{LocalFrontendServices, PresentationConsumer};
 use roe_core::gutter::{GutterConfig, calculate_gutter_width, format_line_number};
 use roe_core::keys::{KeyModifier, LogicalKey, Side};
 use roe_core::renderer::PresentationStreamState;
 use roe_core::session::{
-    DirectSessionClient, FrontendServiceRequest, FrontendServiceResponse, FrontendServiceResult,
-    InputEvent, LifecycleEvent, PointerButton, PointerEvent, PointerKind, PresentationColor,
-    PresentationSnapshot, PresentationUpdate, PresentedView, SessionClient, SessionOutput,
-    StyleDefinition,
+    DirectSessionClient, InputEvent, PointerButton, PointerEvent, PointerKind, PointerTextHit,
+    PresentationColor, PresentationSnapshot, PresentationUpdate, PresentedView, SessionClient,
+    SessionOutput, StyleDefinition,
 };
-use std::borrow::Cow;
-use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -54,27 +53,38 @@ pub const _BORDER_T_UP: &str = "┴";
 pub const BORDER_T_RIGHT: &str = "├";
 pub const BORDER_T_LEFT: &str = "┤";
 
-fn truncate_echo(message: &str, available_width: usize) -> Cow<'_, str> {
-    if message.chars().count() <= available_width {
-        return Cow::Borrowed(message);
+fn gutter_width(view: &PresentedView) -> usize {
+    if !view.show_gutter {
+        return 0;
     }
-
-    if available_width <= 3 {
-        return Cow::Owned(".".repeat(available_width));
-    }
-
-    let mut truncated: String = message.chars().take(available_width - 3).collect();
-    truncated.push_str("...");
-    Cow::Owned(truncated)
+    calculate_gutter_width(view.total_lines, &GutterConfig::default())
+        .min(usize::from(view.geometry.columns.saturating_sub(2)))
 }
 
-fn cursor_in_visible_slice(view: &PresentedView) -> (u16, u16) {
+fn text_width(view: &PresentedView) -> usize {
+    usize::from(view.geometry.columns.saturating_sub(2)).saturating_sub(gutter_width(view))
+}
+
+fn realized_start_column(view: &PresentedView) -> usize {
+    if !view.active {
+        return view.scroll.start_column;
+    }
+    let (column, row) = cursor_in_visible_slice(view);
+    start_for_cursor(
+        session_view_line(view, row).trim_end_matches('\n'),
+        view.scroll.start_column,
+        text_width(view),
+        column,
+    )
+}
+
+fn cursor_in_visible_slice(view: &PresentedView) -> (usize, usize) {
     let target = view
         .cursor
         .saturating_sub(view.visible_start_char)
         .min(view.visible_text.chars().count());
-    let mut column = 0u16;
-    let mut line = 0u16;
+    let mut column = 0usize;
+    let mut line = 0usize;
     for character in view.visible_text.chars().take(target) {
         if character == '\n' {
             line = line.saturating_add(1);
@@ -243,18 +253,8 @@ impl<W: Write> TerminalRenderer<W> {
         &mut self,
         update: &PresentationUpdate,
     ) -> Result<(), std::io::Error> {
-        self.session_presentation
-            .apply(update)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        match update {
-            PresentationUpdate::Full(_) => self.force_clear_render = true,
-            PresentationUpdate::Delta(delta) => {
-                self.force_full_render |= delta
-                    .invalidations
-                    .contains(&roe_core::session::Invalidation::Full);
-            }
-        }
-        Ok(())
+        self.accept_presentation(update)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 
     pub fn session_presentation(&self) -> &PresentationStreamState {
@@ -336,6 +336,7 @@ impl<W: Write> TerminalRenderer<W> {
                 || old.resource != view.resource
                 || old.visible_start_char != view.visible_start_char
                 || old.scroll != view.scroll
+                || realized_start_column(old) != realized_start_column(view)
                 || old.selection != view.selection
                 || old.styled_ranges != view.styled_ranges
                 || old.styled_lines != view.styled_lines
@@ -378,16 +379,65 @@ impl<W: Write> TerminalRenderer<W> {
         Ok(())
     }
 
+    fn pointer_text_hit(&self, pointer: &PointerEvent) -> Option<PointerTextHit> {
+        let snapshot = self.session_presentation.current()?;
+        let dragging =
+            pointer.kind == PointerKind::Move && pointer.button == PointerButton::Primary;
+        let view = snapshot.views.iter().find(|view| {
+            if dragging {
+                return view.active;
+            }
+            let geometry = view.geometry;
+            pointer.column > geometry.x
+                && pointer.column
+                    < geometry
+                        .x
+                        .saturating_add(geometry.columns.saturating_sub(1))
+                && pointer.row > geometry.y
+                && pointer.row < geometry.y.saturating_add(geometry.rows.saturating_sub(1))
+        })?;
+        if view.command_view || view.typeout.is_some() {
+            return None;
+        }
+        let row = usize::from(
+            pointer
+                .row
+                .saturating_sub(view.geometry.y.saturating_add(1)),
+        )
+        .min(usize::from(view.geometry.rows.saturating_sub(3)));
+        let cell = usize::from(
+            pointer
+                .column
+                .saturating_sub(view.geometry.x.saturating_add(1)),
+        )
+        .saturating_sub(gutter_width(view));
+        let line = session_view_line(view, row).trim_end_matches('\n');
+        let cells = CellRow::new(line, realized_start_column(view), text_width(view));
+        let column = cells.character_at_cell(cell).min(line.chars().count());
+        let preceding: usize = view
+            .visible_text
+            .split_inclusive('\n')
+            .take(row)
+            .map(|line| line.chars().count())
+            .sum();
+        Some(PointerTextHit {
+            view: view.id,
+            resource: view.resource,
+            text_revision: view.text_revision,
+            position: view
+                .visible_start_char
+                .saturating_add(preceding)
+                .saturating_add(column)
+                .min(view.visible_end_char),
+        })
+    }
+
     fn draw_echo_area(&mut self, snapshot: &PresentationSnapshot) -> Result<(), std::io::Error> {
-        let message = truncate_echo(&snapshot.echo_area, snapshot.columns as usize);
+        let message = fitted(&snapshot.echo_area, usize::from(snapshot.columns), ' ');
         queue!(
             &mut self.device,
             cursor::MoveTo(0, snapshot.rows),
-            Print(
-                format!("{:<width$}", message, width = snapshot.columns as usize)
-                    .with(self.theme.fg_color)
-                    .on(self.theme.bg_color)
-            )
+            Print(message.with(self.theme.fg_color).on(self.theme.bg_color))
         )
     }
 
@@ -399,21 +449,32 @@ impl<W: Write> TerminalRenderer<W> {
             return Ok(());
         };
         let (column, line) = cursor_in_visible_slice(view);
-        let gutter = if view.show_gutter {
-            calculate_gutter_width(
-                view.visible_text.lines().count().max(1),
-                &GutterConfig::default(),
-            ) as u16
-        } else {
-            0
+        let gutter = gutter_width(view);
+        let cells = CellRow::new(
+            session_view_line(view, line).trim_end_matches('\n'),
+            realized_start_column(view),
+            text_width(view),
+        );
+        let Some(column) = cells
+            .cell_at_character(column)
+            .filter(|column| *column < text_width(view))
+        else {
+            return queue!(&mut self.device, cursor::Hide);
         };
+        if line >= usize::from(view.geometry.rows.saturating_sub(2)) {
+            return queue!(&mut self.device, cursor::Hide);
+        }
         let x = view
             .geometry
             .x
             .saturating_add(1)
-            .saturating_add(gutter)
-            .saturating_add(column.saturating_sub(view.scroll.start_column));
-        let y = view.geometry.y.saturating_add(1).saturating_add(line);
+            .saturating_add(gutter as u16)
+            .saturating_add(column as u16);
+        let y = view
+            .geometry
+            .y
+            .saturating_add(1)
+            .saturating_add(line as u16);
         queue!(&mut self.device, cursor::MoveTo(x, y))?;
         if view.command_view || view.typeout.is_some() {
             queue!(&mut self.device, cursor::Hide)
@@ -501,12 +562,7 @@ impl<W: Write> TerminalRenderer<W> {
             return Ok(());
         }
         let total_width = geometry.columns.saturating_sub(2) as usize;
-        let visible_line_count = view.visible_text.lines().count().max(1);
-        let gutter_width = if view.show_gutter {
-            calculate_gutter_width(visible_line_count, &GutterConfig::default())
-        } else {
-            0
-        };
+        let gutter_width = gutter_width(view);
         let text_width = total_width.saturating_sub(gutter_width);
         let lines: Vec<&str> = view.visible_text.split_inclusive('\n').collect();
         let absolute = view.visible_start_char
@@ -514,7 +570,7 @@ impl<W: Write> TerminalRenderer<W> {
                 offset.saturating_add(line.chars().count())
             });
         let y = geometry.y + 1 + row as u16;
-        let logical_line = usize::from(view.scroll.start_line) + row;
+        let logical_line = view.scroll.start_line + row;
         let (line_foreground, line_background) =
             session_line_style(logical_line, view, styles, &self.theme);
         queue!(
@@ -528,30 +584,30 @@ impl<W: Write> TerminalRenderer<W> {
         )?;
         let line = lines.get(row).copied().unwrap_or("").trim_end_matches('\n');
         if view.show_gutter {
-            let number = usize::from(view.scroll.start_line) + row + 1;
+            let number = view.scroll.start_line + row + 1;
             let digits = gutter_width.saturating_sub(2);
             let gutter = format!(" {}│", format_line_number(number, digits));
             queue!(
                 &mut self.device,
                 cursor::MoveTo(geometry.x + 1, y),
-                Print(gutter.with(GUTTER_FG_COLOR).on(GUTTER_BG_COLOR))
+                Print(
+                    fitted(&gutter, gutter_width, ' ')
+                        .with(GUTTER_FG_COLOR)
+                        .on(GUTTER_BG_COLOR)
+                )
             )?;
         }
         queue!(
             &mut self.device,
             cursor::MoveTo(geometry.x + 1 + gutter_width as u16, y)
         )?;
-        for (offset, character) in line
-            .chars()
-            .skip(usize::from(view.scroll.start_column))
-            .take(text_width)
-            .enumerate()
-        {
-            let position = absolute + usize::from(view.scroll.start_column) + offset;
+        let cells = CellRow::new(line, realized_start_column(view), text_width);
+        for glyph in cells.glyphs {
+            let position = absolute + glyph.characters.start;
             let selected = view.selection.is_some_and(|selection| {
                 let start = selection.anchor.min(selection.active);
                 let end = selection.anchor.max(selection.active);
-                position >= start && position < end
+                position < end && absolute + glyph.characters.end > start
             });
             let (foreground, background) = if selected {
                 (Color::Black, self.theme.selection_color)
@@ -566,7 +622,7 @@ impl<W: Write> TerminalRenderer<W> {
             };
             queue!(
                 &mut self.device,
-                Print(character.to_string().with(foreground).on(background))
+                Print(glyph.text.with(foreground).on(background))
             )?;
         }
         Ok(())
@@ -584,8 +640,7 @@ impl<W: Write> TerminalRenderer<W> {
         } else {
             self.theme.inactive_mode_line_bg_color
         };
-        let modeline = truncate_echo(&view.modeline, total_width);
-        let padded = format!("{:<width$}", modeline, width = total_width);
+        let padded = fitted(&view.modeline, total_width, ' ');
         queue!(
             &mut self.device,
             cursor::MoveTo(geometry.x + 1, bottom),
@@ -642,7 +697,7 @@ impl<W: Write> TerminalRenderer<W> {
                 if framed {
                     typeout_frame_line('│', text, '│', width, ' ')
                 } else {
-                    format!("{:<width$}", truncate_echo(text, width), width = width)
+                    fitted(text, width, ' ')
                 }
             };
             queue!(
@@ -659,18 +714,7 @@ fn typeout_frame_line(left: char, text: &str, right: char, width: usize, fill: c
     if width < 2 {
         return fill.to_string().repeat(width);
     }
-    let inner_width = width - 2;
-    let text = truncate_echo(text, inner_width);
-    let text_width = text.chars().count();
-    let mut line = String::with_capacity(width);
-    line.push(left);
-    line.push_str(&text);
-    line.extend(std::iter::repeat_n(
-        fill,
-        inner_width.saturating_sub(text_width),
-    ));
-    line.push(right);
-    line
+    format!("{left}{}{right}", fitted(text, width - 2, fill))
 }
 
 fn session_layout_matches(
@@ -747,14 +791,14 @@ pub async fn session_event_loop_with_renderer<W: Write>(
     renderer: &mut TerminalRenderer<W>,
     session: &mut DirectSessionClient,
     shutdown_requested: &AtomicBool,
+    frontend_services: &mut LocalFrontendServices,
 ) -> Result<(), std::io::Error> {
     let mut event_tick = interval(Duration::from_millis(20));
-    let mut frontend_services = LocalFrontendServices::new();
 
     loop {
         event_tick.tick().await;
         if let Some(output) = session.poll_output().await.map_err(session_io_error)?
-            && apply_session_output(renderer, session, &mut frontend_services, output).await?
+            && apply_session_output(renderer, session, frontend_services, output).await?
         {
             return Ok(());
         }
@@ -767,12 +811,15 @@ pub async fn session_event_loop_with_renderer<W: Write>(
             continue;
         }
 
-        let Some(input) = normalize_terminal_event(crossterm::event::read()?) else {
+        let Some(mut input) = normalize_terminal_event(crossterm::event::read()?) else {
             continue;
         };
+        if let InputEvent::Pointer(pointer) = &mut input {
+            pointer.text_hit = renderer.pointer_text_hit(pointer);
+        }
         let envelope = session.envelope(input);
         let output = session.dispatch(envelope).await.map_err(session_io_error)?;
-        if apply_session_output(renderer, session, &mut frontend_services, output).await? {
+        if apply_session_output(renderer, session, frontend_services, output).await? {
             return Ok(());
         }
     }
@@ -824,6 +871,7 @@ fn normalize_terminal_pointer(mouse: MouseEvent) -> Option<InputEvent> {
         | MouseEventKind::ScrollRight => return None,
     };
     Some(InputEvent::Pointer(PointerEvent {
+        text_hit: None,
         column: mouse.column,
         row: mouse.row,
         kind,
@@ -839,117 +887,40 @@ fn pointer_button(button: MouseButton) -> PointerButton {
     }
 }
 
-struct LocalFrontendServices {
-    clipboard: Option<arboard::Clipboard>,
-    clipboard_error: Option<String>,
-}
-
-impl LocalFrontendServices {
-    fn new() -> Self {
-        match arboard::Clipboard::new() {
-            Ok(clipboard) => Self {
-                clipboard: Some(clipboard),
-                clipboard_error: None,
-            },
-            Err(error) => Self {
-                clipboard: None,
-                clipboard_error: Some(error.to_string()),
-            },
-        }
-    }
-
-    fn handle(&mut self, request: FrontendServiceRequest) -> FrontendServiceResult {
-        let request_id = request.request_id();
-        let result = match request {
-            FrontendServiceRequest::ReadClipboard { .. } => self
-                .clipboard
-                .as_mut()
-                .ok_or_else(|| {
-                    self.clipboard_error
-                        .clone()
-                        .unwrap_or_else(|| "frontend clipboard is unavailable".to_owned())
-                })
-                .and_then(|clipboard| clipboard.get_text().map_err(|error| error.to_string()))
-                .map(|contents| FrontendServiceResponse::ClipboardContents(Some(contents))),
-            FrontendServiceRequest::WriteClipboard { contents, .. } => self
-                .clipboard
-                .as_mut()
-                .ok_or_else(|| {
-                    self.clipboard_error
-                        .clone()
-                        .unwrap_or_else(|| "frontend clipboard is unavailable".to_owned())
-                })
-                .and_then(|clipboard| {
-                    clipboard
-                        .set_text(contents)
-                        .map(|()| FrontendServiceResponse::Completed)
-                        .map_err(|error| error.to_string())
-                }),
-            FrontendServiceRequest::Notify { .. } => {
-                Err("frontend notifications are not available".to_owned())
-            }
-        };
-        FrontendServiceResult { request_id, result }
-    }
-}
-
 async fn apply_session_output<W: Write>(
     renderer: &mut TerminalRenderer<W>,
     session: &mut DirectSessionClient,
     frontend_services: &mut LocalFrontendServices,
     output: SessionOutput,
 ) -> Result<bool, std::io::Error> {
-    let mut outputs = VecDeque::from([output]);
-    let mut quit = false;
-    while let Some(output) = outputs.pop_front() {
-        let requests = output.frontend_requests.clone();
-        quit |= render_session_output(renderer, output)?;
-        for request in requests {
-            let completion = frontend_services.handle(request);
-            outputs.push_back(
-                session
-                    .complete_frontend_request(completion)
-                    .await
-                    .map_err(session_io_error)?,
-            );
-        }
-    }
-    Ok(quit)
-}
-
-fn render_session_output<W: Write>(
-    renderer: &mut TerminalRenderer<W>,
-    output: SessionOutput,
-) -> Result<bool, std::io::Error> {
-    let quit = output.lifecycle.iter().any(|event| {
-        matches!(
-            event,
-            LifecycleEvent::QuitRequested
-                | LifecycleEvent::AttachmentClosed { .. }
-                | LifecycleEvent::WorkspaceTerminated
-                | LifecycleEvent::Fatal(_)
-        )
-    });
-    for event in &output.lifecycle {
-        match event {
-            LifecycleEvent::Warning(message) => tracing::warn!(%message, "session warning"),
-            LifecycleEvent::Error(message) => tracing::error!(%message, "session error"),
-            LifecycleEvent::Fatal(message) => tracing::error!(%message, "fatal session error"),
-            LifecycleEvent::Overloaded { detail } => {
-                tracing::warn!(%detail, "session overload")
-            }
-            _ => {}
-        }
-    }
-    if let Some(update) = output.presentation.as_ref() {
-        renderer.apply_session_presentation(update)?;
-        renderer.render_session()?;
-    }
-    Ok(quit)
+    roe_core::frontend::consume_output(session, frontend_services, renderer, output)
+        .await
+        .map_err(std::io::Error::other)
 }
 
 fn session_io_error(error: roe_core::session::SessionError) -> std::io::Error {
     std::io::Error::other(error)
+}
+
+impl<W: Write> PresentationConsumer for TerminalRenderer<W> {
+    fn accept_presentation(
+        &mut self,
+        update: &PresentationUpdate,
+    ) -> Result<(), roe_core::renderer::PresentationStreamError> {
+        self.session_presentation.apply(update)?;
+        match update {
+            PresentationUpdate::Full(_) => self.force_clear_render = true,
+            PresentationUpdate::Delta(delta) => {
+                self.force_full_render |= delta
+                    .invalidations
+                    .contains(&roe_core::session::Invalidation::Full);
+            }
+        }
+        Ok(())
+    }
+    fn redraw_presentation(&mut self) -> std::io::Result<()> {
+        self.render_session()
+    }
 }
 
 #[cfg(test)]
@@ -981,7 +952,7 @@ mod tests {
                 last_saved_revision: 0,
                 modified: false,
                 read_only: false,
-                visible_text: text.to_owned(),
+                visible_text: text.into(),
                 visible_start_char: 0,
                 visible_end_char: text.chars().count(),
                 total_lines: text.lines().count().max(1),
@@ -1036,9 +1007,9 @@ mod tests {
 
     #[test]
     fn unicode_echo_truncation_preserves_character_boundaries() {
-        assert_eq!(truncate_echo("λé猫abc", 5), "λé...");
-        assert_eq!(truncate_echo("λé", 5), "λé");
-        assert_eq!(truncate_echo("λé", 1), ".");
+        assert_eq!(fitted("λé猫abc", 5, ' '), "λé...");
+        assert_eq!(fitted("λé", 5, ' '), "λé   ");
+        assert_eq!(fitted("λé", 1, ' '), ".");
     }
 
     #[test]
@@ -1177,5 +1148,61 @@ mod tests {
         renderer.render_session().unwrap();
         assert!(!renderer.device.windows(4).any(|bytes| bytes == b"\x1b[2J"));
         assert!(String::from_utf8_lossy(&renderer.device).contains(BORDER_TOP_LEFT));
+    }
+    #[test]
+    fn terminal_cursor_and_pointer_share_display_cell_mapping() {
+        let mut renderer = TerminalRenderer::new(Vec::new());
+        let snapshot = test_snapshot(1, "a\t界e\u{301}");
+        renderer
+            .apply_session_presentation(&PresentationUpdate::Full(snapshot))
+            .unwrap();
+        renderer.render_session().unwrap();
+        let output = String::from_utf8_lossy(&renderer.device);
+        assert!(!output.contains('\t'));
+        assert!(output.contains("\x1b[2;13H"), "{output:?}");
+        let hit = renderer
+            .pointer_text_hit(&PointerEvent {
+                text_hit: None,
+                column: 10,
+                row: 1,
+                kind: PointerKind::Down,
+                button: PointerButton::Primary,
+            })
+            .unwrap();
+        assert_eq!(hit.position, 2); // Second cell of the wide character.
+        let hit = renderer
+            .pointer_text_hit(&PointerEvent {
+                text_hit: None,
+                column: 5,
+                row: 1,
+                kind: PointerKind::Down,
+                button: PointerButton::Primary,
+            })
+            .unwrap();
+        assert_eq!(hit.position, 1); // Interior of the expanded tab.
+    }
+
+    #[test]
+    fn every_terminal_text_surface_escapes_terminal_controls() {
+        let attack = "\x1b]52;x\x07";
+        let mut renderer = TerminalRenderer::new(Vec::new());
+        let mut snapshot = test_snapshot(1, attack);
+        snapshot.echo_area = attack.into();
+        snapshot.views[0].modeline = attack.into();
+        renderer
+            .draw_session_view_content_row(&snapshot.views[0], &[], 0)
+            .unwrap();
+        renderer
+            .draw_session_view_modeline(&snapshot.views[0])
+            .unwrap();
+        renderer.draw_echo_area(&snapshot).unwrap();
+        let output = String::from_utf8_lossy(&renderer.device);
+        assert!(!output.contains("\x1b]52"));
+        assert!(!output.contains('\x07'));
+        assert!(output.matches("^[").count() >= 3, "{output:?}");
+        let frame = typeout_frame_line('│', attack, '│', 18, ' ');
+        assert!(!frame.contains('\x1b'));
+        assert!(!frame.contains('\x07'));
+        assert!(frame.contains("^[]52;x^G"));
     }
 }

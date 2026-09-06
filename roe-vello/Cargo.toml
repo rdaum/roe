@@ -14,25 +14,23 @@ path = "src/bin/roe-vello.rs"
 
 [dependencies]
 # Core roe
-arboard = { workspace = true }
 roe-core = { path = "../roe-core" }
 
 # Rendering
-vello = "0.9"
+vello = { workspace = true }
 # Note: wgpu version must match what vello uses.
 
 # Windowing
-winit = "0.30"
+winit = { workspace = true }
 
 # Text
-parley = "0.11"
+parley = { workspace = true }
 
 # Async
 compio = { workspace = true }
-pollster = "1.0"
+pollster = { workspace = true }
 
 # Utilities
-slotmap = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

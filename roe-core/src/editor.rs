@@ -31,10 +31,7 @@ pub enum WindowType {
     /// Normal editing window
     Normal,
     /// Command window for M-x, C-x b, etc.
-    Command {
-        position: CommandWindowPosition,
-        command_type: CommandType,
-    },
+    Command { position: CommandWindowPosition },
 }
 
 /// How to open a file
@@ -44,25 +41,6 @@ pub enum OpenType {
     New,
     /// Replace current buffer (visit-file behavior)
     Visit,
-}
-
-/// Type of command being executed in a command window
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommandType {
-    /// M-x command execution
-    Execute,
-    /// Generic Mica interactive argument acquisition
-    Argument,
-    /// C-x b buffer switching
-    BufferSwitch,
-    /// C-x k buffer killing
-    KillBuffer,
-    /// File opening
-    OpenFile(OpenType),
-    /// Destination acquisition for a non-file buffer.
-    SaveFile,
-    /// Incremental search
-    ISearch { forward: bool },
 }
 
 /// Command window position
@@ -199,36 +177,38 @@ impl Frame {
 }
 
 pub struct Editor {
-    pub frame: Frame,
-    pub buffers: SlotMap<BufferId, Buffer>,
-    pub windows: SlotMap<WindowId, Window>,
-    pub active_window: WindowId,
+    pub(crate) frame: Frame,
+    pub(crate) buffers: SlotMap<BufferId, Buffer>,
+    pub(crate) windows: SlotMap<WindowId, Window>,
+    pub(crate) active_window: WindowId,
     /// Tree structure representing window layout
-    pub window_tree: WindowNode,
+    pub(crate) window_tree: WindowNode,
     /// Global kill-ring for cut/copy/paste operations
-    pub kill_ring: KillRing,
+    pub(crate) kill_ring: KillRing,
     /// Window that was active before opening command/buffer switch window
-    pub previous_active_window: Option<WindowId>,
+    pub(crate) previous_active_window: Option<WindowId>,
     /// Buffer history (most recently used first) for smart buffer switching
-    pub buffer_history: Vec<BufferId>,
+    pub(crate) buffer_history: Vec<BufferId>,
     /// Current echo area message
-    pub echo_message: String,
+    pub(crate) echo_message: String,
     /// When the echo message was set (for auto-clearing)
-    pub echo_message_time: Option<Instant>,
-    pub clock: Arc<dyn Clock>,
+    pub(crate) echo_message_time: Option<Instant>,
+    pub(crate) clock: Arc<dyn Clock>,
     /// Mouse drag state for window resizing
-    pub mouse_drag_state: Option<MouseDragState>,
+    pub(crate) mouse_drag_state: Option<MouseDragState>,
     /// Messages buffer for collecting echo messages and logs
-    pub messages_buffer_id: Option<BufferId>,
+    pub(crate) messages_buffer_id: Option<BufferId>,
     /// File watcher for detecting external changes
-    pub file_watcher: crate::file_watcher::FileWatcher,
+    pub(crate) file_watcher: crate::file_watcher::FileWatcher,
+    /// User-requested startup buffers; Mica chooses their initial presentation.
+    pub(crate) startup_buffers: Vec<BufferId>,
 }
 
 /// Character-oriented location for a native text mutation.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum ActionPosition {
     Cursor,
-    Absolute(u16, u16),
+    Absolute { column: usize, line: usize },
     End,
 }
 
@@ -240,7 +220,6 @@ impl ActionPosition {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum ChromeAction {
-    Save,
     Echo(String),
     MarkDirty(DirtyRegion),
     BufferChanged {
@@ -252,6 +231,51 @@ pub enum ChromeAction {
 }
 
 impl Editor {
+    /// Construct one native view. This seed has no command, mode, or layout policy.
+    pub fn new(buffer: Buffer, frame: Frame) -> Self {
+        let mut buffers = SlotMap::default();
+        let buffer_id = buffers.insert(buffer);
+        let mut windows = SlotMap::default();
+        let window_id = windows.insert(Window {
+            x: 0,
+            y: 0,
+            width_chars: frame.available_columns,
+            height_chars: frame.available_lines,
+            active_buffer: buffer_id,
+            cursor: 0,
+            window_type: WindowType::Normal,
+        });
+        Self {
+            frame,
+            buffers,
+            windows,
+            active_window: window_id,
+            window_tree: WindowNode::new_leaf(window_id),
+            kill_ring: KillRing::with_capacity(60),
+            previous_active_window: None,
+            buffer_history: vec![buffer_id],
+            echo_message: String::new(),
+            echo_message_time: None,
+            clock: Arc::new(crate::native_services::SystemClock),
+            mouse_drag_state: None,
+            messages_buffer_id: None,
+            file_watcher: crate::file_watcher::FileWatcher::new(),
+            startup_buffers: Vec::new(),
+        }
+    }
+
+    pub fn frame(&self) -> &Frame {
+        &self.frame
+    }
+
+    pub fn active_buffer(&self) -> &Buffer {
+        &self.buffers[self.windows[self.active_window].active_buffer]
+    }
+
+    pub fn set_native_wake_handler(&mut self, wake: Arc<dyn crate::native_services::FrontendWake>) {
+        self.file_watcher.set_wake_handler(wake);
+    }
+
     /// Realize a native action selected by Mica's keymap. This vocabulary does
     /// not assign platform keys or editor policy.
     pub async fn perform_native_action(
@@ -273,7 +297,7 @@ impl Editor {
             KeyAction::MarkWholeBuffer => self.mark_whole_buffer(),
             KeyAction::KillRegion(true) => self.kill_region(),
             KeyAction::KillRegion(false) => self.copy_region(),
-            KeyAction::KillLine(_) => self.kill_line(),
+            KeyAction::KillLine => self.kill_line(),
             KeyAction::Yank(Some(index)) => self.yank_index(&ActionPosition::Cursor, index),
             KeyAction::Yank(None) => self.yank(&ActionPosition::Cursor),
             KeyAction::DeleteWord => self.forward_kill_word(),
@@ -318,14 +342,14 @@ impl Editor {
             CursorDirection::BufferStart => buffer.move_buffer_start(),
             CursorDirection::BufferEnd => buffer.move_buffer_end(),
             CursorDirection::PageUp => {
-                let height = window.height_chars.saturating_sub(3);
+                let height = usize::from(window.height_chars.saturating_sub(3));
                 let (column, line) = buffer.to_column_line(window.cursor);
                 buffer.to_char_index(column, line.saturating_sub(height))
             }
             CursorDirection::PageDown => {
-                let height = window.height_chars.saturating_sub(3);
+                let height = usize::from(window.height_chars.saturating_sub(3));
                 let (column, line) = buffer.to_column_line(window.cursor);
-                let last = buffer.buffer_len_lines().saturating_sub(1) as u16;
+                let last = buffer.buffer_len_lines().saturating_sub(1);
                 buffer.to_char_index(column, line.saturating_add(height).min(last))
             }
             CursorDirection::WordForward => buffer.move_word_forward(window.cursor),
@@ -346,11 +370,17 @@ impl Editor {
     }
 
     /// Realize an exact character cursor chosen by external editor policy.
-    pub fn move_cursor_to(&mut self, position: usize) -> Vec<ChromeAction> {
+    pub fn move_cursor_to(&mut self, position: usize, selecting: bool) -> Vec<ChromeAction> {
         let window = &mut self.windows[self.active_window];
         let buffer = &self.buffers[window.active_buffer];
         buffer.undo_boundary();
-        buffer.clear_transient_mark();
+        if selecting {
+            if !buffer.has_mark() {
+                buffer.set_transient_mark(window.cursor);
+            }
+        } else {
+            buffer.clear_transient_mark();
+        }
         window.cursor = position.min(buffer.buffer_len_chars());
         vec![ChromeAction::MarkDirty(DirtyRegion::Buffer {
             buffer_id: window.active_buffer,
@@ -381,7 +411,6 @@ impl Editor {
     /// live in Mica. The Rust side owns only its text buffer and geometry.
     pub fn create_mica_prompt_window(
         &mut self,
-        command_type: CommandType,
         height: u16,
         content: String,
         cursor: usize,
@@ -398,10 +427,7 @@ impl Editor {
             height_chars: height,
             active_buffer: command_buffer_id,
             cursor: cursor.min(content.chars().count()),
-            window_type: WindowType::Command {
-                position,
-                command_type,
-            },
+            window_type: WindowType::Command { position },
         });
         self.previous_active_window = Some(self.active_window);
         self.active_window = window;
@@ -417,34 +443,43 @@ impl Editor {
         Some(window_id)
     }
 
-    pub fn select_mica_buffer(&mut self, buffer_id: BufferId, kill: bool) -> Vec<ChromeAction> {
+    pub fn select_mica_buffer(&mut self, buffer_id: BufferId) -> Vec<ChromeAction> {
         if let Some(prompt) = self.find_command_window() {
             self.close_command_window(prompt);
         }
         if !self.buffers.contains_key(buffer_id) || self.is_command_buffer(buffer_id) {
             return vec![ChromeAction::Echo("Buffer no longer exists".to_owned())];
         }
-        if !kill {
-            self.windows[self.active_window].active_buffer = buffer_id;
-            self.windows[self.active_window].cursor = 0;
-            self.record_buffer_access(buffer_id);
-            return vec![
-                ChromeAction::Echo(format!(
-                    "Switched to buffer: {}",
-                    self.buffers[buffer_id].display_name()
-                )),
-                ChromeAction::MarkDirty(DirtyRegion::FullScreen),
-            ];
-        }
+        self.windows[self.active_window].active_buffer = buffer_id;
+        self.windows[self.active_window].cursor = 0;
+        self.record_buffer_access(buffer_id);
+        vec![
+            ChromeAction::Echo(format!(
+                "Switched to buffer: {}",
+                self.buffers[buffer_id].display_name()
+            )),
+            ChromeAction::MarkDirty(DirtyRegion::FullScreen),
+        ]
+    }
 
+    /// Apply a policy-selected replacement without choosing a logical target.
+    pub fn kill_mica_buffer(
+        &mut self,
+        buffer_id: BufferId,
+        replacement: BufferId,
+    ) -> Vec<ChromeAction> {
+        if buffer_id == replacement
+            || !self.buffers.contains_key(buffer_id)
+            || !self.buffers.contains_key(replacement)
+            || self.is_command_buffer(buffer_id)
+            || self.is_command_buffer(replacement)
+        {
+            return vec![ChromeAction::Echo("Invalid buffer replacement".to_owned())];
+        }
+        if let Some(prompt) = self.find_command_window() {
+            self.close_command_window(prompt);
+        }
         let name = self.buffers[buffer_id].display_name();
-        let replacement = self
-            .buffers
-            .iter()
-            .find_map(|(candidate, _)| (candidate != buffer_id).then_some(candidate));
-        let Some(replacement) = replacement else {
-            return vec![ChromeAction::Echo("Cannot kill the only buffer".to_owned())];
-        };
         for (_, window) in &mut self.windows {
             if window.active_buffer == buffer_id {
                 window.active_buffer = replacement;
@@ -1261,7 +1296,7 @@ impl Editor {
                 window.cursor += length;
 
                 // Mark dirty regions based on what was inserted
-                let cursor_line = buffer.to_column_line(window.cursor).1 as usize;
+                let cursor_line = buffer.to_column_line(window.cursor).1;
                 let dirty_action = if has_newline {
                     // Newlines affect multiple lines, mark entire buffer dirty
                     ChromeAction::MarkDirty(DirtyRegion::Buffer { buffer_id })
@@ -1285,11 +1320,11 @@ impl Editor {
                     },
                 ]
             }
-            ActionPosition::Absolute(l, c) => {
+            ActionPosition::Absolute { column: c, line: l } => {
                 let buffer_id = window.active_buffer;
                 let start = buffer.to_char_index(*c, *l);
                 let length = text.chars().count();
-                if !buffer.insert_col_line(text.clone(), (*l, *c)) {
+                if !buffer.insert_col_line(text.clone(), (*c, *l)) {
                     return vec![ChromeAction::Echo("Buffer is read-only".to_owned())];
                 }
 
@@ -1300,7 +1335,7 @@ impl Editor {
                     // Simple text insertion, only current line affected
                     ChromeAction::MarkDirty(DirtyRegion::Line {
                         buffer_id,
-                        line: *l as usize,
+                        line: *l,
                     })
                 };
 
@@ -1364,7 +1399,7 @@ impl Editor {
                 if count < 0 {
                     window.cursor = window.cursor.saturating_sub(deleted_len);
                 }
-                let cursor_line = buffer.to_column_line(window.cursor).1 as usize;
+                let cursor_line = buffer.to_column_line(window.cursor).1;
 
                 // If we deleted a newline, mark entire buffer dirty to handle line merging
                 let dirty_action = if deleted.contains('\n') {
@@ -1387,10 +1422,10 @@ impl Editor {
                     },
                 ]
             }
-            ActionPosition::Absolute(l, c) => {
+            ActionPosition::Absolute { column: c, line: l } => {
                 let buffer_id = window.active_buffer;
                 let start = buffer.to_char_index(*c, *l);
-                let Some(deleted) = buffer.delete_col_line((*l, *c), count) else {
+                let Some(deleted) = buffer.delete_col_line((*c, *l), count) else {
                     return vec![];
                 };
                 if deleted.is_empty() {
@@ -1409,7 +1444,7 @@ impl Editor {
                 } else {
                     ChromeAction::MarkDirty(DirtyRegion::Line {
                         buffer_id,
-                        line: *l as usize,
+                        line: *l,
                     })
                 };
 
@@ -1467,8 +1502,8 @@ impl Editor {
                     }),
                 ]
             }
-            ActionPosition::Absolute(l, c) => {
-                let Some(deleted) = buffer.delete_col_line((*l, *c), count) else {
+            ActionPosition::Absolute { column: c, line: l } => {
+                let Some(deleted) = buffer.delete_col_line((*c, *l), count) else {
                     return vec![];
                 };
                 if deleted.is_empty() {
@@ -1746,98 +1781,8 @@ impl Editor {
         self.insert_text(text, position)
     }
 
-    #[cfg(test)]
-    async fn handle_open_file_action(
-        &mut self,
-        path: std::path::PathBuf,
-        open_type: OpenType,
-    ) -> Vec<ChromeAction> {
-        let mut actions = Vec::new();
-        if let Some(command_window_id) = self.find_command_window() {
-            self.close_command_window(command_window_id);
-            actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
-        }
-
-        let window_to_open = self
-            .previous_active_window
-            .filter(|window_id| self.windows.contains_key(*window_id))
-            .unwrap_or(self.active_window);
-        let replaced_buffer = (open_type == OpenType::Visit)
-            .then(|| self.windows[window_to_open].active_buffer)
-            .filter(|buffer_id| !self.is_command_buffer(*buffer_id));
-
-        match self.open_file_in_window(path.clone(), window_to_open).await {
-            Ok(message) => {
-                let opened_buffer = self.windows[window_to_open].active_buffer;
-                let watch_error = if path.exists()
-                    && let Some(buffer) = self.buffers.get(opened_buffer)
-                {
-                    self.file_watcher
-                        .watch_file(opened_buffer, &path, buffer.content())
-                        .err()
-                        .map(|error| {
-                            format!("Opened {}, but failed to watch it: {error}", path.display())
-                        })
-                } else {
-                    None
-                };
-
-                let unwatch_error = if let Some(replaced_buffer) = replaced_buffer
-                    && !self
-                        .windows
-                        .values()
-                        .any(|window| window.active_buffer == replaced_buffer)
-                {
-                    let error = self.file_watcher.unwatch_file(replaced_buffer).err();
-                    self.buffers.remove(replaced_buffer);
-                    error.map(|error| {
-                        format!("Replaced buffer, but failed to stop watching it: {error}")
-                    })
-                } else {
-                    None
-                };
-
-                actions.push(ChromeAction::Echo(message));
-                actions.extend(watch_error.into_iter().map(ChromeAction::Echo));
-                actions.extend(unwatch_error.into_iter().map(ChromeAction::Echo));
-                actions.push(ChromeAction::MarkDirty(DirtyRegion::FullScreen));
-            }
-            Err(error) => actions.push(ChromeAction::Echo(format!("Error opening file: {error}"))),
-        }
-        actions
-    }
-
-    /// Open a file in the specified window
-    #[cfg(test)]
-    async fn open_file_in_window(
-        &mut self,
-        file_path: std::path::PathBuf,
-        window_id: WindowId,
-    ) -> Result<String, String> {
-        if !self.windows.contains_key(window_id) {
-            return Err("Window no longer exists".to_string());
-        }
-
-        // Try to load the file
-        let buffer = match Buffer::from_file(&file_path.to_string_lossy()).await {
-            Ok(buffer) => buffer,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                // A missing file is the normal create-new-file path.
-                Buffer::visiting(file_path.clone())
-            }
-            Err(error) => {
-                return Err(format!("Failed to open {}: {error}", file_path.display()));
-            }
-        };
-
-        self.open_file_content_in_window(file_path, window_id, Some(buffer.content()))
-    }
-
-    /// Create a CommandContext from the current editor state
-    /// Process ChromeActions and handle those that need editor state changes
-    /// Poll for external file changes and handle them with CRDT-lite merge
-    /// Returns actions to update the UI if any changes were applied
-    pub fn poll_file_changes(&mut self) -> Vec<ChromeAction> {
+    /// Poll external file changes and merge them with native buffer state.
+    pub async fn poll_file_changes(&mut self) -> Vec<ChromeAction> {
         use crate::file_watcher::{MergeResult, merge_changes};
 
         let mut actions = Vec::new();
@@ -1850,16 +1795,19 @@ impl Editor {
 
         for event in events {
             // Read the new file content
-            let new_content = match std::fs::read_to_string(&event.file_path) {
-                Ok(content) => content,
-                Err(error) => {
-                    actions.push(ChromeAction::Echo(format!(
-                        "External file change unavailable for {}: {error}",
-                        event.file_path.display()
-                    )));
-                    continue;
-                }
-            };
+            let new_content =
+                match crate::native_io::read_text(&event.file_path, crate::native_io::MAX_IO_BYTES)
+                    .await
+                {
+                    Ok(content) => content,
+                    Err(error) => {
+                        actions.push(ChromeAction::Echo(format!(
+                            "External file change unavailable for {}: {error}",
+                            event.file_path.display()
+                        )));
+                        continue;
+                    }
+                };
 
             // Get the buffer and sync state
             let buffer = match self.buffers.get(event.buffer_id) {
@@ -2038,39 +1986,12 @@ mod tests {
     }
 
     fn test_editor() -> Editor {
-        let mut buffers: SlotMap<BufferId, Buffer> = SlotMap::default();
-        let scratch_buffer = Buffer::named("test", BufferKind::Scratch);
-        scratch_buffer.load_str("Hello\nWorld\nTest");
-        let scratch_buffer_id = buffers.insert(scratch_buffer);
-
-        let window = Window {
-            x: 0,
-            y: 0,
-            width_chars: 80,
-            height_chars: 22,
-            active_buffer: scratch_buffer_id,
-            cursor: 0,
-            window_type: WindowType::Normal,
-        };
-        let mut windows: SlotMap<WindowId, Window> = SlotMap::default();
-        let window_id = windows.insert(window);
-
-        Editor {
-            frame: Frame::new(80, 24),
-            buffers,
-            windows,
-            active_window: window_id,
-            previous_active_window: None,
-            window_tree: WindowNode::new_leaf(window_id),
-            kill_ring: KillRing::with_capacity(60),
-            buffer_history: vec![],
-            echo_message: "".to_string(),
-            echo_message_time: None,
-            clock: Arc::new(crate::native_services::SystemClock),
-            mouse_drag_state: None,
-            messages_buffer_id: None,
-            file_watcher: crate::file_watcher::FileWatcher::new(),
-        }
+        let buffer = Buffer::named("test", BufferKind::Scratch);
+        buffer.load_str("Hello\nWorld\nTest");
+        let mut editor = Editor::new(buffer, Frame::new(80, 24));
+        editor.windows[editor.active_window].height_chars = 22;
+        editor.buffer_history.clear();
+        editor
     }
 
     #[test]
@@ -2108,87 +2029,6 @@ mod tests {
         *clock.now.lock().unwrap() = start + Duration::from_secs(ECHO_TIMEOUT_SECS);
         assert!(editor.check_and_clear_expired_echo());
         assert!(editor.echo_message.is_empty());
-    }
-
-    #[test]
-    fn open_file_reports_non_not_found_io_errors() {
-        let _runtime_guard = COMPIO_RUNTIME_LOCK.lock().unwrap();
-        compio::runtime::Runtime::new().unwrap().block_on(async {
-            let mut editor = test_editor();
-            let directory =
-                std::env::temp_dir().join(format!("roe-open-error-{}", std::process::id()));
-            let _ = std::fs::remove_dir(&directory);
-            std::fs::create_dir(&directory).unwrap();
-
-            let error = editor
-                .open_file_in_window(directory.clone(), editor.active_window)
-                .await
-                .expect_err("a directory must not be treated as a new empty file");
-
-            assert!(error.contains("Failed to open"), "{error}");
-            std::fs::remove_dir(directory).unwrap();
-        });
-    }
-
-    #[test]
-    fn visit_file_is_transactional_and_preserves_shared_buffers() {
-        let _runtime_guard = COMPIO_RUNTIME_LOCK.lock().unwrap();
-        compio::runtime::Runtime::new().unwrap().block_on(async {
-            let mut editor = test_editor();
-            let original_buffer = editor.windows[editor.active_window].active_buffer;
-            let directory =
-                std::env::temp_dir().join(format!("roe-visit-error-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&directory);
-            std::fs::create_dir(&directory).unwrap();
-
-            let actions = editor
-                .handle_open_file_action(directory.clone(), OpenType::Visit)
-                .await;
-
-            assert!(actions.iter().any(
-                |action| matches!(action, ChromeAction::Echo(message) if message.contains("Error opening file"))
-            ));
-            assert_eq!(
-                editor.windows[editor.active_window].active_buffer,
-                original_buffer
-            );
-            assert!(editor.buffers.contains_key(original_buffer));
-
-            let other_window = editor.windows[editor.active_window].clone();
-            let other_window_id = editor.windows.insert(other_window);
-            let visited_path = directory.join("visited.txt");
-            std::fs::write(&visited_path, "visited").unwrap();
-            let actions = editor
-                .handle_open_file_action(visited_path, OpenType::Visit)
-                .await;
-
-            assert!(actions.iter().any(
-                |action| matches!(action, ChromeAction::Echo(message) if message.contains("Opened:"))
-            ));
-            assert_ne!(
-                editor.windows[editor.active_window].active_buffer,
-                original_buffer
-            );
-            let visited_buffer = editor.windows[editor.active_window].active_buffer;
-            assert!(editor.file_watcher.get_sync_state(visited_buffer).is_some());
-            assert_eq!(editor.windows[other_window_id].active_buffer, original_buffer);
-            assert!(editor.buffers.contains_key(original_buffer));
-
-            let visited_path = editor.file_watcher.get_sync_state(visited_buffer).unwrap().file_path.clone();
-            std::fs::write(&visited_path, "external").unwrap();
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while editor.buffers[visited_buffer].content() != "external"
-                && Instant::now() < deadline
-            {
-                editor.poll_file_changes();
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            assert_eq!(editor.buffers[visited_buffer].content(), "external");
-
-            assert!(editor.shutdown_native_work().is_empty());
-            assert!(editor.file_watcher.get_sync_state(visited_buffer).is_none());
-            std::fs::remove_dir_all(directory).unwrap();
-        });
     }
 
     #[test]

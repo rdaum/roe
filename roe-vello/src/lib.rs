@@ -18,6 +18,8 @@
 
 mod key_translate;
 mod renderer;
+mod scene;
+use scene::{SCROLLBAR_WIDTH, session_view_metrics};
 mod text;
 mod theme;
 
@@ -26,24 +28,21 @@ pub use text::StyledSpan;
 pub use theme::VelloTheme;
 
 use roe_core::Editor;
-use roe_core::gutter::{GutterConfig, calculate_gutter_width, format_line_number};
-use roe_core::native_kernel::{CapabilityGrants, ViewId};
+use roe_core::frontend::LocalFrontendServices;
+use roe_core::native_kernel::ViewId;
 use roe_core::native_services::FrontendWake;
-use roe_core::renderer::DirtyRegion;
 use roe_core::session::{
-    AttachmentConfiguration, DirectSessionClient, FrontendServiceRequest, FrontendServiceResponse,
-    FrontendServiceResult, InputEvent, LifecycleEvent, PointerButton, PointerEvent, PointerKind,
-    PresentationColor, PresentedView, SessionClient, SessionOutput, StartupRecoveryOperation,
-    StyleDefinition, WorkspaceHost,
+    AttachmentConfiguration, DirectSessionClient, InputEvent, LifecycleEvent, PointerButton,
+    PointerEvent, PointerKind, PresentedView, SessionClient, SessionOutput,
+    StartupRecoveryOperation,
 };
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use text::TextRenderer;
 use thiserror::Error;
-use vello::kurbo::{Affine, Rect};
-use vello::peniko::{Color, Fill};
+use vello::kurbo::Affine;
+
 use vello::util::{RenderContext, RenderSurface};
 use vello::wgpu;
 use vello::{AaConfig, RenderParams, RendererOptions, Scene};
@@ -72,6 +71,10 @@ pub enum FrontendError {
     Session(#[source] roe_core::session::SessionError),
     #[error("failed to start Mica editor host: {0}")]
     MicaHost(#[source] roe_core::mica_host::MicaHostError),
+    #[error("{0}")]
+    Startup(#[from] roe_core::startup::StartupError),
+    #[error("{0}")]
+    Output(#[from] roe_core::frontend::FrontendOutputError),
     #[error("Mica recovery failed: {0}")]
     Recovery(String),
     #[error("Vello renderer state is inconsistent: {0}")]
@@ -129,154 +132,6 @@ fn pump_runtime(runtime: &compio::runtime::Runtime) {
         runtime.poll_with(Some(Duration::ZERO));
         runtime.run();
     });
-}
-
-fn session_vello_color(color: &PresentationColor, default: Color) -> Color {
-    match color {
-        PresentationColor::Rgb { r, g, b } => Color::from_rgb8(*r, *g, *b),
-        PresentationColor::Named(name) => match name.as_str() {
-            "black" => Color::BLACK,
-            "white" => Color::WHITE,
-            "red" => Color::from_rgb8(255, 0, 0),
-            "green" => Color::from_rgb8(0, 255, 0),
-            "blue" => Color::from_rgb8(0, 0, 255),
-            "yellow" => Color::from_rgb8(255, 255, 0),
-            "cyan" => Color::from_rgb8(0, 255, 255),
-            "magenta" => Color::from_rgb8(255, 0, 255),
-            _ => default,
-        },
-        PresentationColor::Inherit => default,
-    }
-}
-
-fn session_vello_line_style(
-    line: usize,
-    view: &PresentedView,
-    styles: &[StyleDefinition],
-    default_foreground: Color,
-    default_background: Color,
-) -> (Color, Color) {
-    let style = view
-        .styled_lines
-        .iter()
-        .rev()
-        .find(|styled| styled.line == line)
-        .and_then(|styled| styles.iter().find(|style| style.id == styled.style));
-    let Some(style) = style else {
-        return (default_foreground, default_background);
-    };
-    (
-        style
-            .foreground
-            .as_ref()
-            .map(|color| session_vello_color(color, default_foreground))
-            .unwrap_or(default_foreground),
-        style
-            .background
-            .as_ref()
-            .map(|color| session_vello_color(color, default_background))
-            .unwrap_or(default_background),
-    )
-}
-
-/// Scrollbar width in logical pixels
-const SCROLLBAR_WIDTH: f64 = 14.0;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SessionViewMetrics {
-    content_width_chars: usize,
-    content_rows: usize,
-    horizontal_overflow: bool,
-}
-
-fn session_view_metrics(view: &PresentedView, char_width: f64) -> SessionViewMetrics {
-    let gutter_chars = if view.show_gutter {
-        calculate_gutter_width(view.total_lines, &GutterConfig::default())
-    } else {
-        0
-    };
-    let width = f64::from(view.geometry.columns) * char_width;
-    let gutter_width = gutter_chars as f64 * char_width;
-    let renderer_chrome_width = if view.command_view {
-        0.0
-    } else {
-        SCROLLBAR_WIDTH + 4.0
-    };
-    let content_width =
-        (width - (2.0 * char_width) - renderer_chrome_width - gutter_width).max(0.0);
-    let content_width_chars = (content_width / char_width).floor() as usize;
-    let content_rows = if view.command_view {
-        view.geometry.rows.saturating_sub(2) as usize
-    } else {
-        view.geometry.rows.saturating_sub(3) as usize
-    };
-    SessionViewMetrics {
-        content_width_chars,
-        content_rows,
-        horizontal_overflow: !view.command_view && view.max_line_chars > content_width_chars,
-    }
-}
-
-fn typeout_body_capacity(body_top: f64, footer_top: f64, line_height: f64) -> usize {
-    if line_height <= 0.0 || footer_top <= body_top {
-        return 0;
-    }
-    // Font metrics are fractional. A half-pixel tolerance keeps an exact
-    // logical row from disappearing through harmless floating-point rounding.
-    (((footer_top - body_top) + 0.5) / line_height).floor() as usize
-}
-
-/// Gutter colors
-const GUTTER_FG_COLOR: Color = Color::from_rgba8(0x60, 0x60, 0x60, 0xFF); // Dimmed line numbers
-
-struct LocalFrontendServices {
-    clipboard: Option<arboard::Clipboard>,
-    clipboard_error: Option<String>,
-}
-
-impl LocalFrontendServices {
-    fn new() -> Self {
-        match arboard::Clipboard::new() {
-            Ok(clipboard) => Self {
-                clipboard: Some(clipboard),
-                clipboard_error: None,
-            },
-            Err(error) => Self {
-                clipboard: None,
-                clipboard_error: Some(error.to_string()),
-            },
-        }
-    }
-
-    fn handle(&mut self, request: FrontendServiceRequest) -> FrontendServiceResult {
-        let request_id = request.request_id();
-        let unavailable = self
-            .clipboard_error
-            .clone()
-            .unwrap_or_else(|| "frontend clipboard is unavailable".to_owned());
-        let result = match request {
-            FrontendServiceRequest::ReadClipboard { .. } => self
-                .clipboard
-                .as_mut()
-                .ok_or_else(|| unavailable.clone())
-                .and_then(|clipboard| clipboard.get_text().map_err(|error| error.to_string()))
-                .map(|contents| FrontendServiceResponse::ClipboardContents(Some(contents))),
-            FrontendServiceRequest::WriteClipboard { contents, .. } => self
-                .clipboard
-                .as_mut()
-                .ok_or(unavailable)
-                .and_then(|clipboard| {
-                    clipboard
-                        .set_text(contents)
-                        .map(|()| FrontendServiceResponse::Completed)
-                        .map_err(|error| error.to_string())
-                }),
-            FrontendServiceRequest::Notify { .. } => {
-                Err("frontend notifications are not available".to_owned())
-            }
-        };
-        FrontendServiceResult { request_id, result }
-    }
 }
 
 /// Application state for the Vello renderer
@@ -339,31 +194,32 @@ impl<'a> RoeVelloApp<'a> {
         };
 
         let attachment = AttachmentConfiguration::local_frontend(
-            editor.frame.available_columns,
-            editor.frame.available_lines,
+            editor.frame().available_columns,
+            editor.frame().available_lines,
         );
-        let mut workspace =
-            WorkspaceHost::open_with_mica(editor, CapabilityGrants::editor_default())
-                .map_err(FrontendError::MicaHost)?;
-        workspace.set_mica_wake_handler(frontend_wake);
-        let reports = runtime
-            .block_on(workspace.execute_startup_recovery(recovery))
-            .map_err(FrontendError::Recovery)?;
-        if let Some(report) = reports.last() {
-            workspace.set_recovery_message(report.clone());
-        }
-        let mut session = DirectSessionClient::new(workspace, attachment);
+        let mut session = runtime
+            .block_on(roe_core::startup::attach_editor(
+                editor,
+                attachment,
+                recovery,
+                Some(frontend_wake),
+            ))
+            .map_err(FrontendError::Startup)?;
         let initial = runtime.block_on(session.initial_output());
         let mut redraw_state = VelloRenderer::with_theme(theme.clone());
-        if let Some(update) = initial.presentation.as_ref() {
-            redraw_state
-                .apply_session_presentation(update)
-                .expect("initial session snapshot must be valid");
-        }
+        let mut frontend_services = LocalFrontendServices::new();
+        let quit_requested = runtime
+            .block_on(roe_core::frontend::consume_output(
+                &mut session,
+                &mut frontend_services,
+                &mut redraw_state,
+                initial,
+            ))
+            .map_err(FrontendError::Output)?;
 
         Ok(Self {
             session,
-            frontend_services: LocalFrontendServices::new(),
+            frontend_services,
             runtime,
             render_cx: RenderContext::new(),
             renderers: vec![],
@@ -374,7 +230,7 @@ impl<'a> RoeVelloApp<'a> {
             scene: Scene::new(),
             text_renderer: TextRenderer::new(font_size, font_family),
             theme,
-            quit_requested: false,
+            quit_requested,
             modifiers: ModifiersState::empty(),
             cursor_position: None,
             mouse_dragging: false,
@@ -384,9 +240,9 @@ impl<'a> RoeVelloApp<'a> {
         })
     }
 
-    fn request_redraw(&mut self, region: DirtyRegion) {
-        tracing::trace!(?region, "Vello redraw requested");
-        self.redraw_state.invalidate(region);
+    fn request_redraw(&mut self) {
+        tracing::trace!("Vello redraw requested");
+        self.redraw_state.invalidate();
         if let Some(ref state) = self.state {
             state.window.request_redraw();
         }
@@ -411,71 +267,17 @@ impl<'a> RoeVelloApp<'a> {
     }
 
     fn apply_session_output(&mut self, output: SessionOutput) {
-        let mut outputs = VecDeque::from([output]);
-        while let Some(mut output) = outputs.pop_front() {
-            let requests = std::mem::take(&mut output.frontend_requests);
-            self.render_session_output(output);
-            for request in requests {
-                let completion = self.frontend_services.handle(request);
-                match self
-                    .runtime
-                    .block_on(self.session.complete_frontend_request(completion))
-                {
-                    Ok(output) => outputs.push_back(output),
-                    Err(error) => {
-                        self.fatal_error = Some(FrontendError::Session(error));
-                        self.quit_requested = true;
-                        return;
-                    }
-                }
-            }
-        }
-    }
-
-    fn render_session_output(&mut self, output: SessionOutput) {
-        for event in output.lifecycle {
-            match event {
-                LifecycleEvent::QuitRequested
-                | LifecycleEvent::AttachmentClosed { .. }
-                | LifecycleEvent::WorkspaceTerminated => {
-                    self.quit_requested = true;
-                }
-                LifecycleEvent::Warning(message) => tracing::warn!(%message, "session warning"),
-                LifecycleEvent::Error(message) => tracing::error!(%message, "session error"),
-                LifecycleEvent::Fatal(message) => {
-                    tracing::error!(%message, "fatal session error");
-                    self.quit_requested = true;
-                }
-                LifecycleEvent::Overloaded { detail } => {
-                    tracing::warn!(%detail, "session overload")
-                }
-                LifecycleEvent::RecoveryResult { operation, result } => match result {
-                    Ok(_) => tracing::info!(%operation, "Mica recovery operation completed"),
-                    Err(error) => {
-                        tracing::error!(%operation, %error, "Mica recovery operation failed")
-                    }
-                },
-                LifecycleEvent::Ready { .. }
-                | LifecycleEvent::AttachmentAttached { .. }
-                | LifecycleEvent::AttachmentDetached { .. }
-                | LifecycleEvent::Heartbeat
-                | LifecycleEvent::MicaTaskCancelled { .. }
-                | LifecycleEvent::MicaSubscriptionReady { .. }
-                | LifecycleEvent::RequestCancelled { .. }
-                | LifecycleEvent::ResourceChanged { .. }
-                | LifecycleEvent::ResourceInvalidated { .. } => {}
-            }
-        }
-        if let Some(update) = output.presentation {
-            if let Err(error) = self.redraw_state.apply_session_presentation(&update) {
-                self.fatal_error = Some(FrontendError::Presentation(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    error,
-                )));
+        match self.runtime.block_on(roe_core::frontend::consume_output(
+            &mut self.session,
+            &mut self.frontend_services,
+            &mut self.redraw_state,
+            output,
+        )) {
+            Ok(quit) => self.quit_requested |= quit,
+            Err(error) => {
+                self.fatal_error = Some(FrontendError::Output(error));
                 self.quit_requested = true;
-                return;
             }
-            self.redraw_state.invalidate(DirtyRegion::FullScreen);
         }
     }
 
@@ -532,7 +334,7 @@ impl<'a> RoeVelloApp<'a> {
             wgpu::CurrentSurfaceTexture::Outdated
             | wgpu::CurrentSurfaceTexture::Lost
             | wgpu::CurrentSurfaceTexture::Validation => {
-                self.redraw_state.invalidate(DirtyRegion::FullScreen);
+                self.redraw_state.invalidate();
                 return Ok(());
             }
         };
@@ -599,435 +401,16 @@ impl<'a> RoeVelloApp<'a> {
     }
 
     fn build_session_scene(&mut self, width: u32, height: u32) -> Result<(), FrontendError> {
-        let snapshot = self
-            .redraw_state
-            .session_presentation()
-            .current()
-            .cloned()
-            .ok_or(FrontendError::InvalidState(
-                "session has no logical presentation",
-            ))?;
-        let background = Rect::new(0.0, 0.0, width as f64, height as f64);
-        self.scene.fill(
-            Fill::NonZero,
-            Affine::IDENTITY,
-            self.theme.bg_color,
-            None,
-            &background,
-        );
-        for view in &snapshot.views {
-            self.draw_session_view(view, &snapshot.styles);
+        let snapshot = self.redraw_state.session_presentation().current().ok_or(
+            FrontendError::InvalidState("session has no logical presentation"),
+        )?;
+        scene::SceneBuilder {
+            scene: &mut self.scene,
+            text_renderer: &mut self.text_renderer,
+            theme: &self.theme,
         }
-
-        let line_height = f64::from(self.text_renderer.line_height());
-        let echo_y = height as f64 - line_height;
-        let echo_rect = Rect::new(0.0, echo_y, width as f64, height as f64);
-        self.scene.fill(
-            Fill::NonZero,
-            Affine::IDENTITY,
-            self.theme.bg_color,
-            None,
-            &echo_rect,
-        );
-        if !snapshot.echo_area.is_empty() {
-            self.text_renderer.render_line(
-                &mut self.scene,
-                &snapshot.echo_area,
-                4.0,
-                echo_y as f32,
-                self.theme.fg_color,
-                Some(width as f32 - 8.0),
-            );
-        }
+        .build(snapshot, width, height);
         Ok(())
-    }
-
-    fn draw_session_view(&mut self, view: &PresentedView, styles: &[StyleDefinition]) {
-        let char_width = f64::from(self.text_renderer.char_width());
-        let line_height = f64::from(self.text_renderer.line_height());
-        let x = f64::from(view.geometry.x) * char_width;
-        let y = f64::from(view.geometry.y) * line_height;
-        let width = f64::from(view.geometry.columns) * char_width;
-        let height = f64::from(view.geometry.rows) * line_height;
-        let border = if view.active {
-            self.theme.active_border_color
-        } else {
-            self.theme.border_color
-        };
-        self.scene.fill(
-            Fill::NonZero,
-            Affine::IDENTITY,
-            self.theme.bg_color,
-            None,
-            &Rect::new(x, y, x + width, y + height),
-        );
-        for rect in [
-            Rect::new(x, y, x + width, y + 2.0),
-            Rect::new(x, y, x + 2.0, y + height),
-            Rect::new(x + width - 2.0, y, x + width, y + height),
-        ] {
-            self.scene
-                .fill(Fill::NonZero, Affine::IDENTITY, border, None, &rect);
-        }
-        let modeline_y = y + height - line_height;
-        let modeline_color = if view.active {
-            self.theme.mode_line_bg_color
-        } else {
-            self.theme.inactive_mode_line_bg_color
-        };
-        self.scene.fill(
-            Fill::NonZero,
-            Affine::IDENTITY,
-            modeline_color,
-            None,
-            &Rect::new(x, modeline_y, x + width, modeline_y + line_height),
-        );
-        self.text_renderer.render_line(
-            &mut self.scene,
-            &view.modeline,
-            (x + 4.0) as f32,
-            modeline_y as f32,
-            self.theme.fg_color,
-            Some((width - 8.0) as f32),
-        );
-
-        let gutter_chars = if view.show_gutter {
-            calculate_gutter_width(view.total_lines, &GutterConfig::default())
-        } else {
-            0
-        };
-        let content_x = x + char_width * (1 + gutter_chars) as f64;
-        // Normal views reserve renderer-owned scrollbar lanes. Command views
-        // present an already-windowed candidate list and use the full shared
-        // text area, matching terminal row geometry.
-        let metrics = session_view_metrics(view, char_width);
-        let content_width_chars = metrics.content_width_chars;
-        let content_rows = metrics.content_rows;
-        let mut absolute = view.visible_start_char;
-        let mut lines: Vec<&str> = view.visible_text.split_inclusive('\n').collect();
-        if lines.is_empty() {
-            lines.push("");
-        }
-        for (row, raw_line) in lines.into_iter().take(content_rows).enumerate() {
-            let line = raw_line.trim_end_matches('\n');
-            let displayed: String = line
-                .chars()
-                .skip(usize::from(view.scroll.start_column))
-                .take(content_width_chars)
-                .collect();
-            let line_y = y + line_height * (row + 1) as f64;
-            let logical_line = usize::from(view.scroll.start_line) + row;
-            let (line_foreground, line_background) = session_vello_line_style(
-                logical_line,
-                view,
-                styles,
-                self.theme.fg_color,
-                self.theme.bg_color,
-            );
-            if line_background != self.theme.bg_color {
-                self.scene.fill(
-                    Fill::NonZero,
-                    Affine::IDENTITY,
-                    line_background,
-                    None,
-                    &Rect::new(
-                        x + char_width,
-                        line_y,
-                        x + width - char_width,
-                        line_y + line_height,
-                    ),
-                );
-            }
-            if view.show_gutter {
-                let line_number = usize::from(view.scroll.start_line) + row + 1;
-                let label = format_line_number(line_number, gutter_chars.saturating_sub(2));
-                self.text_renderer.render_line(
-                    &mut self.scene,
-                    &format!(" {label}│"),
-                    (x + char_width) as f32,
-                    line_y as f32,
-                    GUTTER_FG_COLOR,
-                    None,
-                );
-            }
-            let visible_column = usize::from(view.scroll.start_column);
-            let display_start = absolute + visible_column;
-            let display_end = display_start + displayed.chars().count();
-            if let Some(selection) = view.selection {
-                let start = selection.anchor.min(selection.active).max(display_start);
-                let end = selection.anchor.max(selection.active).min(display_end);
-                if start < end {
-                    let left = content_x + (start - display_start) as f64 * char_width;
-                    let right = content_x + (end - display_start) as f64 * char_width;
-                    self.scene.fill(
-                        Fill::NonZero,
-                        Affine::IDENTITY,
-                        self.theme.selection_color,
-                        None,
-                        &Rect::new(left, line_y, right, line_y + line_height),
-                    );
-                }
-            }
-            if view.active
-                && view.typeout.is_none()
-                && view.cursor >= display_start
-                && view.cursor <= display_end
-            {
-                let cursor_x = content_x + (view.cursor - display_start) as f64 * char_width;
-                self.scene.fill(
-                    Fill::NonZero,
-                    Affine::IDENTITY,
-                    self.theme.cursor_color,
-                    None,
-                    &Rect::new(cursor_x, line_y, cursor_x + 2.0, line_y + line_height),
-                );
-            }
-            let spans: Vec<StyledSpan> = view
-                .styled_ranges
-                .iter()
-                .filter_map(|range| {
-                    let start = range.start.max(absolute + visible_column);
-                    let end = range
-                        .end
-                        .min(absolute + visible_column + displayed.chars().count());
-                    if start >= end {
-                        return None;
-                    }
-                    let style = styles.iter().find(|style| style.id == range.style)?;
-                    let color = style
-                        .foreground
-                        .as_ref()
-                        .map(|color| session_vello_color(color, line_foreground))
-                        .unwrap_or(line_foreground);
-                    Some(
-                        StyledSpan::new(
-                            start - absolute - visible_column,
-                            end - absolute - visible_column,
-                            color,
-                        )
-                        .with_bold(style.bold)
-                        .with_italic(style.italic),
-                    )
-                })
-                .collect();
-            self.text_renderer.render_line_with_styles(
-                &mut self.scene,
-                &displayed,
-                content_x as f32,
-                line_y as f32,
-                line_foreground,
-                &spans,
-            );
-            absolute += line.chars().count() + usize::from(raw_line.ends_with('\n'));
-        }
-
-        if !view.command_view {
-            let scrollbar_top = y + 2.0;
-            let scrollbar_extent = (height - line_height - 4.0).max(1.0);
-            let scrollbar_x = x + width - SCROLLBAR_WIDTH - 2.0;
-            self.scene.fill(
-                Fill::NonZero,
-                Affine::IDENTITY,
-                Color::from_rgba8(0x40, 0x40, 0x40, 0x80),
-                None,
-                &Rect::new(
-                    scrollbar_x,
-                    scrollbar_top,
-                    scrollbar_x + SCROLLBAR_WIDTH,
-                    scrollbar_top + scrollbar_extent,
-                ),
-            );
-            let visible_lines = content_rows.max(1);
-            let vertical_fraction =
-                (visible_lines as f64 / view.total_lines.max(1) as f64).min(1.0);
-            let thumb_height = (scrollbar_extent * vertical_fraction)
-                .max(20.0)
-                .min(scrollbar_extent);
-            let max_line = view.total_lines.saturating_sub(visible_lines);
-            let vertical_position = if max_line == 0 {
-                0.0
-            } else {
-                f64::from(view.scroll.start_line) / max_line as f64
-            };
-            let thumb_y = scrollbar_top + vertical_position * (scrollbar_extent - thumb_height);
-            self.scene.fill(
-                Fill::NonZero,
-                Affine::IDENTITY,
-                if view.active {
-                    self.theme.active_border_color
-                } else {
-                    self.theme.border_color
-                },
-                None,
-                &Rect::new(
-                    scrollbar_x + 2.0,
-                    thumb_y,
-                    scrollbar_x + SCROLLBAR_WIDTH - 2.0,
-                    thumb_y + thumb_height,
-                ),
-            );
-        }
-
-        if metrics.horizontal_overflow {
-            let horizontal_x = x + 2.0;
-            let horizontal_y = y + height - line_height - SCROLLBAR_WIDTH - 2.0;
-            let horizontal_extent = (width - SCROLLBAR_WIDTH - 6.0).max(1.0);
-            self.scene.fill(
-                Fill::NonZero,
-                Affine::IDENTITY,
-                Color::from_rgba8(0x40, 0x40, 0x40, 0x80),
-                None,
-                &Rect::new(
-                    horizontal_x,
-                    horizontal_y,
-                    horizontal_x + horizontal_extent,
-                    horizontal_y + SCROLLBAR_WIDTH,
-                ),
-            );
-            let visible_columns = content_width_chars.max(1);
-            let horizontal_fraction =
-                (visible_columns as f64 / view.max_line_chars.max(1) as f64).min(1.0);
-            let thumb_width = (horizontal_extent * horizontal_fraction)
-                .max(20.0)
-                .min(horizontal_extent);
-            let max_column = view.max_line_chars.saturating_sub(visible_columns);
-            let horizontal_position = if max_column == 0 {
-                0.0
-            } else {
-                f64::from(view.scroll.start_column) / max_column as f64
-            };
-            let thumb_x = horizontal_x + horizontal_position * (horizontal_extent - thumb_width);
-            self.scene.fill(
-                Fill::NonZero,
-                Affine::IDENTITY,
-                if view.active {
-                    self.theme.active_border_color
-                } else {
-                    self.theme.border_color
-                },
-                None,
-                &Rect::new(
-                    thumb_x,
-                    horizontal_y + 2.0,
-                    thumb_x + thumb_width,
-                    horizontal_y + SCROLLBAR_WIDTH - 2.0,
-                ),
-            );
-        }
-
-        self.draw_session_typeout(view, x, y, width, height, line_height);
-    }
-
-    fn draw_session_typeout(
-        &mut self,
-        view: &PresentedView,
-        x: f64,
-        y: f64,
-        width: f64,
-        height: f64,
-        line_height: f64,
-    ) {
-        let Some(typeout) = view.typeout.as_ref() else {
-            return;
-        };
-        let inset = (width * 0.025)
-            .clamp(16.0, 32.0)
-            .min((width / 4.0).max(2.0));
-        let body: Vec<_> = if typeout.visible_text.is_empty() {
-            vec![""]
-        } else {
-            typeout.visible_text.lines().collect()
-        };
-        let vertical_padding = 6.0;
-        let desired_height =
-            (body.len().saturating_add(2) as f64) * line_height + vertical_padding * 4.0;
-        let max_height =
-            ((height - line_height).max(line_height) * 2.0 / 3.0).max(line_height * 3.0);
-        let overlay_height = desired_height.min(max_height).min(height - line_height);
-        let left = x + inset;
-        let top = y + line_height + 4.0;
-        let right = (x + width - inset).max(left + 1.0);
-        let available_bottom = y + height - line_height - 4.0;
-        if available_bottom <= top + line_height {
-            return;
-        }
-        let bottom = (top + overlay_height).min(available_bottom);
-        let shadow = Rect::new(left + 4.0, top + 6.0, right + 4.0, bottom + 6.0);
-        self.scene.fill(
-            Fill::NonZero,
-            Affine::IDENTITY,
-            Color::from_rgba8(0x00, 0x00, 0x00, 0x70),
-            None,
-            &shadow,
-        );
-        let panel = Rect::new(left, top, right, bottom);
-        self.scene.fill(
-            Fill::NonZero,
-            Affine::IDENTITY,
-            Color::from_rgba8(0x18, 0x1d, 0x21, 0xf2),
-            None,
-            &panel,
-        );
-        let border = if typeout.kind == "diagnostic" {
-            Color::from_rgba8(0xc7, 0x91, 0x4f, 0xe0)
-        } else {
-            Color::from_rgba8(0x55, 0x7d, 0x8d, 0xd0)
-        };
-        for rect in [
-            Rect::new(left, top, right, top + 1.0),
-            Rect::new(left, bottom - 1.0, right, bottom),
-            Rect::new(left, top, left + 1.0, bottom),
-            Rect::new(right - 1.0, top, right, bottom),
-        ] {
-            self.scene
-                .fill(Fill::NonZero, Affine::IDENTITY, border, None, &rect);
-        }
-        let header_bottom = top + line_height + vertical_padding * 2.0;
-        self.scene.fill(
-            Fill::NonZero,
-            Affine::IDENTITY,
-            Color::from_rgba8(0x24, 0x2c, 0x31, 0xc0),
-            None,
-            &Rect::new(left + 1.0, top + 1.0, right - 1.0, header_bottom),
-        );
-        let text_x = (left + 12.0) as f32;
-        let max_text_width = ((right - left) - 24.0).max(1.0) as f32;
-        self.text_renderer.render_line(
-            &mut self.scene,
-            &typeout.title,
-            text_x,
-            (top + vertical_padding) as f32,
-            border,
-            Some(max_text_width),
-        );
-        let body_top = header_bottom;
-        let footer_top = bottom - line_height - vertical_padding * 2.0;
-        let available_body_rows = typeout_body_capacity(body_top, footer_top, line_height);
-        for (row, line) in body.into_iter().take(available_body_rows).enumerate() {
-            self.text_renderer.render_line(
-                &mut self.scene,
-                line,
-                text_x,
-                (body_top + line_height * row as f64) as f32,
-                self.theme.fg_color,
-                Some(max_text_width),
-            );
-        }
-        let status = if typeout.more_after {
-            "More — Space"
-        } else if typeout.more_before {
-            "End — Backspace"
-        } else {
-            "End"
-        };
-        self.text_renderer.render_line(
-            &mut self.scene,
-            status,
-            text_x,
-            (footer_top + vertical_padding) as f32,
-            Color::from_rgb8(0xa9, 0xb2, 0xb7),
-            Some(max_text_width),
-        );
     }
 
     async fn handle_key_event(&mut self, event: winit::event::KeyEvent) {
@@ -1055,6 +438,7 @@ impl<'a> RoeVelloApp<'a> {
         let column = (x / f64::from(self.text_renderer.char_width())) as u16;
         let row = (y / f64::from(self.text_renderer.line_height())) as u16;
         let envelope = self.session.envelope(InputEvent::Pointer(PointerEvent {
+            text_hit: None,
             column,
             row,
             kind: PointerKind::Down,
@@ -1114,8 +498,7 @@ impl<'a> RoeVelloApp<'a> {
         }
         let max_start = view.total_lines.saturating_sub(visible);
         let start = ((max_start as f64) * ratio).round() as usize;
-        self.set_view_scroll(view_id, Some(start.min(u16::MAX as usize) as u16), None)
-            .await;
+        self.set_view_scroll(view_id, Some(start), None).await;
     }
 
     async fn handle_scrollbar_drag(&mut self, py: f64) {
@@ -1164,8 +547,7 @@ impl<'a> RoeVelloApp<'a> {
         }
         let max_start = view.max_line_chars.saturating_sub(visible);
         let start = ((max_start as f64) * ratio).round() as usize;
-        self.set_view_scroll(view_id, None, Some(start.min(u16::MAX as usize) as u16))
-            .await;
+        self.set_view_scroll(view_id, None, Some(start)).await;
     }
 
     async fn handle_hscrollbar_drag(&mut self, px: f64) {
@@ -1185,8 +567,8 @@ impl<'a> RoeVelloApp<'a> {
     async fn set_view_scroll(
         &mut self,
         view: ViewId,
-        start_line: Option<u16>,
-        start_column: Option<u16>,
+        start_line: Option<usize>,
+        start_column: Option<usize>,
     ) {
         let envelope = self.session.envelope(InputEvent::SetViewScroll {
             view,
@@ -1259,7 +641,7 @@ impl<'a> ApplicationHandler<HostEvent> for RoeVelloApp<'a> {
         };
 
         self.state = Some(RenderState { window, surface });
-        self.request_redraw(DirtyRegion::FullScreen);
+        self.request_redraw();
     }
 
     fn window_event(
@@ -1306,7 +688,7 @@ impl<'a> ApplicationHandler<HostEvent> for RoeVelloApp<'a> {
                             event_loop.exit();
                         }
                     }
-                    self.request_redraw(DirtyRegion::FullScreen);
+                    self.request_redraw();
                 }
                 WindowEvent::RedrawRequested => {
                     if self.redraw_state.needs_redraw()
@@ -1321,7 +703,7 @@ impl<'a> ApplicationHandler<HostEvent> for RoeVelloApp<'a> {
                     if self.quit_requested {
                         event_loop.exit();
                     } else if self.redraw_state.needs_redraw() {
-                        self.request_redraw(DirtyRegion::FullScreen);
+                        self.request_redraw();
                     }
                 }
                 WindowEvent::CursorMoved { position, .. } => {
@@ -1342,6 +724,7 @@ impl<'a> ApplicationHandler<HostEvent> for RoeVelloApp<'a> {
                             (logical_x / f64::from(self.text_renderer.char_width())) as u16;
                         let row = (logical_y / f64::from(self.text_renderer.line_height())) as u16;
                         let envelope = self.session.envelope(InputEvent::Pointer(PointerEvent {
+                            text_hit: None,
                             column,
                             row,
                             kind: PointerKind::Move,
@@ -1354,17 +737,17 @@ impl<'a> ApplicationHandler<HostEvent> for RoeVelloApp<'a> {
                                 event_loop.exit();
                             }
                         }
-                        self.request_redraw(DirtyRegion::FullScreen);
+                        self.request_redraw();
                     }
                     // Handle vertical scrollbar dragging
                     else if self.scrollbar_dragging.is_some() {
                         self.handle_scrollbar_drag(logical_y).await;
-                        self.request_redraw(DirtyRegion::FullScreen);
+                        self.request_redraw();
                     }
                     // Handle horizontal scrollbar dragging
                     else if self.hscrollbar_dragging.is_some() {
                         self.handle_hscrollbar_drag(logical_x).await;
-                        self.request_redraw(DirtyRegion::FullScreen);
+                        self.request_redraw();
                     }
                     // Handle text selection drag
                     else if self.mouse_dragging {
@@ -1372,6 +755,7 @@ impl<'a> ApplicationHandler<HostEvent> for RoeVelloApp<'a> {
                             (logical_x / f64::from(self.text_renderer.char_width())) as u16;
                         let row = (logical_y / f64::from(self.text_renderer.line_height())) as u16;
                         let envelope = self.session.envelope(InputEvent::Pointer(PointerEvent {
+                            text_hit: None,
                             column,
                             row,
                             kind: PointerKind::Move,
@@ -1384,7 +768,7 @@ impl<'a> ApplicationHandler<HostEvent> for RoeVelloApp<'a> {
                                 event_loop.exit();
                             }
                         }
-                        self.request_redraw(DirtyRegion::FullScreen);
+                        self.request_redraw();
                     }
 
                     // Update cursor icon based on hover state
@@ -1463,7 +847,7 @@ impl<'a> ApplicationHandler<HostEvent> for RoeVelloApp<'a> {
                                     self.handle_mouse_click(x, y).await;
                                     self.mouse_dragging = true;
                                 }
-                                self.request_redraw(DirtyRegion::FullScreen);
+                                self.request_redraw();
                             }
                         }
                         ElementState::Released => {
@@ -1473,6 +857,7 @@ impl<'a> ApplicationHandler<HostEvent> for RoeVelloApp<'a> {
                                 let row = (y / f64::from(self.text_renderer.line_height())) as u16;
                                 let envelope =
                                     self.session.envelope(InputEvent::Pointer(PointerEvent {
+                                        text_hit: None,
                                         column,
                                         row,
                                         kind: PointerKind::Up,
@@ -1517,7 +902,7 @@ pub fn run_vello(editor: Editor, runtime: compio::runtime::Runtime) -> Result<()
 }
 
 pub fn run_vello_with_recovery(
-    mut editor: Editor,
+    editor: Editor,
     runtime: compio::runtime::Runtime,
     recovery: Vec<StartupRecoveryOperation>,
 ) -> Result<(), FrontendError> {
@@ -1534,9 +919,6 @@ pub fn run_vello_with_recovery(
         proxy: wake_proxy,
         state: wake_state.clone(),
     });
-    editor
-        .file_watcher
-        .set_wake_handler(Arc::clone(&frontend_wake));
     event_loop.set_control_flow(ControlFlow::WaitUntil(
         Instant::now() + Duration::from_millis(20),
     ));
@@ -1562,21 +944,19 @@ pub fn run_vello_with_recovery(
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+    use crate::scene::{session_vello_line_style, typeout_body_capacity};
+    use roe_core::session::{PresentationColor, StyleDefinition};
+    use vello::peniko::Color;
 
     struct NoopWake;
 
     impl FrontendWake for NoopWake {
         fn wake(&self) {}
     }
-    use roe_core::editor::{WindowNode, WindowType};
-    use roe_core::file_watcher::FileWatcher;
     use roe_core::keys::{KeyModifier, LogicalKey, Side};
-    use roe_core::kill_ring::KillRing;
     use roe_core::native_kernel::ResourceId;
-    use roe_core::native_services::SystemClock;
     use roe_core::session::{StyleRef, StyledLine, ViewGeometry, ViewScroll};
-    use roe_core::{Buffer, BufferId, Frame, Window as EditorWindow, WindowId};
-    use slotmap::SlotMap;
+    use roe_core::{Buffer, Frame};
     use std::cell::Cell;
     use std::rc::Rc;
     use std::sync::atomic::AtomicUsize;
@@ -1638,36 +1018,11 @@ mod lifecycle_tests {
     }
 
     fn session_editor() -> Editor {
-        let mut buffers: SlotMap<BufferId, Buffer> = SlotMap::default();
         let buffer = Buffer::named("*vello-session*", roe_core::buffer::BufferKind::Ordinary);
         buffer.load_str("headless scene λ");
-        let buffer_id = buffers.insert(buffer);
-        let mut windows: SlotMap<WindowId, EditorWindow> = SlotMap::default();
-        let window_id = windows.insert(EditorWindow {
-            x: 0,
-            y: 0,
-            width_chars: 80,
-            height_chars: 23,
-            active_buffer: buffer_id,
-            cursor: 16,
-            window_type: WindowType::Normal,
-        });
-        Editor {
-            frame: Frame::new(80, 23),
-            buffers,
-            windows,
-            active_window: window_id,
-            window_tree: WindowNode::new_leaf(window_id),
-            kill_ring: KillRing::with_capacity(60),
-            previous_active_window: None,
-            buffer_history: vec![buffer_id],
-            echo_message: String::new(),
-            echo_message_time: None,
-            clock: Arc::new(SystemClock),
-            mouse_drag_state: None,
-            messages_buffer_id: None,
-            file_watcher: FileWatcher::new(),
-        }
+        let mut editor = Editor::new(buffer, Frame::new(80, 23));
+        editor.move_cursor_to(16, false);
+        editor
     }
 
     #[test]
@@ -1752,11 +1107,9 @@ mod lifecycle_tests {
     fn production_mica_typeout_builds_a_vello_scene_without_a_display() {
         let runtime = compio::runtime::Runtime::new().unwrap();
         let mut editor = session_editor();
-        let view = editor.active_window;
-        let buffer = editor.windows[view].active_buffer;
-        editor.buffers[buffer].load_str("1 + 2");
-        editor.buffers[buffer].set_mark(0);
-        editor.windows[view].cursor = 5;
+        editor.active_buffer().load_str("1 + 2");
+        editor.active_buffer().set_mark(0);
+        editor.move_cursor_to(5, false);
         let mut app = RoeVelloApp::new(
             editor,
             VelloTheme::default(),
@@ -1804,7 +1157,7 @@ mod lifecycle_tests {
             last_saved_revision: 0,
             modified: false,
             read_only: false,
-            visible_text: String::new(),
+            visible_text: String::new().into(),
             visible_start_char: 0,
             visible_end_char: 0,
             total_lines: 20,

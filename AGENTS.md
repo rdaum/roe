@@ -15,8 +15,8 @@ of editor policy; Rust owns bounded native mechanisms, the session boundary, and
 realization.
 
 The workspace uses Rust edition 2024, declares Rust 1.96 as its MSRV, and pins Rust 1.97.1 for
-development and CI. `mica-driver` is pinned to the exact revision in `Cargo.toml` with default
-features disabled.
+development and CI. `Cargo.lock` fixes the Mica revision, and `mica/MICA-REVISION` records it.
+The manifests track the Mica repository without revision selectors. Driver default features remain disabled.
 
 ## Architectural Boundary
 
@@ -58,6 +58,9 @@ Rust owns:
 - ordered session envelopes, lifecycle delivery, bounds, and presentation revisioning; and
 - terminal state/cells and Vello/Winit/WGPU/Parley resources.
 
+Mica emits logical target decisions. Rust republishes the realized active view as volatile context.
+Do not add a second Mica writer to the host-owned `ActiveView` observation.
+
 Rust may validate invariants and enforce authority, but it must not choose commands, bindings,
 modes, hooks, candidates, packages, or logical targets in the production path.
 
@@ -89,25 +92,30 @@ roe/
 ├── roe-core/src/
 │   ├── buffer.rs                # Rope storage, marks, gutter intent, undo primitives
 │   ├── editor.rs                # buffers/windows plus native mechanism realization
+│   ├── frontend.rs              # shared attachment-local services and output recovery
+│   ├── startup.rs               # shared input parsing and native construction
 │   ├── file_watcher.rs          # transactional, bounded external file watching
 │   ├── keys.rs                  # normalized key and native-action vocabulary only
 │   ├── kill_ring.rs             # Emacs-style kill ring and clipboard integration
 │   ├── mica_host.rs             # Mica driver lifecycle and native bridge
+│   ├── mica_host/               # typed effects, decoding, and live source provider
 │   ├── native_kernel.rs         # capabilities, resources, native operations, layouts
+│   ├── native_io.rs             # authorized, bounded asynchronous I/O ownership
 │   ├── native_services.rs       # injectable platform service traits
+│   ├── watch_backend.rs         # shared transactional notification ownership
 │   ├── renderer.rs              # shared renderer utility types
-│   ├── session.rs               # transport-neutral input/output/presentation protocol
-│   ├── undo.rs
-│   └── window.rs
-├── roe-terminal/src/terminal_renderer.rs
-├── roe-vello/src/
+│   ├── session.rs               # workspace/session coordination
+│   ├── session/                 # protocol, attachment, projection, layout, effects, recovery, tests
+│   └── undo.rs
+├── roe-terminal/src/           # terminal presentation and safe text-to-cell realization
+├── roe-vello/src/               # scene.rs isolates presentation-to-scene construction
 ├── roe/src/main.rs
-├── docs/                        # phase records, ADRs, and dependency policy
+├── docs/                        # ADRs, design notes, reviews, and dependency policy
 └── scripts/
 ```
 
-The definitive ownership summary is `docs/PHASE-5-POLICY-TRANSFER.md`. Architectural decisions are
-recorded in `docs/adr/0001` through `0006`.
+The ownership summary is `docs/adr/0001-mica-owns-editor-policy.md`.
+The `docs/adr/` directory contains decisions 0001 through 0004.
 
 ## Essential Commands
 
@@ -221,7 +229,10 @@ discard deltas and request a full snapshot. Idle work that changes no logical pr
 advance the presentation revision.
 
 Frontends may realize presentation differently, but must not infer editor meaning from presentation
-data. Terminal incremental rendering should repaint changed views/rows without clearing the screen;
+data. Renderer text hits carry a view, resource generation, text revision, and character position.
+Reject stale hits before pointer selection. Document offsets use `usize`, not terminal coordinate types.
+
+Terminal incremental rendering should repaint changed views/rows without clearing the screen;
 layout changes may require a complete clear. Vello owns pixel geometry, shaping, scrollbars, and GPU
 scenes.
 
@@ -244,6 +255,8 @@ and must retain the last working unit on failure.
 Current important bounds include:
 
 - 256 queued Mica driver events;
+- 256 retained bridge events and 4 MiB of event data per batch;
+- 256 applied events per effect cascade, with a maximum depth of 32;
 - 16 concurrent external requests;
 - 64 subscription events;
 - 64 logical keys per input;
@@ -257,6 +270,20 @@ Preserve or deliberately revise bounds when adding work; do not introduce hidden
 histories, task sets, caches, directory accumulation, or diagnostics.
 
 ### Compio lifecycle
+
+External native I/O uses `native_io` admission after capability checks.
+Keep the kernel mutex outside every external I/O await.
+The I/O owner permits 16 requests. Each request has a 30-second deadline.
+File contents and combined process output have a 1 MiB byte limit.
+Startup loads, recovery file transfers, and watcher rereads use the same file limit.
+Directory results contain at most 256 entries. A scan examines at most 65,536 entries.
+The directory worker retains an ownership lease until its OS work ends.
+Workspace termination cancels admitted requests and waits for their leases.
+Process cancellation kills and reaps the direct child. It does not manage descendant process groups.
+Normal process cleanup is asynchronous. Future-drop cleanup uses a synchronous kill-and-wait fallback.
+
+The direct session still awaits each accepted input operation.
+These I/O mechanisms do not introduce concurrent frontend input or a process-job UI.
 
 - Compio runtime ownership stays on its owning thread; do not move a runtime across threads.
 - Frontends drive asynchronous session work through their existing Compio/Winit loops.
@@ -311,6 +338,9 @@ When adding a genuinely native mechanism:
 
 Never expose a Rope, Rust SlotMap key, renderer handle, OS handle, or `ResourceId` directly to Mica.
 
+Decode effect operands into typed variants before application. Preserve emission order and complete policy-snapshot boundaries.
+A rejected policy snapshot must retain the last complete projection and its revision.
+
 ### Mica policy changes
 
 For commands, bindings, prompts, modes, hooks, faces, syntax, configuration, or packages:
@@ -360,11 +390,11 @@ should use one test thread when they share driver/recovery state.
 ## Dependencies and Tooling
 
 - `compio` is exactly pinned at 0.18.0 for Mica compatibility.
-- `mica-driver` is pinned by Git revision with default features disabled.
+- `Cargo.lock` and `mica/MICA-REVISION` fix the Mica revision. Driver default features remain disabled.
 - Mica relation acceleration and persistent storage are intentionally disabled.
 - Vello, its WGPU graph, Parley, Winit, and Pollster are a coupled upgrade group.
 - Dependency policy and temporary advisory exceptions live in `docs/DEPENDENCY-POLICY.md`.
-- `scripts/check-dependencies.sh` enforces the runtime pins and centralized workspace dependencies.
+- `scripts/check-dependencies.sh` parses manifests and the lockfile to enforce runtime policy and centralized dependencies.
 - Rust formatting is checked with `cargo fmt`; strict Clippy is part of `scripts/check.sh`.
 
 Do not update Compio, Mica, or the graphics stack as an incidental change. A Mica revision change

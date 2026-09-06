@@ -610,9 +610,7 @@ verb roe/other_window(actor, session)
   end
   let exactly {:view -> next} = next_rows
   roe/SessionLeafView(session, next) || return :invalid_next_view
-  retract roe/ActiveView(session, current)
-  assert roe/ActiveView(session, next)
-  emit(session, {:kind -> :presentation_invalidated, :view -> next})
+  emit(session, {:kind -> :host_action, :action -> :other_window, :view -> next})
   return next
 end
 
@@ -837,14 +835,6 @@ verb roe/pointer_event(actor, session, view, position, phase, button)
       let exactly {:view -> pointer_view, :anchor -> pointer_anchor} = pointer_rows
       retract roe/PointerSelection(session, pointer_view, pointer_anchor)
     end
-    let active_rows = roe/ActiveView(session, ?active)
-    if active_rows
-      let exactly {:active -> active} = active_rows
-      if active != view
-        retract roe/ActiveView(session, active)
-      end
-    end
-    assert roe/ActiveView(session, view)
     assert roe/PointerSelection(session, view, position)
     emit(session, {:kind -> :host_action, :action -> :pointer_selection, :view -> view, :position -> position, :anchor -> position, :phase -> phase})
     return :handled

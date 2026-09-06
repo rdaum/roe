@@ -1,51 +1,20 @@
-use roe_core::editor::{WindowNode, WindowType};
-use roe_core::file_watcher::FileWatcher;
 use roe_core::keys::{KeyModifier, LogicalKey, Side};
-use roe_core::kill_ring::KillRing;
 use roe_core::native_kernel::CapabilityGrants;
-use roe_core::native_services::SystemClock;
 use roe_core::session::{
     AttachmentConfiguration, DirectSessionClient, InputEvent, PresentationUpdate, SessionClient,
     WorkspaceHost,
 };
-use roe_core::{Buffer, BufferId, Editor, Frame, Window, WindowId};
+use roe_core::{Buffer, Editor, Frame};
 use roe_terminal::TerminalRenderer;
 use roe_vello::VelloRenderer;
-use slotmap::SlotMap;
-use std::sync::Arc;
 
 fn editor_fixture() -> Editor {
-    let mut buffers: SlotMap<BufferId, Buffer> = SlotMap::default();
     let buffer = Buffer::named("*conformance*", roe_core::buffer::BufferKind::Scratch);
     buffer.load_str("let one = \"λ\"\n1 + 2");
     buffer.set_mark(14);
-    let buffer_id = buffers.insert(buffer);
-    let mut windows: SlotMap<WindowId, Window> = SlotMap::default();
-    let window_id = windows.insert(Window {
-        x: 0,
-        y: 0,
-        width_chars: 80,
-        height_chars: 23,
-        active_buffer: buffer_id,
-        cursor: 19,
-        window_type: WindowType::Normal,
-    });
-    Editor {
-        frame: Frame::new(80, 23),
-        buffers,
-        windows,
-        active_window: window_id,
-        window_tree: WindowNode::new_leaf(window_id),
-        kill_ring: KillRing::with_capacity(60),
-        previous_active_window: None,
-        buffer_history: vec![buffer_id],
-        echo_message: String::new(),
-        echo_message_time: None,
-        clock: Arc::new(SystemClock),
-        mouse_drag_state: None,
-        messages_buffer_id: None,
-        file_watcher: FileWatcher::new(),
-    }
+    let mut editor = Editor::new(buffer, Frame::new(80, 23));
+    editor.move_cursor_to(19, false);
+    editor
 }
 
 #[test]

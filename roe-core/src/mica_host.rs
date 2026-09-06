@@ -4,21 +4,33 @@
 //! identities, bounded native requests, and committed effects at the host
 //! boundary; it does not expose renderer or Rust policy objects to Mica.
 
+mod decode;
+mod events;
+mod source_provider;
+pub use events::{MicaEvent, MicaEventBatch, MicaHostAction, MicaNativeAction, MicaPolicyFact};
+#[cfg(test)]
+use source_provider::source_path;
+use source_provider::{
+    RoeBufferSourceProvider, RoeSourceBuffers, source_context_facts, source_relative_path,
+    synchronize_source_buffers,
+};
+
 use crate::editor::{SplitDirection, WindowNode};
 use crate::native_kernel::{KernelError, NativeKernel, NativeOperation, NativeResult, ResourceId};
 use crate::native_services::FrontendWake;
 use crate::{BufferId, Editor, WindowId};
+#[cfg(test)]
+use mica_driver::TaskId;
 use mica_driver::{
     DriverAdministrator, DriverClient, DriverError, DriverEvent, DriverEventPump, DriverOwner,
     DriverResources, EndpointConfiguration, EndpointSession, ExternalRequestContext,
     ExternalRequestFuture, ExternalRequestHandler, ExternalStreamRequestHandler, FileinMode,
-    Identity, InvocationHandle, InvocationOutcome, ListRequest, ProviderResult, ReadRequest,
-    RelationAcceleration, SourceCapabilities, SourceConfig, SourceDocument, SourceEntry,
-    SourceFailure, SourceProvider, SourceProviderKey, Symbol, TaskId, TaskLimits, Value,
+    Identity, InvocationHandle, InvocationOutcome, RelationAcceleration, SourceConfig, Symbol,
+    TaskLimits, Value,
 };
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 #[derive(Debug, Clone)]
@@ -86,7 +98,6 @@ const TIMER_CAPACITY: usize = 64;
 const TERMINAL_TASK_RETENTION: usize = 256;
 const MAX_PROMPT_CANDIDATES: usize = 256;
 const MAX_SEARCH_MATCHES: usize = 1_024;
-const MAX_POLICY_FACTS: usize = 256;
 const ROE_BUFFER_SOURCE_PROVIDER: &str = "roe-buffer";
 
 /// Keep each HTTP future inside the driver's bounded external-request slot.
@@ -108,209 +119,6 @@ fn agent_stream_handler() -> ExternalStreamRequestHandler {
             Value::bool(true)
         })
     })
-}
-
-#[derive(Default)]
-struct RoeSourceBuffers {
-    by_path: HashMap<PathBuf, crate::Buffer>,
-}
-
-struct RoeBufferSourceProvider {
-    root: PathBuf,
-    buffers: Arc<RwLock<RoeSourceBuffers>>,
-}
-
-impl SourceProvider for RoeBufferSourceProvider {
-    fn key(&self) -> SourceProviderKey {
-        SourceProviderKey::new(ROE_BUFFER_SOURCE_PROVIDER)
-    }
-
-    fn name(&self) -> &str {
-        "live Roe buffers"
-    }
-
-    fn capabilities(&self) -> SourceCapabilities {
-        SourceCapabilities::READ.union(SourceCapabilities::LIST)
-    }
-
-    fn supports_revision_kind(&self, kind: &str) -> bool {
-        kind == "worktree"
-    }
-
-    fn read(&self, request: &ReadRequest) -> ProviderResult<SourceDocument> {
-        if request.revision_kind != "worktree" {
-            return ProviderResult::Absent;
-        }
-        if request.root != self.root {
-            return ProviderResult::Absent;
-        }
-        let Some(path) = source_path(&self.root, &request.relative_path) else {
-            return ProviderResult::Absent;
-        };
-        let buffer = self
-            .buffers
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .by_path
-            .get(&path)
-            .cloned();
-        let Some(buffer) = buffer else {
-            return ProviderResult::Absent;
-        };
-        let text = buffer.content();
-        if text.len() > request.max_bytes {
-            return ProviderResult::Failed(SourceFailure::new(format!(
-                "live Roe buffer exceeds the {} byte source bound",
-                request.max_bytes
-            )));
-        }
-        ProviderResult::Found(SourceDocument::from_text(
-            text,
-            format!("roe-buffer:{}", buffer.text_revision()),
-        ))
-    }
-
-    fn list(&self, request: &ListRequest) -> ProviderResult<Vec<SourceEntry>> {
-        if request.revision_kind != "worktree" || request.root != self.root {
-            return ProviderResult::Absent;
-        }
-        let Some(directory) = source_path(&self.root, &request.relative_path) else {
-            return ProviderResult::Absent;
-        };
-        let buffers = self
-            .buffers
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut entries = BTreeMap::new();
-        for path in buffers.by_path.keys() {
-            let Ok(relative) = path.strip_prefix(&directory) else {
-                continue;
-            };
-            let mut components = relative.components();
-            let Some(Component::Normal(first)) = components.next() else {
-                continue;
-            };
-            let name = first.to_string_lossy().into_owned();
-            let is_directory = components.next().is_some();
-            let child = directory.join(first);
-            let Ok(child) = child.strip_prefix(&self.root) else {
-                continue;
-            };
-            let relative_path = child
-                .components()
-                .filter_map(|component| match component {
-                    Component::Normal(value) => value.to_str(),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("/");
-            entries.entry(relative_path.clone()).or_insert_with(|| {
-                SourceEntry::new(
-                    relative_path,
-                    if is_directory { "directory" } else { "file" },
-                    name,
-                )
-            });
-            if entries.len() >= request.limit {
-                break;
-            }
-        }
-        if entries.is_empty() {
-            ProviderResult::Absent
-        } else {
-            ProviderResult::Found(entries.into_values().collect())
-        }
-    }
-}
-
-fn source_path(root: &Path, relative: &str) -> Option<PathBuf> {
-    let relative = Path::new(relative);
-    if relative.is_absolute()
-        || relative
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
-    {
-        return None;
-    }
-    Some(root.join(relative))
-}
-
-fn source_relative_path(root: &Path, path: &Path) -> Option<String> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        root.join(path)
-    };
-    let absolute = absolute.canonicalize().unwrap_or(absolute);
-    let relative = absolute.strip_prefix(root).ok()?;
-    let components: Option<Vec<_>> = relative
-        .components()
-        .map(|component| match component {
-            Component::Normal(value) => value.to_str().map(str::to_owned),
-            Component::CurDir => Some(String::new()),
-            _ => None,
-        })
-        .collect();
-    let path = components?
-        .into_iter()
-        .filter(|component| !component.is_empty())
-        .collect::<Vec<_>>()
-        .join("/");
-    (!path.is_empty()).then_some(path)
-}
-
-fn synchronize_source_buffers(root: &Path, state: &Arc<RwLock<RoeSourceBuffers>>, editor: &Editor) {
-    let by_path = editor
-        .buffers
-        .iter()
-        .filter(|(buffer, _)| !editor.is_command_buffer(*buffer))
-        .filter_map(|(_, buffer)| {
-            let relative = source_relative_path(root, &buffer.visited_file()?)?;
-            Some((source_path(root, &relative)?, buffer.clone()))
-        })
-        .collect();
-    state
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .by_path = by_path;
-}
-
-fn source_context_facts(
-    repository: Identity,
-    revision: Identity,
-    root: &Path,
-) -> Vec<(Symbol, mica_driver::Tuple)> {
-    vec![
-        (
-            sym("source/Repository"),
-            [Value::identity(repository)].into(),
-        ),
-        (
-            sym("source/RepositoryName"),
-            [Value::identity(repository), Value::string("workspace")].into(),
-        ),
-        (
-            sym("source/RepositoryRoot"),
-            [
-                Value::identity(repository),
-                Value::string(root.to_string_lossy()),
-            ]
-            .into(),
-        ),
-        (sym("source/Revision"), [Value::identity(revision)].into()),
-        (
-            sym("source/RevisionOf"),
-            [Value::identity(revision), Value::identity(repository)].into(),
-        ),
-        (
-            sym("source/RevisionKind"),
-            [Value::identity(revision), Value::string("worktree")].into(),
-        ),
-        (
-            sym("source/RevisionLabel"),
-            [Value::identity(revision), Value::string("live worktree")].into(),
-        ),
-    ]
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -344,59 +152,13 @@ pub enum MicaKeyResult {
     Failed(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MicaPromptTarget {
-    Selector(String),
-    Buffer(BufferId),
-    View(WindowId),
-    Path(String),
-    Opaque(String),
-}
-
+/// Display-only prompt data. Candidate identities and interaction state stay in Mica.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MicaPromptUpdate {
-    pub kind: String,
-    pub value_kind: Option<String>,
-    pub prompt: String,
+    pub prefix: String,
     pub query: String,
     pub selected: usize,
-    pub candidates: Vec<(String, MicaPromptTarget)>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct MicaHostAction {
-    pub name: String,
-    pub text: Option<String>,
-    pub title: Option<String>,
-    pub typeout_kind: Option<String>,
-    pub buffer: Option<BufferId>,
-    pub buffer_name: Option<String>,
-    pub unit: Option<String>,
-    pub view: Option<WindowId>,
-    pub path: Option<String>,
-    pub position: Option<usize>,
-    pub anchor: Option<usize>,
-    pub phase: Option<String>,
-    pub line: Option<u16>,
-    pub column: Option<u16>,
-    pub split_path: Option<Vec<usize>>,
-    pub ratio: Option<f32>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MicaNativeAction {
-    pub name: String,
-    pub text: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MicaPolicyFact {
-    pub kind: String,
-    pub subject: Option<BufferId>,
-    pub name: String,
-    pub attribute: Option<String>,
-    pub value: String,
-    pub precedence: Option<i64>,
+    pub candidates: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -412,38 +174,6 @@ pub struct MicaSearchFinish {
     pub original_cursor: usize,
     pub query: String,
     pub accepted: bool,
-}
-
-#[derive(Debug, Default)]
-pub struct MicaEventBatch {
-    pub effects: Vec<MicaPresentationEffect>,
-    pub host_actions: Vec<MicaHostAction>,
-    pub native_actions: Vec<MicaNativeAction>,
-    pub policy_reset: bool,
-    pub policy_facts: Vec<MicaPolicyFact>,
-    pub prompt_updates: Vec<MicaPromptUpdate>,
-    pub prompt_close: bool,
-    pub search_updates: Vec<MicaSearchUpdate>,
-    pub search_finishes: Vec<MicaSearchFinish>,
-    pub errors: Vec<String>,
-    pub cancelled_tasks: Vec<TaskId>,
-    pub ready_subscriptions: Vec<u64>,
-}
-
-impl MicaEventBatch {
-    fn push_policy(&mut self, policy: MicaPolicyFact) {
-        if self.policy_facts.len() < MAX_POLICY_FACTS {
-            self.policy_facts.push(policy);
-        } else if !self
-            .errors
-            .iter()
-            .any(|error| error.contains("policy fact limit"))
-        {
-            self.errors.push(format!(
-                "Mica policy fact limit of {MAX_POLICY_FACTS} exceeded"
-            ));
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -515,73 +245,83 @@ impl NativeBridge {
         self.state.lock().unwrap().services.remove(&service);
     }
 
-    fn handle(&self, context: ExternalRequestContext, service: Symbol, payload: Value) -> Value {
+    async fn handle(
+        &self,
+        context: ExternalRequestContext,
+        service: Symbol,
+        payload: Value,
+    ) -> Value {
         if context.cancellation.is_cancelled() {
             return native_error("request cancelled before native admission");
         }
-        let state = self.state.lock().unwrap();
-        if context.actor != state.actor {
-            return native_error("request actor does not own this Roe endpoint");
-        }
+        let operation = {
+            let state = self.state.lock().unwrap();
+            if context.actor != state.actor {
+                return native_error("request actor does not own this Roe endpoint");
+            }
 
-        let required_service = if service == sym("clock_millis") {
-            sym("clock_read")
-        } else if service == sym("text_insert") {
-            sym("text_write")
-        } else if service == sym("text_search") {
-            sym("text_read")
-        } else if service == sym("list_directory") {
-            sym("file_read")
-        } else {
-            return native_error("unknown Roe native service");
-        };
-        if !state.services.contains(&required_service) {
-            return native_error("request actor lacks the required native service grant");
-        }
+            let required_service = if service == sym("clock_millis") {
+                sym("clock_read")
+            } else if service == sym("text_insert") {
+                sym("text_write")
+            } else if service == sym("text_search") {
+                sym("text_read")
+            } else if service == sym("list_directory") {
+                sym("file_read")
+            } else {
+                return native_error("unknown Roe native service");
+            };
+            if !state.services.contains(&required_service) {
+                return native_error("request actor lacks the required native service grant");
+            }
 
-        let operation = if service == sym("clock_millis") {
-            NativeOperation::ReadClockMillis
-        } else if service == sym("list_directory") {
-            let path = map_value(&payload, "path")
-                .and_then(|value| value.with_str(str::to_owned))
-                .unwrap_or_else(|| ".".to_owned());
-            NativeOperation::ListDirectory { path: path.into() }
-        } else if service == sym("text_search") {
-            let Some(buffer) = map_value(&payload, "buffer").and_then(|value| value.as_identity())
-            else {
-                return native_error("text_search requires an identity buffer");
-            };
-            let Some(resource) = state.resources.get(&buffer).copied() else {
-                return native_error("text_search buffer is not authorized for this endpoint");
-            };
-            NativeOperation::Snapshot { resource }
-        } else {
-            let Some(buffer) = map_value(&payload, "buffer").and_then(|value| value.as_identity())
-            else {
-                return native_error("text_insert requires an identity buffer");
-            };
-            let Some(resource) = state.resources.get(&buffer).copied() else {
-                return native_error("text_insert buffer is not authorized for this endpoint");
-            };
-            let Some(at) = map_value(&payload, "at")
-                .and_then(|value| value.as_int())
-                .and_then(|value| usize::try_from(value).ok())
-            else {
-                return native_error("text_insert requires a non-negative character offset");
-            };
-            let Some(text) =
-                map_value(&payload, "text").and_then(|value| value.with_str(str::to_owned))
-            else {
-                return native_error("text_insert requires string text");
-            };
-            NativeOperation::Insert { resource, at, text }
+            if service == sym("clock_millis") {
+                NativeOperation::ReadClockMillis
+            } else if service == sym("list_directory") {
+                let path = map_value(&payload, "path")
+                    .and_then(|value| value.with_str(str::to_owned))
+                    .unwrap_or_else(|| ".".to_owned());
+                NativeOperation::ListDirectory { path: path.into() }
+            } else if service == sym("text_search") {
+                let Some(buffer) =
+                    map_value(&payload, "buffer").and_then(|value| value.as_identity())
+                else {
+                    return native_error("text_search requires an identity buffer");
+                };
+                let Some(resource) = state.resources.get(&buffer).copied() else {
+                    return native_error("text_search buffer is not authorized for this endpoint");
+                };
+                NativeOperation::Snapshot { resource }
+            } else {
+                let Some(buffer) =
+                    map_value(&payload, "buffer").and_then(|value| value.as_identity())
+                else {
+                    return native_error("text_insert requires an identity buffer");
+                };
+                let Some(resource) = state.resources.get(&buffer).copied() else {
+                    return native_error("text_insert buffer is not authorized for this endpoint");
+                };
+                let Some(at) = map_value(&payload, "at")
+                    .and_then(|value| value.as_int())
+                    .and_then(|value| usize::try_from(value).ok())
+                else {
+                    return native_error("text_insert requires a non-negative character offset");
+                };
+                let Some(text) =
+                    map_value(&payload, "text").and_then(|value| value.with_str(str::to_owned))
+                else {
+                    return native_error("text_insert requires string text");
+                };
+                NativeOperation::Insert { resource, at, text }
+            }
         };
-        drop(state);
 
         if context.cancellation.is_cancelled() {
             return native_error("request cancelled before native execution");
         }
-        match self.kernel.lock().unwrap().execute(operation) {
+        match crate::native_io::execute(&self.kernel, operation, context.cancellation.cancelled())
+            .await
+        {
             Ok(NativeResult::ClockMillis(value)) => native_ok(
                 Value::int(i64::try_from(value).unwrap_or(i64::MAX))
                     .unwrap_or_else(|_| Value::string(value.to_string())),
@@ -644,7 +384,7 @@ impl NativeBridge {
 }
 
 pub struct MicaHost {
-    owner: DriverOwner,
+    owner: Option<DriverOwner>,
     client: DriverClient,
     administrator: DriverAdministrator,
     event_pump: Option<DriverEventPump>,
@@ -797,7 +537,9 @@ impl MicaHost {
                     context.cancellation.cancelled().await;
                     return native_error("request cancelled");
                 }
-                bridge.handle(context, request.service, request.payload)
+                bridge
+                    .handle(context, request.service, request.payload)
+                    .await
             }) as ExternalRequestFuture
         });
 
@@ -1032,7 +774,7 @@ impl MicaHost {
         );
 
         Ok(Self {
-            owner,
+            owner: Some(owner),
             client,
             administrator,
             event_pump: Some(event_pump),
@@ -1144,8 +886,8 @@ impl MicaHost {
         editor: &Editor,
         resource_ids: &HashMap<BufferId, ResourceId>,
         view: WindowId,
-        line: u16,
-        column: u16,
+        line: usize,
+        column: usize,
     ) -> Result<MicaEventBatch, MicaHostError> {
         self.synchronize_context(editor, resource_ids)?;
         let view = *self
@@ -1156,8 +898,8 @@ impl MicaHost {
             "roe/set_view_scroll",
             vec![
                 (sym("view"), Value::identity(view)),
-                (sym("line"), int_value(line as usize)),
-                (sym("column"), int_value(column as usize)),
+                (sym("line"), int_value(line)),
+                (sym("column"), int_value(column)),
             ],
         )
         .await
@@ -1234,6 +976,36 @@ impl MicaHost {
         self.invoke_editor_verb("roe/agent_start", Vec::new()).await
     }
 
+    pub(crate) async fn initialize_startup(
+        &mut self,
+        editor: &Editor,
+        resource_ids: &HashMap<BufferId, ResourceId>,
+        buffers: &[BufferId],
+    ) -> Result<MicaEventBatch, MicaHostError> {
+        if buffers.len() > crate::session::MAX_SESSION_VIEWS {
+            return Err(MicaHostError::Policy(
+                "startup buffer limit exceeded".into(),
+            ));
+        }
+        self.ensure_first_wave().await?;
+        self.synchronize_context(editor, resource_ids)?;
+        let buffers = buffers
+            .iter()
+            .map(|id| {
+                self.buffer_ids
+                    .get(id)
+                    .copied()
+                    .map(Value::identity)
+                    .ok_or_else(|| MicaHostError::Policy("startup buffer no longer exists".into()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.invoke_editor_verb(
+            "roe/initialize_startup",
+            vec![(sym("buffers"), Value::list(buffers))],
+        )
+        .await
+    }
+
     async fn invoke_editor_verb(
         &mut self,
         selector: &str,
@@ -1278,20 +1050,8 @@ impl MicaHost {
         }
         self.ensure_first_wave().await?;
         self.synchronize_context(editor, resource_ids)?;
-        let invocation = self
-            .endpoint_session()
-            .invoke(
-                sym("roe/publish_policy"),
-                vec![
-                    (sym("actor"), Value::identity(self.actor)),
-                    (sym("session"), Value::identity(self.session)),
-                ],
-            )
-            .await?;
-        Ok(self
-            .wait_for_task(&invocation, "roe/publish_policy")
-            .await?
-            .events)
+        self.invoke_editor_verb("roe/publish_policy", Vec::new())
+            .await
     }
 
     pub async fn check_source(&self, source: String) -> Result<(), MicaHostError> {
@@ -1300,13 +1060,17 @@ impl MicaHost {
     }
 
     pub async fn replace_unit(&mut self, unit: &str, source: String) -> Result<(), MicaHostError> {
-        self.administrator
-            .check_filein(source.clone(), None)
-            .await?;
         let unit_symbol = sym(unit);
         let mode = if self.loaded_units.contains(&unit_symbol) {
+            // Replace validates in a staged kernel after retracting the old unit.
+            // An additive check_filein would reject legitimate functional-key changes
+            // against the still-installed unit. The staged replacement commits only
+            // after every declaration completes; failure retains the working unit.
             FileinMode::Replace
         } else {
+            self.administrator
+                .check_filein(source.clone(), None)
+                .await?;
             FileinMode::Add
         };
         self.administrator
@@ -1889,362 +1653,31 @@ end
     }
 
     fn record_background_event(&mut self, event: DriverEvent, batch: &mut MicaEventBatch) {
-        match event {
-            DriverEvent::Effect(effect) => {
-                if let Some(effect) = self.presentation_effect(effect.target, &effect.value) {
-                    batch.effects.push(effect);
-                } else if let Some(update) = self.prompt_update(effect.target, &effect.value) {
-                    self.prompt_active = true;
-                    batch.prompt_updates.push(update);
-                } else if self.prompt_closed(effect.target, &effect.value) {
-                    self.prompt_active = false;
-                    batch.prompt_close = true;
-                } else if let Some(update) = self.search_update(effect.target, &effect.value) {
-                    batch.search_updates.push(update);
-                } else if let Some(finish) = self.search_finish(effect.target, &effect.value) {
-                    batch.search_finishes.push(finish);
-                } else if self.policy_reset(effect.target, &effect.value) {
-                    batch.policy_reset = true;
-                } else if let Some(policy) = self.policy_fact(effect.target, &effect.value) {
-                    batch.push_policy(policy);
-                } else if let Some(action) = self.native_action(effect.target, &effect.value) {
-                    batch.native_actions.push(action);
-                } else if let Some(action) = self.host_action(effect.target, &effect.value) {
-                    batch.host_actions.push(action);
-                }
-            }
-            DriverEvent::TaskAborted { task_id, error } => batch.errors.push(format!(
+        let event = match event {
+            DriverEvent::Effect(effect) => self
+                .decode_effect(effect.target, &effect.value)
+                .unwrap_or_else(MicaEvent::Error),
+            DriverEvent::TaskAborted { task_id, error } => MicaEvent::Error(format!(
                 "Mica background task {task_id} aborted: {}",
                 self.format_value(&error)
             )),
-            DriverEvent::TaskFailed { task_id, error } => batch
-                .errors
-                .push(format!("Mica background task {task_id} failed: {error}")),
-            DriverEvent::TaskCancelled { task_id, .. } => {
-                batch.cancelled_tasks.push(task_id);
+            DriverEvent::TaskFailed { task_id, error } => {
+                MicaEvent::Error(format!("Mica background task {task_id} failed: {error}"))
             }
-            DriverEvent::SubscriptionReady { mailbox } => {
-                batch.ready_subscriptions.push(mailbox);
-            }
-            DriverEvent::TaskCompleted { .. } | DriverEvent::TaskSuspended { .. } => {}
-        }
-    }
-
-    fn presentation_effect(
-        &mut self,
-        target: Identity,
-        value: &Value,
-    ) -> Option<MicaPresentationEffect> {
-        if target != self.session {
-            return None;
-        }
-        if map_value(value, "kind")?.as_symbol()? != sym("presentation_invalidated") {
-            return None;
-        }
-        let logical_buffer = map_value(value, "buffer")?.as_identity()?;
-        let logical_view = map_value(value, "view")?.as_identity()?;
-        let cursor = usize::try_from(map_value(value, "cursor")?.as_int()?).ok()?;
-        let buffer = self
-            .buffer_ids
-            .iter()
-            .find_map(|(buffer, identity)| (*identity == logical_buffer).then_some(*buffer))?;
-        let view = self
-            .view_ids
-            .iter()
-            .find_map(|(view, identity)| (*identity == logical_view).then_some(*view))?;
-        self.view_cursors.insert(view, cursor);
-        Some(MicaPresentationEffect {
-            buffer,
-            view,
-            cursor,
-        })
-    }
-
-    fn native_action(&self, target: Identity, value: &Value) -> Option<MicaNativeAction> {
-        if target != self.session || map_value(value, "kind")?.as_symbol()? != sym("native_action")
-        {
-            return None;
-        }
-        let action = map_value(value, "action")?.as_symbol()?;
-        Some(MicaNativeAction {
-            name: action.name()?.to_owned(),
-            text: map_value(value, "text").and_then(|value| value.with_str(str::to_owned)),
-        })
-    }
-
-    fn policy_fact(&self, target: Identity, value: &Value) -> Option<MicaPolicyFact> {
-        if target != self.session {
-            return None;
-        }
-        let kind = map_value(value, "kind")?.as_symbol()?.name()?.to_owned();
-        if !matches!(
-            kind.as_str(),
-            "mode_policy"
-                | "face_policy"
-                | "syntax_policy"
-                | "highlight_policy"
-                | "configuration_policy"
-        ) {
-            return None;
-        }
-        let subject = map_value(value, "buffer")
-            .and_then(|value| value.as_identity())
-            .and_then(|logical| {
-                self.buffer_ids
-                    .iter()
-                    .find_map(|(buffer, identity)| (*identity == logical).then_some(*buffer))
-            });
-        let name = if kind == "face_policy" {
-            map_value(value, "face")?.with_str(str::to_owned)?
-        } else if kind == "mode_policy" {
-            map_value(value, "name")?.with_str(str::to_owned)?
-        } else if kind == "highlight_policy" {
-            map_value(value, "mode")?.with_str(str::to_owned)?
-        } else {
-            map_value(value, "syntax_kind")
-                .or_else(|| map_value(value, "capture"))
-                .or_else(|| map_value(value, "key"))?
-                .as_symbol()?
-                .name()?
-                .to_owned()
+            DriverEvent::TaskCancelled { task_id, .. } => MicaEvent::TaskCancelled(task_id),
+            DriverEvent::SubscriptionReady { mailbox } => MicaEvent::SubscriptionReady(mailbox),
+            DriverEvent::TaskCompleted { .. } | DriverEvent::TaskSuspended { .. } => return,
         };
-        let attribute = map_value(
-            value,
-            if kind == "highlight_policy" {
-                "capture"
-            } else {
-                "attribute"
-            },
-        )
-        .and_then(|value| value.as_symbol())
-        .and_then(Symbol::name)
-        .map(str::to_owned);
-        let precedence = map_value(value, "precedence").and_then(|value| value.as_int());
-        let value = if kind == "highlight_policy" {
-            map_value(value, "face")?.with_str(str::to_owned)?
-        } else {
-            let raw = map_value(value, "value").or_else(|| map_value(value, "pattern"));
-            raw.clone()
-                .and_then(|value| value.with_str(str::to_owned))
-                .or_else(|| raw.map(|value| self.format_value(&value)))
-                .unwrap_or_default()
+        let prompt_active = match &event {
+            MicaEvent::Prompt(_) => Some(true),
+            MicaEvent::PromptClosed => Some(false),
+            _ => None,
         };
-        Some(MicaPolicyFact {
-            kind,
-            subject,
-            name,
-            attribute,
-            value,
-            precedence,
-        })
-    }
-
-    fn policy_reset(&self, target: Identity, value: &Value) -> bool {
-        target == self.session
-            && map_value(value, "kind").and_then(|value| value.as_symbol())
-                == Some(sym("policy_reset"))
-    }
-
-    fn host_action(&self, target: Identity, value: &Value) -> Option<MicaHostAction> {
-        if target != self.session || map_value(value, "kind")?.as_symbol()? != sym("host_action") {
-            return None;
-        }
-        let name = map_value(value, "action")?
-            .as_symbol()?
-            .name()
-            .map(str::to_owned)?;
-        let text = map_value(value, "text").and_then(|value| value.with_str(str::to_owned));
-        let title = map_value(value, "title").and_then(|value| value.with_str(str::to_owned));
-        let typeout_kind = map_value(value, "typeout_kind")
-            .and_then(|value| value.as_symbol())
-            .and_then(Symbol::name)
-            .map(str::to_owned);
-        let buffer = map_value(value, "buffer")
-            .and_then(|value| value.as_identity())
-            .and_then(|logical| {
-                self.buffer_ids
-                    .iter()
-                    .find_map(|(buffer, identity)| (*identity == logical).then_some(*buffer))
-            });
-        let path = map_value(value, "path").and_then(|value| value.with_str(str::to_owned));
-        let buffer_name =
-            map_value(value, "buffer_name").and_then(|value| value.with_str(str::to_owned));
-        let unit = map_value(value, "unit")
-            .and_then(|value| value.as_symbol())
-            .and_then(Symbol::name)
-            .map(str::to_owned);
-        let view = map_value(value, "view")
-            .and_then(|value| value.as_identity())
-            .and_then(|logical| {
-                self.view_ids
-                    .iter()
-                    .find_map(|(view, identity)| (*identity == logical).then_some(*view))
-            });
-        let position = map_value(value, "position")
-            .and_then(|value| value.as_int())
-            .and_then(|value| usize::try_from(value).ok());
-        let anchor = map_value(value, "anchor")
-            .and_then(|value| value.as_int())
-            .and_then(|value| usize::try_from(value).ok());
-        let phase = map_value(value, "phase")
-            .and_then(|value| value.as_symbol())
-            .and_then(|value| value.name().map(str::to_owned));
-        let line = map_value(value, "line")
-            .and_then(|value| value.as_int())
-            .and_then(|value| u16::try_from(value).ok());
-        let column = map_value(value, "column")
-            .and_then(|value| value.as_int())
-            .and_then(|value| u16::try_from(value).ok());
-        let split_path = map_value(value, "node")
-            .and_then(|value| value.as_identity())
-            .and_then(|node| {
-                self.layout_nodes
-                    .iter()
-                    .find_map(|(path, identity)| (*identity == node).then_some(path.clone()))
-            });
-        let ratio = map_value(value, "ratio").and_then(|value| value.as_float());
-        Some(MicaHostAction {
-            name,
-            text,
-            title,
-            typeout_kind,
-            buffer,
-            buffer_name,
-            unit,
-            view,
-            path,
-            position,
-            anchor,
-            phase,
-            line,
-            column,
-            split_path,
-            ratio,
-        })
-    }
-
-    fn prompt_closed(&self, target: Identity, value: &Value) -> bool {
-        target == self.session
-            && map_value(value, "kind").and_then(|value| value.as_symbol())
-                == Some(sym("prompt_close"))
-    }
-
-    fn prompt_update(&self, target: Identity, value: &Value) -> Option<MicaPromptUpdate> {
-        if target != self.session || map_value(value, "kind")?.as_symbol()? != sym("prompt_update")
+        if batch.push(event)
+            && let Some(active) = prompt_active
         {
-            return None;
+            self.prompt_active = active;
         }
-        let kind = map_value(value, "prompt_kind")?
-            .as_symbol()?
-            .name()?
-            .to_owned();
-        let value_kind = map_value(value, "value_kind")
-            .and_then(|value| value.as_symbol())
-            .and_then(Symbol::name)
-            .map(str::to_owned);
-        let prompt = map_value(value, "prompt")
-            .and_then(|value| value.with_str(str::to_owned))
-            .unwrap_or_default();
-        let query = map_value(value, "query")?.with_str(str::to_owned)?;
-        let selected = usize::try_from(map_value(value, "selected")?.as_int()?).ok()?;
-        let values = map_value(value, "candidates")?;
-        let mut candidates = Vec::new();
-        for index in 0..values.list_len()?.min(MAX_PROMPT_CANDIDATES) {
-            let row = values.list_get(index)?;
-            let name = row.list_get(0)?.with_str(str::to_owned)?;
-            let raw = row.list_get(1)?;
-            let target = if kind == "command" {
-                MicaPromptTarget::Selector(raw.as_symbol()?.name()?.to_owned())
-            } else if kind == "switch_buffer" || kind == "kill_buffer" {
-                let logical = raw.as_identity()?;
-                let buffer = self
-                    .buffer_ids
-                    .iter()
-                    .find_map(|(buffer, identity)| (*identity == logical).then_some(*buffer))?;
-                MicaPromptTarget::Buffer(buffer)
-            } else if kind == "command_argument" {
-                match value_kind.as_deref() {
-                    Some("logical_view") => {
-                        let logical = raw.as_identity()?;
-                        let view = self
-                            .view_ids
-                            .iter()
-                            .find_map(|(view, identity)| (*identity == logical).then_some(*view))?;
-                        MicaPromptTarget::View(view)
-                    }
-                    Some("logical_buffer") => {
-                        let logical = raw.as_identity()?;
-                        let buffer = self.buffer_ids.iter().find_map(|(buffer, identity)| {
-                            (*identity == logical).then_some(*buffer)
-                        })?;
-                        MicaPromptTarget::Buffer(buffer)
-                    }
-                    Some("selector") => {
-                        MicaPromptTarget::Selector(raw.as_symbol()?.name()?.to_owned())
-                    }
-                    Some("path") => MicaPromptTarget::Path(raw.with_str(str::to_owned)?),
-                    Some("opaque") => MicaPromptTarget::Opaque(self.format_value(&raw)),
-                    _ => return None,
-                }
-            } else {
-                MicaPromptTarget::Path(raw.with_str(str::to_owned)?)
-            };
-            candidates.push((name, target));
-        }
-        Some(MicaPromptUpdate {
-            kind,
-            value_kind,
-            prompt,
-            query,
-            selected,
-            candidates,
-        })
-    }
-
-    fn search_update(&self, target: Identity, value: &Value) -> Option<MicaSearchUpdate> {
-        if target != self.session || map_value(value, "kind")?.as_symbol()? != sym("search_update")
-        {
-            return None;
-        }
-        let logical = map_value(value, "view")?.as_identity()?;
-        let view = self
-            .view_ids
-            .iter()
-            .find_map(|(view, identity)| (*identity == logical).then_some(*view))?;
-        let raw = map_value(value, "matches")?;
-        let mut matches = Vec::new();
-        for index in 0..raw.list_len()?.min(MAX_SEARCH_MATCHES) {
-            let row = raw.list_get(index)?;
-            let start = usize::try_from(row.list_get(0)?.as_int()?).ok()?;
-            let end = usize::try_from(row.list_get(1)?.as_int()?).ok()?;
-            matches.push((start, end));
-        }
-        let selected = map_value(value, "selected")
-            .and_then(|value| value.as_int())
-            .and_then(|value| usize::try_from(value).ok());
-        Some(MicaSearchUpdate {
-            view,
-            matches,
-            selected,
-        })
-    }
-
-    fn search_finish(&self, target: Identity, value: &Value) -> Option<MicaSearchFinish> {
-        if target != self.session || map_value(value, "kind")?.as_symbol()? != sym("search_finish")
-        {
-            return None;
-        }
-        let logical = map_value(value, "view")?.as_identity()?;
-        let view = self
-            .view_ids
-            .iter()
-            .find_map(|(view, identity)| (*identity == logical).then_some(*view))?;
-        Some(MicaSearchFinish {
-            view,
-            original_cursor: usize::try_from(map_value(value, "original")?.as_int()?).ok()?,
-            query: map_value(value, "query")?.with_str(str::to_owned)?,
-            accepted: map_value(value, "accepted")?.as_bool()?,
-        })
     }
 
     pub async fn close(&mut self) -> Result<MicaEventBatch, MicaHostError> {
@@ -2266,19 +1699,20 @@ end
                 self.record_background_event(event, &mut events);
             })
             .await;
-        let mut shutdown_events = Vec::new();
-        let shutdown_result = self
+        let mut owner = self
             .owner
-            .shutdown(&mut pump, |event| shutdown_events.push(event))
+            .take()
+            .expect("open Mica host retains its driver owner");
+        let shutdown_result = owner
+            .shutdown(&mut pump, |event| {
+                self.record_background_event(event, &mut events)
+            })
             .await;
-        for event in shutdown_events {
-            self.record_background_event(event, &mut events);
-        }
         let report = endpoint_result?;
         shutdown_result?;
-        events.cancelled_tasks.extend(report.cancelled_tasks);
-        events.cancelled_tasks.sort_unstable();
-        events.cancelled_tasks.dedup();
+        for task_id in report.cancelled_tasks {
+            events.push(MicaEvent::TaskCancelled(task_id));
+        }
         Ok(events)
     }
 }
