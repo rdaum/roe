@@ -11,13 +11,13 @@ metadata, and CI together.
 The Phase 1 inventory was captured on 2026-08-13 with `cargo outdated`, `cargo tree -d`, crate
 metadata, and upstream release notes.
 
-| Group              | Dependencies                                                    | Policy                                                                                                         |
-| ------------------ | --------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| Routine compatible | `arboard`, `crossterm`, `notify`, `ropey`, `similar`, `slotmap` | Follow current stable releases compatible with the MSRV.                                                       |
-| Runtime pins       | `compio = 0.18.0`, exact Mica crate revision                    | Change together with Mica lifecycle, replacement, cancellation, streaming, and terminal workflow tests.        |
+| Group              | Dependencies                                                             | Policy                                                                                                                 |
+| ------------------ | ------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------- |
+| Routine compatible | `arboard`, `crossterm`, `notify`, `ropey`, `similar`, `slotmap`          | Follow current stable releases compatible with the MSRV.                                                               |
+| Runtime pins       | `compio = 0.18.0`, exact Mica crate revision                             | Change together with Mica lifecycle, replacement, cancellation, streaming, and terminal workflow tests.                |
 | Mica features      | `mica-driver` with `default-features = false`, `source-provider` enabled | Keep CPU relation execution and Roe's bounded source-provider graph; do not initialize Mica WGPU, Fjall, or Cranelift. |
-| Coupled graphics   | `vello`, its WGPU graph, `parley`, `winit`, `pollster`          | Upgrade as one reviewed group with Vello build and frontend conformance checks.                                |
-| Removed            | `async-trait`, direct `futures`                                 | Unused actor/event-stream dependencies removed in Phase 1.                                                     |
+| Coupled graphics   | `vello`, its WGPU graph, `parley`, `winit`, `pollster`                   | Upgrade as one reviewed group with Vello build and frontend conformance checks.                                        |
+| Removed            | `async-trait`, direct `futures`                                          | Unused actor/event-stream dependencies removed in Phase 1.                                                             |
 
 Ropey 2 is currently a prerelease and is not treated as the current stable target. Winit 0.31 is
 also prerelease. Mica uses `default-features = false`, leaving its WGPU relation accelerator, Fjall

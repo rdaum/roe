@@ -46,8 +46,8 @@ In short Mica takes the place that Lisp usually takes in the rest of the Emacs p
 - Mouse positioning, selection, view activation, scrolling, and split-border dragging.
 - An always-present `*scratch*` Mica buffer plus welcome, messages, prompt, result, and diagnostic
   buffers.
-- Mica buffer and region evaluation with recoverable diagnostics; region results appear in an
-  inset, pageable [typeout window](docs/TYPEOUT-WINDOWS.md) attached to the invoking view.
+- Mica buffer and region evaluation with recoverable diagnostics; region results appear in an inset,
+  pageable [typeout window](docs/TYPEOUT-WINDOWS.md) attached to the invoking view.
 - Composable Mica source providers: live Roe buffers shadow the local worktree, so source queries
   see unsaved edits while files without a live buffer fall through to bounded disk access.
 - A streaming, read-only workspace agent in `*Agent*`, with Mica-owned transcripts and `read`,
@@ -165,14 +165,14 @@ buffer, and each tool invocation is shown in a typeout attached to its view. The
 deliberately read-only: `read`, `grep`, `glob`, and `ls`. All paths are relative to Roe's startup
 directory. Source lookup is provider-composed, so a visited file's unsaved buffer text takes
 precedence over its on-disk contents; files not open in Roe fall through to the bounded local
-worktree provider. You can switch buffers while it works; incoming text does not move focus back
-to `*Agent*`. Prompts and tool results (including unsaved text) are sent to the configured model
+worktree provider. You can switch buffers while it works; incoming text does not move focus back to
+`*Agent*`. Prompts and tool results (including unsaved text) are sent to the configured model
 service when you invoke the agent.
 
 Agent transcripts are currently workspace-local and in-memory. They disappear when the workspace
 terminates, and the agent cannot edit files or execute commands. Each prompt allows four tool
-rounds, with at most 16 calls per response; the conversation is capped at 128 messages. Closing
-the workspace cancels any pending response.
+rounds, with at most 16 calls per response; the conversation is capped at 128 messages. Closing the
+workspace cancels any pending response.
 
 ## Mica programming model
 

@@ -6,8 +6,8 @@ Roe's production editor policy is split between three Mica source units:
   behaviors.
 - `roe-first-wave.mica` defines the policy shipped with Roe: commands, key bindings, modes, faces,
   syntax rules, prompts, and configuration.
-- `roe-agent.mica` defines the `*Agent*` transcript, `agent-chat` command, read-only workspace tools,
-  and streaming response loop.
+- `roe-agent.mica` defines the `*Agent*` transcript, `agent-chat` command, read-only workspace
+  tools, and streaming response loop.
 
 `roe-core` embeds all three files and loads them for every production `WorkspaceHost`. The Rust host
 publishes workspace-local sessions, buffers, views, and native-resource associations as volatile

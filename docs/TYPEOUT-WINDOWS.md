@@ -21,10 +21,10 @@ consume the same logical typeout presentation but realize it differently.
 ## Historical context
 
 "Typeout" was already TECO and ITS vocabulary for printed terminal output, including `--MORE--`
-paging. The distinctive overlay discussed here came from the Lisp Machine window system rather
-than from the universal Emacs buffer model.
+paging. The distinctive overlay discussed here came from the Lisp Machine window system rather than
+from the universal Emacs buffer model.
 
-The 1983 *Lisp Machine Window System Manual* describes a typeout window as an inferior child of a
+The 1983 _Lisp Machine Window System Manual_ describes a typeout window as an inferior child of a
 window whose normal display reflects a persistent data source. The child exposes itself when output
 is directed to it. This was a general window-system service available to editor and scroll windows,
 not a Zmacs-only invention.
@@ -60,8 +60,8 @@ Primary references:
    emerge from the particular view that invoked the command.
 4. **Exposure follows output.** A command selects a typeout destination and writes to it; it should
    not need to manage a renderer popup manually.
-5. **Promotion is explicit.** Output becomes an editable or retainable results buffer only when
-   Mica policy or the user requests it.
+5. **Promotion is explicit.** Output becomes an editable or retainable results buffer only when Mica
+   policy or the user requests it.
 6. **The semantics are shared.** Vello may animate and composite the surface, but terminal Roe must
    receive and present the same logical object.
 
@@ -100,13 +100,13 @@ through the existing authorized host boundary.
 
 The logical association and output content have different lifetimes:
 
-| State | Owner | Lifetime |
-| --- | --- | --- |
-| Output destination, kind, title, active association | Mica | Editor session |
-| Bounded text and text revision | Rust workspace mechanism | Active typeout |
-| Page offset for a particular viewport | Attachment | Attachment or typeout dismissal |
-| Visible slice and paging flags | Presentation snapshot | Presentation revision |
-| Pixel inset, alpha, shadow, animation | Vello | Render realization |
+| State                                               | Owner                    | Lifetime                        |
+| --------------------------------------------------- | ------------------------ | ------------------------------- |
+| Output destination, kind, title, active association | Mica                     | Editor session                  |
+| Bounded text and text revision                      | Rust workspace mechanism | Active typeout                  |
+| Page offset for a particular viewport               | Attachment               | Attachment or typeout dismissal |
+| Visible slice and paging flags                      | Presentation snapshot    | Presentation revision           |
+| Pixel inset, alpha, shadow, animation               | Vello                    | Render realization              |
 
 Deleting the parent view must close its typeout. Switching that view to another buffer should
 normally dismiss it because the visible output no longer has the same provenance; this remains Mica
@@ -160,12 +160,12 @@ was hit, but Mica must still decide what the interaction means.
 
 Typeout fills the gap between the echo area and a permanent results buffer:
 
-| Output | Default destination |
-| --- | --- |
-| Brief status or scalar result | Echo area, optionally mirrored to `*Messages*` |
-| Multi-line help, evaluation, or inspection | Typeout |
-| Output explicitly retained by the user | Results buffer |
-| Durable or substantial diagnostics | Typeout plus diagnostics buffer |
+| Output                                     | Default destination                            |
+| ------------------------------------------ | ---------------------------------------------- |
+| Brief status or scalar result              | Echo area, optionally mirrored to `*Messages*` |
+| Multi-line help, evaluation, or inspection | Typeout                                        |
+| Output explicitly retained by the user     | Results buffer                                 |
+| Durable or substantial diagnostics         | Typeout plus diagnostics buffer                |
 
 Region-evaluation success and failure now pass through the functional Mica `roe/OutputRoute`
 relation. Shipped policy routes both to typeout while Rust continues to enforce the size and title
@@ -189,8 +189,8 @@ for the first implementation.
 
 The terminal composites the same child over rows at the top of the parent view, with a one-cell
 inset or simple border. It appears and disappears immediately. Dismissal repaints the underlying
-view from the current presentation snapshot rather than attempting to preserve terminal cells.
-A small terminal may give the typeout the entire content area while retaining the modeline.
+view from the current presentation snapshot rather than attempting to preserve terminal cells. A
+small terminal may give the typeout the entire content area while retaining the modeline.
 
 ## Bounds and failure behavior
 
@@ -204,9 +204,9 @@ The first implementation should make all resource policy explicit:
 - recoverable diagnostics for malformed, unauthorized, oversized, or stale-view updates; and
 - deterministic cleanup on view deletion, endpoint close, and workspace shutdown.
 
-The producer should initially submit complete output atomically. Streaming output and true
-producer backpressure at `More` are valuable later features, but they require explicit task,
-cancellation, and queue ownership.
+The producer should initially submit complete output atomically. Streaming output and true producer
+backpressure at `More` are valuable later features, but they require explicit task, cancellation,
+and queue ownership.
 
 ## Implementation status
 

@@ -19,9 +19,9 @@ rust-version = "1.96"
 arboard = "3.6"
 compio = { version = "=0.18.0", features = ["fs", "time"] }
 crossterm = "0.29"
-mica-compiler = { git = "https://github.com/timbran-project/mica.git", rev = "dd7db6b04c9d780787f2b3ee4b15a468728624c9" }
-mica-driver = { git = "https://github.com/timbran-project/mica.git", rev = "dd7db6b04c9d780787f2b3ee4b15a468728624c9", default-features = false, features = ["source-provider"] }
-mica-external-http = { git = "https://github.com/timbran-project/mica.git", rev = "dd7db6b04c9d780787f2b3ee4b15a468728624c9" }
+mica-compiler = { git = "https://github.com/timbran-project/mica.git" }
+mica-driver = { git = "https://github.com/timbran-project/mica.git", default-features = false, features = ["source-provider"] }
+mica-external-http = { git = "https://github.com/timbran-project/mica.git" }
 notify = "8.2"
 ropey = "1.6"
 serde = { version = "1.0", features = ["derive"] }
