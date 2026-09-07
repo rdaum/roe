@@ -1105,11 +1105,32 @@ mod lifecycle_tests {
 
     #[test]
     fn production_rust_mode_builds_a_vello_scene_without_a_display() {
-        let buffer = Buffer::named("scene.rs", roe_core::buffer::BufferKind::File);
-        buffer.set_visited_file(Some("scene.rs".into()));
-        buffer.load_str("fn scene() {\nlet λ = 1;\n}\n");
+        assert_mode_scene(
+            "scene.rs",
+            "fn scene() {\nlet λ = 1;\n}\n",
+            13,
+            "fn scene() {\n    let λ = 1;\n}\n",
+            "syntax-keyword",
+        );
+    }
+
+    #[test]
+    fn production_markdown_mode_builds_a_vello_scene_without_a_display() {
+        assert_mode_scene(
+            "scene.md",
+            "# λ **bold**\n",
+            0,
+            "  # λ **bold**\n",
+            "markdown-strong",
+        );
+    }
+
+    fn assert_mode_scene(file: &str, source: &str, cursor: usize, expected: &str, face: &str) {
+        let buffer = Buffer::named(file, roe_core::buffer::BufferKind::File);
+        buffer.set_visited_file(Some(file.into()));
+        buffer.load_str(source);
         let mut editor = Editor::new(buffer, Frame::new(80, 23));
-        editor.move_cursor_to(13, false);
+        editor.move_cursor_to(cursor, false);
         let runtime = compio::runtime::Runtime::new().unwrap();
         let mut app = RoeVelloApp::new(
             editor,
@@ -1145,16 +1166,8 @@ mod lifecycle_tests {
         app.build_session_scene(DEFAULT_WIDTH, DEFAULT_HEIGHT)
             .unwrap();
         let snapshot = app.redraw_state.session_presentation().current().unwrap();
-        assert_eq!(
-            snapshot.views[0].visible_text,
-            "fn scene() {\n    let λ = 1;\n}\n"
-        );
-        assert!(
-            snapshot
-                .styles
-                .iter()
-                .any(|style| style.name == "syntax-keyword")
-        );
+        assert_eq!(snapshot.views[0].visible_text, expected);
+        assert!(snapshot.styles.iter().any(|style| style.name == face));
         assert!(!app.scene.encoding().path_tags.is_empty());
     }
 

@@ -1,0 +1,152 @@
+// Copyright (C) 2026 Ryan Daum <ryan.daum@gmail.com>
+// SPDX-License-Identifier: GPL-3.0-only
+// Markdown source editing policy. Whitespace is document structure, not layout.
+make_identity(:roe/markdown_package)
+make_identity(:roe/markdown_mode)
+make_identity(:roe/markdown_map)
+make_identity(:roe/enable_markdown_mode)
+make_identity(:roe/markdown_insert_indent)
+make_relation(:roe/MarkdownBuffer, 1)
+assert RoleCanRead(#roe/editor_role, :roe/MarkdownBuffer)
+assert roe/Package(#roe/markdown_package)
+assert roe/PackageUnit(#roe/markdown_package, :roe/markdown)
+assert roe/PackageEnabled(#roe/markdown_package, true)
+assert Delegates(#roe/markdown_mode, #roe/mode, 0)
+assert roe/MajorMode(#roe/markdown_mode)
+assert roe/ModeName(#roe/markdown_mode, "markdown")
+assert roe/PackageMode(#roe/markdown_package, #roe/markdown_mode)
+assert roe/Keymap(#roe/markdown_map)
+assert roe/PackageKeymap(#roe/markdown_package, #roe/markdown_map)
+assert roe/KeymapParent(#roe/markdown_map, #roe/global_map)
+assert roe/ModeKeymap(#roe/markdown_mode, #roe/markdown_map, 200)
+assert roe/ModeHook(#roe/markdown_mode, :roe/invalidate_syntax_hook, 100)
+assert roe/SyntaxRule(#roe/markdown_mode, :word, "[[:alnum:]_]", 200)
+assert roe/Configuration(#roe/markdown_mode, :indent_width, 2)
+assert roe/ConfigurationParent(#roe/markdown_mode, #roe/core_configuration)
+
+roe/MarkdownBuffer(buffer) :-
+  roe/BufferFileExtension(buffer, "md")
+roe/MarkdownBuffer(buffer) :-
+  roe/BufferFileExtension(buffer, "markdown")
+roe/MarkdownBuffer(buffer) :-
+  roe/BufferFileExtension(buffer, "mdown")
+roe/BufferMajorMode(buffer, #roe/markdown_mode) :-
+  roe/MarkdownBuffer(buffer),
+  not roe/BufferHasModeOverride(buffer)
+
+assert roe/SyntaxParser(#roe/markdown_mode, :markdown, "(atx_heading) @heading\n(setext_heading) @heading\n(pipe_table_header) @heading\n[(atx_h1_marker) (atx_h2_marker) (atx_h3_marker) (atx_h4_marker) (atx_h5_marker) (atx_h6_marker) (setext_h1_underline) (setext_h2_underline) (thematic_break) (pipe_table_delimiter_row)] @marker\n[(list_marker_plus) (list_marker_minus) (list_marker_star) (list_marker_dot) (list_marker_parenthesis) (task_list_marker_checked) (task_list_marker_unchecked)] @list\n(block_quote_marker) @quote\n[(link_destination) (link_label)] @link\n[(fenced_code_block) (indented_code_block) (html_block)] @code\n(fenced_code_block_delimiter) @marker\n(info_string) @marker")
+assert roe/SyntaxInjection(#roe/markdown_mode, :markdown_inline, "[(inline) (pipe_table_cell)] @content", "(emphasis) @emphasis\n(strong_emphasis) @strong\n(strikethrough) @strike\n[(link_text) (image_description) (link_label) (link_destination) (uri_autolink) (email_autolink)] @link\n[(code_span) (html_tag)] @code\n[(backslash_escape) (hard_line_break)] @escape")
+// No automatic reindentation rules: list nesting, code indentation, and hard
+// breaks are user-authored structure. Enter copies the previous leading whitespace.
+
+make_identity(:roe/markdown_heading_face)
+assert roe/Face(#roe/markdown_heading_face)
+assert roe/FaceName(#roe/markdown_heading_face, "markdown-heading")
+assert roe/FaceAttribute(#roe/markdown_heading_face, :foreground, "#569cd6")
+assert roe/FaceAttribute(#roe/markdown_heading_face, :weight, "bold")
+assert roe/SyntaxHighlightRule(#roe/markdown_mode, :heading, #roe/markdown_heading_face, 200)
+
+make_identity(:roe/markdown_marker_face)
+assert roe/Face(#roe/markdown_marker_face)
+assert roe/FaceName(#roe/markdown_marker_face, "markdown-marker")
+assert roe/FaceAttribute(#roe/markdown_marker_face, :foreground, "#808080")
+assert roe/SyntaxHighlightRule(#roe/markdown_mode, :marker, #roe/markdown_marker_face, 200)
+
+make_identity(:roe/markdown_list_face)
+assert roe/Face(#roe/markdown_list_face)
+assert roe/FaceName(#roe/markdown_list_face, "markdown-list")
+assert roe/FaceAttribute(#roe/markdown_list_face, :foreground, "#ce9178")
+assert roe/SyntaxHighlightRule(#roe/markdown_mode, :list, #roe/markdown_list_face, 200)
+
+make_identity(:roe/markdown_quote_face)
+assert roe/Face(#roe/markdown_quote_face)
+assert roe/FaceName(#roe/markdown_quote_face, "markdown-quote")
+assert roe/FaceAttribute(#roe/markdown_quote_face, :foreground, "#6a9955")
+assert roe/SyntaxHighlightRule(#roe/markdown_mode, :quote, #roe/markdown_quote_face, 200)
+
+make_identity(:roe/markdown_link_face)
+assert roe/Face(#roe/markdown_link_face)
+assert roe/FaceName(#roe/markdown_link_face, "markdown-link")
+assert roe/FaceAttribute(#roe/markdown_link_face, :foreground, "#4ec9b0")
+assert roe/FaceAttribute(#roe/markdown_link_face, :underline, true)
+assert roe/SyntaxHighlightRule(#roe/markdown_mode, :link, #roe/markdown_link_face, 200)
+
+make_identity(:roe/markdown_code_face)
+assert roe/Face(#roe/markdown_code_face)
+assert roe/FaceName(#roe/markdown_code_face, "markdown-code")
+assert roe/FaceAttribute(#roe/markdown_code_face, :foreground, "#dcdcaa")
+assert roe/SyntaxHighlightRule(#roe/markdown_mode, :code, #roe/markdown_code_face, 200)
+
+make_identity(:roe/markdown_emphasis_face)
+assert roe/Face(#roe/markdown_emphasis_face)
+assert roe/FaceName(#roe/markdown_emphasis_face, "markdown-emphasis")
+assert roe/FaceAttribute(#roe/markdown_emphasis_face, :foreground, "#d4d4d4")
+assert roe/FaceAttribute(#roe/markdown_emphasis_face, :slant, "italic")
+assert roe/SyntaxHighlightRule(#roe/markdown_mode, :emphasis, #roe/markdown_emphasis_face, 200)
+
+make_identity(:roe/markdown_strong_face)
+assert roe/Face(#roe/markdown_strong_face)
+assert roe/FaceName(#roe/markdown_strong_face, "markdown-strong")
+assert roe/FaceAttribute(#roe/markdown_strong_face, :foreground, "#d4d4d4")
+assert roe/FaceAttribute(#roe/markdown_strong_face, :weight, "bold")
+assert roe/SyntaxHighlightRule(#roe/markdown_mode, :strong, #roe/markdown_strong_face, 200)
+
+make_identity(:roe/markdown_strike_face)
+assert roe/Face(#roe/markdown_strike_face)
+assert roe/FaceName(#roe/markdown_strike_face, "markdown-strike")
+assert roe/FaceAttribute(#roe/markdown_strike_face, :foreground, "#808080")
+assert roe/SyntaxHighlightRule(#roe/markdown_mode, :strike, #roe/markdown_strike_face, 200)
+
+make_identity(:roe/markdown_escape_face)
+assert roe/Face(#roe/markdown_escape_face)
+assert roe/FaceName(#roe/markdown_escape_face, "markdown-escape")
+assert roe/FaceAttribute(#roe/markdown_escape_face, :foreground, "#c586c0")
+assert roe/SyntaxHighlightRule(#roe/markdown_mode, :escape, #roe/markdown_escape_face, 200)
+
+assert Delegates(#roe/enable_markdown_mode, #roe/command, 0)
+assert roe/Command(#roe/enable_markdown_mode)
+assert roe/CommandSelector(#roe/enable_markdown_mode, :roe/enable_markdown_mode)
+assert roe/CommandName(#roe/enable_markdown_mode, "markdown-mode")
+assert roe/CommandSummary(#roe/enable_markdown_mode, "Use Markdown editing policy in the active buffer")
+assert roe/PackageCommand(#roe/markdown_package, #roe/enable_markdown_mode)
+assert RoleCanInvoke(#roe/editor_role, :roe/enable_markdown_mode)
+
+verb roe/enable_markdown_mode(actor, session)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  let exactly {:view -> view} = roe/ActiveView(session, ?view)
+  let exactly {:buffer -> buffer} = roe/ViewBuffer(view, ?buffer)
+  roe/CanUseBuffer(actor, buffer) || return :buffer_denied
+  retract roe/BufferModeOverride(buffer, _)
+  assert roe/BufferModeOverride(buffer, #roe/markdown_mode)
+  roe/publish_policy(actor, session)
+  return :ok
+end
+
+assert Delegates(#roe/markdown_insert_indent, #roe/command, 0)
+assert roe/Command(#roe/markdown_insert_indent)
+assert roe/CommandSelector(#roe/markdown_insert_indent, :roe/markdown_insert_indent)
+assert roe/CommandName(#roe/markdown_insert_indent, "markdown-insert-indent")
+assert roe/CommandSummary(#roe/markdown_insert_indent, "Insert one configured indentation unit")
+assert roe/PackageCommand(#roe/markdown_package, #roe/markdown_insert_indent)
+assert RoleCanInvoke(#roe/editor_role, :roe/markdown_insert_indent)
+assert roe/KeyBinding(#roe/markdown_map, "Tab", #roe/markdown_insert_indent, 2000)
+assert roe/KeyBinding(#roe/markdown_map, "⏎", #roe/newline_and_indent, 2000)
+
+verb roe/markdown_insert_indent(actor, session)
+  roe/SessionActor(session, actor) || return :not_session_actor
+  roe/CanRequestService(actor, :text_write) || return :text_write_denied
+  let exactly {:view -> view} = roe/ActiveView(session, ?view)
+  let exactly {:buffer -> buffer} = roe/ViewBuffer(view, ?buffer)
+  roe/CanUseBuffer(actor, buffer) || return :buffer_denied
+  let exactly {:width -> width} = roe/EffectiveConfiguration(#roe/markdown_mode, :indent_width, ?width)
+  width >= 1 && width <= 16 || raise E_INVARG, "indentation width must be between 1 and 16"
+  let text = ""
+  let count = 0
+  while count < width
+    text = string_concat(text, " ")
+    count = count + 1
+  end
+  emit(session, {:kind -> :native_action, :action -> :insert_text, :text -> text})
+  roe/emit_edit_hooks(actor, session)
+  return :ok
+end

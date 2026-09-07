@@ -48,8 +48,24 @@ impl PolicyProjection {
         let mut grammars = HashMap::new();
         let mut queries = HashMap::new();
         let mut indentation: HashMap<String, Vec<IndentRule>> = HashMap::new();
+        let mut injections = HashMap::new();
         for fact in &facts {
             match fact {
+                MicaPolicyFact::Injection {
+                    mode,
+                    grammar,
+                    query,
+                    highlights,
+                } => {
+                    let specification = (grammar.clone(), query.clone(), highlights.clone());
+                    if let Some(previous) = injections.insert(mode.clone(), specification.clone())
+                        && previous != specification
+                    {
+                        return Err(
+                            "Mica syntax injections contain conflicting functional facts".into(),
+                        );
+                    }
+                }
                 MicaPolicyFact::Parser {
                     mode,
                     grammar,
@@ -121,10 +137,11 @@ impl PolicyProjection {
         }
         for (mode, grammar) in grammars {
             let rules = indentation.remove(&mode).unwrap_or_default();
+            let injection = injections.remove(&mode);
             // A changed face or buffer association does not recompile unchanged queries.
             let parser_facts = |set: &HashSet<MicaPolicyFact>| {
                 set.iter().filter(|fact| matches!(fact,
-                MicaPolicyFact::Parser { mode: found, .. } | MicaPolicyFact::Indentation { mode: found, .. } if found == &mode)).cloned().collect::<HashSet<_>>()
+                MicaPolicyFact::Parser { mode: found, .. } | MicaPolicyFact::Indentation { mode: found, .. } | MicaPolicyFact::Injection { mode: found, .. } if found == &mode)).cloned().collect::<HashSet<_>>()
             };
             let plan = if parser_facts(&facts) == parser_facts(&self.facts) {
                 self.parsers.get(&mode).cloned()
@@ -135,12 +152,18 @@ impl PolicyProjection {
                 mode.clone(),
                 match plan {
                     Some(plan) => plan,
-                    None => Arc::new(SyntaxPlan::compile(&grammar, &queries[&mode], &rules)?),
+                    None => {
+                        let mut plan = SyntaxPlan::compile(&grammar, &queries[&mode], &rules)?;
+                        if let Some((grammar, regions, highlights)) = injection {
+                            plan = plan.with_injection(&grammar, &regions, &highlights)?;
+                        }
+                        Arc::new(plan)
+                    }
                 },
             );
         }
-        if !indentation.is_empty() {
-            return Err("indentation rules require a syntax parser policy".into());
+        if !indentation.is_empty() || !injections.is_empty() {
+            return Err("indentation and injection rules require a syntax parser policy".into());
         }
         next.facts = facts;
         next.revision = self
@@ -201,6 +224,40 @@ mod tests {
         );
         assert_eq!(projection.revision, 1);
         assert_eq!(projection.configuration["tab-width"], "4");
+        assert_eq!(projection.facts, old_facts);
+    }
+
+    #[test]
+    fn rejected_injection_preserves_the_complete_policy() {
+        let mut projection = PolicyProjection::default();
+        let parser = MicaPolicyFact::Parser {
+            mode: "markdown".into(),
+            grammar: "markdown".into(),
+            query: "(atx_heading) @heading".into(),
+        };
+        projection
+            .replace(vec![parser.clone(), setting("4")])
+            .unwrap();
+        let old_facts = projection.facts.clone();
+        let previous = Arc::clone(&projection.parsers["markdown"]);
+        let injection = MicaPolicyFact::Injection {
+            mode: "markdown".into(),
+            grammar: "markdown_inline".into(),
+            query: "(inline) @content".into(),
+            highlights: "(not_a_node) @code".into(),
+        };
+        assert!(
+            projection
+                .replace(vec![parser, injection.clone(), setting("8")])
+                .is_err()
+        );
+        assert_eq!(projection.facts, old_facts);
+        assert_eq!(projection.revision, 1);
+        assert!(Arc::ptr_eq(&previous, &projection.parsers["markdown"]));
+        assert!(
+            projection.replace(vec![injection]).is_err(),
+            "injections without a parser must be rejected"
+        );
         assert_eq!(projection.facts, old_facts);
     }
 }

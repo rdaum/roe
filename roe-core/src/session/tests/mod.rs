@@ -86,6 +86,7 @@ mod commands;
 mod file_prompts;
 mod indentation;
 mod layout;
+mod markdown_mode;
 mod native;
 mod pointer;
 mod policy;

@@ -317,6 +317,12 @@ impl MicaHost {
                 grammar: symbol(value, "grammar")?,
                 query: string(value, "query")?,
             },
+            "injection_policy" => Injection {
+                mode: string(value, "mode")?,
+                grammar: symbol(value, "grammar")?,
+                query: string(value, "query")?,
+                highlights: string(value, "highlights")?,
+            },
             "indentation_policy" => Indentation {
                 mode: string(value, "mode")?,
                 query: string(value, "query")?,

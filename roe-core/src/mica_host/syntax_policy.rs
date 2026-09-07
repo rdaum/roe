@@ -26,7 +26,12 @@ for parser in roe/SyntaxParser(?mode, ?grammar, ?query)
       rules = [@rules, rule]
     end
   end
-  plans = [@plans, {:grammar -> parser[:grammar], :query -> parser[:query], :rules -> rules}]
+  let injections = []
+  for injection in roe/SyntaxInjection(parser[:mode], ?grammar, ?query, ?highlights)
+    not injections || raise E_INVARG, "syntax injection limit exceeded"
+    injections = [injection]
+  end
+  plans = [@plans, {:grammar -> parser[:grammar], :query -> parser[:query], :rules -> rules, :injections -> injections}]
 end
 plans
 "#;
@@ -76,7 +81,22 @@ fn validate_plans(value: &Value) -> Result<(), String> {
                 precedence: integer(&rule, "precedence")?,
             });
         }
-        SyntaxPlan::compile(&grammar, &query, &decoded)?;
+        let compiled = SyntaxPlan::compile(&grammar, &query, &decoded)?;
+        let injections = map_value(&plan, "injections").ok_or("missing syntax injections")?;
+        let count = injections
+            .list_len()
+            .ok_or("syntax injections must be a list")?;
+        if count > 1 {
+            return Err("syntax injection limit exceeded".into());
+        }
+        if count == 1 {
+            let injection = injections.list_get(0).ok_or("missing syntax injection")?;
+            compiled.with_injection(
+                &symbol(&injection, "grammar")?,
+                &string(&injection, "query")?,
+                &string(&injection, "highlights")?,
+            )?;
+        }
     }
     Ok(())
 }

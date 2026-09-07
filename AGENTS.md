@@ -48,6 +48,8 @@ The core ontology and generic behaviors live in `mica/roe-model.mica`. Shipped e
 bindings live in `mica/roe-first-wave.mica`.
 Rust-mode policy lives in `mica/roe-rust.mica`. Its package is `roe/rust_package`.
 The usage and configuration guide is `docs/RUST-MODE.md`.
+Markdown-mode policy lives in `mica/roe-markdown.mica`, in the `roe/markdown_package` package.
+Its guide is `docs/MARKDOWN-MODE.md`. Shared indentation commands belong to core Mica policy.
 
 ### Rust owns mechanisms
 
@@ -401,6 +403,9 @@ should use one test thread when they share driver/recovery state.
 - Tree-sitter and its Rust grammar use the versions already fixed by the Mica dependency graph.
   The native syntax service shares bounded buffer trees between highlighting and indentation.
   Keep grammar selection, queries, faces, indentation rules, and mode bindings in Mica.
+- The Markdown block and inline grammars use the locked `tree-sitter-md` version.
+  `SyntaxInjection` supplies one bounded, nonrecursive layer of query-selected regions.
+  Keep region selection and inline highlight queries in Mica.
 
 Do not update Compio, Mica, or the graphics stack as an incidental change. A Mica revision change
 requires rechecking source compatibility, lifecycle, authority, replacement, recovery, backpressure,

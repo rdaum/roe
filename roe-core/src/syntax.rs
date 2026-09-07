@@ -4,6 +4,9 @@
 //! Bounded syntax mechanisms. Languages, queries, faces, and indentation rules
 //! are selected by Mica. No file extensions or editor commands live here.
 
+mod injection;
+use injection::inject_highlights;
+
 use crate::BufferId;
 use crate::syntax_highlighting::{HighlightSpan, MAX_HIGHLIGHT_SOURCE_BYTES, MAX_HIGHLIGHT_SPANS};
 use ropey::Rope;
@@ -21,6 +24,8 @@ const MAX_CAPTURE_NAME_BYTES: usize = 128;
 const MAX_INDENT_RULES: usize = 64;
 const MAX_INDENT_COLUMNS: usize = 256;
 const WORK_TIME: Duration = Duration::from_millis(50);
+const MAX_INJECTION_REGIONS: usize = 1024;
+const MAX_INJECTION_RANGES: usize = 16_384;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct IndentRule {
@@ -50,11 +55,20 @@ pub(crate) struct SyntaxPlan {
     grammar: String,
     highlights: Option<Query>,
     indentation: Vec<CompiledIndentRule>,
+    injection: Option<InjectionPlan>,
+}
+
+struct InjectionPlan {
+    language: Language,
+    regions: Query,
+    highlights: Query,
 }
 
 fn language(name: &str) -> Result<Language, String> {
     match name {
         "rust" => Ok(tree_sitter_rust::LANGUAGE.into()),
+        "markdown" => Ok(tree_sitter_md::LANGUAGE.into()),
+        "markdown_inline" => Ok(tree_sitter_md::INLINE_LANGUAGE.into()),
         _ => Err(format!("syntax grammar is unavailable: {name}")),
     }
 }
@@ -96,6 +110,7 @@ impl SyntaxPlan {
                 grammar: grammar.into(),
                 highlights: None,
                 indentation: Vec::new(),
+                injection: None,
             });
         }
         if rules.len() > MAX_INDENT_RULES
@@ -137,7 +152,29 @@ impl SyntaxPlan {
             grammar: grammar.into(),
             highlights: Some(compile_query(&language, highlights)?),
             indentation,
+            injection: None,
         })
+    }
+
+    /// One nonrecursive layer. Mica selects both the regions and their grammar.
+    pub fn with_injection(
+        mut self,
+        grammar: &str,
+        regions: &str,
+        highlights: &str,
+    ) -> Result<Self, String> {
+        let regions = compile_query(&language(&self.grammar)?, regions)?;
+        if regions.capture_names() != ["content"] {
+            return Err("syntax injection queries require only @content".into());
+        }
+        let language = language(grammar)?;
+        let highlights = compile_query(&language, highlights)?;
+        self.injection = Some(InjectionPlan {
+            language,
+            regions,
+            highlights,
+        });
+        Ok(self)
     }
 }
 
@@ -248,11 +285,20 @@ impl SyntaxService {
                     capture.node.start_byte(),
                     capture.node.end_byte(),
                     matched.pattern_index,
-                    capture.index,
+                    query.capture_names()[capture.index as usize],
                 ));
             }
             Ok(())
         })?;
+        if let Some(injection) = &plan.injection {
+            inject_highlights(
+                injection,
+                &cached.tree,
+                &source,
+                query.pattern_count(),
+                &mut spans,
+            )?;
+        }
         // Query captures can nest and overlap. Normalize in byte coordinates
         // before one ordered Unicode conversion; later query patterns win.
         let mut events = Vec::with_capacity(spans.len() * 2);
@@ -263,7 +309,7 @@ impl SyntaxService {
             }
         }
         events.sort_unstable();
-        let mut active = BTreeSet::new();
+        let mut active: BTreeSet<(usize, std::cmp::Reverse<usize>, usize)> = BTreeSet::new();
         let mut previous = 0;
         let mut byte_cursor = 0;
         let mut char_cursor = 0;
@@ -272,12 +318,11 @@ impl SyntaxService {
             if position > previous
                 && let Some(&(_, _, winner)) = active.last()
             {
-                let (_, _, _, capture) = spans[winner];
+                let (_, _, _, name) = spans[winner];
                 char_cursor += source[byte_cursor..previous].chars().count();
                 let start = char_cursor;
                 char_cursor += source[previous..position].chars().count();
                 byte_cursor = position;
-                let name = query.capture_names()[capture as usize];
                 if let Some(last) = result.last_mut()
                     && last.end == start
                     && last.capture == name
@@ -395,6 +440,9 @@ pub(crate) struct IndentRequest {
     pub tab_width: usize,
 }
 
+#[cfg(test)]
+mod markdown_tests;
+
 #[derive(Debug)]
 pub(crate) struct TextEdit {
     pub start: usize,
@@ -477,6 +525,24 @@ fn visit_matches(
     tree: &Tree,
     source: &str,
     range: Option<std::ops::Range<usize>>,
+    visit: impl FnMut(&tree_sitter::QueryMatch<'_, '_>) -> Result<(), String>,
+) -> Result<(), String> {
+    visit_matches_until(
+        query,
+        tree,
+        source,
+        range,
+        Instant::now() + WORK_TIME,
+        visit,
+    )
+}
+
+fn visit_matches_until(
+    query: &Query,
+    tree: &Tree,
+    source: &str,
+    range: Option<std::ops::Range<usize>>,
+    deadline: Instant,
     mut visit: impl FnMut(&tree_sitter::QueryMatch<'_, '_>) -> Result<(), String>,
 ) -> Result<(), String> {
     let mut cursor = QueryCursor::new();
@@ -484,7 +550,6 @@ fn visit_matches(
     if let Some(range) = range {
         cursor.set_byte_range(range);
     }
-    let deadline = Instant::now() + WORK_TIME;
     let mut cancelled = false;
     let mut progress = |_: &tree_sitter::QueryCursorState| {
         cancelled = Instant::now() >= deadline;

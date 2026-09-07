@@ -19,6 +19,17 @@ trap cleanup EXIT
 
 cargo build --release --manifest-path "$project_root/Cargo.toml" --bin roe
 
+wait_for_pane_text() {
+    local name="$1" expected="$2" pane="" attempt
+    for ((attempt = 0; attempt < 50; attempt++)); do
+        pane="$(tmux -L "$tmux_socket" capture-pane -p -t "$name")" || return 1
+        [[ "$pane" == *"$expected"* ]] && return 0
+        sleep 0.1
+    done
+    printf '%s\n' "$pane" >&2
+    return 1
+}
+
 start_session() {
     local name="$1"
     shift
@@ -32,7 +43,7 @@ start_session() {
         command+="$quoted_argument "
     done
     tmux -L "$tmux_socket" new-session -d -s "$name" -x 80 -y 24 "$command"
-    sleep 0.5
+    wait_for_pane_text "$name" '└'
 }
 
 finish_session() {
@@ -92,14 +103,23 @@ finish_session rust-mode
 [[ "$(sed -n '2p' "$rust_file")" == '    let x = 1;' ]]
 [[ "$(sed -n '3p' "$rust_file")" == '    let y = 2;' ]]
 
+# Markdown Tab adds one indentation unit; Enter preserves leading whitespace.
+markdown_file="$probe_dir/notes.md"
+printf '# Title\n  - item\n' >"$markdown_file"
+start_session markdown-mode "$markdown_file"
+tmux -L "$tmux_socket" send-keys -t markdown-mode C-n Home Tab C-e Enter
+tmux -L "$tmux_socket" send-keys -t markdown-mode -l continuation
+tmux -L "$tmux_socket" send-keys -t markdown-mode C-x C-s
+finish_session markdown-mode
+[[ "$(sed -n '2p' "$markdown_file")" == '    - item' ]]
+[[ "$(sed -n '3p' "$markdown_file")" == '    continuation' ]]
+
 # An ordinary save failure is reported in the UI and leaves the session usable.
 failed_save_path="/proc/roe-phase1-save-$$"
 start_session failed-save "$failed_save_path"
 tmux -L "$tmux_socket" send-keys -t failed-save -l Z
 tmux -L "$tmux_socket" send-keys -t failed-save C-x C-s
-sleep 0.2
-failed_save_pane="$(tmux -L "$tmux_socket" capture-pane -p -t failed-save)"
-[[ "$failed_save_pane" == *"failed to save"* ]]
+wait_for_pane_text failed-save 'failed to save'
 finish_session failed-save
 
 # Movement, a multibyte region kill, undo, yank, and insertion must all retain
@@ -247,3 +267,4 @@ tmux -L "$tmux_socket" kill-session -t forced-shutdown
 printf '%s\n' 'phase0_terminal_workflows=pass'
 printf '%s\n' 'phase1_forced_shutdown=terminal_restored'
 printf '%s\n' 'rust_terminal_workflow=pass'
+printf '%s\n' 'markdown_terminal_workflow=pass'

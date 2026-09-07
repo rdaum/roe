@@ -7,8 +7,6 @@ make_identity(:roe/rust_package)
 make_identity(:roe/rust_mode)
 make_identity(:roe/rust_map)
 make_identity(:roe/enable_rust_mode)
-make_identity(:roe/indent_line)
-make_identity(:roe/newline_and_indent)
 assert roe/Package(#roe/rust_package)
 assert roe/PackageUnit(#roe/rust_package, :roe/rust)
 assert roe/PackageEnabled(#roe/rust_package, true)
@@ -124,44 +122,5 @@ verb roe/enable_rust_mode(actor, session)
   return :ok
 end
 
-assert Delegates(#roe/indent_line, #roe/command, 0)
-assert roe/Command(#roe/indent_line)
-assert roe/CommandSelector(#roe/indent_line, :roe/indent_line)
-assert roe/CommandName(#roe/indent_line, "indent-line")
-assert roe/CommandSummary(#roe/indent_line, "Indent this line with the active mode's syntax rules")
-assert roe/PackageCommand(#roe/rust_package, #roe/indent_line)
 assert roe/KeyBinding(#roe/rust_map, "Tab", #roe/indent_line, 2000)
-assert RoleCanInvoke(#roe/editor_role, :roe/indent_line)
-assert Delegates(#roe/newline_and_indent, #roe/command, 0)
-assert roe/Command(#roe/newline_and_indent)
-assert roe/CommandSelector(#roe/newline_and_indent, :roe/newline_and_indent)
-assert roe/CommandName(#roe/newline_and_indent, "newline-and-indent")
-assert roe/CommandSummary(#roe/newline_and_indent, "Insert a newline and indent it in one undo group")
-assert roe/PackageCommand(#roe/rust_package, #roe/newline_and_indent)
 assert roe/KeyBinding(#roe/rust_map, "⏎", #roe/newline_and_indent, 2000)
-assert RoleCanInvoke(#roe/editor_role, :roe/newline_and_indent)
-assert RoleCanInvoke(#roe/editor_role, :roe/indent_current_line)
-
-verb roe/indent_line(actor, session)
-  return roe/indent_current_line(actor, session, false)
-end
-
-verb roe/newline_and_indent(actor, session)
-  return roe/indent_current_line(actor, session, true)
-end
-
-verb roe/indent_current_line(actor, session, newline)
-  roe/SessionActor(session, actor) || return :not_session_actor
-  roe/CanRequestService(actor, :text_read) || return :text_read_denied
-  roe/CanRequestService(actor, :text_write) || return :text_write_denied
-  let exactly {:view -> view} = roe/ActiveView(session, ?view)
-  let exactly {:buffer -> buffer} = roe/ViewBuffer(view, ?buffer)
-  roe/CanUseBuffer(actor, buffer) || return :buffer_denied
-  let exactly {:mode -> mode} = roe/EffectiveMajorMode(buffer, ?mode)
-  let exactly {:revision -> revision} = roe/NativeBufferRevision(buffer, ?revision)
-  let exactly {:width -> width} = roe/EffectiveConfiguration(mode, :indent_width, ?width)
-  let exactly {:tab_width -> tab_width} = roe/EffectiveConfiguration(mode, :tab_width, ?tab_width)
-  emit(session, {:kind -> :host_action, :action -> :indent_line, :view -> view, :buffer -> buffer, :revision -> revision, :newline -> newline, :width -> width, :tab_width -> tab_width})
-  roe/emit_edit_hooks(actor, session)
-  return :ok
-end

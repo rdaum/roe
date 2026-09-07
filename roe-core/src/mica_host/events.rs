@@ -298,6 +298,12 @@ impl MicaNativeAction {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum MicaPolicyFact {
+    Injection {
+        mode: String,
+        grammar: String,
+        query: String,
+        highlights: String,
+    },
     Parser {
         mode: String,
         grammar: String,
@@ -338,6 +344,12 @@ pub enum MicaPolicyFact {
 impl MicaPolicyFact {
     pub(crate) fn heap_bytes(&self) -> usize {
         match self {
+            Self::Injection {
+                mode,
+                grammar,
+                query,
+                highlights,
+            } => mode.len() + grammar.len() + query.len() + highlights.len(),
             Self::Parser {
                 mode,
                 grammar,

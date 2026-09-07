@@ -56,6 +56,8 @@ In short Mica takes the place that Lisp usually takes in the rest of the Emacs p
 - Mica syntax highlighting in scratch and `.mica` files.
 - [Rust mode](docs/RUST-MODE.md) with syntax highlighting, Tab indentation, and newline indentation.
   Rust mode activates for `.rs` files or through `M-x rust-mode`.
+- [Markdown mode](docs/MARKDOWN-MODE.md) with block and inline highlighting and whitespace-preserving newline indentation.
+  Markdown mode activates for `.md`, `.markdown`, and `.mdown` files or through `M-x markdown-mode`.
 - Safe Mica experimentation: Roe rejects invalid code and keeps the last working editor behavior.
 
 ## Building and running

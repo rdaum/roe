@@ -31,16 +31,25 @@ impl Write for CountingWriter {
     }
 }
 
-fn fixture(rust: bool) -> Editor {
+fn fixture(rust: bool, markdown: bool) -> Editor {
     let buffer = Buffer::named("*baseline*", roe_core::buffer::BufferKind::Ordinary);
     let mut content = String::with_capacity(FIXTURE_LINES * 64);
     if rust {
         buffer.set_visited_file(Some("baseline.rs".into()));
         content.push_str("fn baseline() {\n");
+    } else if markdown {
+        buffer.set_visited_file(Some("baseline.md".into()));
     }
     for line in 0..FIXTURE_LINES {
         if rust {
             content.push_str(&format!("    let value_{line} = \"Rust source with λ\";\n"));
+        } else if markdown {
+            match line % 4 {
+                0 => content.push_str(&format!("## Section {line}\n")),
+                1 => content.push_str("Text with **strong words** and `code` λ.\n"),
+                2 => content.push_str("Continuation with a [local link](notes.md).\n"),
+                _ => content.push('\n'),
+            }
         } else {
             content.push_str(&format!(
                 "line {line:04}: Roe baseline text with unicode lambda λ\n"
@@ -73,7 +82,14 @@ fn main() -> io::Result<()> {
 async fn run() -> io::Result<()> {
     let process_started = Instant::now();
     let rust = std::env::args().any(|argument| argument == "--rust");
-    let editor = fixture(rust);
+    let markdown = std::env::args().any(|argument| argument == "--markdown");
+    if rust && markdown {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "select one syntax mode",
+        ));
+    }
+    let editor = fixture(rust, markdown);
     let fixture_construction = process_started.elapsed();
     let workspace = WorkspaceHost::open_with_mica(editor, CapabilityGrants::editor_default())
         .map_err(io::Error::other)?;
@@ -81,6 +97,19 @@ async fn run() -> io::Result<()> {
         DirectSessionClient::new(workspace, AttachmentConfiguration::headless(80, 23));
     let initial = session.initial_output().await;
     check_output(&initial)?;
+    if rust || markdown {
+        let Some(roe_core::session::PresentationUpdate::Full(snapshot)) = &initial.presentation
+        else {
+            return Err(io::Error::other("missing initial syntax presentation"));
+        };
+        if snapshot
+            .views
+            .iter()
+            .all(|view| view.styled_ranges.is_empty())
+        {
+            return Err(io::Error::other("syntax benchmark has no highlight spans"));
+        }
+    }
     let ready = process_started.elapsed();
     let post_fixture_rss_kib = resident_memory_kib();
 
@@ -120,7 +149,16 @@ async fn run() -> io::Result<()> {
     let redraw_elapsed = redraw_started.elapsed();
     let post_workload_rss_kib = resident_memory_kib();
 
-    println!("syntax_mode={}", if rust { "rust" } else { "fundamental" });
+    println!(
+        "syntax_mode={}",
+        if rust {
+            "rust"
+        } else if markdown {
+            "markdown"
+        } else {
+            "fundamental"
+        }
+    );
     println!("fixture_lines={FIXTURE_LINES}");
     println!(
         "fixture_construction_us={}",

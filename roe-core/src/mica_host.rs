@@ -90,6 +90,7 @@ macro_rules! layout_named_tuples {
 const CORE_SOURCE: &str = include_str!("../../mica/roe-model.mica");
 const FIRST_WAVE_SOURCE: &str = include_str!("../../mica/roe-first-wave.mica");
 const RUST_SOURCE: &str = include_str!("../../mica/roe-rust.mica");
+const MARKDOWN_SOURCE: &str = include_str!("../../mica/roe-markdown.mica");
 const AGENT_SOURCE: &str = include_str!("../../mica/roe-agent.mica");
 const EVENT_QUEUE_CAPACITY: usize = 256;
 const EXTERNAL_REQUEST_CAPACITY: usize = 16;
@@ -1107,7 +1108,7 @@ impl MicaHost {
     }
 
     pub async fn export_unit(&mut self, unit: &str) -> Result<String, MicaHostError> {
-        if unit == "roe/first-wave" || unit == "roe/rust" {
+        if matches!(unit, "roe/first-wave" | "roe/rust" | "roe/markdown") {
             self.ensure_first_wave().await?;
         }
         Ok(self.administrator.fileout_unit(sym(unit)).await?)
@@ -1118,7 +1119,10 @@ impl MicaHost {
             .await?;
         self.replace_unit("roe/agent", AGENT_SOURCE.to_owned())
             .await?;
-        self.replace_unit("roe/rust", RUST_SOURCE.to_owned()).await
+        self.replace_unit("roe/rust", RUST_SOURCE.to_owned())
+            .await?;
+        self.replace_unit("roe/markdown", MARKDOWN_SOURCE.to_owned())
+            .await
     }
 
     async fn ensure_first_wave(&mut self) -> Result<(), MicaHostError> {
@@ -1137,19 +1141,16 @@ impl MicaHost {
             self.loaded_units.insert(sym("roe/first-wave"));
             self.first_wave_loaded = true;
         }
-        if !self.loaded_units.contains(&sym("roe/rust")) {
-            self.administrator
-                .check_filein(RUST_SOURCE.to_owned(), None)
-                .await?;
-            self.administrator
-                .filein_unit(
-                    sym("roe/rust"),
-                    RUST_SOURCE.to_owned(),
-                    FileinMode::Add,
-                    None,
-                )
-                .await?;
-            self.loaded_units.insert(sym("roe/rust"));
+        for (unit, source) in [("roe/rust", RUST_SOURCE), ("roe/markdown", MARKDOWN_SOURCE)] {
+            if !self.loaded_units.contains(&sym(unit)) {
+                self.administrator
+                    .check_filein(source.to_owned(), None)
+                    .await?;
+                self.administrator
+                    .filein_unit(sym(unit), source.to_owned(), FileinMode::Add, None)
+                    .await?;
+                self.loaded_units.insert(sym(unit));
+            }
         }
         if !self.loaded_units.contains(&sym("roe/agent")) {
             self.administrator
